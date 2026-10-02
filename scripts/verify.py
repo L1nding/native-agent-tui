@@ -53,6 +53,8 @@ def main():
     generated = run([str(fixture)], stdout=subprocess.PIPE)
     run([sys.executable, str(fixtures / "observation_consumer.py")], input=generated.stdout)
     run([sys.executable, str(fixtures / "live_jsonl_check.py"), "--binary", str(binary)])
+    if os.name == "nt":
+        run([sys.executable, str(fixtures / "process_ownership_check.py"), "--fixture", str(binary.parent / "examples/process_fixture.exe")])
     if args.live:
         arguments = ["nextest", "run", "--locked", "--run-ignored", "only", "--no-capture", "--no-fail-fast"] if nextest else [
             "test", "--locked", "--all-targets", "--", "--ignored", "--nocapture", "--test-threads=1"

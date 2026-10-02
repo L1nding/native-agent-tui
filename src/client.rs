@@ -2919,7 +2919,7 @@ mod tests {
         }
         let catalog =
             app_server::DirectCatalog::from_bytes(&serde_json::to_vec(&catalog).unwrap()).unwrap();
-        let mut command = tokio::process::Command::new(&config.executable);
+        let mut command = crate::owned_process::Command::new(&config.executable);
         command
             .env("CODEX_HOME", &home.0)
             .env_remove("OPENAI_API_KEY")

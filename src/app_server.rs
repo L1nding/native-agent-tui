@@ -1,15 +1,14 @@
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::owned_process::{self, Child, Command, Input};
 use crate::protocol::{Envelope, RpcId, WAIT_TOOL};
 use crate::transport::{PipeTransport, TransportError};
 
@@ -29,8 +28,6 @@ pub(crate) struct AppServer {
     child: Child,
     stderr: JoinHandle<()>,
     _catalog: Option<DirectCatalog>,
-    #[cfg(windows)]
-    job: Option<WindowsJob>,
 }
 
 impl AppServer {
@@ -50,23 +47,8 @@ impl AppServer {
         Ok(server)
     }
 
-    pub(crate) fn spawn_command(mut command: Command) -> Result<Self, AppServerError> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW: no console helper windows.
-        let mut child = command.spawn()?;
-        #[cfg(windows)]
-        let job = match WindowsJob::attach(&child) {
-            Ok(job) => Some(job),
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(error.into());
-            }
-        };
+    pub(crate) fn spawn_command(command: Command) -> Result<Self, AppServerError> {
+        let mut child = owned_process::spawn(command, Input::Pipe)?;
         let stdout = child
             .stdout
             .take()
@@ -89,8 +71,6 @@ impl AppServer {
             child,
             stderr,
             _catalog: None,
-            #[cfg(windows)]
-            job,
         })
     }
 
@@ -100,7 +80,7 @@ impl AppServer {
         }
         let exited = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         #[cfg(windows)]
-        self.job.take(); // Closing the job terminates any surviving descendants too.
+        self.child.shutdown_tree().await?;
         match exited {
             Ok(status) => {
                 status?;
@@ -123,18 +103,8 @@ pub(crate) struct DirectCatalog {
 impl DirectCatalog {
     async fn prepare(config: &Config) -> Result<Self, AppServerError> {
         let mut command = Command::new(&config.executable);
-        command
-            .args(["debug", "models"])
-            .current_dir(&config.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(0x08000000);
-        let mut child = command.spawn()?;
-        #[cfg(windows)]
-        let _job = WindowsJob::attach(&child)?;
+        command.args(["debug", "models"]).current_dir(&config.cwd);
+        let mut child = owned_process::spawn(command, Input::Null)?;
         let stdout = child
             .stdout
             .take()
@@ -238,60 +208,8 @@ impl Drop for DirectCatalog {
 
 impl Drop for AppServer {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        self.job.take();
         let _ = self.child.start_kill();
         self.stderr.abort();
-    }
-}
-
-#[cfg(windows)]
-struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
-
-// SAFETY: the exclusively owned job handle is only used by its owner and closed once.
-#[cfg(windows)]
-unsafe impl Send for WindowsJob {}
-
-#[cfg(windows)]
-impl WindowsJob {
-    fn attach(child: &Child) -> std::io::Result<Self> {
-        use windows_sys::Win32::System::JobObjects::*;
-        // SAFETY: calls use initialized structs, correct buffer lengths and live process handles.
-        unsafe {
-            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            let job = Self(handle);
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of_val(&info) as u32,
-            ) == 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            let process = child
-                .raw_handle()
-                .ok_or_else(|| std::io::Error::other("missing process handle"))?;
-            if AssignProcessToJobObject(handle, process as _) == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(job)
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        // SAFETY: this unique live handle is closed exactly once.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
     }
 }
 

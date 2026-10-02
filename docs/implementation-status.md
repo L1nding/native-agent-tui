@@ -15,7 +15,7 @@
 - 根线程注册 `wait_for_subagent_completion`：目标集合在接受时固定，无等待超时；全部当前轮次完成或任一失败/中断才回复，重复和旧轮事件不能释放新等待。
 - 等待期间子代理审批/问题继续处理；根输入最多排队 8 项，当前根轮成功结束后按依赖提交，失败/中断保留为阻塞任务供检查、取消或显式重试。断连不伪造子代理完成。
 - F3 切换根/子代理对话；宽屏显示代理列表，状态区显示等待进度、排队数和等待期间根 `turn/start` 增量。输入框明确标示根任务。
-- Windows Job Object 清理 app-server 的已纳入进程树；终端退出恢复 raw mode、alternate screen 和 bracketed paste。
+- Windows 在创建时将 app-server 和目录查询纳入 Job，关闭时确认已纳入进程树退出；终端退出恢复 raw mode、alternate screen 和 bracketed paste。
 
 ## 验证证据
 
@@ -85,7 +85,7 @@ Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入�
 
 `scheduler.rs` 已接入真实 Core 和 UI，具体证据见[调度接入验证](scheduler-validation.md)。`rpc.rs` 和 `diagnostics.rs` 的独立接口仍不能作为完整诊断已接入的证据。本地 provider 验证同一直属子代理的两轮；8 子代理场景通过内存 transport 验证，尚未扩展到真实 provider 并行计数。
 
-Job 在进程创建后附加。现有清理测试覆盖附加后的后代；创建与附加之间的竞态仍需进一步消除或验证。
+Windows 已通过创建时的 Job 属性建立进程所有权，消除先创建、后附加之间的窗口；原生 suspended/硬终止与关闭确认见[进程所有权](windows-process-ownership.md)。Shell 预检仍存在间歇超时，启动可靠性门禁尚未通过。
 
 ## S2.5a 活动观察接入
 
@@ -111,10 +111,18 @@ Core 默认写入脱敏状态，首个快照先于 app-server 启动提交；写
 
 `--export SESSION_ID [--since SEQ] [--output NEW_FILE]` 和历史页的 `e` 支持预览后保存。导出保留结果、关系及证据，将自由字符串身份替换为稳定别名；预览范围固定，保存不加入后续记录。已有文件与托管 journal 受保护；写入失败不发布部分目标。使用和文件系统限制见[历史与导出](history-export.md)，最终复验结果见[观察恢复验证](history-validation.md)。
 
-协议兼容门禁、Windows 创建与 Job 附加竞态、搜索/提醒关闭/完整请求详情，以及 Alpha 试用与发布验收仍待完成。历史导入和自动执行恢复没有实现，V2 完整调度继续保留独立验收范围。
+协议兼容门禁、Shell 启动可靠性、搜索/提醒关闭/完整请求详情，以及 Alpha 试用与发布验收仍待完成。历史导入和自动执行恢复没有实现，V2 完整调度继续保留独立验收范围。
 
 ## S10a 持续验证入口
 
 新增 `scripts/verify.py`，统一 Rust 基线、release 构建与历史/回放/观察/实时 JSONL 原生 fixture；每个命令失败立即停止。nextest 不可用时使用 Cargo 原生测试，可选 `--live` 验证锁定 Codex。`.github/workflows/verify.yml` 已配置 Windows、Rust 1.96.0 和 Python 3.12，使用固定 action SHA 与只读权限。
 
 本地 Cargo 路径完成 128 项默认测试和全部原生 fixture；失败工具链用例在首个检查停止。workflow 通过 actionlint；远端 Actions 尚未运行。最低 Rust 1.89、Linux/macOS、终端交互和 Alpha 发布门禁保持单独验收，详见[持续验证](ci-validation.md)。
+
+## S3 Windows 创建时的进程所有权
+
+app-server 和目录查询共用私有 `owned_process` 接口。Windows 通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 在创建时建立 Job 所有权，主线程随后才恢复；继承列表限于三条 stdio。关闭时确认 Job 活动进程归零，超时或查询失败返回清理错误；取消 wait 后可重新等待，保留真实退出码。命令参数及批处理长度在创建边缘校验。
+
+清理本包编译缓存后，`python scripts/verify.py --live` 全部通过：128 项默认测试、4 项真实 Codex 测试、11 个 Windows 原生所有权场景及已有原生 fixture；fmt/check/clippy/doctest/release 通过。ConPTY 验证历史动作只读、秘密草稿保持掩码、退出恢复终端，RPC 与 journal 均没有提交测试回答。
+
+此前本轮完整验证及重复 Ready 测试曾出现预检超时。固定旧版 `f6e7a70` 的独立对照也捕获同类 Unknown，零模型轮次；共享编译缓存的三路径探针统计已排除，不能作为验收证据。最终单次通过不证明启动稳定，也未确定超时根因。创建边界、样本与限制见[Windows 进程所有权](windows-process-ownership.md)，持续验证范围见[CI 验证](ci-validation.md)。Alpha/V2 尚未完成。
