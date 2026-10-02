@@ -1,5 +1,7 @@
+use std::io::Read;
 use std::path::PathBuf;
 
+use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +12,7 @@ pub struct Config {
     pub sandbox: String,
     pub approval_policy: String,
     pub windows_sandbox: Option<String>,
+    pub attention: AttentionSettings,
 }
 
 impl Default for Config {
@@ -25,6 +28,7 @@ impl Default for Config {
             sandbox: "workspace-write".into(),
             approval_policy: "on-request".into(),
             windows_sandbox: None,
+            attention: AttentionSettings::default(),
         }
     }
 }
@@ -61,6 +65,8 @@ pub enum CliError {
     ConflictingModes,
     #[error("invalid value for {option}: {value}")]
     InvalidValue { option: String, value: String },
+    #[error("{0}")]
+    Attention(String),
 }
 
 pub fn parse_args<I, S>(args: I) -> Result<CliCommand, CliError>
@@ -74,6 +80,8 @@ where
     let mut goal = None;
     let mut headless = false;
     let mut index = 0;
+    let mut attention_file = None;
+    let mut attention_overrides = Vec::new();
     while index < args.len() {
         let option = &args[index];
         index += 1;
@@ -96,6 +104,27 @@ where
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
             "--codex" => config.executable = value(&args, &mut index, option)?.into(),
             "--model" => config.model = Some(value(&args, &mut index, option)?),
+            "--attention-config" => attention_file = Some(value(&args, &mut index, option)?),
+            "--attention-model"
+            | "--attention-tool"
+            | "--attention-children"
+            | "--attention-transport" => {
+                let pair = value(&args, &mut index, option)?;
+                let class = match option.as_str() {
+                    "--attention-model" => AttentionClass::Model,
+                    "--attention-tool" => AttentionClass::Tool,
+                    "--attention-children" => AttentionClass::Children,
+                    _ => AttentionClass::Transport,
+                };
+                let parsed = pair.split_once(',').and_then(|(quiet, attention)| {
+                    Some((quiet.parse::<u64>().ok()?, attention.parse::<u64>().ok()?))
+                });
+                let (quiet, attention) = parsed.ok_or_else(|| CliError::InvalidValue {
+                    option: option.clone(),
+                    value: "expected QUIET_MS,ATTENTION_MS".into(),
+                })?;
+                attention_overrides.push((class, quiet, attention));
+            }
             "--windows-sandbox" => {
                 let val = value(&args, &mut index, option)?;
                 if !cfg!(windows) || !["elevated", "unelevated"].contains(&val.as_str()) {
@@ -131,6 +160,22 @@ where
     if headless && mode != Some("--workflow") {
         return Err(CliError::ConflictingModes);
     }
+    if let Some(path) = attention_file {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(8193).read_to_end(&mut bytes))
+            .map_err(|_| CliError::Attention("Cannot read attention configuration.".into()))?;
+        config
+            .attention
+            .apply_json(&bytes, ConfigSource::Global)
+            .map_err(CliError::Attention)?;
+    }
+    for (class, quiet, attention) in attention_overrides {
+        config
+            .attention
+            .set(class, quiet, attention, ConfigSource::Cli)
+            .map_err(|error| CliError::Attention(error.to_string()))?;
+    }
     Ok(match mode {
         Some("--workflow") => CliCommand::Workflow {
             path: goal.unwrap().into(),
@@ -158,6 +203,50 @@ fn value(args: &[String], index: &mut usize, option: &str) -> Result<String, Cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_attention_overrides_file_values_regardless_of_argument_order() {
+        let path = std::env::temp_dir().join(format!(
+            "native-agent-attention-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, br#"{"model":{"quiet_ms":100,"attention_ms":200},"tool":{"quiet_ms":300,"attention_ms":400}}"#).unwrap();
+        for args in [
+            vec![
+                "--attention-model".to_owned(),
+                "5,10".into(),
+                "--attention-config".into(),
+                path.to_string_lossy().into_owned(),
+            ],
+            vec![
+                "--attention-config".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--attention-model".into(),
+                "5,10".into(),
+            ],
+        ] {
+            let CliCommand::Tui { config, .. } = parse_args(args).unwrap() else {
+                panic!()
+            };
+            assert_eq!(config.attention.model.quiet_ms, 5);
+            assert_eq!(config.attention.model.source, ConfigSource::Cli);
+            assert_eq!(config.attention.tool.source, ConfigSource::Global);
+            assert_eq!(config.attention.children.source, ConfigSource::Default);
+        }
+        std::fs::remove_file(path).unwrap();
+        for value in [
+            "0,1",
+            "1,1",
+            "2,1",
+            "1,604800001",
+            "a,1",
+            "1",
+            "1,2,3",
+            "-1,1",
+        ] {
+            assert!(parse_args(["--attention-model", value]).is_err());
+        }
+    }
 
     #[test]
     fn parses_settings_and_multilingual_goal() {

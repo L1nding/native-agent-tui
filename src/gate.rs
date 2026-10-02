@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitTarget {
@@ -18,7 +18,7 @@ pub struct WaitRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WaitToken(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChildOutcome {
     Completed,

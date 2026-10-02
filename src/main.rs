@@ -31,6 +31,11 @@ Options:
   --model NAME     Requested model; uses Codex configuration when omitted
   --sandbox MODE   read-only | workspace-write | danger-full-access
   --approval MODE  untrusted | on-request | never (default: on-request)
+  --attention-config FILE  JSON threshold pairs (milliseconds)
+  --attention-model QUIET_MS,ATTENTION_MS  Override model silence thresholds
+  --attention-tool QUIET_MS,ATTENTION_MS   Override tool silence thresholds
+  --attention-children QUIET_MS,ATTENTION_MS  Override child wait thresholds
+  --attention-transport QUIET_MS,ATTENTION_MS  Override response wait thresholds
   --help, -h       Show this help
   --version, -V    Show version
 
@@ -41,6 +46,7 @@ See docs/scheduler-usage.md and docs/workflow-example.json.
 TUI: Enter send, Ctrl+Enter queue, Shift+Enter newline, Ctrl+C interrupt,
      Ctrl+Q quit, PgUp/PgDn scroll, Ctrl+Y approve, Ctrl+N decline,
      F1 help, F2 request, F3 agent, F4 tasks, F5 pause dispatch.
+     F10 attention thresholds, F11 activity evidence.
 Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat
        side effects), +/- priority, F9 twice stop workflow.
 

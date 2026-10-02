@@ -86,3 +86,9 @@ Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入�
 `scheduler.rs` 已接入真实 Core 和 UI，具体证据见[调度接入验证](scheduler-validation.md)。`rpc.rs` 和 `diagnostics.rs` 的独立接口仍不能作为完整诊断已接入的证据。本地 provider 验证同一直属子代理的两轮；8 子代理场景通过内存 transport 验证，尚未扩展到真实 provider 并行计数。
 
 Job 在进程创建后附加。现有清理测试覆盖附加后的后代；创建与附加之间的竞态仍需进一步消除或验证。
+
+## S2.5a 活动观察接入
+
+Core 已提供按 agent/tool/request 隔离的活动证据、进展序号和注意级别；CLI 支持显式全局配置和分类阈值覆盖，TUI 通过 F10 临时设置、F11 查看证据。观察计时器不会发起执行或释放 Gate。使用说明见[活动观察](activity-observation.md)。
+
+本次 85 项默认测试、3 项可选真实 app-server 测试及 Python 消费 fixture 通过；fmt、check、clippy、release build 通过。真实 Gate fixture 验证静默升级时 provider 请求和根进展序号不变。完整记录和验证范围见[观察验证](observation-validation.md)。持久 journal、JSONL CLI 与只读回放继续列为未完成工作。

@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
@@ -19,6 +19,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::client::{ClientHandle, Command};
 use crate::interactions::{ApprovalDecision, RequestKind, RequestView};
+use crate::observation::{
+    ActivityScope, ActivitySnapshot, AttentionClass, AttentionLevel, ExecutionState,
+};
 use crate::protocol::RpcId;
 use crate::scheduler::{
     RootTaskSpec, SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, ROOT_QUEUE_LIMIT,
@@ -78,6 +81,9 @@ impl Editor {
 
 #[derive(Default)]
 struct LocalState {
+    attention_editor: Option<AttentionEditor>,
+    evidence: bool,
+    evidence_scroll: usize,
     editor: Editor,
     task_draft: Option<Editor>,
     scroll_from_bottom: usize,
@@ -91,6 +97,37 @@ struct LocalState {
     answering: Option<RpcId>,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
+}
+
+struct AttentionEditor {
+    class_index: usize,
+    field: usize,
+    quiet: String,
+    attention: String,
+    notice: Option<String>,
+}
+
+impl AttentionEditor {
+    fn new(snapshot: &CoreSnapshot, class_index: usize) -> Self {
+        let pair = snapshot
+            .observation
+            .settings
+            .get(AttentionClass::ALL[class_index]);
+        Self {
+            class_index,
+            field: 0,
+            quiet: pair.quiet_ms.to_string(),
+            attention: pair.attention_ms.to_string(),
+            notice: None,
+        }
+    }
+    fn input(&mut self) -> &mut String {
+        if self.field == 0 {
+            &mut self.quiet
+        } else {
+            &mut self.attention
+        }
+    }
 }
 
 pub async fn run(client: ClientHandle, goal: Option<String>) -> Result<(), UiError> {
@@ -134,7 +171,12 @@ pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Re
                                 let snapshot = client.snapshots.borrow().clone();
                                 let request = selected_request(&snapshot, &local).cloned();
                                 sync_questions(&mut local, request);
-                                local.editor.insert(&text); dirty = true;
+                                if let Some(editor) = &mut local.attention_editor {
+                                    for digit in text.chars().filter(char::is_ascii_digit).take(10) {
+                                        if editor.input().len() < 10 { editor.input().push(digit); }
+                                    }
+                                } else { local.editor.insert(&text); }
+                                dirty = true;
                             }
                             Event::Resize(_, _) => dirty = true,
                             _ => {}
@@ -204,6 +246,61 @@ fn handle_key(
 ) -> bool {
     sync_questions(local, selected_request(snapshot, local).cloned());
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if let Some(editor) = &mut local.attention_editor {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('d') if control => return true,
+            KeyCode::Char('c') if control => {
+                send(Command::Interrupt, tx, local);
+            }
+            KeyCode::Esc | KeyCode::F(10) => local.attention_editor = None,
+            KeyCode::Up | KeyCode::Down => {
+                let index = if key.code == KeyCode::Up {
+                    (editor.class_index + 3) % 4
+                } else {
+                    (editor.class_index + 1) % 4
+                };
+                local.attention_editor = Some(AttentionEditor::new(snapshot, index));
+            }
+            KeyCode::Tab | KeyCode::BackTab => editor.field = 1 - editor.field,
+            KeyCode::Backspace => {
+                editor.input().pop();
+            }
+            KeyCode::Char('u') if control => editor.input().clear(),
+            KeyCode::Char(digit) if !control && digit.is_ascii_digit() => {
+                if editor.input().len() < 10 {
+                    editor.input().push(digit);
+                }
+            }
+            KeyCode::Enter => {
+                let values = editor
+                    .quiet
+                    .parse::<u64>()
+                    .ok()
+                    .zip(editor.attention.parse::<u64>().ok());
+                let valid = values.filter(|(quiet, attention)| {
+                    *quiet > 0 && quiet < attention && *attention <= 604800000
+                });
+                if let Some((quiet_ms, attention_ms)) = valid {
+                    let class = AttentionClass::ALL[editor.class_index];
+                    if send(
+                        Command::ConfigureAttention {
+                            class,
+                            quiet_ms,
+                            attention_ms,
+                        },
+                        tx,
+                        local,
+                    ) {
+                        local.attention_editor = None;
+                    }
+                } else {
+                    editor.notice = Some("Require 0 < quiet < attention <= 604800000".into());
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
     if key.code != KeyCode::F(9) {
         local.confirm_stop = false;
     }
@@ -239,6 +336,17 @@ fn handle_key(
         }
     }
     match key.code {
+        KeyCode::F(10) => local.attention_editor = Some(AttentionEditor::new(snapshot, 0)),
+        KeyCode::F(11) => {
+            local.evidence = !local.evidence;
+            local.evidence_scroll = 0;
+        }
+        KeyCode::PageUp if local.evidence => {
+            local.evidence_scroll = local.evidence_scroll.saturating_sub(8)
+        }
+        KeyCode::PageDown if local.evidence => {
+            local.evidence_scroll = local.evidence_scroll.saturating_add(8)
+        }
         KeyCode::F(4) => local.tasks = !local.tasks,
         KeyCode::F(5) => {
             send(
@@ -335,6 +443,7 @@ fn handle_key(
         KeyCode::Esc => {
             local.help = false;
             local.tasks = false;
+            local.evidence = false;
             local.editor.clear();
         }
         KeyCode::PageUp => local.scroll_from_bottom = local.scroll_from_bottom.saturating_add(8),
@@ -459,7 +568,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if area.height > 16 { 4 } else { 3 }),
+            Constraint::Length(if area.height > 16 {
+                if snapshot.observation.activities.is_empty() {
+                    4
+                } else {
+                    6
+                }
+            } else {
+                3
+            }),
             Constraint::Min(1),
             Constraint::Length(
                 if area.height > 16
@@ -474,9 +591,23 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
             Constraint::Length(1),
         ])
         .split(area);
+    let actions = snapshot
+        .observation
+        .activities
+        .iter()
+        .filter(|activity| activity.attention.requires_action)
+        .count();
+    let attention = snapshot
+        .observation
+        .activities
+        .iter()
+        .filter(|activity| activity.attention.level == AttentionLevel::AttentionNeeded)
+        .count();
     let status = format!(
-        "{:?} | turns: {} | children: {} | queued: {}{}",
+        "{:?} | action:{} attention:{} | turns: {} | children: {} | queued: {}{}",
         snapshot.phase,
+        actions,
+        attention,
         snapshot.root_turn_count,
         snapshot.agents.len(),
         snapshot.queued_inputs,
@@ -495,16 +626,28 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         snapshot.sandbox,
         snapshot.approval_policy
     );
+    let agent_id = selected_agent.map_or("root", |agent| agent.info.id.as_str());
+    let selected_activity = focus_activity(snapshot, agent_id);
+    let mut header = vec![Line::from(status)];
+    if let Some(activity) = selected_activity {
+        header.push(Line::from(display_text(&activity_brief(activity))));
+        header.push(Line::from(display_text(&evidence_brief(activity))));
+    }
+    header.push(Line::from(display_text(&settings)));
+    if area.height <= 16 && selected_activity.is_some() {
+        header.remove(0);
+    }
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(status),
-            Line::from(display_text(&settings)),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Native Agent TUI {} ", env!("CARGO_PKG_VERSION"))),
-        ),
+        Paragraph::new(header).block(Block::default().borders(Borders::ALL).title(
+            if area.height <= 16 && selected_activity.is_some() {
+                format!(
+                    " {:?} action:{actions} attention:{attention} ",
+                    snapshot.phase
+                )
+            } else {
+                format!(" Native Agent TUI {} ", env!("CARGO_PKG_VERSION"))
+            },
+        )),
         chunks[0],
     );
 
@@ -547,6 +690,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                 "    {status} / gen {}",
                 agent.generation
             )));
+            if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
+                agents.push(Line::from(format!(
+                    "    {:?} / quiet {}",
+                    activity.attention.level,
+                    age(activity.silence_ms)
+                )));
+            }
         }
         frame.render_widget(
             Paragraph::new(agents).block(
@@ -627,6 +777,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     if local.tasks {
         draw_tasks(frame, chunks[1], snapshot, local);
     }
+    if local.evidence {
+        draw_evidence(frame, chunks[1], snapshot, local, agent_id);
+    }
 
     let notice = local
         .notice
@@ -634,7 +787,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow".to_owned()
+        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence".to_owned()
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {
@@ -749,11 +902,239 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     frame.render_widget(
         Paragraph::new(if local.tasks {
             "Up/Down select  F5 workflow  F6 pause  F7 cancel  F8 retry  +/- priority  F9 stop"
+        } else if local.evidence {
+            "PgUp/PgDn evidence  F10 thresholds  F11 close  F3 agent"
         } else {
             "Enter send  Ctrl+Enter queue  Ctrl+C interrupt  Ctrl+Q quit  F3 agent  F4 tasks"
         }),
         chunks[4],
     );
+    if let Some(editor) = &local.attention_editor {
+        draw_attention_editor(frame, snapshot, editor);
+    }
+}
+
+fn age(ms: Option<u64>) -> String {
+    ms.map_or_else(|| "unknown".into(), |ms| format!("{}s", ms / 1000))
+}
+
+fn focus_activity<'a>(snapshot: &'a CoreSnapshot, agent_id: &str) -> Option<&'a ActivitySnapshot> {
+    snapshot
+        .observation
+        .activities
+        .iter()
+        .filter(|activity| activity.identity.agent_id == agent_id)
+        .max_by_key(|activity| {
+            let rank = if activity.attention.requires_action {
+                5
+            } else if activity.attention.level == AttentionLevel::AttentionNeeded {
+                4
+            } else if matches!(
+                activity.execution_state,
+                ExecutionState::Starting | ExecutionState::Running | ExecutionState::Waiting
+            ) {
+                3
+            } else if activity.scope == ActivityScope::Turn {
+                2
+            } else {
+                1
+            };
+            (
+                rank,
+                activity.scope == ActivityScope::Tool,
+                activity.silence_ms.unwrap_or(0),
+            )
+        })
+}
+
+fn activity_brief(activity: &ActivitySnapshot) -> String {
+    format!(
+        "{:?} {} | quiet {} | {:?}",
+        activity.execution_state,
+        activity.tool_category.map_or_else(
+            || format!("{:?}", activity.kind),
+            |category| format!("{category:?}")
+        ),
+        age(activity.silence_ms),
+        activity.attention.level
+    )
+}
+
+fn next_action(activity: &ActivitySnapshot) -> &'static str {
+    if activity.attention.requires_action {
+        "F2 answer request"
+    } else if activity.execution_state == ExecutionState::Unknown {
+        "inspect unknown outcome"
+    } else if matches!(
+        activity.attention.level,
+        AttentionLevel::Quiet | AttentionLevel::AttentionNeeded
+    ) {
+        "F11 inspect; wait or Ctrl+C"
+    } else if activity.attention.level == AttentionLevel::Ended {
+        "review result"
+    } else {
+        "wait; F11 evidence"
+    }
+}
+
+fn evidence_brief(activity: &ActivitySnapshot) -> String {
+    format!(
+        "Next: {} | Last: {}",
+        next_action(activity),
+        activity.last_evidence.as_ref().map_or_else(
+            || "unknown".into(),
+            |evidence| format!("{:?} {:?} #{}", evidence.kind, evidence.source, evidence.id)
+        )
+    )
+}
+
+fn draw_evidence(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    snapshot: &CoreSnapshot,
+    local: &LocalState,
+    agent_id: &str,
+) {
+    let mut rows = Vec::new();
+    for activity in snapshot
+        .observation
+        .activities
+        .iter()
+        .filter(|activity| activity.identity.agent_id == agent_id)
+    {
+        rows.push(format!(
+            "{:?} {} | {:?}",
+            activity.scope,
+            activity.item_id.as_deref().unwrap_or("turn"),
+            activity.attention.level
+        ));
+        rows.push(activity_brief(activity));
+        rows.push(format!(
+            "Last: {}",
+            activity.last_evidence.as_ref().map_or_else(
+                || "unknown".into(),
+                |evidence| format!(
+                    "{:?} / {:?} #{}",
+                    evidence.kind, evidence.source, evidence.id
+                )
+            )
+        ));
+        rows.push(format!("Next: {}", next_action(activity)));
+        rows.push(format!(
+            "Elapsed {} / progress {} / bytes {}",
+            age(activity.elapsed_ms),
+            activity.progress_seq,
+            activity.output_bytes
+        ));
+        rows.push(format!(
+            "Thread {:?} turn {:?} gen {:?} attempt {:?}",
+            activity.identity.thread_id,
+            activity.identity.turn_id,
+            activity.identity.generation,
+            activity.identity.attempt_id
+        ));
+        rows.push(format!(
+            "Quiet {:?}ms / attention {:?}ms / source {:?}",
+            activity.attention.quiet_after_ms,
+            activity.attention.attention_after_ms,
+            activity.attention.config_source
+        ));
+        rows.push("Provider execution: unavailable".into());
+        if let Some(reason) = activity.wait_reason {
+            rows.push(format!(
+                "Wait: {reason:?} / resume: {:?}",
+                activity.resume_condition
+            ));
+        }
+        for target in &activity.wait_targets {
+            rows.push(format!(
+                "Target {} / turn {:?} gen {} / {:?} / quiet {} / {:?}",
+                target.thread_id,
+                target.turn_id,
+                target.generation,
+                target.outcome,
+                age(target.silence_ms),
+                target.attention.as_ref().map(|attention| attention.level)
+            ));
+        }
+        rows.push(String::new());
+    }
+    if rows.is_empty() {
+        rows.push("Activity evidence unavailable.".into());
+    }
+    let lines: Vec<_> = rows
+        .iter()
+        .flat_map(|row| wrap(&display_text(row), area.width.saturating_sub(2) as usize))
+        .map(Line::from)
+        .collect();
+    let height = area.height.saturating_sub(2) as usize;
+    let start = local
+        .evidence_scroll
+        .min(lines.len().saturating_sub(height));
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(height)
+                .collect::<Vec<_>>(),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Evidence · F11 · PgUp/PgDn "),
+        ),
+        area,
+    );
+}
+
+fn draw_attention_editor(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &CoreSnapshot,
+    editor: &AttentionEditor,
+) {
+    let screen = frame.area();
+    let width = screen.width.min(68);
+    let height = screen.height.min(12);
+    let area = ratatui::layout::Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let class = AttentionClass::ALL[editor.class_index];
+    let effective = snapshot.observation.settings.get(class);
+    let rows = [
+        format!("{class:?} / effective source {:?}", effective.source),
+        format!(
+            "{} Quiet ms: {}",
+            if editor.field == 0 { ">" } else { " " },
+            editor.quiet
+        ),
+        format!(
+            "{} Attention ms: {}",
+            if editor.field == 1 { ">" } else { " " },
+            editor.attention
+        ),
+        "Up/Down class · Tab field · Ctrl+U clear".into(),
+        "Enter apply · Esc close · session only".into(),
+        editor.notice.clone().unwrap_or_default(),
+    ];
+    let lines: Vec<_> = rows
+        .iter()
+        .flat_map(|row| wrap(row, width.saturating_sub(2) as usize))
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Attention · F10 "),
+        ),
+        area,
+    );
+    frame.set_cursor_position((area.x + 1, area.y + 2 + editor.field as u16));
 }
 
 fn draw_tasks(
@@ -918,6 +1299,189 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observed_snapshot() -> CoreSnapshot {
+        use crate::observation::{ObservationFacts, Observer};
+        use crate::scheduler::{ExternalTurn, Scheduler};
+        let now = tokio::time::Instant::now();
+        let mut scheduler = Scheduler::default();
+        scheduler
+            .enqueue(vec![RootTaskSpec::input("private task".into())])
+            .unwrap();
+        let attempt = scheduler.dispatch().unwrap().attempt;
+        scheduler
+            .started_root(
+                attempt,
+                ExternalTurn {
+                    thread_id: "root-thread".into(),
+                    turn_id: "turn".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let mut observer = Observer::new_at("ui-fixture".into(), Default::default(), now, None);
+        observer
+            .reconcile(
+                ObservationFacts {
+                    phase: crate::state::SessionPhase::Running,
+                    root_thread: Some("root-thread"),
+                    root_generation: 1,
+                    root_task: scheduler.task(attempt.task),
+                    children: vec![],
+                    requests: &[],
+                    gate: None,
+                },
+                now,
+            )
+            .unwrap();
+        CoreSnapshot {
+            phase: crate::state::SessionPhase::Running,
+            observation: observer.snapshot_at(1, now + Duration::from_secs(31)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn threshold_editor_keeps_task_and_secret_buffers_separate_and_validates_before_sending() {
+        let mut snapshot = observed_snapshot();
+        snapshot.requests.push(RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root-thread","turnId":"turn","questions":[{"id":"secret","header":"Secret","question":"Value?","isSecret":true}]})).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        local.editor.insert("TASK_DRAFT");
+        sync_questions(&mut local, snapshot.requests.first().cloned());
+        local.editor.insert("SECRET_ANSWER");
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        handle_key(
+            key(KeyCode::F(10), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(local.attention_editor.as_ref().unwrap().notice.is_some());
+        handle_key(
+            key(KeyCode::Char('5'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        for digit in ['1', '0'] {
+            handle_key(
+                key(KeyCode::Char(digit), KeyModifiers::NONE),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+        }
+        handle_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::ConfigureAttention {
+                class: AttentionClass::Model,
+                quiet_ms: 5,
+                attention_ms: 10
+            }
+        );
+        assert_eq!(local.editor.text, "SECRET_ANSWER");
+        assert_eq!(local.task_draft.as_ref().unwrap().text, "TASK_DRAFT");
+        handle_key(
+            key(KeyCode::F(10), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        snapshot.requests.clear();
+        handle_key(
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert!(local.attention_editor.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn evidence_and_threshold_views_render_at_supported_sizes_without_leaking_drafts() {
+        let snapshot = observed_snapshot();
+        for (width, height) in [(40, 12), (80, 24), (160, 45)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut local = LocalState::default();
+            local.editor.insert("draft 中文 👋");
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("quiet 31s"), "{rendered}");
+            assert!(rendered.contains("attention:1"), "{rendered}");
+            local.evidence = true;
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Evidence"), "{rendered}");
+            local.attention_editor = Some(AttentionEditor::new(&snapshot, 0));
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Quiet ms: 15000"), "{rendered}");
+            assert!(rendered.contains("Attention ms: 30000"), "{rendered}");
+            assert_eq!(local.editor.text, "draft 中文 👋");
+        }
+        let mut interrupted = snapshot.clone();
+        interrupted.observation.activities[0].execution_state = ExecutionState::Interrupted;
+        interrupted.observation.activities[0].kind = crate::observation::ActivityKind::Completed;
+        assert!(activity_brief(&interrupted.observation.activities[0]).starts_with("Interrupted"));
+    }
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;
 

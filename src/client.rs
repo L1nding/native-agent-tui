@@ -12,9 +12,11 @@ use crate::app_server::{self, AppServer, AppServerError};
 use crate::config::Config;
 use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequest, WaitToken};
 use crate::interactions::{ApprovalDecision, RequestView};
+use crate::observation::{AttentionClass, ChildFact, ObservationFacts, Observer};
 use crate::protocol::{self, Envelope, RpcId};
 use crate::scheduler::{
-    ExternalTurn, InterruptEffect, RootTaskSpec, Scheduler, SchedulerCommand, TaskAttempt, TaskKind,
+    ExternalTurn, InterruptEffect, RootTaskSpec, Scheduler, SchedulerCommand, TaskAttempt,
+    TaskKind, TaskSnapshot,
 };
 use crate::state::{CoreSnapshot, GateSnapshot, SessionPhase, SessionState, MESSAGE_BYTES};
 use crate::transport::{PipeTransport, TransportError};
@@ -41,6 +43,11 @@ pub enum Command {
         answers: BTreeMap<String, Vec<String>>,
     },
     Interrupt,
+    ConfigureAttention {
+        class: AttentionClass,
+        quiet_ms: u64,
+        attention_ms: u64,
+    },
     Quit,
 }
 
@@ -79,17 +86,22 @@ impl ClientHandle {
         check_only: bool,
     ) -> Self {
         let (commands, command_rx) = mpsc::channel(32);
+        let observer = Observer::new(config.attention.clone());
         let initial = CoreSnapshot {
             phase: SessionPhase::Launching,
             cwd: config.cwd.display().to_string(),
             sandbox: config.sandbox.clone(),
             approval_policy: config.approval_policy.clone(),
+            observation: observer.snapshot_at(0, Instant::now()),
             ..Default::default()
         };
         let (snapshot_tx, snapshots) = watch::channel(Arc::new(initial.clone()));
         let join = tokio::spawn(
             Core {
                 pipe,
+                observer,
+                root_attempt: None,
+                root_observed: None,
                 config,
                 server,
                 command_rx,
@@ -154,6 +166,9 @@ struct PendingRpc {
 }
 
 struct Core {
+    observer: Observer,
+    root_attempt: Option<TaskAttempt>,
+    root_observed: Option<TaskSnapshot>,
     pipe: PipeTransport,
     server: Option<AppServer>,
     config: Config,
@@ -198,8 +213,16 @@ impl Core {
         self.publish();
         let mut clock = tokio::time::interval(Duration::from_millis(250));
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut observation_clock = tokio::time::interval(Duration::from_secs(1));
+        observation_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _ = observation_clock.tick(), if self.observer.has_timed_activity() => {
+                    // Observation must not dispatch, retry, flush writes, or release a Gate.
+                    self.publish();
+                    if self.state.view.phase == SessionPhase::Unknown { break; }
+                    continue;
+                }
                 command = self.command_rx.recv() => {
                     match command {
                         Some(Command::Quit) | None => break,
@@ -291,7 +314,41 @@ impl Core {
         self.scheduler.interactions(&self.state.view.requests);
         self.state.view.scheduler = self.scheduler.snapshot();
         self.state.view.queued_inputs = self.state.view.scheduler.queued_roots;
+        self.reconcile_observation();
+        self.state.view.observation = self
+            .observer
+            .snapshot_at(self.state.view.version + 1, Instant::now());
         self.snapshot_tx.send_replace(self.state.snapshot());
+    }
+
+    fn reconcile_observation(&mut self) {
+        let children = self.state.agents.snapshots();
+        if let Some(task) = self
+            .root_attempt
+            .and_then(|attempt| self.scheduler.task(attempt.task))
+            .filter(|task| Some(task.attempt) == self.root_attempt.map(|attempt| attempt.attempt))
+        {
+            self.root_observed = Some(task.clone());
+        }
+        let facts = ObservationFacts {
+            phase: self.state.view.phase,
+            root_thread: self.state.view.thread_id.as_deref(),
+            root_generation: self.generation,
+            root_task: self.root_observed.as_ref(),
+            children: children
+                .iter()
+                .map(|agent| ChildFact {
+                    agent,
+                    task: self.scheduler.child_task(&agent.info.id),
+                })
+                .collect(),
+            requests: &self.state.view.requests,
+            gate: self.state.view.gate.as_ref(),
+        };
+        if let Err(error) = self.observer.reconcile(facts, Instant::now()) {
+            self.state.error(SessionPhase::Unknown, error.to_string());
+            self.observer.execution_unavailable(Instant::now());
+        }
     }
 
     fn send_rpc(&mut self, kind: RpcKind) -> Result<(), TransportError> {
@@ -331,6 +388,18 @@ impl Core {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::ConfigureAttention {
+                class,
+                quiet_ms,
+                attention_ms,
+            } => {
+                self.state.view.notice = Some(
+                    match self.observer.configure(class, quiet_ms, attention_ms) {
+                        Ok(()) => format!("{class:?} attention settings applied for this session."),
+                        Err(error) => error.to_string(),
+                    },
+                );
+            }
             Command::SubmitRootInput { text } => {
                 if text.trim().is_empty() || text.len() > MESSAGE_BYTES {
                     self.state.view.notice =
@@ -501,6 +570,7 @@ impl Core {
             return;
         }
         if let Some(dispatch) = self.scheduler.dispatch() {
+            self.root_attempt = Some(dispatch.attempt);
             self.submit(&dispatch.text);
         }
     }
@@ -667,6 +737,7 @@ impl Core {
     }
 
     fn envelope(&mut self, envelope: Envelope) {
+        self.observer.raw_message();
         self.ingress_seq += 1;
         match (envelope.method.as_deref(), envelope.id.clone()) {
             (Some(method), Some(id)) => {
@@ -1347,6 +1418,15 @@ impl Core {
                 return;
             }
             if let Ok(id) = serde_json::from_value::<RpcId>(params["requestId"].clone()) {
+                if self
+                    .state
+                    .view
+                    .requests
+                    .iter()
+                    .any(|request| request.id == id && request.thread_id == thread)
+                {
+                    self.observer.request_resolved(thread, &id, Instant::now());
+                }
                 self.state
                     .view
                     .requests
@@ -1360,6 +1440,60 @@ impl Core {
             return;
         }
         let thread = params.get("threadId").and_then(Value::as_str);
+        // Decode observation only for an owned current turn. Unrelated malformed
+        // telemetry cannot make this execution uncertain.
+        if let (Some(thread), Some(turn)) = (thread, params["turnId"].as_str()) {
+            let owned = (Some(thread) == self.state.view.thread_id.as_deref()
+                && Some(turn) == self.state.view.turn_id.as_deref()
+                && matches!(
+                    self.state.view.phase,
+                    SessionPhase::Running | SessionPhase::GatePending
+                ))
+                || self.state.agents.active_turn(thread, turn);
+            if owned {
+                if let Some(notice) = protocol::decode_observed_tool(method, &params) {
+                    match notice {
+                        Ok(notice) => {
+                            if let Err(error) = self.observer.tool(&notice, Instant::now()) {
+                                self.state.error(SessionPhase::Unknown, error.to_string());
+                            }
+                        }
+                        Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
+                    }
+                }
+                if let Some(output) = protocol::decode_observed_output(method, &params) {
+                    match output {
+                        Ok(output) => match output.kind {
+                            protocol::ObservedOutputKind::Reasoning => {
+                                if let Err(error) = self.observer.output(
+                                    thread,
+                                    turn,
+                                    &output.item_id,
+                                    output.bytes,
+                                    false,
+                                    Instant::now(),
+                                ) {
+                                    self.state.error(SessionPhase::Unknown, error.to_string());
+                                }
+                            }
+                            protocol::ObservedOutputKind::Tool(category) => {
+                                if let Err(error) = self.observer.tool_output(
+                                    thread,
+                                    turn,
+                                    &output.item_id,
+                                    output.bytes,
+                                    category,
+                                    Instant::now(),
+                                ) {
+                                    self.state.error(SessionPhase::Unknown, error.to_string());
+                                }
+                            }
+                        },
+                        Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
+                    }
+                }
+            }
+        }
         if thread != self.state.view.thread_id.as_deref() {
             if let Some(thread) = thread.filter(|id| self.state.agents.known(id)) {
                 if let Some(turn) = params["turnId"].as_str() {
@@ -1367,7 +1501,18 @@ impl Core {
                         if let (Some(id), Some(text)) =
                             (params["itemId"].as_str(), params["delta"].as_str())
                         {
-                            self.state.child_message(thread, turn, id, text, false);
+                            if self.state.child_message(thread, turn, id, text, false) {
+                                if let Err(error) = self.observer.output(
+                                    thread,
+                                    turn,
+                                    id,
+                                    text.len(),
+                                    false,
+                                    Instant::now(),
+                                ) {
+                                    self.state.error(SessionPhase::Unknown, error.to_string());
+                                }
+                            }
                         }
                     } else if method == "item/completed" && params["item"]["type"] == "agentMessage"
                     {
@@ -1375,7 +1520,18 @@ impl Core {
                             params["item"]["id"].as_str(),
                             params["item"]["text"].as_str(),
                         ) {
-                            self.state.child_message(thread, turn, id, text, true);
+                            if self.state.child_message(thread, turn, id, text, true) {
+                                if let Err(error) = self.observer.output(
+                                    thread,
+                                    turn,
+                                    id,
+                                    text.len(),
+                                    true,
+                                    Instant::now(),
+                                ) {
+                                    self.state.error(SessionPhase::Unknown, error.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -1490,7 +1646,18 @@ impl Core {
                 if let (Some(turn), Some(id), Some(delta)) =
                     (turn, params["itemId"].as_str(), params["delta"].as_str())
                 {
-                    self.state.message(turn, id, delta, false);
+                    if self.state.message(turn, id, delta, false) {
+                        if let Err(error) = self.observer.output(
+                            self.state.view.thread_id.as_deref().unwrap_or(""),
+                            turn,
+                            id,
+                            delta.len(),
+                            false,
+                            Instant::now(),
+                        ) {
+                            self.state.error(SessionPhase::Unknown, error.to_string());
+                        }
+                    }
                 }
             }
             "item/started" | "item/completed" => {
@@ -1509,7 +1676,18 @@ impl Core {
                     if let (Some(turn), Some(id), Some(text)) =
                         (turn, item["id"].as_str(), item["text"].as_str())
                     {
-                        self.state.message(turn, id, text, true);
+                        if self.state.message(turn, id, text, true) {
+                            if let Err(error) = self.observer.output(
+                                self.state.view.thread_id.as_deref().unwrap_or(""),
+                                turn,
+                                id,
+                                text.len(),
+                                true,
+                                Instant::now(),
+                            ) {
+                                self.state.error(SessionPhase::Unknown, error.to_string());
+                            }
+                        }
                     }
                 } else if method == "item/started" && item["type"] != "userMessage" {
                     self.state.view.tool_activity = item["type"].as_str().map(str::to_owned);
@@ -1538,6 +1716,320 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn observation_event(
+        client: &mut ClientHandle,
+        server: &mut BufReader<tokio::io::DuplexStream>,
+        event: Value,
+    ) {
+        let raw = client.snapshots.borrow().observation.raw_message_count;
+        send(server, event).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.observation.raw_message_count > raw)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_retry_retains_the_last_executed_attempt_until_actual_dispatch() {
+        use crate::observation::{ActivityScope, ExecutionState};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}})).await;
+        let attempt = client.snapshots.borrow().scheduler.tasks[0].id;
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::PauseWorkflow))
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.scheduler.paused)
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::Retry(attempt)))
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.scheduler.tasks[0].attempt == 2)
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            let root = snapshot
+                .observation
+                .activities
+                .iter()
+                .find(|activity| {
+                    activity.scope == ActivityScope::Turn && activity.identity.agent_id == "root"
+                })
+                .unwrap();
+            assert_eq!(root.execution_state, ExecutionState::Interrupted);
+            assert_eq!(root.identity.attempt_id, Some(1));
+            assert_eq!(root.identity.turn_id.as_deref(), Some("root-turn"));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::ResumeWorkflow))
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        assert_eq!(start["method"], "turn/start");
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"retry-turn"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        assert!(client
+            .snapshots
+            .borrow()
+            .observation
+            .activities
+            .iter()
+            .any(|activity| activity.identity.attempt_id == Some(2)
+                && activity.identity.turn_id.as_deref() == Some("retry-turn")));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observation_uses_current_turn_evidence_and_preserves_execution_on_configuration() {
+        use crate::observation::{ActivityScope, AttentionLevel, ConfigSource, ExecutionState};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let initial = client
+            .snapshots
+            .borrow()
+            .observation
+            .accepted_evidence_count;
+        for params in [
+            json!({"threadId":"unrelated","turnId":"root-turn","item":{"type":"commandExecution"}}),
+            json!({"threadId":"root","turnId":"old","item":{"type":"commandExecution"}}),
+        ] {
+            observation_event(
+                &mut client,
+                &mut server,
+                json!({"method":"item/started","params":params}),
+            )
+            .await;
+        }
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Running);
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count,
+            initial
+        );
+        for id in ["one", "two"] {
+            observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":id,"type":"commandExecution","status":"inProgress","command":"PRIVATE_COMMAND"}}})).await;
+        }
+        let after_tools = client
+            .snapshots
+            .borrow()
+            .observation
+            .accepted_evidence_count;
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"one","type":"commandExecution"}}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/reasoning/textDelta","params":{"threadId":"root","turnId":"root-turn","itemId":"reasoning","delta":""}})).await;
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count,
+            after_tools
+        );
+        client
+            .commands
+            .send(Command::ConfigureAttention {
+                class: AttentionClass::Tool,
+                quiet_ms: 10,
+                attention_ms: 20,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.observation.settings.tool.source == ConfigSource::Tui)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count,
+            after_tools
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        observation_event(&mut client, &mut server, json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"root","turnId":"root-turn","itemId":"one","delta":"PRIVATE_OUTPUT"}})).await;
+        {
+            let snapshot = client.snapshots.borrow();
+            let activities = &snapshot.observation.activities;
+            assert_eq!(
+                activities
+                    .iter()
+                    .find(|activity| activity.item_id.as_deref() == Some("one"))
+                    .unwrap()
+                    .attention
+                    .level,
+                AttentionLevel::Active
+            );
+            assert_eq!(
+                activities
+                    .iter()
+                    .find(|activity| activity.item_id.as_deref() == Some("two"))
+                    .unwrap()
+                    .attention
+                    .level,
+                AttentionLevel::AttentionNeeded
+            );
+            assert_eq!(snapshot.root_start_requests, 1);
+            assert_eq!(snapshot.observation.snapshot_version, snapshot.version);
+            let encoded = serde_json::to_string(&snapshot.observation).unwrap();
+            assert!(!encoded.contains("PRIVATE_COMMAND") && !encoded.contains("PRIVATE_OUTPUT"));
+        }
+        for _ in 0..2 {
+            observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"answer","type":"agentMessage","text":"final"}}})).await;
+        }
+        let finalized = client
+            .snapshots
+            .borrow()
+            .observation
+            .accepted_evidence_count;
+        observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"answer","type":"agentMessage","text":"final"}}})).await;
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count,
+            finalized
+        );
+        observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}})).await;
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .activities
+                .iter()
+                .find(|activity| activity.scope == ActivityScope::Turn)
+                .unwrap()
+                .execution_state,
+            ExecutionState::Interrupted
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attention_changes_and_child_output_cannot_release_a_paused_gate_or_hide_approval() {
+        use crate::observation::{ActivityScope, AttentionLevel, ConfigSource};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        child(&mut server, "b", "b-1").await;
+        wait_call(&mut server, "observation-wait", vec![]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::PauseWorkflow))
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.scheduler.paused)
+            .await
+            .unwrap();
+        let initial = client
+            .snapshots
+            .borrow()
+            .observation
+            .accepted_evidence_count;
+        client
+            .commands
+            .send(Command::ConfigureAttention {
+                class: AttentionClass::Children,
+                quiet_ms: 10,
+                attention_ms: 20,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.observation.settings.children.source == ConfigSource::Tui)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count,
+            initial
+        );
+        tokio::time::advance(Duration::from_secs(130)).await;
+        tokio::task::yield_now().await;
+        observation_event(&mut client, &mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"a","turnId":"a-1","itemId":"a-message","delta":"activity"}})).await;
+        {
+            let snapshot = client.snapshots.borrow();
+            let main = |agent: &str| {
+                snapshot
+                    .observation
+                    .activities
+                    .iter()
+                    .find(|activity| {
+                        activity.scope == ActivityScope::Turn && activity.identity.agent_id == agent
+                    })
+                    .unwrap()
+            };
+            assert_eq!(
+                main("root").attention.level,
+                AttentionLevel::AttentionNeeded
+            );
+            assert_eq!(main("a").attention.level, AttentionLevel::Active);
+            assert_eq!(main("b").attention.level, AttentionLevel::AttentionNeeded);
+            assert_eq!(main("root").wait_targets.len(), 2);
+        }
+        observation_event(&mut client, &mut server, json!({"id":"approval","method":"item/commandExecution/requestApproval","params":{"threadId":"b","turnId":"b-1","command":"PRIVATE"}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/reasoning/textDelta","params":{"threadId":"b","turnId":"b-1","itemId":"reasoning","delta":"activity"}})).await;
+        assert!(client
+            .snapshots
+            .borrow()
+            .observation
+            .activities
+            .iter()
+            .any(
+                |activity| activity.attention.requires_action && activity.identity.agent_id == "b"
+            ));
+        assert!(client.snapshots.borrow().gate.as_ref().unwrap().pending);
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
 
     #[cfg(windows)]
     #[tokio::test]
@@ -1690,6 +2182,13 @@ mod tests {
                 })
                 .await
                 .map_err(|_| "child provider request missing".to_owned())?;
+                client.commands.send(Command::ConfigureAttention { class: AttentionClass::Children, quiet_ms: 10, attention_ms: 20 }).await.map_err(|error| error.to_string())?;
+                let attention = tokio::time::timeout(Duration::from_secs(3), client.snapshots.wait_for(|snapshot| {
+                    snapshot.observation.activities.iter().any(|activity| activity.identity.agent_id == "root"
+                        && activity.kind == crate::observation::ActivityKind::WaitingChildren
+                        && activity.attention.level == crate::observation::AttentionLevel::AttentionNeeded)
+                })).await.map_err(|_| "Gate attention did not rise".to_owned())?.map_err(|error| error.to_string())?.clone();
+                let root_progress = attention.observation.activities.iter().find(|activity| activity.identity.agent_id == "root" && activity.scope == crate::observation::ActivityScope::Turn).unwrap().progress_seq;
                 // Sample AFTER a held interval: an early sample cannot prove the quiet window.
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let counts = http(port, "GET", "/stats");
@@ -1701,6 +2200,9 @@ mod tests {
                 }
                 if client.snapshots.borrow().phase != SessionPhase::GatePending {
                     return Err("Gate released before the child response was released".into());
+                }
+                if client.snapshots.borrow().observation.activities.iter().find(|activity| activity.identity.agent_id == "root" && activity.scope == crate::observation::ActivityScope::Turn).unwrap().progress_seq != root_progress {
+                    return Err("Observation ticking invented Gate evidence".into());
                 }
                 client
                     .commands
@@ -2281,13 +2783,33 @@ mod tests {
         wait_call(&mut server, "long-wait", vec![]).await;
         phase(&mut client, SessionPhase::GatePending).await;
         let version = client.snapshots.borrow().version;
+        let evidence = client
+            .snapshots
+            .borrow()
+            .observation
+            .accepted_evidence_count;
         tokio::time::advance(Duration::from_secs(3600)).await;
         tokio::task::yield_now().await;
-        assert_eq!(
-            client.snapshots.borrow().version,
-            version,
-            "An idle Gate must not publish timer-only snapshots"
-        );
+        {
+            let snapshot = client.snapshots.borrow();
+            assert!(
+                snapshot.version > version && snapshot.version <= version + 2,
+                "Missed ticks must not cause a burst"
+            );
+            assert_eq!(snapshot.observation.accepted_evidence_count, evidence);
+            assert_eq!(snapshot.observation.snapshot_version, snapshot.version);
+            let root = snapshot
+                .observation
+                .activities
+                .iter()
+                .find(|activity| activity.identity.agent_id == "root")
+                .unwrap();
+            assert_eq!(
+                root.attention.level,
+                crate::observation::AttentionLevel::AttentionNeeded
+            );
+            assert!(snapshot.gate.as_ref().unwrap().pending);
+        }
         client
             .commands
             .send(Command::SubmitRootInput {

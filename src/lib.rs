@@ -7,6 +7,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod gate;
 pub mod interactions;
+pub mod observation;
 pub mod protocol;
 pub mod rpc;
 pub mod scheduler;

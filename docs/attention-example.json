@@ -1,0 +1,6 @@
+{
+  "model": { "quiet_ms": 15000, "attention_ms": 30000 },
+  "tool": { "quiet_ms": 30000, "attention_ms": 60000 },
+  "children": { "quiet_ms": 60000, "attention_ms": 120000 },
+  "transport": { "quiet_ms": 15000, "attention_ms": 30000 }
+}

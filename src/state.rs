@@ -56,6 +56,7 @@ pub struct CoreSnapshot {
     pub root_start_requests: u64,
     pub queued_inputs: usize,
     pub scheduler: crate::scheduler::SchedulerSnapshot,
+    pub observation: crate::observation::ObservationSnapshot,
     pub agents: Vec<AgentSnapshot>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -90,6 +91,7 @@ impl Default for CoreSnapshot {
             root_start_requests: 0,
             queued_inputs: 0,
             scheduler: Default::default(),
+            observation: Default::default(),
             agents: Vec::new(),
             thread_id: None,
             turn_id: None,
@@ -185,6 +187,9 @@ impl SessionState {
         text: &str,
         complete: bool,
     ) -> bool {
+        if !complete && text.is_empty() {
+            return false;
+        }
         if id.is_empty() || id.len() > 1024 {
             return false;
         }
@@ -207,6 +212,12 @@ impl SessionState {
                 }
             };
         if item.complete && !complete {
+            return false;
+        }
+        if item.complete
+            && complete
+            && (item.text == text || item.truncated && text.ends_with(&item.text))
+        {
             return false;
         }
         if complete {

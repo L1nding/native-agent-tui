@@ -46,6 +46,8 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F7 / F8 | Cancel selected task / explicitly retry a failed root task |
 | + / - | Adjust queued root priority in the task panel |
 | F9 twice | Stop new dispatch and interrupt known workflow tasks |
+| F10 | Edit temporary attention thresholds; Up/Down class, Tab field, Enter apply |
+| F11 / PageUp, PageDown | Open activity evidence / scroll its details |
 | Ctrl+Enter | Explicitly queue a root task during a running turn |
 | Escape | Close help/tasks and clear input |
 
@@ -60,6 +62,10 @@ The root can call `wait_for_subagent_completion` with `{"targets":[]}` to captur
 Startup obtains the effective catalog with `codex debug models`, writes a private temporary copy with `tool_mode: direct`, and removes it when the app-server owner exits. User configuration stays intact. This requires a Codex version supporting that command and the pinned protocol.
 
 Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Durable recovery, enforced native capacity, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
+
+## Activity observation
+
+Activity evidence and silence attention are now projected by Core for each agent, tool, and interaction. F10 changes session thresholds; F11 shows evidence, waiting targets, elapsed/silence times, and configuration sources. See [activity observation](docs/activity-observation.md) and [validation](docs/observation-validation.md). Journal, JSONL events, and replay remain planned.
 
 ## Verify
 

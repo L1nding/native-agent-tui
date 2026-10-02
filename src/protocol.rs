@@ -6,6 +6,147 @@ use thiserror::Error;
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const WAIT_TOOL: &str = "wait_for_subagent_completion";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedToolOutcome {
+    Completed,
+    Failed,
+    Interrupted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolCategory {
+    Shell,
+    File,
+    Mcp,
+    Dynamic,
+    Delegation,
+    Web,
+    Image,
+    Sleep,
+    Review,
+    Compaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedTool {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub outcome: Option<ObservedToolOutcome>,
+    pub category: ToolCategory,
+}
+
+pub fn decode_observed_tool(
+    method: &str,
+    params: &Value,
+) -> Option<Result<ObservedTool, ProtocolError>> {
+    if !matches!(method, "item/started" | "item/completed") {
+        return None;
+    }
+    let item = &params["item"];
+    let category = match item["type"].as_str()? {
+        "commandExecution" => ToolCategory::Shell,
+        "fileChange" => ToolCategory::File,
+        "mcpToolCall" => ToolCategory::Mcp,
+        "dynamicToolCall" => ToolCategory::Dynamic,
+        "collabAgentToolCall" => ToolCategory::Delegation,
+        "webSearch" => ToolCategory::Web,
+        "imageView" | "imageGeneration" => ToolCategory::Image,
+        "sleep" => ToolCategory::Sleep,
+        "enteredReviewMode" | "exitedReviewMode" => ToolCategory::Review,
+        "contextCompaction" => ToolCategory::Compaction,
+        _ => return None,
+    };
+    let id = |value: &Value| {
+        value
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 1024)
+            .map(str::to_owned)
+            .ok_or(ProtocolError::InvalidEnvelope(
+                "invalid observation item identity",
+            ))
+    };
+    Some((|| {
+        let thread_id = id(&params["threadId"])?;
+        let turn_id = id(&params["turnId"])?;
+        let item_id = id(&item["id"])?;
+        let outcome = if method == "item/started" {
+            None
+        } else {
+            Some(match item["status"].as_str() {
+                Some("completed")
+                    if item["exitCode"].as_i64().is_none_or(|code| code == 0)
+                        && item["success"].as_bool() != Some(false)
+                        && item["error"].is_null() =>
+                {
+                    ObservedToolOutcome::Completed
+                }
+                Some("completed" | "failed" | "declined") => ObservedToolOutcome::Failed,
+                Some("interrupted" | "cancelled") => ObservedToolOutcome::Interrupted,
+                _ => ObservedToolOutcome::Unknown,
+            })
+        };
+        Ok(ObservedTool {
+            thread_id,
+            turn_id,
+            item_id,
+            outcome,
+            category,
+        })
+    })())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedOutputKind {
+    Reasoning,
+    Tool(ToolCategory),
+}
+pub struct ObservedOutput {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub bytes: usize,
+    pub kind: ObservedOutputKind,
+}
+pub fn decode_observed_output(
+    method: &str,
+    params: &Value,
+) -> Option<Result<ObservedOutput, ProtocolError>> {
+    let kind = match method {
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+            ObservedOutputKind::Reasoning
+        }
+        "item/commandExecution/outputDelta" => ObservedOutputKind::Tool(ToolCategory::Shell),
+        "item/fileChange/outputDelta" => ObservedOutputKind::Tool(ToolCategory::File),
+        _ => return None,
+    };
+    let id = |value: &Value| {
+        value
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 1024)
+            .map(str::to_owned)
+            .ok_or(ProtocolError::InvalidEnvelope(
+                "invalid observation output identity",
+            ))
+    };
+    Some((|| {
+        Ok(ObservedOutput {
+            thread_id: id(&params["threadId"])?,
+            turn_id: id(&params["turnId"])?,
+            item_id: id(&params["itemId"])?,
+            bytes: params["delta"]
+                .as_str()
+                .ok_or(ProtocolError::InvalidEnvelope(
+                    "observation delta is not text",
+                ))?
+                .len(),
+            kind,
+        })
+    })())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaitCall {
@@ -276,6 +417,52 @@ pub fn encode_line(envelope: &Envelope) -> Result<String, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::{decode_line, encode_line, Envelope, ProtocolError, RpcId};
+
+    #[test]
+    fn tool_observation_excludes_arguments_and_does_not_guess_missing_results() {
+        use super::{
+            decode_observed_output, decode_observed_tool, ObservedOutputKind, ObservedToolOutcome,
+        };
+        for (item, expected) in [
+            (
+                serde_json::json!({"type":"commandExecution","id":"tool","status":"completed","exitCode":0,"command":"PRIVATE"}),
+                ObservedToolOutcome::Completed,
+            ),
+            (
+                serde_json::json!({"type":"commandExecution","id":"tool","status":"completed","exitCode":1}),
+                ObservedToolOutcome::Failed,
+            ),
+            (
+                serde_json::json!({"type":"mcpToolCall","id":"tool","status":"completed","error":{"message":"PRIVATE"}}),
+                ObservedToolOutcome::Failed,
+            ),
+            (
+                serde_json::json!({"type":"fileChange","id":"tool"}),
+                ObservedToolOutcome::Unknown,
+            ),
+            (
+                serde_json::json!({"type":"commandExecution","id":"tool","status":"interrupted"}),
+                ObservedToolOutcome::Interrupted,
+            ),
+        ] {
+            let notice = decode_observed_tool(
+                "item/completed",
+                &serde_json::json!({"threadId":"t","turnId":"u","item":item}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(notice.outcome, Some(expected));
+            assert!(!format!("{notice:?}").contains("PRIVATE"));
+        }
+        let output = decode_observed_output(
+            "item/reasoning/textDelta",
+            &serde_json::json!({"threadId":"t","turnId":"u","itemId":"i","delta":"中"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.bytes, 3);
+        assert_eq!(output.kind, ObservedOutputKind::Reasoning);
+    }
 
     #[test]
     fn decodes_numeric_and_string_ids() {

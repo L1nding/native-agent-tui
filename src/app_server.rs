@@ -296,6 +296,9 @@ impl Drop for WindowsJob {
 }
 
 pub fn normalize_config(mut config: Config) -> Result<Config, AppServerError> {
+    config.attention.validate().map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    })?;
     config.cwd = config.cwd.canonicalize()?;
     if !config.cwd.is_dir() {
         return Err(AppServerError::InvalidDirectory(
