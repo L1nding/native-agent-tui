@@ -3,7 +3,8 @@ name = "native-agent-tui"
 version = "0.1.0"
 edition = "2021"
 description = "A native terminal UI for observing and coordinating agent execution"
-license = "MIT"\nreadme = "README.md"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
