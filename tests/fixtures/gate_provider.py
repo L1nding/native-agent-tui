@@ -30,8 +30,8 @@ def function(name, arguments, call_id):
     return item
 
 
-def message(text):
-    return {"id": "msg-" + text, "type": "message", "role": "assistant", "status": "completed",
+def message(text, item_id):
+    return {"id": item_id, "type": "message", "role": "assistant", "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]}
 
 
@@ -81,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
             if step >= len(releases) or not releases[step].wait(30):
                 self.send_error(504)
                 return
-            output = message("CHILD_DONE_" + str(step))
+            output = message("CHILD_DONE_" + str(step), "msg-child-" + str(step))
         elif step == 0:
             output = function("spawn_agent", {"task_name": "fixture_child", "message": "CHILD_TASK: Return CHILD_DONE.", "fork_turns": "none", "model":"gpt-6.1-sol"}, "spawn")
         elif step == 1 or step == 3:
@@ -89,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
         elif step == 2:
             output = function("followup_task", {"target": "/root/fixture_child", "message": "CHILD_TASK: Return CHILD_DONE_1."}, "followup")
         else:
-            output = message("GATE_DONE")
+            output = message("GATE_DONE", "msg-root-" + str(step))
         response_id = "resp-" + ("child" if child else "root") + "-" + str(step)
         response = {"id": response_id, "object": "response", "created_at": 1,
                     "model": body.get("model", "gpt-6.1-sol"), "status": "in_progress", "output": []}

@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use crate::journal::JournalSettings;
 use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
 use thiserror::Error;
 
@@ -13,6 +14,7 @@ pub struct Config {
     pub approval_policy: String,
     pub windows_sandbox: Option<String>,
     pub attention: AttentionSettings,
+    pub journal: JournalSettings,
 }
 
 impl Default for Config {
@@ -29,6 +31,7 @@ impl Default for Config {
             approval_policy: "on-request".into(),
             windows_sandbox: None,
             attention: AttentionSettings::default(),
+            journal: JournalSettings::default(),
         }
     }
 }
@@ -38,6 +41,13 @@ pub enum CliCommand {
     Help,
     Version,
     CheckShell(Config),
+    Sessions(Config),
+    Replay {
+        session: String,
+        since: u64,
+        json_events: bool,
+        config: Config,
+    },
     Workflow {
         path: PathBuf,
         headless: bool,
@@ -59,14 +69,14 @@ pub enum CliError {
     UnknownOption(String),
     #[error("{0} requires a value")]
     MissingValue(String),
-    #[error(
-        "choose one of --run, --tui, --workflow, or --check-shell; --headless requires --workflow"
-    )]
+    #[error("choose one execution, --sessions, or --replay mode; --headless requires --workflow")]
     ConflictingModes,
     #[error("invalid value for {option}: {value}")]
     InvalidValue { option: String, value: String },
     #[error("{0}")]
     Attention(String),
+    #[error("--since and --json-events currently require --replay SESSION_ID")]
+    ReplayOptions,
 }
 
 pub fn parse_args<I, S>(args: I) -> Result<CliCommand, CliError>
@@ -82,17 +92,20 @@ where
     let mut index = 0;
     let mut attention_file = None;
     let mut attention_overrides = Vec::new();
+    let mut since = None;
+    let mut json_events = false;
     while index < args.len() {
         let option = &args[index];
         index += 1;
         match option.as_str() {
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
-            "--run" | "--tui" | "--check-shell" | "--workflow" => {
+            "--run" | "--tui" | "--check-shell" | "--workflow" | "--sessions" | "--replay" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
                 if option == "--run"
+                    || option == "--replay"
                     || option == "--workflow"
                     || (option == "--tui"
                         && args.get(index).is_some_and(|next| !next.starts_with('-')))
@@ -104,6 +117,15 @@ where
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
             "--codex" => config.executable = value(&args, &mut index, option)?.into(),
             "--model" => config.model = Some(value(&args, &mut index, option)?),
+            "--journal-dir" => config.journal.root = Some(value(&args, &mut index, option)?.into()),
+            "--json-events" if !json_events => json_events = true,
+            "--since" if since.is_none() => {
+                let val = value(&args, &mut index, option)?;
+                since = Some(val.parse::<u64>().map_err(|_| CliError::InvalidValue {
+                    option: option.clone(),
+                    value: "expected an unsigned event sequence".into(),
+                })?);
+            }
             "--attention-config" => attention_file = Some(value(&args, &mut index, option)?),
             "--attention-model"
             | "--attention-tool"
@@ -160,6 +182,9 @@ where
     if headless && mode != Some("--workflow") {
         return Err(CliError::ConflictingModes);
     }
+    if (since.is_some() || json_events) && mode != Some("--replay") {
+        return Err(CliError::ReplayOptions);
+    }
     if let Some(path) = attention_file {
         let mut bytes = Vec::new();
         std::fs::File::open(path)
@@ -177,6 +202,13 @@ where
             .map_err(|error| CliError::Attention(error.to_string()))?;
     }
     Ok(match mode {
+        Some("--sessions") => CliCommand::Sessions(config),
+        Some("--replay") => CliCommand::Replay {
+            session: goal.unwrap(),
+            since: since.unwrap_or(0),
+            json_events,
+            config,
+        },
         Some("--workflow") => CliCommand::Workflow {
             path: goal.unwrap().into(),
             headless,
@@ -203,6 +235,85 @@ fn value(args: &[String], index: &mut usize, option: &str) -> Result<String, Cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_and_sessions_are_explicit_read_only_modes_with_a_journal_override() {
+        let CliCommand::Replay {
+            session,
+            since,
+            json_events,
+            config,
+        } = parse_args([
+            "--since",
+            "0",
+            "--replay",
+            "session-42",
+            "--json-events",
+            "--journal-dir",
+            "local history",
+            "--codex",
+            "never-execute",
+        ])
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(session, "session-42");
+        assert_eq!(since, 0);
+        assert!(json_events);
+        assert_eq!(config.journal.root, Some(PathBuf::from("local history")));
+        assert_eq!(config.executable, PathBuf::from("never-execute"));
+        assert!(matches!(
+            parse_args(["--sessions"]).unwrap(),
+            CliCommand::Sessions(_)
+        ));
+        assert!(matches!(
+            parse_args(["--replay", "s"]).unwrap(),
+            CliCommand::Replay {
+                since: 0,
+                json_events: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_args(["--replay", "s", "--since", "18446744073709551615"]).unwrap(),
+            CliCommand::Replay {
+                since: u64::MAX,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_options_reject_bad_sequences_and_execution_mode_conflicts() {
+        for sequence in ["-1", "18446744073709551616", "1.0", "x"] {
+            assert!(matches!(
+                parse_args(["--replay", "s", "--since", sequence]),
+                Err(CliError::InvalidValue { .. })
+            ));
+        }
+        for args in [
+            vec!["--replay"],
+            vec!["--replay", "s", "--since"],
+            vec!["--replay", "s", "--since", "0", "--since", "1"],
+            vec!["--replay", "s", "--json-events", "--json-events"],
+            vec!["--replay", "s", "--run", "task"],
+            vec!["--replay", "s", "--workflow", "plan.json"],
+            vec!["--replay", "s", "--check-shell"],
+            vec!["--replay", "s", "--headless"],
+            vec!["--sessions", "--tui"],
+            vec!["--journal-dir"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
+        for args in [
+            vec!["--run", "task", "--json-events"],
+            vec!["--sessions", "--since", "0"],
+            vec!["--json-events"],
+        ] {
+            assert_eq!(parse_args(args), Err(CliError::ReplayOptions));
+        }
+    }
 
     #[test]
     fn cli_attention_overrides_file_values_regardless_of_argument_order() {

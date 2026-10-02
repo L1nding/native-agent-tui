@@ -79,7 +79,7 @@ Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入�
 ## 尚未完成的设计要求
 
 1. 在已接入的 DAG、根槽位、Gate 和任务控制之上，实现完整资源预算、原生并发/深度限制及持久调度恢复。当前能力和验收见[调度接入验证](scheduler-validation.md)。
-2. 提供持久化日志、恢复语义、上下文压缩及 skill 的服务端事实记录。
+2. 在已接入的脱敏 journal 与只读回放上，完成实时 JSONL、手动导出、观察恢复入口、上下文压缩及 skill 的服务端事实记录。
 3. 扩展协议兼容快照，验证一层子代理限制、整棵代理树停止，以及正在运行的子代理收到普通消息时的轮次语义。
 4. 提供代理/任务树、搜索、详细工具轨迹、usage/context 面板和诊断指标。
 
@@ -91,4 +91,10 @@ Job 在进程创建后附加。现有清理测试覆盖附加后的后代；创�
 
 Core 已提供按 agent/tool/request 隔离的活动证据、进展序号和注意级别；CLI 支持显式全局配置和分类阈值覆盖，TUI 通过 F10 临时设置、F11 查看证据。观察计时器不会发起执行或释放 Gate。使用说明见[活动观察](activity-observation.md)。
 
-本次 85 项默认测试、3 项可选真实 app-server 测试及 Python 消费 fixture 通过；fmt、check、clippy、release build 通过。真实 Gate fixture 验证静默升级时 provider 请求和根进展序号不变。完整记录和验证范围见[观察验证](observation-validation.md)。持久 journal、JSONL CLI 与只读回放继续列为未完成工作。
+本次 85 项默认测试、3 项可选真实 app-server 测试及 Python 消费 fixture 通过；fmt、check、clippy、release build 通过。真实 Gate fixture 验证静默升级时 provider 请求和根进展序号不变。完整记录和验证范围见[观察验证](observation-validation.md)。后续 journal 接入结果见下节。
+
+## S9a 持久日志与只读回放
+
+Core 默认写入脱敏状态，首个快照先于 app-server 启动提交；写入确认与 UI 投影版本分开，持久化故障进入 Unknown 并停止执行。CLI 新增 `--sessions`、`--replay`、`--since` 和 `--journal-dir`，`--json-events` 当前只支持回放。读取保留历史证据和不确定结果，不启动模型或回答旧审批。
+
+本轮 102 项默认测试、3 项可选真实 app-server 测试、Python 持久消费者及 fmt/check/clippy/doctest/release build 通过。完整记录见[日志回放验证](journal-validation.md)。实时 stdout 背压/断管、脱敏导出、观察恢复交互和 Alpha 完整发布门禁仍未完成。

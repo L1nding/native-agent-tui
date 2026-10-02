@@ -61,11 +61,17 @@ The root can call `wait_for_subagent_completion` with `{"targets":[]}` to captur
 
 Startup obtains the effective catalog with `codex debug models`, writes a private temporary copy with `tool_mode: direct`, and removes it when the app-server owner exits. User configuration stays intact. This requires a Codex version supporting that command and the pinned protocol.
 
-Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Durable recovery, enforced native capacity, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
+Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Enforced native capacity, execution recovery, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
 
 ## Activity observation
 
-Activity evidence and silence attention are now projected by Core for each agent, tool, and interaction. F10 changes session thresholds; F11 shows evidence, waiting targets, elapsed/silence times, and configuration sources. See [activity observation](docs/activity-observation.md) and [validation](docs/observation-validation.md). Journal, JSONL events, and replay remain planned.
+Activity evidence and silence attention are now projected by Core for each agent, tool, and interaction. F10 changes session thresholds; F11 shows evidence, waiting targets, elapsed/silence times, and configuration sources. See [activity observation](docs/activity-observation.md) and [validation](docs/observation-validation.md).
+
+## Journal and replay
+
+Sessions now persist redacted state in the OS user data directory. `--sessions` lists this workspace's history; `--replay SESSION_ID [--since SEQ] --json-events` reads a fixed committed prefix without launching Codex or answering historical requests. F11 shows the session and committed sequence. Select a storage directory with `--journal-dir PATH`.
+
+Default retention is 30 days / 500 MiB; active and uncertain sessions are protected. Missing terminal records remain unknown. Live `--run --json-events` is still pending and is explicitly rejected. See [storage and replay](docs/journal-replay.md) and [validation](docs/journal-validation.md).
 
 ## Verify
 

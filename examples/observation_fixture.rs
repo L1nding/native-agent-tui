@@ -4,13 +4,21 @@ use std::time::Duration;
 use native_agent_tui::agents::{AgentInfo, AgentSnapshot};
 use native_agent_tui::gate::WaitTarget;
 use native_agent_tui::interactions::RequestView;
+use native_agent_tui::journal::{Journal, JournalSettings, Replay, StoredSnapshot};
 use native_agent_tui::observation::{ChildFact, ObservationFacts, Observer};
 use native_agent_tui::protocol::{ObservedTool, RpcId, ToolCategory};
 use native_agent_tui::scheduler::{ExternalTurn, RootTaskSpec, Scheduler, TaskState};
-use native_agent_tui::state::{GateSnapshot, SessionPhase};
+use native_agent_tui::state::{CoreSnapshot, GateSnapshot, SessionPhase};
 use tokio::time::Instant;
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let journal_root = args.next().map(|flag| {
+        assert_eq!(flag, "--journal-dir");
+        std::path::PathBuf::from(args.next().expect("--journal-dir PATH"))
+    });
+    assert!(args.next().is_none());
     let now = Instant::now();
     let mut scheduler = Scheduler::default();
     scheduler
@@ -69,12 +77,19 @@ fn main() {
         )
         .unwrap()
     });
-    let mut observer = Observer::new_at(
-        "observation-fixture".into(),
-        Default::default(),
-        now,
-        Some(1_000_000),
-    );
+    let session = if journal_root.is_some() {
+        format!(
+            "fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    } else {
+        "observation-fixture".into()
+    };
+    let mut observer = Observer::new_at(session.clone(), Default::default(), now, Some(1_000_000));
     observer
         .reconcile(
             ObservationFacts {
@@ -129,6 +144,36 @@ fn main() {
         )
         .unwrap();
     let resumed = observer.snapshot_at(3, now + Duration::from_secs(131));
+    if let Some(root) = journal_root {
+        let settings = JournalSettings {
+            root: Some(root),
+            ..Default::default()
+        };
+        let cwd = std::env::current_dir().unwrap();
+        let mut core = CoreSnapshot {
+            phase: SessionPhase::GatePending,
+            root_start_requests: 1,
+            scheduler: scheduler.snapshot(),
+            observation: initial,
+            ..Default::default()
+        };
+        let mut journal = Journal::open(&settings, &cwd, StoredSnapshot::capture(&core)).unwrap();
+        core.observation = silence;
+        journal.append(StoredSnapshot::capture(&core)).unwrap();
+        core.observation = resumed;
+        journal.append(StoredSnapshot::capture(&core)).unwrap();
+        core.observation.snapshot_version = 4;
+        core.phase = SessionPhase::Unknown;
+        let mut final_state = StoredSnapshot::capture(&core);
+        final_state.close(SessionPhase::Unknown, true);
+        journal.finish(final_state).await.unwrap();
+        eprintln!("session: {session}");
+        Replay::open(&settings, &cwd, &session, 0)
+            .unwrap()
+            .write_jsonl(&mut std::io::stdout().lock())
+            .unwrap();
+        return;
+    }
     println!(
         "{}",
         serde_json::json!({"fixture_version":1,"snapshots":[initial,silence,resumed]})

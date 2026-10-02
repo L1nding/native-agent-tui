@@ -194,6 +194,9 @@ pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Re
     if let Some(error) = report.cleanup_error {
         return Err(UiError::Shutdown(error));
     }
+    if let Some(error) = report.journal_error {
+        return Err(UiError::Shutdown(error.to_string()));
+    }
     result
 }
 
@@ -996,6 +999,12 @@ fn draw_evidence(
     agent_id: &str,
 ) {
     let mut rows = Vec::new();
+    if let Some(journal) = &snapshot.journal {
+        rows.push(format!(
+            "Session {} / committed {} / submitted {}",
+            journal.session_id, journal.committed_seq, journal.submitted_seq
+        ));
+    }
     for activity in snapshot
         .observation
         .activities

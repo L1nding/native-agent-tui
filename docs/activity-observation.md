@@ -38,4 +38,4 @@ child A 输出只更新 A；工具 A 输出也不会刷新工具 B。工具完�
 
 观察投影只保存身份、类型、时间和字节计数，排除任务正文、命令参数、工具输出、问题正文和秘密回答。输出字节计数是接受的通知字节数，包含 final 正文，不能当作去重后的生成长度。每次会话最多保留 1024 个活动/已完成消息身份，每个活动最多保留 8 条最近证据；超限明确进入 Unknown 并关闭执行所有者。
 
-当前实现为内存投影。Python fixture 的运行方式和验收结果见[验证记录](observation-validation.md)；持久 journal、JSONL CLI 和只读回放仍属后续阶段。
+活动投影已接入持久 journal；只读回放和 JSONL 消费方式见[会话日志](journal-replay.md)。原内存 Python fixture 的验收见[观察验证](observation-validation.md)，持久化测试见[日志回放验证](journal-validation.md)。实时 JSONL stdout 仍属后续阶段。

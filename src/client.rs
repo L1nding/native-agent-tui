@@ -12,6 +12,7 @@ use crate::app_server::{self, AppServer, AppServerError};
 use crate::config::Config;
 use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequest, WaitToken};
 use crate::interactions::{ApprovalDecision, RequestView};
+use crate::journal::{Journal, JournalError, StoredSnapshot};
 use crate::observation::{AttentionClass, ChildFact, ObservationFacts, Observer};
 use crate::protocol::{self, Envelope, RpcId};
 use crate::scheduler::{
@@ -56,6 +57,15 @@ pub struct ExitReport {
     pub final_phase: SessionPhase,
     pub error: Option<String>,
     pub cleanup_error: Option<String>,
+    pub journal_error: Option<JournalError>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error(transparent)]
+    AppServer(#[from] AppServerError),
+    #[error(transparent)]
+    Journal(#[from] JournalError),
 }
 
 pub struct ClientHandle {
@@ -65,18 +75,53 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
-    pub async fn spawn(config: Config) -> Result<Self, AppServerError> {
-        let config = app_server::normalize_config(config)?;
-        let mut server = AppServer::spawn(&config).await?;
-        let pipe = server.pipe.take().expect("new app-server has a transport");
-        Ok(Self::start(pipe, config, Some(server), false))
+    pub async fn spawn(config: Config) -> Result<Self, ClientError> {
+        Self::launch(config, false).await
     }
 
-    pub async fn check_shell(config: Config) -> Result<Self, AppServerError> {
+    pub async fn check_shell(config: Config) -> Result<Self, ClientError> {
+        Self::launch(config, true).await
+    }
+
+    async fn launch(config: Config, check_only: bool) -> Result<Self, ClientError> {
         let config = app_server::normalize_config(config)?;
-        let mut server = AppServer::spawn(&config).await?;
+        let observer = Observer::new(config.attention.clone());
+        let initial = Self::initial(&config, &observer);
+        let journal = Journal::open(
+            &config.journal,
+            &config.cwd,
+            StoredSnapshot::capture(&initial),
+        )?;
+        let mut server = match AppServer::spawn(&config).await {
+            Ok(server) => server,
+            Err(error) => {
+                let mut failure = StoredSnapshot::capture(&initial);
+                failure.phase = SessionPhase::Failed;
+                failure.issue = Some(crate::journal::PersistenceIssue::StartupFailed);
+                failure.close(SessionPhase::Failed, true);
+                journal.finish(failure).await?;
+                return Err(error.into());
+            }
+        };
         let pipe = server.pipe.take().expect("new app-server has a transport");
-        Ok(Self::start(pipe, config, Some(server), true))
+        Ok(Self::start(
+            pipe,
+            config,
+            Some(server),
+            check_only,
+            Some((observer, journal)),
+        ))
+    }
+
+    fn initial(config: &Config, observer: &Observer) -> CoreSnapshot {
+        CoreSnapshot {
+            phase: SessionPhase::Launching,
+            cwd: config.cwd.display().to_string(),
+            sandbox: config.sandbox.clone(),
+            approval_policy: config.approval_policy.clone(),
+            observation: observer.snapshot_at(0, Instant::now()),
+            ..Default::default()
+        }
     }
 
     fn start(
@@ -84,22 +129,22 @@ impl ClientHandle {
         config: Config,
         server: Option<AppServer>,
         check_only: bool,
+        prepared: Option<(Observer, Journal)>,
     ) -> Self {
         let (commands, command_rx) = mpsc::channel(32);
-        let observer = Observer::new(config.attention.clone());
-        let initial = CoreSnapshot {
-            phase: SessionPhase::Launching,
-            cwd: config.cwd.display().to_string(),
-            sandbox: config.sandbox.clone(),
-            approval_policy: config.approval_policy.clone(),
-            observation: observer.snapshot_at(0, Instant::now()),
-            ..Default::default()
+        let (observer, journal) = match prepared {
+            Some((observer, journal)) => (observer, Some(journal)),
+            None => (Observer::new(config.attention.clone()), None),
         };
+        let mut initial = Self::initial(&config, &observer);
+        initial.journal = journal.as_ref().map(Journal::view);
         let (snapshot_tx, snapshots) = watch::channel(Arc::new(initial.clone()));
         let join = tokio::spawn(
             Core {
                 pipe,
                 observer,
+                journal,
+                journal_error: None,
                 root_attempt: None,
                 root_observed: None,
                 config,
@@ -167,6 +212,8 @@ struct PendingRpc {
 
 struct Core {
     observer: Observer,
+    journal: Option<Journal>,
+    journal_error: Option<JournalError>,
     root_attempt: Option<TaskAttempt>,
     root_observed: Option<TaskSnapshot>,
     pipe: PipeTransport,
@@ -215,8 +262,24 @@ impl Core {
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut observation_clock = tokio::time::interval(Duration::from_secs(1));
         observation_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut journal_status = self.journal.as_ref().map(|journal| journal.status.clone());
         loop {
             tokio::select! {
+                changed = async {
+                    match &mut journal_status { Some(status) => Some(status.changed().await), None => std::future::pending().await }
+                } => {
+                    let error = if matches!(changed, Some(Err(_))) { Some(JournalError::Closed) }
+                        else { self.persistence_error() };
+                    if let Some(error) = error {
+                        self.journal_error = Some(error.clone());
+                        self.state.error(SessionPhase::Unknown, error.to_string());
+                        self.scheduler.disconnected();
+                        self.publish();
+                        break;
+                    }
+                    self.publish_journal_status();
+                    continue;
+                }
                 _ = observation_clock.tick(), if self.observer.has_timed_activity() => {
                     // Observation must not dispatch, retry, flush writes, or release a Gate.
                     self.publish();
@@ -297,10 +360,33 @@ impl Core {
             self.state.view.phase = SessionPhase::Stopped;
         }
         self.publish();
+        if let Some(journal) = self.journal.take() {
+            let mut final_snapshot = StoredSnapshot::capture(&self.state.view);
+            final_snapshot.close(
+                if self.journal_error.is_some() {
+                    SessionPhase::Unknown
+                } else {
+                    outcome
+                },
+                cleanup_error.is_none(),
+            );
+            if self.journal_error.is_some() {
+                final_snapshot.issue = Some(crate::journal::PersistenceIssue::JournalUnavailable);
+            }
+            match journal.finish(final_snapshot).await {
+                Ok(view) => self.state.view.journal = Some(view),
+                Err(error) => {
+                    self.journal_error = Some(error.clone());
+                    self.state.error(SessionPhase::Unknown, error.to_string());
+                }
+            }
+            self.publish_journal_status();
+        }
         ExitReport {
             final_phase: self.state.view.phase,
             error: self.state.view.last_error.clone(),
             cleanup_error,
+            journal_error: self.journal_error,
         }
     }
 
@@ -318,6 +404,39 @@ impl Core {
         self.state.view.observation = self
             .observer
             .snapshot_at(self.state.view.version + 1, Instant::now());
+        if self.journal_error.is_none() {
+            if let Some(journal) = &mut self.journal {
+                if let Err(error) = journal.append(StoredSnapshot::capture(&self.state.view)) {
+                    self.journal_error = Some(error.clone());
+                    self.state.error(SessionPhase::Unknown, error.to_string());
+                    self.scheduler.disconnected();
+                    self.state.view.scheduler = self.scheduler.snapshot();
+                    self.observer.execution_unavailable(Instant::now());
+                    self.state.view.observation = self
+                        .observer
+                        .snapshot_at(self.state.view.version + 1, Instant::now());
+                }
+            }
+        }
+        self.state.view.journal = self.journal.as_ref().map(Journal::view).or(self
+            .state
+            .view
+            .journal
+            .take());
+        if let Some(view) = &mut self.state.view.journal {
+            view.error = self.journal_error.clone().or(view.error.take());
+        }
+        self.snapshot_tx.send_replace(self.state.snapshot());
+    }
+
+    fn publish_journal_status(&mut self) {
+        if let Some(journal) = &self.journal {
+            self.state.view.journal = Some(journal.view());
+        }
+        if let Some(view) = &mut self.state.view.journal {
+            view.error = self.journal_error.clone().or(view.error.take());
+        }
+        self.state.view.observation.snapshot_version = self.state.view.version + 1;
         self.snapshot_tx.send_replace(self.state.snapshot());
     }
 
@@ -561,6 +680,9 @@ impl Core {
     }
 
     fn dispatch_root(&mut self) {
+        if self.persistence_error().is_some() {
+            return;
+        }
         if !self.preflight_passed
             || self.check_only
             || self.wait.is_some()
@@ -573,6 +695,18 @@ impl Core {
             self.root_attempt = Some(dispatch.attempt);
             self.submit(&dispatch.text);
         }
+    }
+
+    fn persistence_error(&self) -> Option<JournalError> {
+        self.journal_error.clone().or_else(|| {
+            self.journal.as_ref().and_then(|journal| {
+                let status = journal.status.borrow();
+                status
+                    .error
+                    .clone()
+                    .or_else(|| status.closed.then_some(JournalError::Closed))
+            })
+        })
     }
 
     fn flush_child_interrupt(&mut self) {
@@ -1714,8 +1848,221 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::{tests::Fixture as JournalFixture, Payload, Replay};
     use serde_json::json;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    async fn journal_harness(
+        fixture: &JournalFixture,
+    ) -> (
+        ClientHandle,
+        BufReader<tokio::io::DuplexStream>,
+        Config,
+        String,
+    ) {
+        let config = Config {
+            journal: fixture.settings(),
+            ..Default::default()
+        };
+        let observer = Observer::new(config.attention.clone());
+        let initial = ClientHandle::initial(&config, &observer);
+        let session = initial.observation.session_id.clone();
+        let journal = Journal::open(
+            &config.journal,
+            &config.cwd,
+            StoredSnapshot::capture(&initial),
+        )
+        .unwrap();
+        let (client, server) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(client);
+        (
+            ClientHandle::start(
+                PipeTransport::new(read, write),
+                config.clone(),
+                None,
+                false,
+                Some((observer, journal)),
+            ),
+            BufReader::new(server),
+            config,
+            session,
+        )
+    }
+
+    async fn journal_committed(client: &mut ClientHandle) {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|s| {
+                s.journal
+                    .as_ref()
+                    .is_some_and(|j| j.committed_seq == j.submitted_seq)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_core_replays_a_durable_terminal_without_private_text_or_ack_feedback() {
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        journal_committed(&mut client).await;
+        let settled = client.snapshots.borrow().journal.clone().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .journal
+                .as_ref()
+                .unwrap()
+                .submitted_seq,
+            settled.submitted_seq,
+            "Persistence acknowledgments must not append new records"
+        );
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "PRIVATE_PROMPT".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"journal-turn"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        observation_event(&mut client, &mut server, json!({"id":"approval-id","method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"journal-turn","command":"PRIVATE_COMMAND"}})).await;
+        journal_committed(&mut client).await;
+        let mut bytes = Vec::new();
+        Replay::open(&config.journal, &config.cwd, &session, 0)
+            .unwrap()
+            .write_jsonl(&mut bytes)
+            .unwrap();
+        let history = String::from_utf8(bytes).unwrap();
+        assert!(history.contains("approval-id") && history.contains("journal-turn"));
+        assert!(!history.contains("PRIVATE_"));
+        client
+            .commands
+            .send(Command::AnswerApproval {
+                request_id: RpcId::String("approval-id".into()),
+                decision: ApprovalDecision::Decline,
+            })
+            .await
+            .unwrap();
+        let answer = next(&mut server).await;
+        assert_eq!(answer["id"], "approval-id");
+        observation_event(&mut client, &mut server, json!({"method":"serverRequest/resolved","params":{"threadId":"root","requestId":"approval-id"}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"journal-turn","itemId":"message","delta":"PRIVATE_OUTPUT"}})).await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"journal-turn","status":"completed"}}})).await;
+        phase(&mut client, SessionPhase::Completed).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        let report = client.join.await.unwrap();
+        assert_eq!(report.journal_error, None);
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert!(replay.info.session_closed && !replay.info.needs_recovery);
+        assert_eq!(
+            replay.latest_state().execution_result,
+            Some(SessionPhase::Completed)
+        );
+        assert_eq!(replay.latest_state().cleanup_confirmed, Some(true));
+        assert_eq!(replay.latest_state().root_start_requests, 1);
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .journal
+                .as_ref()
+                .unwrap()
+                .committed_seq,
+            replay.info.committed_seq
+        );
+        let mut bytes = Vec::new();
+        replay.write_jsonl(&mut bytes).unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().contains("PRIVATE_"));
+    }
+
+    #[tokio::test]
+    async fn journal_commit_failure_stops_core_without_dispatching_another_root() {
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        running_root(&mut client, &mut server).await;
+        journal_committed(&mut client).await;
+        let cursor = std::fs::read_dir(&fixture.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "cursor")
+            })
+            .unwrap();
+        std::fs::create_dir(cursor.with_extension("cursor.new")).unwrap();
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "PRIVATE_QUEUED".into(),
+            })
+            .await
+            .unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(4), client.join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.final_phase, SessionPhase::Unknown);
+        assert!(report.journal_error.is_some());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert!(client
+            .snapshots
+            .borrow()
+            .observation
+            .activities
+            .iter()
+            .all(|a| !matches!(
+                a.execution_state,
+                crate::observation::ExecutionState::Running
+                    | crate::observation::ExecutionState::Waiting
+            )));
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert!(
+            replay.info.needs_recovery && !replay.info.session_closed && replay.uncommitted_tail
+        );
+        assert_eq!(replay.info.execution_result, None);
+        let mut bytes = Vec::new();
+        replay.write_jsonl(&mut bytes).unwrap();
+        let end: crate::journal::Record =
+            serde_json::from_str(String::from_utf8(bytes).unwrap().lines().last().unwrap())
+                .unwrap();
+        assert!(
+            matches!(end.payload, Payload::ReplayEnd(end) if end.needs_recovery && !end.live_attached)
+        );
+        let mut trailing = String::new();
+        server.read_to_string(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn journal_startup_failure_precedes_any_app_server_launch() {
+        let fixture = JournalFixture::new();
+        let invalid = fixture.root.join("file-not-directory");
+        std::fs::write(&invalid, b"occupied").unwrap();
+        let config = Config {
+            executable: fixture.root.join("must-never-launch"),
+            journal: crate::journal::JournalSettings {
+                root: Some(invalid),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ClientHandle::spawn(config).await,
+            Err(ClientError::Journal(JournalError::Io))
+        ));
+    }
 
     async fn observation_event(
         client: &mut ClientHandle,
@@ -2106,7 +2453,9 @@ mod tests {
                 .join(format!("gate-fixture-{}", std::process::id())),
         );
         std::fs::create_dir(&home.0).unwrap();
+        let journal_fixture = JournalFixture::new();
         let config = app_server::normalize_config(Config {
+            journal: journal_fixture.settings(),
             windows_sandbox: Some("unelevated".into()),
             sandbox: "read-only".into(),
             model: Some("gpt-6.1-sol".into()),
@@ -2134,9 +2483,20 @@ mod tests {
             .env_remove("CODEX_API_KEY");
         command.args(["-c", &catalog.config_override()]);
         command.args(["-c", "windows.sandbox=\"unelevated\"", "-c", "model_provider=\"gate_fixture\"", "-c", &format!("model_providers.gate_fixture={{name=\"Gate fixture\",base_url=\"http://127.0.0.1:{port}/v1\",wire_api=\"responses\",requires_openai_auth=false}}"), "app-server", "--strict-config", "--listen", "stdio://"]).current_dir(&config.cwd);
+        let observer = Observer::new(config.attention.clone());
+        let initial = ClientHandle::initial(&config, &observer);
+        let session = initial.observation.session_id.clone();
+        let journal = Journal::open(
+            &config.journal,
+            &config.cwd,
+            StoredSnapshot::capture(&initial),
+        )
+        .unwrap();
+        let replay_config = config.clone();
         let mut server = AppServer::spawn_command(command).unwrap();
         let pipe = server.pipe.take().unwrap();
-        let mut client = ClientHandle::start(pipe, config, Some(server), false);
+        let mut client =
+            ClientHandle::start(pipe, config, Some(server), false, Some((observer, journal)));
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -2317,7 +2677,20 @@ mod tests {
         provider.stdin.take();
         let provider_exit = tokio::time::timeout(Duration::from_secs(3), provider.wait()).await;
         observation.unwrap_or_else(|error| panic!("{error}; provider counters: {counts}"));
-        assert!(exit.unwrap().cleanup_error.is_none());
+        let exit = exit.unwrap();
+        assert!(exit.cleanup_error.is_none() && exit.journal_error.is_none());
+        let replay = Replay::open(&replay_config.journal, &replay_config.cwd, &session, 0).unwrap();
+        assert!(replay.info.session_closed && !replay.info.needs_recovery);
+        assert_eq!(replay.info.execution_result, Some(SessionPhase::Completed));
+        assert_eq!(replay.latest_state().root_start_requests, 3);
+        let mut bytes = Vec::new();
+        replay.write_jsonl(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains("ROOT_TASK:")
+                && !text.contains("WORKFLOW_FIRST")
+                && !text.contains("GATE_DONE")
+        );
         assert!(provider_exit.unwrap().unwrap().success());
     }
 
@@ -3214,7 +3587,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the installed authenticated Codex app-server"]
     async fn live_windows_core_reaches_ready_without_a_model_turn() {
+        let fixture = JournalFixture::new();
         let config = Config {
+            journal: fixture.settings(),
             windows_sandbox: Some("unelevated".into()),
             sandbox: "read-only".into(),
             ..Default::default()
@@ -3258,6 +3633,7 @@ mod tests {
                 Config::default(),
                 None,
                 false,
+                None,
             ),
             BufReader::new(server),
         )

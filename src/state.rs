@@ -7,7 +7,8 @@ use crate::interactions::RequestView;
 pub const MESSAGE_BYTES: usize = 32 * 1024;
 pub const HISTORY_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SessionPhase {
     Created,
     Launching,
@@ -57,6 +58,7 @@ pub struct CoreSnapshot {
     pub queued_inputs: usize,
     pub scheduler: crate::scheduler::SchedulerSnapshot,
     pub observation: crate::observation::ObservationSnapshot,
+    pub journal: Option<crate::journal::JournalView>,
     pub agents: Vec<AgentSnapshot>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -92,6 +94,7 @@ impl Default for CoreSnapshot {
             queued_inputs: 0,
             scheduler: Default::default(),
             observation: Default::default(),
+            journal: None,
             agents: Vec::new(),
             thread_id: None,
             turn_id: None,

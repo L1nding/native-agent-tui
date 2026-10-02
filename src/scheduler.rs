@@ -35,19 +35,21 @@ impl WorkflowPlan {
 #[serde(transparent)]
 pub struct TaskId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskAttempt {
     pub task: TaskId,
     pub attempt: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TaskKind {
     RootTurn,
     NativeChild,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TaskState {
     Queued,
     Ready,
@@ -137,7 +139,7 @@ pub enum BlockedReason {
     DependencyUnknown(TaskId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalTurn {
     pub thread_id: String,
     pub turn_id: String,
