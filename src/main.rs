@@ -18,6 +18,10 @@ fn print_help() {
     };
     println!("Native Agent TUI {}", env!("CARGO_PKG_VERSION"));
     println!(
+        "Execution requires codex-cli {}.",
+        native_agent_tui::compatibility::SUPPORTED_CODEX_VERSION
+    );
+    println!(
         r#"
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]

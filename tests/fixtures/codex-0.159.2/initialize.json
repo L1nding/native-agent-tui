@@ -1,0 +1,9 @@
+{
+  "id": 1,
+  "result": {
+    "userAgent": "native-agent-tui/0.1.0 (fixture; sanitized)",
+    "codexHome": "C:\\fixture\\codex-home",
+    "platformFamily": "windows",
+    "platformOs": "windows"
+  }
+}

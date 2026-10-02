@@ -102,10 +102,15 @@ impl ClientHandle {
         let mut server = match AppServer::spawn(&config).await {
             Ok(server) => server,
             Err(error) => {
+                let cleanup_confirmed = !matches!(error, AppServerError::StartupCleanup);
                 let mut failure = StoredSnapshot::capture(&initial);
                 failure.phase = SessionPhase::Failed;
-                failure.issue = Some(crate::journal::PersistenceIssue::StartupFailed);
-                failure.close(SessionPhase::Failed, true);
+                failure.issue = Some(if cleanup_confirmed {
+                    crate::journal::PersistenceIssue::StartupFailed
+                } else {
+                    crate::journal::PersistenceIssue::CleanupUncertain
+                });
+                failure.close(SessionPhase::Failed, cleanup_confirmed);
                 journal.finish(failure).await?;
                 return Err(error.into());
             }
@@ -1112,6 +1117,10 @@ impl Core {
     fn response(&mut self, kind: RpcKind, result: Value) {
         let action = match kind {
             RpcKind::Initialize => {
+                if let Err(error) = crate::compatibility::verify_initialize(&result) {
+                    self.state.error(SessionPhase::Failed, error.to_string());
+                    return;
+                }
                 if let Err(error) = self.pipe.send(Envelope::notification("initialized", None)) {
                     self.state.error(SessionPhase::Failed, error.to_string());
                     return;
@@ -1123,6 +1132,10 @@ impl Core {
                 })
             }
             RpcKind::ThreadStart => {
+                if let Err(error) = crate::compatibility::verify_thread_start(&result) {
+                    self.state.error(SessionPhase::Failed, error.to_string());
+                    return;
+                }
                 let Some(id) = result.pointer("/thread/id").and_then(Value::as_str) else {
                     self.state.error(
                         SessionPhase::Failed,
@@ -4100,13 +4113,18 @@ mod tests {
     async fn initialized(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
         let init = next(server).await;
         assert_eq!(init["method"], "initialize");
-        send(server, json!({"id":init["id"],"result":{}})).await;
+        let mut response: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.159.2/initialize.json"
+        ))
+        .unwrap();
+        response["id"] = init["id"].clone();
+        send(server, response).await;
         assert_eq!(next(server).await["method"], "initialized");
         let thread = next(server).await;
         assert_eq!(thread["method"], "thread/start");
         send(
             server,
-            json!({"id":thread["id"],"result":{"thread":{"id":"root"},"model":"test-model"}}),
+            json!({"id":thread["id"],"result":{"thread":{"id":"root","cliVersion":"0.159.2"},"model":"test-model"}}),
         )
         .await;
         let preflight = next(server).await;
@@ -4121,6 +4139,109 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_startup_transcript_reaches_ready_with_zero_model_turns() {
+        let (mut client, mut server) = harness().await;
+        let records: Vec<Value> = include_str!("../tests/fixtures/codex-0.159.2/startup.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for (method, response) in ["initialize", "thread/start", "command/exec"]
+            .into_iter()
+            .zip(records)
+        {
+            let request = next(&mut server).await;
+            assert_eq!(request["method"], method);
+            assert_eq!(request["id"], response["id"]);
+            send(&mut server, response).await;
+            if method == "initialize" {
+                assert_eq!(next(&mut server).await["method"], "initialized");
+            }
+        }
+        phase(&mut client, SessionPhase::Ready).await;
+        assert_eq!(client.snapshots.borrow().root_turn_count, 0);
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_initialize_cannot_start_a_thread_preflight_or_queued_task() {
+        for result in [
+            json!({}),
+            json!({"userAgent":"PRIVATE_METADATA"}),
+            Value::Null,
+        ] {
+            let (mut client, mut server) = harness().await;
+            let request = next(&mut server).await;
+            client
+                .commands
+                .send(Command::SubmitRootInput {
+                    text: "PRIVATE_PROMPT".into(),
+                })
+                .await
+                .unwrap();
+            send(&mut server, json!({"id":request["id"],"result":result})).await;
+            phase(&mut client, SessionPhase::Failed).await;
+            client
+                .commands
+                .send(Command::SubmitRootInput {
+                    text: "PRIVATE_RETRY".into(),
+                })
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), next(&mut server))
+                    .await
+                    .is_err()
+            );
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.root_start_requests, 0);
+            assert_eq!(snapshot.root_turn_count, 0);
+            assert!(snapshot.thread_id.is_none());
+            assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
+            drop(snapshot);
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_new_thread_release_cannot_start_preflight_or_a_model_turn() {
+        let (mut client, mut server) = harness().await;
+        let request = next(&mut server).await;
+        let mut response: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.159.2/initialize.json"
+        ))
+        .unwrap();
+        response["id"] = request["id"].clone();
+        send(&mut server, response).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "thread/start");
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "PRIVATE_PROMPT".into(),
+            })
+            .await
+            .unwrap();
+        send(&mut server, json!({"id":request["id"],"result":{"thread":{"id":"root","cliVersion":"PRIVATE_VERSION"}}})).await;
+        phase(&mut client, SessionPhase::Failed).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), next(&mut server))
+                .await
+                .is_err()
+        );
+        let snapshot = client.snapshots.borrow();
+        assert_eq!(snapshot.root_start_requests, 0);
+        assert!(snapshot.thread_id.is_none());
+        assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
+        drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

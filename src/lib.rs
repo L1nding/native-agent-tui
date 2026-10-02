@@ -3,6 +3,7 @@
 pub mod agents;
 pub mod app_server;
 pub mod client;
+pub mod compatibility;
 pub mod config;
 pub mod diagnostics;
 pub mod gate;

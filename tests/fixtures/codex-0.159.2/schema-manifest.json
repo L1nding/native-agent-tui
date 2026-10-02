@@ -1,0 +1,77 @@
+{
+  "codex_version": "0.159.2",
+  "experimental": true,
+  "canonical_json": "sorted keys, UTF-8, compact separators",
+  "schemas": {
+    "v1/InitializeParams.json": {
+      "sha256": "e38c4d61719f7c6b0aa3976de697b52748befcb6335dad5386da140c05f9aba2",
+      "required": [
+        "clientInfo"
+      ]
+    },
+    "v1/InitializeResponse.json": {
+      "sha256": "747401b5d7d395b71e4023d3d13aaaaefb0f6ae044d611675f59838672720c3d",
+      "required": [
+        "codexHome",
+        "platformFamily",
+        "platformOs",
+        "userAgent"
+      ]
+    },
+    "v2/ThreadStartResponse.json": {
+      "sha256": "0afc9860d4a1d41f2af9ac36603af033264c33e1660abc2f9790be9900ce326a",
+      "required": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "model",
+        "modelProvider",
+        "sandbox",
+        "thread"
+      ]
+    },
+    "v2/CommandExecResponse.json": {
+      "sha256": "f40282af0193d753edd4df784fd96054da3634ec41965619e8ffd27141a21191",
+      "required": [
+        "exitCode",
+        "stderr",
+        "stdout"
+      ]
+    },
+    "v2/TurnCompletedNotification.json": {
+      "sha256": "78e6f8b0eff801649f93623eed4ec5551caa7d05dda740d36515d0d34cd82c70",
+      "required": [
+        "threadId",
+        "turn"
+      ]
+    },
+    "CommandExecutionRequestApprovalParams.json": {
+      "sha256": "739c3b53bffc7ef0cda2ffa1c26238a2e2fb6120d236bd97434084a03a3b6a0f",
+      "required": [
+        "itemId",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "FileChangeRequestApprovalParams.json": {
+      "sha256": "1683d378ee81b2d4d2aeab348d4aa8236a8070c6ee44a1548a8d206ee947411d",
+      "required": [
+        "itemId",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "ToolRequestUserInputParams.json": {
+      "sha256": "b99ace3211269f77083d8d86664393deb7992c3b53ef596582915b1256668682",
+      "required": [
+        "isBlocking",
+        "itemId",
+        "questions",
+        "threadId",
+        "turnId"
+      ]
+    }
+  }
+}

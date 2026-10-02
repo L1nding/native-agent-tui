@@ -11,6 +11,7 @@
 - 未知外部结果会关闭执行通道，避免迟到事件恢复运行或自动重放副作用。
 - 秘密回答不会进入对话记录；请求结束会清除回答缓冲，恢复原任务草稿。
 - 启动前读取有效模型目录，生成仅将 `tool_mode` 改为 `direct` 的临时副本；app-server 持有副本并在退出时清理，不修改用户配置。
+- 执行前准确核对 Codex CLI 0.159.2，验证初始化字段及新线程的 `cliVersion`；版本不符、查询失败或握手不完整时禁止模型轮次。历史入口继续离线可用。
 - Core 登记真实子代理身份、直属关系和当前 turn/generation。原生 `subAgentActivity` 可先提供临时身份，首次 `turn/started` 后用一次 `thread/read` 补齐元数据；补齐期间不提前释放等待。
 - 根线程注册 `wait_for_subagent_completion`：目标集合在接受时固定，无等待超时；全部当前轮次完成或任一失败/中断才回复，重复和旧轮事件不能释放新等待。
 - 等待期间子代理审批/问题继续处理；根输入最多排队 8 项，当前根轮成功结束后按依赖提交，失败/中断保留为阻塞任务供检查、取消或显式重试。断连不伪造子代理完成。
@@ -111,7 +112,7 @@ Core 默认写入脱敏状态，首个快照先于 app-server 启动提交；写
 
 `--export SESSION_ID [--since SEQ] [--output NEW_FILE]` 和历史页的 `e` 支持预览后保存。导出保留结果、关系及证据，将自由字符串身份替换为稳定别名；预览范围固定，保存不加入后续记录。已有文件与托管 journal 受保护；写入失败不发布部分目标。使用和文件系统限制见[历史与导出](history-export.md)，最终复验结果见[观察恢复验证](history-validation.md)。
 
-协议兼容门禁、Shell 启动可靠性、搜索/提醒关闭/完整请求详情，以及 Alpha 试用与发布验收仍待完成。历史导入和自动执行恢复没有实现，V2 完整调度继续保留独立验收范围。
+更广协议兼容快照与必需能力校验、Shell 启动可靠性、搜索/提醒关闭/完整请求详情，以及 Alpha 试用与发布验收仍待完成。历史导入和自动执行恢复没有实现，V2 完整调度继续保留独立验收范围。
 
 ## S10a 持续验证入口
 
@@ -126,3 +127,11 @@ app-server 和目录查询共用私有 `owned_process` 接口。Windows 通过 `
 清理本包编译缓存后，`python scripts/verify.py --live` 全部通过：128 项默认测试、4 项真实 Codex 测试、11 个 Windows 原生所有权场景及已有原生 fixture；fmt/check/clippy/doctest/release 通过。ConPTY 验证历史动作只读、秘密草稿保持掩码、退出恢复终端，RPC 与 journal 均没有提交测试回答。
 
 此前本轮完整验证及重复 Ready 测试曾出现预检超时。固定旧版 `f6e7a70` 的独立对照也捕获同类 Unknown，零模型轮次；共享编译缓存的三路径探针统计已排除，不能作为验收证据。最终单次通过不证明启动稳定，也未确定超时根因。创建边界、样本与限制见[Windows 进程所有权](windows-process-ownership.md)，持续验证范围见[CI 验证](ci-validation.md)。Alpha/V2 尚未完成。
+
+## S1a 后端版本与启动协议门禁
+
+生产启动只接受准确的 `codex-cli 0.159.2`；有界版本查询通过后才读取目录和启动 app-server。Core 校验初始化必需字符串，以及新线程报告的固定 `cliVersion` 和非空身份。拒绝时不能发起模型轮次，banner 和私有初始化 metadata 不进入错误或 journal；查询清理未获确认时保留 CleanupUncertain。
+
+新增八份导出 schema 指纹、两个保留源 schema、脱敏初始化与合成启动回放夹具。默认 CI 检查本地夹具及九个原生 CLI 场景；可选真实 schema 测试在独立目录重新导出并比较，字段类型漂移注入会返回失败。范围与升级步骤见[Codex 兼容门禁](codex-compatibility.md)。完整 typed event 与更多协议快照尚未全部实现。
+
+最终 `python scripts/verify.py` 通过 134 项默认测试、九个兼容场景、11 个 Windows 进程所有权场景和原有原生 fixture；fmt/check/clippy/doctest/release 通过。Cargo 原生测试路径同样通过 134 项。最新完整 `--live` 的五项真实检查四项通过，Ready 因约 31 秒的 shell 预检超时进入 Unknown，零模型轮次，整次命令失败。最终源码的 schema 专项复验通过，不能据此替代 Ready 或完整真实验证。启动可靠性及 Alpha/V2 仍未完成。

@@ -47,6 +47,8 @@ def main():
     if not binary.is_file() or not fixture.is_file():
         parser.error("release binaries are missing; run without --fixtures-only to build them")
     fixtures = REPO / "tests/fixtures"
+    run([sys.executable, str(REPO / "scripts/check_protocol_schema.py")])
+    run([sys.executable, str(fixtures / "compatibility_cli_check.py"), "--binary", str(binary)])
     for script in ["history_cli_check.py", "journal_replay_check.py"]:
         run([sys.executable, str(fixtures / script), "--fixture", str(fixture), "--binary", str(binary)])
     # Keep JSONL as bytes; shell pipelines can recode text and hide the producer exit code.

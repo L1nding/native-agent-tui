@@ -4,7 +4,7 @@ A Rust terminal client for the local Codex app-server. Interactive and headless 
 
 ## Run
 
-Install Rust and make an authenticated Codex CLI available on `PATH`. The current protocol baseline is Codex **0.159.2**. `--codex PATH` or `CODEX_BIN` selects another executable; Windows uses `codex.cmd` by default.
+Install Rust and make an authenticated Codex CLI **0.159.2** available on `PATH`. Execution checks the exact CLI release before catalog lookup, then validates initialization and the new thread's reported release. `--codex PATH` or `CODEX_BIN` selects a compatible executable; Windows uses `codex.cmd` by default. Other versions are refused before model execution. See [backend compatibility](docs/codex-compatibility.md).
 
 ```text
 cargo run --locked -- --check-shell

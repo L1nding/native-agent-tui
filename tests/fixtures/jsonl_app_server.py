@@ -5,12 +5,40 @@ from pathlib import Path
 import subprocess
 import sys
 
+root = Path(os.environ["NATIVE_JSONL_FIXTURE_ROOT"])
+mode = os.environ.get("NATIVE_JSONL_FIXTURE_MODE", "success")
+stage = "version" if "--version" in sys.argv else "catalog" if "debug" in sys.argv and "models" in sys.argv else "app-server"
+with (root / "startup.jsonl").open("a") as record:
+    record.write(json.dumps({"stage": stage}) + "\n")
+if stage == "version":
+    if mode == "version_hang":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                 creationflags=subprocess.CREATE_NO_WINDOW) if os.name == "nt" else None
+        (root / "pids.json").write_text(json.dumps([os.getpid(), child.pid] if child else [os.getpid()]))
+        print("codex-cli 0.159.2", flush=True)
+        try:
+            import time
+            time.sleep(120)
+        finally:
+            if os.name != "nt" and child:
+                child.terminate()
+                child.wait()
+    if mode == "version_empty":
+        sys.exit(0)
+    if mode == "version_bad":
+        print("codex-cli 0.159.20")
+    elif mode == "version_private":
+        print("PRIVATE_BANNER 0.159.2")
+    elif mode == "version_large":
+        print("PRIVATE_BANNER" * 1000)
+    else:
+        print("codex-cli 0.159.2")
+    sys.exit(1 if mode == "version_failure" else 0)
+
 if "debug" in sys.argv and "models" in sys.argv:
     print(json.dumps({"models": [{"slug": "fixture-model", "tool_mode": "code"}]}))
     sys.exit(0)
 
-root = Path(os.environ["NATIVE_JSONL_FIXTURE_ROOT"])
-mode = os.environ.get("NATIVE_JSONL_FIXTURE_MODE", "success")
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 (root / "pids.json").write_text(json.dumps([os.getpid(), child.pid]))
@@ -44,9 +72,13 @@ try:
             record.write(json.dumps({"method": method, "id": message.get("id"),
                                      "decision": message.get("result", {}).get("decision")}) + "\n")
         if method == "initialize":
-            send({"id": message["id"], "result": {}})
+            response = json.loads((Path(__file__).parent / "codex-0.159.2/initialize.json").read_text())
+            response["id"] = message["id"]
+            if mode == "initialize_bad":
+                response["result"] = {"userAgent": "PRIVATE_METADATA"}
+            send(response)
         elif method == "thread/start":
-            send({"id": message["id"], "result": {"thread": {"id": "root"}, "model": "fixture-model"}})
+            send({"id": message["id"], "result": {"thread": {"id": "root", "cliVersion": "PRIVATE_VERSION" if mode == "thread_version_bad" else "0.159.2"}, "model": "fixture-model"}})
         elif method == "command/exec":
             send({"id": message["id"], "result": {"exitCode": 0, "stdout": "native-agent-tui-shell-ok"}})
         elif method == "turn/start":
