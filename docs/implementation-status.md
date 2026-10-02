@@ -111,4 +111,10 @@ Core 默认写入脱敏状态，首个快照先于 app-server 启动提交；写
 
 `--export SESSION_ID [--since SEQ] [--output NEW_FILE]` 和历史页的 `e` 支持预览后保存。导出保留结果、关系及证据，将自由字符串身份替换为稳定别名；预览范围固定，保存不加入后续记录。已有文件与托管 journal 受保护；写入失败不发布部分目标。使用和文件系统限制见[历史与导出](history-export.md)，最终复验结果见[观察恢复验证](history-validation.md)。
 
-协议兼容门禁、Windows 创建与 Job 附加竞态、持续 CI、搜索/提醒关闭/完整请求详情，以及 Alpha 试用与发布验收仍待完成。历史导入和自动执行恢复没有实现，V2 完整调度继续保留独立验收范围。
+协议兼容门禁、Windows 创建与 Job 附加竞态、搜索/提醒关闭/完整请求详情，以及 Alpha 试用与发布验收仍待完成。历史导入和自动执行恢复没有实现，V2 完整调度继续保留独立验收范围。
+
+## S10a 持续验证入口
+
+新增 `scripts/verify.py`，统一 Rust 基线、release 构建与历史/回放/观察/实时 JSONL 原生 fixture；每个命令失败立即停止。nextest 不可用时使用 Cargo 原生测试，可选 `--live` 验证锁定 Codex。`.github/workflows/verify.yml` 已配置 Windows、Rust 1.96.0 和 Python 3.12，使用固定 action SHA 与只读权限。
+
+本地 Cargo 路径完成 128 项默认测试和全部原生 fixture；失败工具链用例在首个检查停止。workflow 通过 actionlint；远端 Actions 尚未运行。最低 Rust 1.89、Linux/macOS、终端交互和 Alpha 发布门禁保持单独验收，详见[持续验证](ci-validation.md)。

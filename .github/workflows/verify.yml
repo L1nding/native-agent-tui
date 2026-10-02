@@ -1,0 +1,41 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows Rust and native fixtures
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+      - name: Install verified Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run repository verification
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          python scripts/verify.py --toolchain 1.96.0 --cargo-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

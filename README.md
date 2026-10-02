@@ -104,6 +104,8 @@ cargo build --locked --release
 
 Use `cargo test --locked --all-targets` when nextest is unavailable. Contributor guidance and architecture documents are under [docs/](docs/AGENTS.md).
 
+`python scripts/verify.py` runs these checks plus doctests and native CLI/Python fixtures, stopping on the first failure. Windows CI uses the same entry point with Rust 1.96.0; see [continuous verification](docs/ci-validation.md).
+
 ### Optional live verification (Windows)
 
 The local provider fixture requires Codex 0.159.2 and Python. It uses an isolated `CODEX_HOME`, no API keys, and localhost Responses SSE. It holds two child turns and counts provider requests before releasing each one:
