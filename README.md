@@ -71,7 +71,13 @@ Activity evidence and silence attention are now projected by Core for each agent
 
 Sessions now persist redacted state in the OS user data directory. `--sessions` lists this workspace's history; `--replay SESSION_ID [--since SEQ] --json-events` reads a fixed committed prefix without launching Codex or answering historical requests. F11 shows the session and committed sequence. Select a storage directory with `--journal-dir PATH`.
 
-Default retention is 30 days / 500 MiB; active and uncertain sessions are protected. Missing terminal records remain unknown. Live `--run --json-events` is still pending and is explicitly rejected. See [storage and replay](docs/journal-replay.md) and [validation](docs/journal-validation.md).
+Default retention is 30 days / 500 MiB; active and uncertain sessions are protected. Missing terminal records remain unknown. New sessions use schema 2; schema 1 history stays readable. See [storage and replay](docs/journal-replay.md) and [validation](docs/journal-validation.md).
+
+## Live JSONL
+
+`--run TASK --json-events` and `--workflow FILE --headless --json-events` stream committed redacted state on stdout. A separate writer catches up from the journal; blocked output cannot hold Core. Broken pipes and sustained stalls stop the owner with a nonzero exit code. Final snapshots keep execution results and cleanup confirmation separate.
+
+Approvals are declined; unavailable decline decisions and user input request interruption with fixed recorded reasons. JSONL does not accept answers on stdin. See [the stream contract and Python consumer](docs/jsonl-events.md) and [pipe / real Codex validation](docs/jsonl-validation.md).
 
 ## Verify
 

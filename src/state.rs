@@ -37,6 +37,30 @@ impl SessionPhase {
     }
 }
 
+/// A completed turn is successful only when every root task succeeded.
+pub(crate) fn workflow_outcome(
+    phase: SessionPhase,
+    roots: impl Iterator<Item = crate::scheduler::TaskState>,
+) -> SessionPhase {
+    use crate::scheduler::TaskState;
+    if phase != SessionPhase::Completed {
+        return phase;
+    }
+    let mut failed = false;
+    for state in roots {
+        match state {
+            TaskState::Succeeded => {}
+            TaskState::Failed | TaskState::Cancelled | TaskState::Blocked => failed = true,
+            _ => return SessionPhase::Unknown,
+        }
+    }
+    if failed {
+        SessionPhase::Failed
+    } else {
+        SessionPhase::Completed
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationItem {
     pub id: String,
@@ -68,6 +92,7 @@ pub struct CoreSnapshot {
     pub approval_policy: String,
     pub messages: Vec<ConversationItem>,
     pub requests: Vec<RequestView>,
+    pub last_headless_action: Option<crate::interactions::HeadlessAction>,
     pub notice: Option<String>,
     pub last_error: Option<String>,
     pub tool_activity: Option<String>,
@@ -104,6 +129,7 @@ impl Default for CoreSnapshot {
             approval_policy: String::new(),
             messages: Vec::new(),
             requests: Vec::new(),
+            last_headless_action: None,
             notice: None,
             last_error: None,
             tool_activity: None,

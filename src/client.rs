@@ -49,6 +49,13 @@ pub enum Command {
         quiet_ms: u64,
         attention_ms: u64,
     },
+    HeadlessRequest {
+        request_id: RpcId,
+        thread_id: String,
+        turn_id: String,
+    },
+    OutputUnavailable,
+    UnconfirmedHeadlessInteraction,
     Quit,
 }
 
@@ -289,6 +296,24 @@ impl Core {
                 command = self.command_rx.recv() => {
                     match command {
                         Some(Command::Quit) | None => break,
+                        Some(Command::OutputUnavailable) => {
+                            self.command(Command::Interrupt);
+                            self.state.view.last_headless_action = Some(crate::interactions::HeadlessAction::StopForOutput);
+                            if !self.state.view.phase.can_submit() {
+                                self.state.error(SessionPhase::Unknown, "JSONL output unavailable; any active external outcome is unknown");
+                            }
+                            self.scheduler.disconnected();
+                            self.publish();
+                            break;
+                        }
+                        Some(Command::UnconfirmedHeadlessInteraction) => {
+                            if !self.state.view.phase.can_submit() {
+                                self.state.error(SessionPhase::Unknown, "Headless interaction is unavailable; interruption was not confirmed");
+                            }
+                            self.scheduler.disconnected();
+                            self.publish();
+                            break;
+                        }
                         Some(command) => self.command(command),
                     }
                 }
@@ -507,6 +532,62 @@ impl Core {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::HeadlessRequest {
+                request_id,
+                thread_id,
+                turn_id,
+            } => {
+                let Some(request) = self
+                    .state
+                    .view
+                    .requests
+                    .iter()
+                    .find(|request| {
+                        request.id == request_id
+                            && request.thread_id == thread_id
+                            && request.turn_id == turn_id
+                            && !request.responding
+                    })
+                    .cloned()
+                else {
+                    return;
+                };
+                let action = if matches!(
+                    request.kind,
+                    crate::interactions::RequestKind::UserInput { .. }
+                ) {
+                    crate::interactions::HeadlessAction::InterruptForInput {
+                        request_id,
+                        thread_id: request.thread_id,
+                        turn_id: request.turn_id,
+                    }
+                } else if !request.allow_decline {
+                    crate::interactions::HeadlessAction::InterruptForApproval {
+                        request_id,
+                        thread_id: request.thread_id,
+                        turn_id: request.turn_id,
+                    }
+                } else {
+                    crate::interactions::HeadlessAction::DeclineApproval {
+                        request_id: request_id.clone(),
+                        thread_id: request.thread_id,
+                        turn_id: request.turn_id,
+                    }
+                };
+                if matches!(
+                    action,
+                    crate::interactions::HeadlessAction::InterruptForInput { .. }
+                        | crate::interactions::HeadlessAction::InterruptForApproval { .. }
+                ) {
+                    self.command(Command::Interrupt);
+                } else {
+                    self.command(Command::AnswerApproval {
+                        request_id: request.id,
+                        decision: ApprovalDecision::Decline,
+                    });
+                }
+                self.state.view.last_headless_action = Some(action);
+            }
             Command::ConfigureAttention {
                 class,
                 quiet_ms,
@@ -629,7 +710,9 @@ impl Core {
                     .and_then(|request| request.input_result(&answers).map_err(|e| e.to_string()));
                 self.respond(request_id, result);
             }
-            Command::Quit => {}
+            Command::Quit
+            | Command::OutputUnavailable
+            | Command::UnconfirmedHeadlessInteraction => {}
         }
     }
 
@@ -1904,6 +1987,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_journal_reports_earlier_failure_after_the_last_root_succeeds() {
+        use crate::scheduler::TaskState;
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::QueueRootTasks {
+                tasks: vec![
+                    RootTaskSpec::input("first".into()),
+                    RootTaskSpec::input("last".into()),
+                ],
+            })
+            .await
+            .unwrap();
+        for (turn, status) in [("first", "failed"), ("last", "completed")] {
+            let start = next(&mut server).await;
+            assert_eq!(start["method"], "turn/start");
+            send(
+                &mut server,
+                json!({"id":start["id"],"result":{"turn":{"id":turn}}}),
+            )
+            .await;
+            phase(&mut client, SessionPhase::Running).await;
+            send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":turn,"status":status}}})).await;
+        }
+        phase(&mut client, SessionPhase::Completed).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        assert!(client.join.await.unwrap().journal_error.is_none());
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert_eq!(replay.info.execution_result, Some(SessionPhase::Failed));
+        assert_eq!(
+            replay
+                .latest_state()
+                .tasks
+                .iter()
+                .map(|task| task.state)
+                .collect::<Vec<_>>(),
+            [TaskState::Failed, TaskState::Succeeded]
+        );
+    }
+
+    #[tokio::test]
     async fn journal_core_replays_a_durable_terminal_without_private_text_or_ack_feedback() {
         let fixture = JournalFixture::new();
         let (mut client, mut server, config, session) = journal_harness(&fixture).await;
@@ -2062,6 +2189,276 @@ mod tests {
             ClientHandle::spawn(config).await,
             Err(ClientError::Journal(JournalError::Io))
         ));
+    }
+
+    #[derive(Clone)]
+    struct JsonBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for JsonBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn output_failure_preserves_a_previously_confirmed_terminal_result() {
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        running_root(&mut client, &mut server).await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        phase(&mut client, SessionPhase::Completed).await;
+        client
+            .commands
+            .send(Command::OutputUnavailable)
+            .await
+            .unwrap();
+        client.join.await.unwrap();
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert_eq!(replay.info.execution_result, Some(SessionPhase::Completed));
+        assert_eq!(
+            replay.latest_state().issue,
+            Some(crate::journal::PersistenceIssue::OutputUnavailable)
+        );
+        assert!(replay.info.needs_recovery);
+        assert_eq!(
+            replay.latest_state().tasks[0].state,
+            crate::scheduler::TaskState::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_approval_without_decline_requests_interruption_and_records_its_reason() {
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        running_root(&mut client, &mut server).await;
+        observation_event(&mut client, &mut server, json!({"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"root-turn","command":"PRIVATE_COMMAND","availableDecisions":["accept"]}})).await;
+        client
+            .commands
+            .send(Command::HeadlessRequest {
+                request_id: RpcId::Number(7),
+                thread_id: "root".into(),
+                turn_id: "root-turn".into(),
+            })
+            .await
+            .unwrap();
+        let interrupt = next(&mut server).await;
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}})).await;
+        phase(&mut client, SessionPhase::Interrupted).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert_eq!(
+            replay.info.execution_result,
+            Some(SessionPhase::Interrupted)
+        );
+        assert!(matches!(
+            replay.latest_state().last_headless_action,
+            Some(crate::interactions::HeadlessAction::InterruptForApproval {
+                request_id: RpcId::Number(7),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn headless_jsonl_declines_approvals_and_interrupts_secret_input_with_durable_reasons() {
+        let fixture = JournalFixture::new();
+        let (client, mut server, config, session) = journal_harness(&fixture).await;
+        let bytes = JsonBuffer(Default::default());
+        let output = crate::json_events::LiveOutput::start(
+            &config.journal,
+            &config.cwd,
+            &session,
+            bytes.clone(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let runner = tokio::spawn(crate::headless::run(
+            client,
+            vec![RootTaskSpec::input("PRIVATE_PROMPT".into())],
+            false,
+            Some(output),
+        ));
+        ready(&mut server).await;
+        let start = next(&mut server).await;
+        assert_eq!(start["method"], "turn/start");
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"headless-turn"}}}),
+        )
+        .await;
+        send(&mut server, json!({"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"headless-turn","command":"PRIVATE_COMMAND"}})).await;
+        let reply = next(&mut server).await;
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["result"]["decision"], "decline");
+        send(
+            &mut server,
+            json!({"method":"serverRequest/resolved","params":{"threadId":"root","requestId":7}}),
+        )
+        .await;
+        send(&mut server, json!({"id":"input","method":"item/tool/requestUserInput","params":{"threadId":"root","turnId":"headless-turn","questions":[{"id":"q","header":"PRIVATE_HEADER","question":"PRIVATE_QUESTION","isSecret":true}]}})).await;
+        let interrupt = next(&mut server).await;
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"headless-turn","status":"interrupted"}}})).await;
+        let result = tokio::time::timeout(Duration::from_secs(4), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().0, 130);
+        let text = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("PRIVATE_"));
+        assert!(text.contains("declineApproval") && text.contains("interruptForInput"));
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert_eq!(
+            replay.info.execution_result,
+            Some(SessionPhase::Interrupted)
+        );
+        assert!(replay.latest_state().session_closed);
+        assert_eq!(replay.latest_state().cleanup_confirmed, Some(true));
+        assert_eq!(replay.latest_state().root_start_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn headless_jsonl_broken_writer_interrupts_the_owner_and_preserves_unknown() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        running_root(&mut client, &mut server).await;
+        let output = crate::json_events::LiveOutput::start(
+            &config.journal,
+            &config.cwd,
+            &session,
+            Broken,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let runner = tokio::spawn(crate::headless::run(
+            client,
+            Vec::new(),
+            false,
+            Some(output),
+        ));
+        assert_eq!(next(&mut server).await["method"], "turn/interrupt");
+        let result = tokio::time::timeout(Duration::from_secs(4), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().0, 4);
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert_eq!(replay.info.execution_result, Some(SessionPhase::Unknown));
+        assert_eq!(
+            replay.latest_state().issue,
+            Some(crate::journal::PersistenceIssue::OutputUnavailable)
+        );
+        assert_eq!(replay.latest_state().root_start_requests, 1);
+        assert_eq!(replay.latest_state().cleanup_confirmed, Some(true));
+        assert!(replay.info.needs_recovery);
+    }
+
+    #[tokio::test]
+    async fn headless_jsonl_stalled_output_never_holds_core_cleanup_or_starts_another_root() {
+        struct Held(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl std::io::Write for Held {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let (lock, condition) = &*self.0;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        running_root(&mut client, &mut server).await;
+        let mut snapshots = client.snapshots.clone();
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let output = crate::json_events::LiveOutput::start(
+            &config.journal,
+            &config.cwd,
+            &session,
+            Held(gate.clone()),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let runner = tokio::spawn(crate::headless::run(
+            client,
+            Vec::new(),
+            false,
+            Some(output),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            snapshots.wait_for(|s| s.phase == SessionPhase::Unknown),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Core reached Unknown while stdout was still held by the consumer.
+        assert_eq!(snapshots.borrow().root_start_requests, 1);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert_eq!(next(&mut server).await["method"], "turn/interrupt");
+        let result = tokio::time::timeout(Duration::from_secs(4), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().0, 4);
+        let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
+        assert_eq!(replay.info.execution_result, Some(SessionPhase::Unknown));
+        assert_eq!(replay.latest_state().cleanup_confirmed, Some(true));
+        assert_eq!(replay.latest_state().root_start_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn headless_request_actions_reject_stale_turns_before_declining() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        observation_event(&mut client, &mut server, json!({"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"root-turn","command":"PRIVATE_COMMAND"}})).await;
+        client
+            .commands
+            .send(Command::HeadlessRequest {
+                request_id: RpcId::Number(7),
+                thread_id: "root".into(),
+                turn_id: "old-turn".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert!(client.snapshots.borrow().last_headless_action.is_none());
+        client
+            .commands
+            .send(Command::HeadlessRequest {
+                request_id: RpcId::Number(7),
+                thread_id: "root".into(),
+                turn_id: "root-turn".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(next(&mut server).await["result"]["decision"], "decline");
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     async fn observation_event(

@@ -130,7 +130,7 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
         vec!["--replay", "../cli-session"],
         vec!["--replay", "missing"],
         vec!["--replay", "cli-session", "--since", "2"],
-        vec!["--run", "PRIVATE_PROMPT", "--json-events"],
+        vec!["--run", "PRIVATE_PROMPT", "--since", "0", "--json-events"],
     ] {
         let rejected = fixture.run(&args);
         assert_eq!(rejected.status.code(), Some(2));

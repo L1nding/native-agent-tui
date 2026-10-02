@@ -8,6 +8,7 @@ releases = [threading.Event(), threading.Event()]
 lock = threading.Lock()
 stats = {"root_requests": 0, "child_requests": 0, "root_requests_while_child_held": 0}
 tools = {}
+single_agent = "--single-agent" in sys.argv
 
 
 def catalog(entries, namespace=None):
@@ -77,7 +78,9 @@ class Handler(BaseHTTPRequestHandler):
             stats[counter] += 1
             if not child and ((step >= 2 and not releases[0].is_set()) or (step >= 4 and not releases[1].is_set())):
                 stats["root_requests_while_child_held"] += 1
-        if child:
+        if single_agent:
+            output = message("PRIVATE_SINGLE_OUTPUT", "msg-single-" + str(step))
+        elif child:
             if step >= len(releases) or not releases[step].wait(30):
                 self.send_error(504)
                 return

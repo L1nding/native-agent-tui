@@ -6,6 +6,28 @@ use thiserror::Error;
 
 use crate::protocol::RpcId;
 
+/// Fixed, redacted reasons for actions taken by a noninteractive consumer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum HeadlessAction {
+    DeclineApproval {
+        request_id: RpcId,
+        thread_id: String,
+        turn_id: String,
+    },
+    InterruptForInput {
+        request_id: RpcId,
+        thread_id: String,
+        turn_id: String,
+    },
+    InterruptForApproval {
+        request_id: RpcId,
+        thread_id: String,
+        turn_id: String,
+    },
+    StopForOutput,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Accept,

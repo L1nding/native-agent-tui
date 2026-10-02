@@ -1,13 +1,11 @@
 use std::env;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
 use native_agent_tui::client::Command;
 use native_agent_tui::config::{self, CliCommand, Config};
 use native_agent_tui::journal::{self, JournalError, Replay};
-use native_agent_tui::scheduler::{
-    RootTaskSpec, TaskKind, TaskState, WorkflowPlan, WORKFLOW_BYTES,
-};
+use native_agent_tui::scheduler::{RootTaskSpec, WorkflowPlan, WORKFLOW_BYTES};
 use native_agent_tui::state::{display_text_for_cli, SessionPhase};
 use native_agent_tui::{ui, ClientHandle};
 
@@ -22,8 +20,8 @@ fn print_help() {
         r#"
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]
-  native-agent-tui --run TASK [OPTIONS]
-  native-agent-tui --workflow FILE [--headless] [OPTIONS]
+  native-agent-tui --run TASK [--json-events] [OPTIONS]
+  native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
   native-agent-tui --check-shell [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
   native-agent-tui --replay SESSION_ID [--since SEQ] [--json-events] [OPTIONS]
@@ -45,7 +43,7 @@ Options:
 
 Workflow files contain a JSON task DAG, validated before launching.
 Sessions persist redacted snapshots by default. Replay is read-only and
-never launches app-server. --json-events currently supports replay only.
+never launches app-server. --json-events streams committed redacted state.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
 See docs/scheduler-usage.md and docs/workflow-example.json.
 
@@ -73,7 +71,18 @@ async fn main() -> ExitCode {
 }
 
 async fn execute() -> Result<(), (u8, String)> {
-    match config::parse_args(env::args().skip(1)).map_err(|error| (2, error.to_string()))? {
+    let arguments: Vec<_> = env::args().skip(1).collect();
+    let redact_errors = arguments.iter().any(|argument| argument == "--json-events");
+    match config::parse_args(arguments).map_err(|error| {
+        (
+            2,
+            if redact_errors {
+                "Invalid JSONL command or configuration; inspect --help and local settings.".into()
+            } else {
+                error.to_string()
+            },
+        )
+    })? {
         CliCommand::Help => print_help(),
         CliCommand::Version => println!("native-agent-tui {}", env!("CARGO_PKG_VERSION")),
         CliCommand::Sessions(config) => {
@@ -134,25 +143,50 @@ async fn execute() -> Result<(), (u8, String)> {
                 }
             }
         }
-        CliCommand::Run { goal, config } => {
-            return run_headless(config, vec![RootTaskSpec::input(goal)], false).await
+        CliCommand::Run {
+            goal,
+            config,
+            json_events,
+        } => {
+            return run_headless(config, vec![RootTaskSpec::input(goal)], false, json_events).await
         }
-        CliCommand::CheckShell(config) => return run_headless(config, Vec::new(), true).await,
+        CliCommand::CheckShell(config) => {
+            return run_headless(config, Vec::new(), true, false).await
+        }
         CliCommand::Workflow {
             path,
             headless,
+            json_events,
             config,
         } => {
             // Validate the whole plan before starting an execution owner or model turn.
             let mut bytes = Vec::new();
             std::fs::File::open(&path)
                 .and_then(|file| file.take(WORKFLOW_BYTES as u64 + 1).read_to_end(&mut bytes))
-                .map_err(|error| (2, format!("Cannot read workflow: {error}")))?;
+                .map_err(|error| {
+                    (
+                        2,
+                        if json_events {
+                            "Cannot read workflow file.".into()
+                        } else {
+                            format!("Cannot read workflow: {error}")
+                        },
+                    )
+                })?;
             let tasks = WorkflowPlan::parse(&bytes)
-                .map_err(|error| (2, error))?
+                .map_err(|error| {
+                    (
+                        2,
+                        if json_events {
+                            "Workflow file is invalid; inspect its task definitions.".into()
+                        } else {
+                            error
+                        },
+                    )
+                })?
                 .tasks;
             if headless {
-                return run_headless(config, tasks, false).await;
+                return run_headless(config, tasks, false, json_events).await;
             }
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err((2, "The workflow TUI needs an interactive terminal. Add --headless for scripted execution.".into()));
@@ -191,141 +225,40 @@ async fn run_headless(
     config: Config,
     tasks: Vec<RootTaskSpec>,
     check_only: bool,
+    json_events: bool,
 ) -> Result<(), (u8, String)> {
-    let mut client = if check_only {
+    let journal = config.journal.clone();
+    let cwd = config.cwd.clone();
+    let client = if check_only {
         ClientHandle::check_shell(config).await
     } else {
         ClientHandle::spawn(config).await
     }
-    .map_err(|error| (3, error.to_string()))?;
-    if let Some(journal) = &client.snapshots.borrow().journal {
-        eprintln!("session: {}", journal.session_id);
-    }
-    if !tasks.is_empty() {
-        client
-            .commands
-            .send(Command::QueueRootTasks { tasks })
-            .await
-            .map_err(|error| (1, error.to_string()))?;
-    }
-    let mut displayed = std::collections::HashMap::<(String, String), String>::new();
-    let mut declined = std::collections::HashSet::new();
-    let outcome = loop {
-        let snapshot = client.snapshots.borrow().clone();
-        displayed.retain(|(turn, id), _| {
-            snapshot
-                .messages
-                .iter()
-                .any(|message| &message.turn_id == turn && &message.id == id)
-        });
-        declined.retain(|id| snapshot.requests.iter().any(|request| &request.id == id));
-        for message in snapshot.messages.iter().filter(|message| {
-            message.role == "Agent"
-                && Some(message.thread_id.as_str()) == snapshot.thread_id.as_deref()
-        }) {
-            let previous = displayed
-                .entry((message.turn_id.clone(), message.id.clone()))
-                .or_default();
-            if message.text != *previous {
-                if let Some(suffix) = message.text.strip_prefix(previous.as_str()) {
-                    print!("{}", display_text_for_cli(suffix));
-                } else {
-                    print!("\n{}", display_text_for_cli(&message.text));
-                }
-                *previous = message.text.clone();
-                let _ = io::stdout().flush();
+    .map_err(|error| {
+        (
+            3,
+            if json_events {
+                "Execution startup failed; inspect local Codex configuration and journal storage."
+                    .into()
+            } else {
+                error.to_string()
+            },
+        )
+    })?;
+    let output = if json_events {
+        let session = client.snapshots.borrow().observation.session_id.clone();
+        match native_agent_tui::json_events::LiveOutput::stdout(&journal, &cwd, &session) {
+            Ok(output) => Some(output),
+            Err(error) => {
+                let _ = client.commands.send(Command::OutputUnavailable).await;
+                let _ = client.join.await;
+                return Err((4, error.to_string()));
             }
         }
-        for request in &snapshot.requests {
-            if request.responding || !declined.insert(request.id.clone()) {
-                continue;
-            }
-            match &request.kind {
-                native_agent_tui::interactions::RequestKind::UserInput { .. } => {
-                    eprintln!("\nUser input required. Use --tui to answer questions.");
-                    let _ = client.commands.send(Command::Interrupt).await;
-                }
-                _ => {
-                    eprintln!(
-                        "\nApproval required; declining in headless mode. Use --tui to review."
-                    );
-                    let _ = client
-                        .commands
-                        .send(Command::AnswerApproval {
-                            request_id: request.id.clone(),
-                            decision: native_agent_tui::interactions::ApprovalDecision::Decline,
-                        })
-                        .await;
-                }
-            }
-        }
-        match snapshot.phase {
-            SessionPhase::Ready if check_only => {
-                println!("shell preflight: passed (zero model turns)");
-                break Ok(());
-            }
-            SessionPhase::Completed => {
-                println!();
-                let roots: Vec<_> = snapshot
-                    .scheduler
-                    .tasks
-                    .iter()
-                    .filter(|task| task.kind == TaskKind::RootTurn)
-                    .collect();
-                if roots.iter().all(|task| task.state == TaskState::Succeeded) {
-                    break Ok(());
-                }
-                break Err((1, "Workflow ended with failed, cancelled, or blocked tasks. Use the TUI task panel to inspect or explicitly retry them.".into()));
-            }
-            SessionPhase::Interrupted => break Err((130, "Turn interrupted.".into())),
-            SessionPhase::Unknown | SessionPhase::Disconnected => {
-                break Err((
-                    4,
-                    snapshot
-                        .last_error
-                        .clone()
-                        .unwrap_or_else(|| format!("{:?}", snapshot.phase)),
-                ))
-            }
-            SessionPhase::Failed => {
-                break Err((
-                    if snapshot.root_start_requests == 0 {
-                        3
-                    } else {
-                        1
-                    },
-                    snapshot
-                        .last_error
-                        .clone()
-                        .unwrap_or_else(|| format!("{:?}", snapshot.phase)),
-                ))
-            }
-            _ => {}
-        }
-        tokio::select! {
-            result = client.snapshots.changed() => {
-                if result.is_err() {
-                    break Err((4, "Client exited before confirming a terminal result.".into()));
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                if snapshot.turn_id.is_some() {
-                    let _ = client.commands.send(Command::Interrupt).await;
-                } else {
-                    break Err((130, "Cancelled before the first turn.".into()));
-                }
-            }
-        }
+    } else {
+        None
     };
-    let _ = client.commands.send(Command::Quit).await;
-    let report = client.join.await.map_err(|error| (4, error.to_string()))?;
-    if let Some(error) = report.cleanup_error {
-        return Err((4, format!("Process cleanup failed: {error}")));
-    }
-    if let Some(error) = report.journal_error {
-        return Err((4, error.to_string()));
-    }
-    outcome
+    native_agent_tui::headless::run(client, tasks, check_only, output).await
 }
 
 fn replay_error(error: JournalError) -> (u8, String) {

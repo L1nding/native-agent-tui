@@ -118,6 +118,31 @@ fn cleanup_and_journal_uncertainty_cannot_be_retained_as_safe_closed_history() {
     assert!(snapshot.needs_recovery());
 }
 
+#[test]
+fn workflow_close_keeps_task_terminals_and_reports_unresolved_roots_as_unknown() {
+    for (state, expected) in [
+        (TaskState::Succeeded, SessionPhase::Completed),
+        (TaskState::Failed, SessionPhase::Failed),
+        (TaskState::Cancelled, SessionPhase::Failed),
+        (TaskState::Blocked, SessionPhase::Failed),
+        (TaskState::Unknown, SessionPhase::Unknown),
+        (TaskState::Ready, SessionPhase::Unknown),
+        (TaskState::Paused, SessionPhase::Unknown),
+        (TaskState::Running, SessionPhase::Unknown),
+    ] {
+        let mut snapshot = completed("workflow-result");
+        let mut first = snapshot.tasks[0].clone();
+        first.id = TaskId(2);
+        first.state = state;
+        snapshot.tasks.insert(0, first);
+        snapshot.close(SessionPhase::Completed, true);
+        assert_eq!(snapshot.execution_result, Some(expected), "{state:?}");
+        assert_eq!(snapshot.tasks[0].state, state);
+        assert_eq!(snapshot.tasks[1].state, TaskState::Succeeded);
+        assert_eq!(snapshot.needs_recovery(), expected == SessionPhase::Unknown);
+    }
+}
+
 fn store(fixture: &Fixture, state: StoredSnapshot) -> Store {
     let record = Record::snapshot(0, state);
     let mut store = Store::create(
@@ -465,4 +490,32 @@ fn replay_writer_failure_and_large_records_are_explicit() {
         Record::snapshot(0, large).encode(),
         Err(JournalError::RecordLimit)
     );
+}
+
+#[test]
+fn schema_one_history_stays_readable_and_is_not_mixed_with_schema_two_records() {
+    let fixture = Fixture::new();
+    let mut store = store(&fixture, snapshot("legacy"));
+    let mut record = Record::snapshot(0, snapshot("legacy"));
+    record.schema_version = 1;
+    let bytes = record.encode().unwrap();
+    store.log.set_len(0).unwrap();
+    store.log.seek(SeekFrom::Start(0)).unwrap();
+    store.log.write_all(&bytes).unwrap();
+    store.log.sync_all().unwrap();
+    let mut info = store.cursor.clone();
+    info.schema_version = 1;
+    info.committed_bytes = bytes.len() as u64;
+    atomic_metadata(&store.root.join(format!("{}.cursor", store.stem)), &info).unwrap();
+    let legacy = replay(&fixture, "legacy", 0).unwrap();
+    assert!(legacy.latest_state().last_headless_action.is_none());
+    assert!(jsonl(legacy)
+        .iter()
+        .all(|record| record.schema_version == 1));
+    info.schema_version = SCHEMA_VERSION;
+    atomic_metadata(&store.root.join(format!("{}.cursor", store.stem)), &info).unwrap();
+    assert!(matches!(
+        replay(&fixture, "legacy", 0),
+        Err(JournalError::Corrupt)
+    ));
 }

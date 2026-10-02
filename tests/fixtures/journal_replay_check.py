@@ -58,7 +58,7 @@ def main():
         assert run(common + ["--sessions"]).returncode == 0
         for suffix in [["--replay", "../escape"], ["--replay", "missing"],
                        ["--replay", session, "--since", "4"],
-                       ["--run", "PRIVATE_PROMPT", "--json-events"]]:
+                       ["--run", "PRIVATE_PROMPT", "--since", "0", "--json-events"]]:
             rejected = run(common + suffix)
             assert rejected.returncode == 2 and not rejected.stdout
         assert files(root) == before and not marker.exists()

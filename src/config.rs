@@ -51,10 +51,12 @@ pub enum CliCommand {
     Workflow {
         path: PathBuf,
         headless: bool,
+        json_events: bool,
         config: Config,
     },
     Run {
         goal: String,
+        json_events: bool,
         config: Config,
     },
     Tui {
@@ -75,8 +77,12 @@ pub enum CliError {
     InvalidValue { option: String, value: String },
     #[error("{0}")]
     Attention(String),
-    #[error("--since and --json-events currently require --replay SESSION_ID")]
+    #[error("--since requires --replay SESSION_ID")]
     ReplayOptions,
+    #[error(
+        "--json-events requires --run TASK, --workflow FILE --headless, or --replay SESSION_ID"
+    )]
+    JsonEventsOptions,
 }
 
 pub fn parse_args<I, S>(args: I) -> Result<CliCommand, CliError>
@@ -182,8 +188,13 @@ where
     if headless && mode != Some("--workflow") {
         return Err(CliError::ConflictingModes);
     }
-    if (since.is_some() || json_events) && mode != Some("--replay") {
+    if since.is_some() && mode != Some("--replay") {
         return Err(CliError::ReplayOptions);
+    }
+    if json_events
+        && !(matches!(mode, Some("--replay" | "--run")) || mode == Some("--workflow") && headless)
+    {
+        return Err(CliError::JsonEventsOptions);
     }
     if let Some(path) = attention_file {
         let mut bytes = Vec::new();
@@ -212,10 +223,12 @@ where
         Some("--workflow") => CliCommand::Workflow {
             path: goal.unwrap().into(),
             headless,
+            json_events,
             config,
         },
         Some("--run") => CliCommand::Run {
             goal: goal.unwrap(),
+            json_events,
             config,
         },
         Some("--check-shell") => CliCommand::CheckShell(config),
@@ -307,12 +320,34 @@ mod tests {
             assert!(parse_args(args).is_err());
         }
         for args in [
-            vec!["--run", "task", "--json-events"],
+            vec!["--run", "task", "--since", "0"],
             vec!["--sessions", "--since", "0"],
-            vec!["--json-events"],
         ] {
             assert_eq!(parse_args(args), Err(CliError::ReplayOptions));
         }
+        for args in [
+            vec!["--json-events"],
+            vec!["--tui", "--json-events"],
+            vec!["--workflow", "plan.json", "--json-events"],
+            vec!["--check-shell", "--json-events"],
+        ] {
+            assert_eq!(parse_args(args), Err(CliError::JsonEventsOptions));
+        }
+        assert!(matches!(
+            parse_args(["--run", "task", "--json-events"]).unwrap(),
+            CliCommand::Run {
+                json_events: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_args(["--workflow", "plan.json", "--headless", "--json-events"]).unwrap(),
+            CliCommand::Workflow {
+                json_events: true,
+                headless: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -361,7 +396,7 @@ mod tests {
 
     #[test]
     fn parses_settings_and_multilingual_goal() {
-        let CliCommand::Run { goal, config } = parse_args([
+        let CliCommand::Run { goal, config, .. } = parse_args([
             "--cwd",
             "a b",
             "--run",

@@ -14,7 +14,7 @@ use crate::observation::{ActivityScope, ExecutionState, ObservationSnapshot};
 use crate::scheduler::{ExternalTurn, TaskAttempt, TaskId, TaskKind, TaskState};
 use crate::state::{CoreSnapshot, SessionPhase};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const RECORD_BYTES: usize = 4 * 1024 * 1024;
 const QUEUE_BYTES: usize = 64 * 1024 * 1024;
 const QUEUE_RECORDS: usize = 128;
@@ -134,6 +134,7 @@ pub enum PersistenceIssue {
     CleanupUncertain,
     JournalUnavailable,
     StartupFailed,
+    OutputUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +150,8 @@ pub struct StoredSnapshot {
     pub cleanup_confirmed: Option<bool>,
     pub session_closed: bool,
     pub issue: Option<PersistenceIssue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_headless_action: Option<crate::interactions::HeadlessAction>,
 }
 
 impl StoredSnapshot {
@@ -179,17 +182,28 @@ impl StoredSnapshot {
             execution_result: None,
             cleanup_confirmed: None,
             session_closed: false,
-            issue: match core.phase {
-                SessionPhase::Unknown | SessionPhase::Disconnected => {
+            last_headless_action: core.last_headless_action.clone(),
+            issue: match (&core.last_headless_action, core.phase) {
+                (Some(crate::interactions::HeadlessAction::StopForOutput), _) => {
+                    Some(PersistenceIssue::OutputUnavailable)
+                }
+                (_, SessionPhase::Unknown | SessionPhase::Disconnected) => {
                     Some(PersistenceIssue::ExecutionUncertain)
                 }
-                SessionPhase::Failed => Some(PersistenceIssue::ExecutionFailed),
+                (_, SessionPhase::Failed) => Some(PersistenceIssue::ExecutionFailed),
                 _ => None,
             },
         }
     }
 
     pub fn close(&mut self, outcome: SessionPhase, cleanup_confirmed: bool) {
+        let outcome = crate::state::workflow_outcome(
+            outcome,
+            self.tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::RootTurn)
+                .map(|task| task.state),
+        );
         self.session_closed = true;
         self.cleanup_confirmed = Some(cleanup_confirmed);
         self.execution_result = Some(
@@ -209,6 +223,8 @@ impl StoredSnapshot {
             self.issue = Some(PersistenceIssue::CleanupUncertain);
         } else if self.execution_result == Some(SessionPhase::Unknown) && self.issue.is_none() {
             self.issue = Some(PersistenceIssue::ExecutionUncertain);
+        } else if self.execution_result == Some(SessionPhase::Failed) && self.issue.is_none() {
+            self.issue = Some(PersistenceIssue::ExecutionFailed);
         }
     }
 
@@ -219,6 +235,7 @@ impl StoredSnapshot {
                 self.issue,
                 Some(
                     PersistenceIssue::JournalUnavailable
+                        | PersistenceIssue::OutputUnavailable
                         | PersistenceIssue::CleanupUncertain
                         | PersistenceIssue::ExecutionUncertain
                 )
@@ -317,7 +334,7 @@ impl Record {
             historical: None,
         }
     }
-    fn state(&self) -> Result<&StoredSnapshot, JournalError> {
+    pub(crate) fn state(&self) -> Result<&StoredSnapshot, JournalError> {
         match &self.payload {
             Payload::Snapshot(snapshot) => Ok(snapshot),
             _ => Err(JournalError::Corrupt),
@@ -719,7 +736,7 @@ fn metadata(path: &Path) -> Result<SessionInfo, JournalError> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?;
-    if value["schema_version"].as_u64() != Some(SCHEMA_VERSION as u64) {
+    if !supported_schema(value["schema_version"].as_u64()) {
         return Err(JournalError::Schema);
     }
     let info: SessionInfo = serde_json::from_value(value).map_err(|_| JournalError::Corrupt)?;
@@ -995,10 +1012,11 @@ impl Replay {
 }
 
 fn validate_record(record: &Record, info: &SessionInfo, sequence: u64) -> Result<(), JournalError> {
-    if record.schema_version != SCHEMA_VERSION {
+    if !supported_schema(Some(u64::from(record.schema_version))) {
         return Err(JournalError::Schema);
     }
-    if record.event_seq != sequence
+    if record.schema_version != info.schema_version
+        || record.event_seq != sequence
         || record.event_seq > info.committed_seq
         || record.session_id != info.session_id
         || record.state()?.observation.session_id != info.session_id
@@ -1040,7 +1058,7 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Record>, JournalError
     }
     let version: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| JournalError::Corrupt)?;
-    if version["schema_version"].as_u64() != Some(SCHEMA_VERSION as u64) {
+    if !supported_schema(version["schema_version"].as_u64()) {
         return Err(JournalError::Schema);
     }
     serde_json::from_value(version)
@@ -1048,10 +1066,91 @@ fn read_record(reader: &mut impl BufRead) -> Result<Option<Record>, JournalError
         .map_err(|_| JournalError::Corrupt)
 }
 
-fn write_record(writer: &mut impl Write, record: &Record) -> Result<(), JournalError> {
+fn supported_schema(version: Option<u64>) -> bool {
+    matches!(version, Some(1)) || version == Some(u64::from(SCHEMA_VERSION))
+}
+
+pub(crate) fn write_record(writer: &mut impl Write, record: &Record) -> Result<(), JournalError> {
     writer
         .write_all(&record.encode()?)
         .map_err(|_| JournalError::Output)
+}
+
+/// Sequential reader for one live session. Only committed bytes are exposed.
+/// It holds a single record and never waits on the execution owner.
+pub(crate) struct CommittedReader {
+    cursor: PathBuf,
+    file: File,
+    offset: u64,
+    next_sequence: u64,
+    latest: Option<Record>,
+}
+
+impl CommittedReader {
+    pub(crate) fn open(
+        settings: &JournalSettings,
+        cwd: &Path,
+        session: &str,
+    ) -> Result<Self, JournalError> {
+        validate_session(session)?;
+        let root = settings.directory()?;
+        let stem = format!("{}_{}", workspace_id(cwd)?, session);
+        let cursor = root.join(format!("{stem}.cursor"));
+        let path = root.join(format!("{stem}.jsonl"));
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err(JournalError::Corrupt);
+        }
+        Ok(Self {
+            cursor,
+            file: File::open(path)?,
+            offset: 0,
+            next_sequence: 0,
+            latest: None,
+        })
+    }
+
+    pub(crate) fn drain(
+        &mut self,
+        mut consume: impl FnMut(&Record) -> Result<(), JournalError>,
+    ) -> Result<(), JournalError> {
+        let info = metadata(&self.cursor)?;
+        if info.committed_bytes < self.offset || self.file.metadata()?.len() < info.committed_bytes
+        {
+            return Err(JournalError::Corrupt);
+        }
+        let mut reader = BufReader::new((&mut self.file).take(info.committed_bytes - self.offset));
+        while let Some(record) = read_record(&mut reader)? {
+            validate_record(&record, &info, self.next_sequence)?;
+            if self
+                .latest
+                .as_ref()
+                .is_some_and(|latest| record.snapshot_version < latest.snapshot_version)
+            {
+                return Err(JournalError::Corrupt);
+            }
+            consume(&record)?;
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .ok_or(JournalError::Corrupt)?;
+            self.latest = Some(record);
+        }
+        self.offset = info.committed_bytes;
+        let latest = self.latest.as_ref().ok_or(JournalError::Corrupt)?;
+        if latest.event_seq != info.committed_seq
+            || latest.snapshot_version != info.snapshot_version
+            || latest.state()?.session_closed != info.session_closed
+            || latest.state()?.needs_recovery() != info.needs_recovery
+            || latest.state()?.execution_result != info.execution_result
+        {
+            return Err(JournalError::Corrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn latest(&self) -> Option<&Record> {
+        self.latest.as_ref()
+    }
 }
 
 #[cfg(test)]

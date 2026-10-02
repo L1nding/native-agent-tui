@@ -7,7 +7,7 @@ def main():
     text = sys.stdin.read()
     records = [json.loads(line) for line in text.splitlines()]
     assert "PRIVATE_" not in text
-    assert all(r["schema_version"] == 1 and r["historical"] for r in records)
+    assert all(r["schema_version"] == 2 and r["historical"] for r in records)
     assert len({r["session_id"] for r in records}) == 1
     assert [r["kind"] for r in records] == [
         "snapshot", "state", "state", "state", "snapshot", "replay_end"]

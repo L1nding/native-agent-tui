@@ -79,7 +79,7 @@ Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入�
 ## 尚未完成的设计要求
 
 1. 在已接入的 DAG、根槽位、Gate 和任务控制之上，实现完整资源预算、原生并发/深度限制及持久调度恢复。当前能力和验收见[调度接入验证](scheduler-validation.md)。
-2. 在已接入的脱敏 journal 与只读回放上，完成实时 JSONL、手动导出、观察恢复入口、上下文压缩及 skill 的服务端事实记录。
+2. 在已接入的脱敏 journal、实时 JSONL 与只读回放上，完成手动导出、观察恢复入口、上下文压缩及 skill 的服务端事实记录。
 3. 扩展协议兼容快照，验证一层子代理限制、整棵代理树停止，以及正在运行的子代理收到普通消息时的轮次语义。
 4. 提供代理/任务树、搜索、详细工具轨迹、usage/context 面板和诊断指标。
 
@@ -98,3 +98,9 @@ Core 已提供按 agent/tool/request 隔离的活动证据、进展序号和注�
 Core 默认写入脱敏状态，首个快照先于 app-server 启动提交；写入确认与 UI 投影版本分开，持久化故障进入 Unknown 并停止执行。CLI 新增 `--sessions`、`--replay`、`--since` 和 `--journal-dir`，`--json-events` 当前只支持回放。读取保留历史证据和不确定结果，不启动模型或回答旧审批。
 
 本轮 102 项默认测试、3 项可选真实 app-server 测试、Python 持久消费者及 fmt/check/clippy/doctest/release build 通过。完整记录见[日志回放验证](journal-validation.md)。实时 stdout 背压/断管、脱敏导出、观察恢复交互和 Alpha 完整发布门禁仍未完成。
+
+## S2.5b 实时 JSONL 与输出所有权
+
+`--run --json-events` 和 `--workflow --headless --json-events` 已接入独立写线程，只读已提交日志，支持慢消费者追赶和最终关闭快照。持续堵塞与断管进入有界清理，活动外部结果保留 Unknown，已确认终态保留；非交互请求通过 Core 保存动作理由。新日志使用 schema 2，schema 1 历史继续支持。
+
+本轮 115 项默认测试、4 项可选真实 Codex 测试、11 个 release CLI 管道场景和 Python 消费者通过；fmt/check/clippy/doctest/release build 通过。多根工作流的 CLI、日志与消费者使用一致的最终汇总，保留各任务已确认终态。完整记录见[实时 JSONL 验证](jsonl-validation.md)。手动导出、观察恢复入口、协议兼容门禁、完整进程创建竞态验证及 Alpha 发布验收仍未完成。

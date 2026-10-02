@@ -22,7 +22,7 @@ cargo run --locked -- --sessions --cwd PATH --journal-dir PATH
 
 每条 `state` 保存完整的脱敏投影。`event_seq` 表示日志顺序，`snapshot_version` 表示投影版本，活动 `progress_seq` 才表示有效证据进展。基线、最新快照和结束记录可以重复同一事件序号。回放期间新增记录留待下一次读取。
 
-输出使用 `schema_version=1` 和 `historical=true`。历史 elapsed/silence 数值与 attention 保留；原来为 Current 的活动 freshness 改为 Unknown，不能继续用旧时钟计算当前静默。成功读取返回 0；历史执行结果另见 `execution_result`，`replay_end` 不代表任务成功。
+新日志使用 `schema_version=2`；旧 schema 1 日志仍能回放，输出保留原版本。回放设置 `historical=true`，历史 elapsed/silence 数值与 attention 保留；原来为 Current 的活动 freshness 改为 Unknown，不能继续用旧时钟计算当前静默。成功读取返回 0；历史执行结果另见 `execution_result`，`replay_end` 不代表任务成功。
 
 ## 存储与故障语义
 
@@ -40,4 +40,4 @@ cargo run --locked -- --sessions --cwd PATH --journal-dir PATH
 
 存储 typed 身份、执行状态、任务关系、请求 ID、证据计数和 attention。排除任务正文/标题、对话正文、命令、问题/答案、模型配置、工作区原始路径和原始错误；保留的协议身份字段仍属于本地数据。错误仅保存固定分类。这里不提供完整 transcript 或凭据存储。
 
-目前 `--json-events` 只支持回放；`--run TASK --json-events` 显式返回参数错误。实时 stdout 流、慢消费者追赶和断管清理仍属 S2.5b。验证方法见[日志回放验证](journal-validation.md)。
+`--run TASK --json-events` 与 `--workflow FILE --headless --json-events` 已接入实时脱敏流、日志追赶和断管清理；使用方式见[实时 JSONL](jsonl-events.md)。日志验证方法见[回放验证](journal-validation.md)。
