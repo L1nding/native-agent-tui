@@ -16,6 +16,9 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 

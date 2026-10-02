@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::agents::{AgentRegistry, AgentSnapshot};
+use crate::gate::WaitTarget;
 use crate::interactions::RequestView;
 
 pub const MESSAGE_BYTES: usize = 32 * 1024;
@@ -10,6 +12,7 @@ pub enum SessionPhase {
     Created,
     Launching,
     Initializing,
+    CheckingShell,
     Ready,
     StartingTurn,
     Running,
@@ -34,15 +37,9 @@ impl SessionPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentSnapshot {
-    pub id: String,
-    pub generation: u64,
-    pub completed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationItem {
     pub id: String,
+    pub thread_id: String,
     pub turn_id: String,
     pub role: String,
     pub text: String,
@@ -55,7 +52,9 @@ pub struct CoreSnapshot {
     pub version: u64,
     pub phase: SessionPhase,
     pub root_turn_count: u64,
-    pub gate_pending: bool,
+    pub gate: Option<GateSnapshot>,
+    pub root_start_requests: u64,
+    pub queued_inputs: usize,
     pub agents: Vec<AgentSnapshot>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -72,13 +71,23 @@ pub struct CoreSnapshot {
     pub history_truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateSnapshot {
+    pub targets: Vec<WaitTarget>,
+    pub pending: bool,
+    pub root_starts_at_enter: u64,
+    pub root_starts_at_release: Option<u64>,
+}
+
 impl Default for CoreSnapshot {
     fn default() -> Self {
         Self {
             version: 0,
             phase: SessionPhase::Created,
             root_turn_count: 0,
-            gate_pending: false,
+            gate: None,
+            root_start_requests: 0,
+            queued_inputs: 0,
             agents: Vec::new(),
             thread_id: None,
             turn_id: None,
@@ -101,10 +110,12 @@ impl Default for CoreSnapshot {
 #[derive(Debug, Default)]
 pub(crate) struct SessionState {
     pub view: CoreSnapshot,
+    pub agents: AgentRegistry,
 }
 
 impl SessionState {
     pub fn snapshot(&mut self) -> Arc<CoreSnapshot> {
+        self.view.agents = self.agents.snapshots();
         self.view.version += 1;
         Arc::new(self.view.clone())
     }
@@ -115,6 +126,7 @@ impl SessionState {
         self.view.notice = None;
         self.view.messages.push(ConversationItem {
             id: format!("user-{}", self.view.root_turn_count + 1),
+            thread_id: self.view.thread_id.clone().unwrap_or_default(),
             turn_id: String::new(),
             role: "You".into(),
             text: text.to_owned(),
@@ -143,25 +155,55 @@ impl SessionState {
         {
             return false;
         }
-        let item = match self
-            .view
-            .messages
-            .iter_mut()
-            .find(|m| m.turn_id == turn && m.id == id && m.role == "Agent")
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        self.message_for(&thread, turn, id, text, complete)
+    }
+
+    pub fn child_message(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        id: &str,
+        text: &str,
+        complete: bool,
+    ) -> bool {
+        if !self.agents.current_turn(thread, turn)
+            || (!complete && !self.agents.active_turn(thread, turn))
         {
-            Some(item) => item,
-            None => {
-                self.view.messages.push(ConversationItem {
-                    id: id.into(),
-                    turn_id: turn.into(),
-                    role: "Agent".into(),
-                    text: String::new(),
-                    complete: false,
-                    truncated: false,
-                });
-                self.view.messages.last_mut().unwrap()
-            }
-        };
+            return false;
+        }
+        self.message_for(thread, turn, id, text, complete)
+    }
+
+    fn message_for(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        id: &str,
+        text: &str,
+        complete: bool,
+    ) -> bool {
+        if id.is_empty() || id.len() > 1024 {
+            return false;
+        }
+        let item =
+            match self.view.messages.iter_mut().find(|m| {
+                m.thread_id == thread && m.turn_id == turn && m.id == id && m.role == "Agent"
+            }) {
+                Some(item) => item,
+                None => {
+                    self.view.messages.push(ConversationItem {
+                        id: id.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        role: "Agent".into(),
+                        text: String::new(),
+                        complete: false,
+                        truncated: false,
+                    });
+                    self.view.messages.last_mut().unwrap()
+                }
+            };
         if item.complete && !complete {
             return false;
         }

@@ -1,6 +1,6 @@
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -10,7 +10,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::protocol::{Envelope, RpcId};
+use crate::protocol::{Envelope, RpcId, WAIT_TOOL};
 use crate::transport::{PipeTransport, TransportError};
 
 #[derive(Debug, Error)]
@@ -28,13 +28,16 @@ pub(crate) struct AppServer {
     pub pipe: Option<PipeTransport>,
     child: Child,
     stderr: JoinHandle<()>,
+    _catalog: Option<DirectCatalog>,
     #[cfg(windows)]
     job: Option<WindowsJob>,
 }
 
 impl AppServer {
-    pub fn spawn(config: &Config) -> Result<Self, AppServerError> {
+    pub async fn spawn(config: &Config) -> Result<Self, AppServerError> {
+        let catalog = DirectCatalog::prepare(config).await?;
         let mut command = Command::new(&config.executable);
+        command.args(["-c", &catalog.config_override()]);
         #[cfg(windows)]
         if let Some(mode) = &config.windows_sandbox {
             command.args(["-c", &format!("windows.sandbox=\"{mode}\"")]);
@@ -42,7 +45,9 @@ impl AppServer {
         command
             .args(["app-server", "--strict-config", "--listen", "stdio://"])
             .current_dir(&config.cwd);
-        Self::spawn_command(command)
+        let mut server = Self::spawn_command(command)?;
+        server._catalog = Some(catalog);
+        Ok(server)
     }
 
     pub(crate) fn spawn_command(mut command: Command) -> Result<Self, AppServerError> {
@@ -83,6 +88,7 @@ impl AppServer {
             pipe: Some(PipeTransport::new(stdout, stdin)),
             child,
             stderr,
+            _catalog: None,
             #[cfg(windows)]
             job,
         })
@@ -106,6 +112,127 @@ impl AppServer {
         self.stderr.abort();
         let _ = (&mut self.stderr).await;
         Ok(())
+    }
+}
+
+/// An execution-owned copy: never change the user's catalog or configuration.
+pub(crate) struct DirectCatalog {
+    directory: PathBuf,
+}
+
+impl DirectCatalog {
+    async fn prepare(config: &Config) -> Result<Self, AppServerError> {
+        let mut command = Command::new(&config.executable);
+        command
+            .args(["debug", "models"])
+            .current_dir(&config.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let mut child = command.spawn()?;
+        #[cfg(windows)]
+        let _job = WindowsJob::attach(&child)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing model catalog output"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing model catalog stderr"))?;
+        let mut drains = tokio::task::JoinSet::new();
+        drains.spawn(async move {
+            let mut buffer = [0; 8192];
+            while matches!(stderr.read(&mut buffer).await, Ok(n) if n > 0) {}
+        });
+        let mut bytes = Vec::new();
+        const CATALOG_BYTES: u64 = 16 * 1024 * 1024;
+        let read = tokio::time::timeout(Duration::from_secs(15), async {
+            stdout.take(CATALOG_BYTES + 1).read_to_end(&mut bytes).await?;
+            if bytes.len() as u64 > CATALOG_BYTES {
+                return Err(std::io::Error::other("model catalog exceeds 16 MiB"));
+            }
+            let status = child.wait().await?;
+            if !status.success() {
+                return Err(std::io::Error::other("could not read Codex model catalog; run codex debug models to inspect the configuration"));
+            }
+            Ok(())
+        }).await;
+        drains.abort_all();
+        while drains.join_next().await.is_some() {}
+        match read {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(std::io::Error::other(
+                    "Codex model catalog lookup timed out; no app-server or model turn was started",
+                )
+                .into())
+            }
+        }
+        Self::from_bytes(&bytes)
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AppServerError> {
+        let mut catalog: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+        let models = catalog
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .filter(|models| !models.is_empty())
+            .ok_or_else(|| std::io::Error::other("Codex model catalog has no models"))?;
+        for model in models {
+            let object = model
+                .as_object_mut()
+                .ok_or_else(|| std::io::Error::other("invalid model catalog entry"))?;
+            object.insert("tool_mode".into(), json!("direct"));
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "native-agent-tui-catalog-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder.create(&directory)?;
+        let owned = Self { directory };
+        std::fs::write(
+            owned.path(),
+            serde_json::to_vec(&catalog).map_err(std::io::Error::other)?,
+        )?;
+        Ok(owned)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.directory.join("models.json")
+    }
+
+    pub(crate) fn config_override(&self) -> String {
+        format!(
+            "model_catalog_json={}",
+            serde_json::to_string(&self.path().to_string_lossy())
+                .expect("path string can be encoded")
+        )
+    }
+}
+
+impl Drop for DirectCatalog {
+    fn drop(&mut self) {
+        // Only remove the exact file and empty directory created by this owner.
+        let _ = std::fs::remove_file(self.path());
+        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 
@@ -209,6 +336,16 @@ pub(crate) fn thread_start(id: RpcId, config: &Config) -> Envelope {
         "allowProviderModelFallback":false,
         "experimentalRawEvents":false
     });
+    params["dynamicTools"] = json!([{
+        "type":"function", "name":WAIT_TOOL, "deferLoading":false,
+        "description":"Root coordinator: wait for specific current turns of direct child agents, without a timeout or polling. Targets are child thread IDs, registered paths or nicknames; an empty list captures all known direct children. Returns terminal outcomes when all complete or any fails/is interrupted. Children should return their work directly instead of invoking this root tool.",
+        "inputSchema":{"type":"object","properties":{"targets":{"type":"array","items":{"type":"string"},"maxItems":64}},"required":["targets"],"additionalProperties":false}
+    }]);
+    params["config"] = json!({
+        "features.code_mode":false,"features.code_mode_only":false,
+        "features.multi_agent_v2.enabled":true,"features.multi_agent_v2.wait_agent_enabled":false,
+        "features.multi_agent_v2.expose_spawn_agent_model_overrides":true
+    });
     if let Some(model) = &config.model {
         params["model"] = Value::String(model.clone());
     }
@@ -260,6 +397,25 @@ pub(crate) fn preflight(id: RpcId, config: &Config) -> Envelope {
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_catalog_preserves_all_other_fields_and_removes_its_private_copy() {
+        let original = json!({"models":[{"slug":"fixture-model","tool_mode":"code_mode_only","use_responses_lite":true,"extra":{"keep":true}}],"version":"fixture"});
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let copy = DirectCatalog::from_bytes(&bytes).unwrap();
+        let path = copy.path();
+        let mut expected = original.clone();
+        expected["models"][0]["tool_mode"] = json!("direct");
+        let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), original);
+        drop(copy);
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+        for invalid in [json!({}), json!({"models":[]}), json!({"models":[null]})] {
+            assert!(DirectCatalog::from_bytes(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires the installed authenticated Codex app-server"]
@@ -269,7 +425,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let mut server = AppServer::spawn(&config).unwrap();
+        let mut server = AppServer::spawn(&config).await.unwrap();
         let pipe = server.pipe.as_mut().unwrap();
         pipe.send(initialize(RpcId::Number(1))).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {

@@ -1,5 +1,6 @@
 //! Public module boundaries for the native agent TUI.
 
+pub mod agents;
 pub mod app_server;
 pub mod client;
 pub mod config;

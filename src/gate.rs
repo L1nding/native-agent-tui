@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitTarget {
     pub id: String,
     pub generation: u64,
+    pub turn_id: Option<String>,
+    pub outcome: Option<ChildOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +18,8 @@ pub struct WaitRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WaitToken(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ChildOutcome {
     Completed,
     Failed,
@@ -32,14 +37,15 @@ pub enum GateChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateError {
     AlreadyPending,
-    EmptyTargets,
+    InvalidTargets,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateEvent {
     pub target: String,
     pub generation: u64,
-    pub outcome: ChildOutcome,
+    pub turn_id: String,
+    pub outcome: Option<ChildOutcome>,
 }
 
 pub trait CompletionGate {
@@ -58,24 +64,41 @@ pub struct PendingGate {
 #[derive(Debug)]
 struct PendingWait {
     token: WaitToken,
-    targets: BTreeMap<String, (u64, Option<ChildOutcome>)>,
+    targets: BTreeMap<String, WaitTarget>,
+}
+
+impl PendingWait {
+    fn released(&self) -> bool {
+        self.targets
+            .values()
+            .all(|target| target.outcome == Some(ChildOutcome::Completed))
+            || self.targets.values().any(|target| {
+                matches!(
+                    target.outcome,
+                    Some(ChildOutcome::Failed | ChildOutcome::Interrupted)
+                )
+            })
+    }
 }
 
 impl PendingGate {
-    pub fn result(&self) -> Option<(WaitToken, Vec<(String, ChildOutcome)>)> {
+    pub fn targets(&self) -> Vec<WaitTarget> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.targets.values().cloned().collect())
+            .unwrap_or_default()
+    }
+    pub fn result(&self) -> Option<(WaitToken, Vec<WaitTarget>)> {
         let pending = self.pending.as_ref()?;
-        let outcomes = pending
-            .targets
-            .iter()
-            .filter_map(|(id, (_, outcome))| outcome.clone().map(|outcome| (id.clone(), outcome)))
-            .collect();
-        Some((pending.token, outcomes))
+        pending
+            .released()
+            .then(|| (pending.token, pending.targets.values().cloned().collect()))
     }
 
-    pub fn take_result(&mut self) -> Option<(WaitToken, Vec<(String, ChildOutcome)>)> {
-        let result = self.result();
+    pub fn take_result(&mut self) -> Option<(WaitToken, Vec<WaitTarget>)> {
+        let result = self.result()?;
         self.pending.take();
-        result
+        Some(result)
     }
 }
 
@@ -84,16 +107,24 @@ impl CompletionGate for PendingGate {
         if self.pending.is_some() {
             return Err(GateError::AlreadyPending);
         }
-        if request.targets.is_empty() {
-            return Err(GateError::EmptyTargets);
+        let count = request.targets.len();
+        if request.targets.iter().any(|target| {
+            target.id.is_empty()
+                || target.generation == 0
+                || target.turn_id.as_deref() == Some("")
+                || target.outcome.is_some() && target.turn_id.is_none()
+        }) {
+            return Err(GateError::InvalidTargets);
         }
-
-        self.next_token += 1;
-        let targets = request
+        let targets: BTreeMap<_, _> = request
             .targets
             .into_iter()
-            .map(|target| (target.id, (target.generation, None)))
+            .map(|target| (target.id.clone(), target))
             .collect();
+        if targets.len() != count {
+            return Err(GateError::InvalidTargets);
+        }
+        self.next_token += 1;
         let token = WaitToken(self.next_token);
         self.pending = Some(PendingWait { token, targets });
         Ok(token)
@@ -103,18 +134,27 @@ impl CompletionGate for PendingGate {
         let Some(pending) = self.pending.as_mut() else {
             return GateChange::Pending;
         };
-        let Some((expected_generation, outcome)) = pending.targets.get_mut(&event.target) else {
+        let Some(target) = pending.targets.get_mut(&event.target) else {
             return GateChange::Pending;
         };
-        if *expected_generation != event.generation || outcome.is_some() {
+        if target.generation != event.generation
+            || target.outcome.is_some()
+            || target
+                .turn_id
+                .as_ref()
+                .is_some_and(|id| id != &event.turn_id)
+        {
             return GateChange::Pending;
         }
-        *outcome = Some(event.outcome.clone());
-        if pending
-            .targets
-            .values()
-            .all(|(_, outcome)| outcome.is_some())
-        {
+        // 新一轮必须先由 started 绑定；旧完成或状态摘要不能补绑定。
+        if target.turn_id.is_none() {
+            if event.outcome.is_some() {
+                return GateChange::Pending;
+            }
+            target.turn_id = Some(event.turn_id.clone());
+        }
+        target.outcome = event.outcome.clone();
+        if pending.released() {
             GateChange::Released
         } else {
             GateChange::Pending
@@ -142,6 +182,8 @@ mod tests {
         WaitTarget {
             id: id.into(),
             generation,
+            turn_id: Some(format!("{id}-{generation}")),
+            outcome: None,
         }
     }
 
@@ -157,7 +199,8 @@ mod tests {
             gate.apply(&GateEvent {
                 target: "a".into(),
                 generation: 1,
-                outcome: ChildOutcome::Completed,
+                turn_id: "a-1".into(),
+                outcome: Some(ChildOutcome::Completed),
             }),
             GateChange::Pending
         );
@@ -165,7 +208,8 @@ mod tests {
             gate.apply(&GateEvent {
                 target: "b".into(),
                 generation: 1,
-                outcome: ChildOutcome::Completed,
+                turn_id: "b-1".into(),
+                outcome: Some(ChildOutcome::Completed),
             }),
             GateChange::Pending
         );
@@ -173,11 +217,81 @@ mod tests {
             gate.apply(&GateEvent {
                 target: "b".into(),
                 generation: 2,
-                outcome: ChildOutcome::Failed,
+                turn_id: "b-2".into(),
+                outcome: Some(ChildOutcome::Failed),
             }),
             GateChange::Released
         );
         assert!(gate.take_result().is_some());
         assert!(gate.result().is_none());
+    }
+
+    #[test]
+    fn pending_result_cannot_be_taken_and_failure_releases_without_other_children() {
+        let mut gate = PendingGate::default();
+        gate.accept_wait(WaitRequest {
+            targets: vec![target("a", 1), target("b", 1)],
+        })
+        .unwrap();
+        assert!(gate.take_result().is_none());
+        assert_eq!(
+            gate.apply(&GateEvent {
+                target: "a".into(),
+                generation: 1,
+                turn_id: "a-1".into(),
+                outcome: Some(ChildOutcome::Failed)
+            }),
+            GateChange::Released
+        );
+        let (_, targets) = gate.take_result().unwrap();
+        assert_eq!(targets[1].outcome, None);
+        assert!(gate.take_result().is_none());
+    }
+
+    #[test]
+    fn awaiting_generation_requires_a_started_event_before_completion() {
+        let mut gate = PendingGate::default();
+        gate.accept_wait(WaitRequest {
+            targets: vec![WaitTarget {
+                id: "a".into(),
+                generation: 2,
+                turn_id: None,
+                outcome: None,
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            gate.apply(&GateEvent {
+                target: "a".into(),
+                generation: 1,
+                turn_id: "old".into(),
+                outcome: Some(ChildOutcome::Completed)
+            }),
+            GateChange::Pending
+        );
+        assert_eq!(
+            gate.apply(&GateEvent {
+                target: "a".into(),
+                generation: 2,
+                turn_id: "new".into(),
+                outcome: Some(ChildOutcome::Completed)
+            }),
+            GateChange::Pending
+        );
+        gate.apply(&GateEvent {
+            target: "a".into(),
+            generation: 2,
+            turn_id: "new".into(),
+            outcome: None,
+        });
+        assert_eq!(
+            gate.apply(&GateEvent {
+                target: "a".into(),
+                generation: 2,
+                turn_id: "new".into(),
+                outcome: Some(ChildOutcome::Completed)
+            }),
+            GateChange::Released
+        );
     }
 }

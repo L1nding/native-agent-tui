@@ -87,11 +87,10 @@ async fn run_headless(
                 .any(|message| &message.turn_id == turn && &message.id == id)
         });
         declined.retain(|id| snapshot.requests.iter().any(|request| &request.id == id));
-        for message in snapshot
-            .messages
-            .iter()
-            .filter(|message| message.role == "Agent")
-        {
+        for message in snapshot.messages.iter().filter(|message| {
+            message.role == "Agent"
+                && Some(message.thread_id.as_str()) == snapshot.thread_id.as_deref()
+        }) {
             let previous = displayed
                 .entry((message.turn_id.clone(), message.id.clone()))
                 .or_default();

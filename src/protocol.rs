@@ -1,8 +1,96 @@
+use crate::agents::AgentInfo;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub const WAIT_TOOL: &str = "wait_for_subagent_completion";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitCall {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    tool: String,
+    namespace: Option<String>,
+    pub arguments: WaitArguments,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitArguments {
+    pub targets: Vec<String>,
+}
+
+pub fn decode_wait_call(params: Value) -> Result<WaitCall, ProtocolError> {
+    if params.to_string().len() > 32 * 1024 {
+        return Err(ProtocolError::InvalidEnvelope(
+            "wait parameters exceed 32 KiB",
+        ));
+    }
+    let call: WaitCall = serde_json::from_value(params)?;
+    if call.tool != WAIT_TOOL || call.namespace.is_some() {
+        return Err(ProtocolError::InvalidEnvelope("unsupported dynamic tool"));
+    }
+    if [&call.thread_id, &call.turn_id, &call.call_id]
+        .iter()
+        .any(|id| id.is_empty() || id.len() > 1024)
+        || call.arguments.targets.len() > 64
+        || call
+            .arguments
+            .targets
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 1024)
+    {
+        return Err(ProtocolError::InvalidEnvelope(
+            "invalid wait identity or target count",
+        ));
+    }
+    Ok(call)
+}
+
+pub fn decode_agent_info(params: &Value) -> Result<Option<AgentInfo>, ProtocolError> {
+    let thread = &params["thread"];
+    let source = thread.pointer("/source/subAgent/thread_spawn");
+    if thread.pointer("/source/subAgent").is_some() && source.is_none() {
+        return Ok(None);
+    }
+    let direct_parent = thread["parentThreadId"].as_str();
+    let source_parent = source.and_then(|source| source["parent_thread_id"].as_str());
+    if direct_parent
+        .zip(source_parent)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(ProtocolError::InvalidEnvelope(
+            "conflicting agent parent identity",
+        ));
+    }
+    let Some(parent) = direct_parent.or(source_parent) else {
+        return Ok(None);
+    };
+    let id = thread["id"]
+        .as_str()
+        .ok_or(ProtocolError::InvalidEnvelope("agent thread.id is missing"))?;
+    Ok(Some(AgentInfo {
+        id: id.into(),
+        parent_id: parent.into(),
+        path: source
+            .and_then(|source| source["agent_path"].as_str())
+            .map(str::to_owned),
+        nickname: thread["agentNickname"]
+            .as_str()
+            .or_else(|| source.and_then(|source| source["agent_nickname"].as_str()))
+            .map(str::to_owned),
+        role: thread["agentRole"].as_str().map(str::to_owned),
+        model: thread["model"].as_str().map(str::to_owned),
+        confirmed: true,
+    }))
+}
+
+pub fn dynamic_tool_result(success: bool, data: Value) -> Value {
+    serde_json::json!({"success":success,"contentItems":[{"type":"inputText","text":data.to_string()}]})
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -113,6 +201,13 @@ fn validate(value: &Value) -> Result<(), ProtocolError> {
         return Err(ProtocolError::InvalidEnvelope(
             "id must be a string or integer",
         ));
+    }
+    if object
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.len() > 1024)
+    {
+        return Err(ProtocolError::InvalidEnvelope("RPC id exceeds 1024 bytes"));
     }
     if has_method {
         if object["method"]
@@ -252,5 +347,16 @@ mod tests {
             encode_line(&envelope),
             Err(ProtocolError::LineTooLarge)
         ));
+    }
+
+    #[test]
+    fn oversized_rpc_ids_cannot_enter_pending_requests_or_completed_wait_caches() {
+        let frame =
+            serde_json::json!({"id":"x".repeat(1025),"method":"item/tool/call","params":{}});
+        assert!(matches!(
+            decode_line(&frame.to_string()),
+            Err(ProtocolError::InvalidEnvelope(_))
+        ));
+        assert!(encode_line(&Envelope::response(RpcId::String("x".repeat(1025)), None)).is_err());
     }
 }

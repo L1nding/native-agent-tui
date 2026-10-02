@@ -10,6 +10,11 @@
 - 预检失败禁止提交任务；旧轮响应和终态不能覆盖新轮；中断确认不会伪造轮次完成。
 - 未知外部结果会关闭执行通道，避免迟到事件恢复运行或自动重放副作用。
 - 秘密回答不会进入对话记录；请求结束会清除回答缓冲，恢复原任务草稿。
+- 启动前读取有效模型目录，生成仅将 `tool_mode` 改为 `direct` 的临时副本；app-server 持有副本并在退出时清理，不修改用户配置。
+- Core 登记真实子代理身份、直属关系和当前 turn/generation。原生 `subAgentActivity` 可先提供临时身份，首次 `turn/started` 后用一次 `thread/read` 补齐元数据；补齐期间不提前释放等待。
+- 根线程注册 `wait_for_subagent_completion`：目标集合在接受时固定，无等待超时；全部当前轮次完成或任一失败/中断才回复，重复和旧轮事件不能释放新等待。
+- 等待期间子代理审批/问题继续处理；根输入最多排队 8 项，当前根轮成功结束后依次提交，失败/中断清空队列并提示。断连不伪造子代理完成。
+- F3 切换根/子代理对话；宽屏显示代理列表，状态区显示等待进度、排队数和等待期间根 `turn/start` 增量。输入框明确标示根任务。
 - Windows Job Object 清理 app-server 的已纳入进程树；终端退出恢复 raw mode、alternate screen 和 bracketed paste。
 
 ## 验证证据
@@ -21,6 +26,12 @@
 - 数字/字符串 ID、空 result、非法响应结构、帧上限、分片接收和取消安全。
 - 消息校正、UTF-8 字节截断、秘密输入失效，以及 40×12、80×24、160×45 终端布局。
 - Windows 实际启动隐藏的 PowerShell 父子进程，持有子进程句柄，确认父进程退出后 Job 关闭终止子进程。
+- 原生活动先到达、元数据后到达、后续轮次 started 的两种顺序、重复活动、非直属目标，以及身份 RPC 失败。
+- 8 个子代理中的任一失败可提前释放；根结束后其余活动子代理的审批仍可回答。
+- 虚拟时间推进一小时仍保持等待；取消/断连保留未完成 outcome；等待 ID 在不同根 turn 中复用不会误判为重复。
+- 40×12、80×24、160×45 的子代理对话与 Gate 渲染、F3 只修改本地视图，以及队列满时保留输入草稿。
+
+本轮通过 55 项默认测试，以及 fmt、check、clippy 和 release build。3 项可选真实 app-server 测试曾全部通过；最新复验中的本地 Gate、Windows 配置覆盖测试通过，本机 Ready 启动测试再次超时。后续验证结果保留在下方记录中。
 
 真实 Codex 0.159.2 验证：
 
@@ -33,6 +44,12 @@ cargo run --locked -- --run "只回复 READY" --sandbox read-only --windows-sand
 
 本机 elevated 沙箱预检超时；相同命令在显式 unelevated 沙箱下通过。首次 read-only 会话预检也曾超时，随后独立预检与重复会话通过。保留失败状态和配置建议，不自动扩大权限或重试。
 
+本轮 release 版 `--run "只回复 READY" --sandbox read-only --windows-sandbox unelevated` 再次在预检阶段超时，未发起模型任务；随后相同配置的独立 `--check-shell` 通过。退出后未发现应用进程或本轮临时模型目录残留。该本机预检不稳定性仍未消除，不能将本轮计数 provider 验证视为外部 provider 实跑成功。
+
+预检时显示 `CheckingShell`，初始化期间提交的任务继续留在初始队列。Ready 集成测试的观察窗口为 35 秒，覆盖 Core 的 30 秒 RPC deadline；失败时报告实际阶段和错误，不通过扩大 sandbox 或重试任务取得成功。
+
+扩大测试观察窗口后，实际收到 Core 的 `Unknown` 与 `Shell preflight timed out`，不是测试框架提前退出。独立零模型诊断分别运行了无 dynamic tool、仅 dynamic tool、dynamic tool 加 feature 配置三种启动请求，三者的 shell 检查均返回 exit code 0。该对照未找到可归因于工具注册或 feature 参数的失败条件；仍需继续定位本机 app-server/sandbox 与执行时序。
+
 两个需安装 Codex 的可选测试已单独运行：
 
 ```text
@@ -42,18 +59,30 @@ cargo nextest run --locked --run-ignored only live_windows_core_reaches_ready
 
 前者通过 `config/read` 确认 Windows sandbox 覆盖生效；后者验证真实 Core 启动到 Ready、根轮次为零，连续三次通过。这两个测试默认忽略，避免普通单元测试依赖本机认证和 Codex 安装。
 
+### 本地 provider 的真实 Gate 验收
+
+新增的可选测试运行真实 Codex 0.159.2 app-server 和 `tests/fixtures/gate_provider.py`：
+
+```powershell
+$env:NATIVE_AGENT_TUI_PYTHON = (python -c 'import sys; print(sys.executable)')
+cargo nextest run --locked --run-ignored only live_app_server_gate --no-capture
+```
+
+独立 `CODEX_HOME` 不含认证数据；所有模型请求送到 localhost。测试复制安装版本的 bundled catalog，设置 direct，并仅为普通 Responses SSE fixture 关闭 `use_responses_lite`。该测试配置与正常启动时保留用户目录其他字段的行为分开验证。
+
+第一次等待前根 provider 收到 2 次请求、子 provider 收到 1 次；保持子响应未返回，300 ms 后重新采样，根仍为 2 次。释放子响应后发送原生 `followup_task`，第二次等待时根为 4 次、子为 2 次；再次保持响应并采样，根仍为 4 次。最终释放后根为 5 次并输出 `GATE_DONE`。两个等待窗口内额外根 provider 请求均为零，且第二次 Gate 绑定新 generation。这个证据不依赖 UI 图标或本地 turn 计数。
+
 Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入中文任务后收到 `SECOND_READY`，两轮均由真实 `turn/completed` 进入 Completed。
 
 生成期间 Ctrl+C 已收到真实 Interrupted 终态；Ctrl+Q 退出后恢复终端。快速中断曾返回 `no active turn to interrupt`：现在保留会话、显示拒绝原因并继续接收终态，允许用户再次明确请求中断。相应竞态有自动回归测试。
 
 ## 尚未完成的设计要求
 
-1. 将子线程身份、直属关系、当前 turn 和 generation 接入 Core。
-2. 注册和处理 `wait_for_subagent_completion`，验证等待期间新增根模型请求为零。
-3. 将 scheduler 的任务 DAG、资源槽、等待和手动命令连接到真实执行。
-4. 提供持久化日志、恢复语义、上下文压缩及 skill 的服务端事实记录。
-5. 扩展协议兼容快照和本地计数 provider 验证。
+1. 将 scheduler 的任务 DAG、资源槽、等待和手动命令连接到真实执行。
+2. 提供持久化日志、恢复语义、上下文压缩及 skill 的服务端事实记录。
+3. 扩展协议兼容快照，验证一层子代理限制、整棵代理树停止，以及正在运行的子代理收到普通消息时的轮次语义。
+4. 提供代理/任务树、搜索、详细工具轨迹、usage/context 面板和诊断指标。
 
-`gate.rs`、`scheduler.rs`、`rpc.rs` 和 `diagnostics.rs` 的独立接口不能作为上述功能已在真实运行中工作的证据。
+`scheduler.rs`、`rpc.rs` 和 `diagnostics.rs` 的独立接口不能作为上述功能已在真实运行中工作的证据。现有本地 provider 验证的是同一直属子代理的两轮；8 子代理场景通过内存 transport 验证，尚未扩展到真实 provider 并行计数。
 
 Job 在进程创建后附加。现有清理测试覆盖附加后的后代；创建与附加之间的竞态仍需进一步消除或验证。

@@ -81,6 +81,7 @@ struct LocalState {
     notice: Option<String>,
     help: bool,
     request_index: usize,
+    agent_id: Option<String>,
     answering: Option<RpcId>,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
@@ -230,6 +231,20 @@ fn handle_key(
             local.request_index += 1;
             sync_questions(local, selected_request(snapshot, local).cloned());
         }
+        KeyCode::F(3) => {
+            let next = local
+                .agent_id
+                .as_ref()
+                .and_then(|id| {
+                    snapshot
+                        .agents
+                        .iter()
+                        .position(|agent| &agent.info.id == id)
+                })
+                .map_or(0, |index| index + 1);
+            local.agent_id = snapshot.agents.get(next).map(|agent| agent.info.id.clone());
+            local.scroll_from_bottom = 0;
+        }
         KeyCode::Esc => {
             local.help = false;
             local.editor.clear();
@@ -269,9 +284,15 @@ fn handle_key(
                     return false;
                 }
             }
-            if !snapshot.phase.can_submit() || snapshot.thread_id.is_none() {
+            if !(snapshot.phase.can_submit()
+                || snapshot.phase == crate::state::SessionPhase::GatePending)
+                || snapshot.thread_id.is_none()
+            {
                 local.notice =
                     Some("Wait for the current turn, or use Ctrl+C to interrupt.".into());
+            } else if snapshot.queued_inputs >= 8 {
+                local.notice =
+                    Some("The task queue is full (8 tasks); your draft is retained.".into());
             } else if send(Command::SubmitRootInput { text }, tx, local) {
                 local.editor.clear();
                 local.scroll_from_bottom = 0;
@@ -317,32 +338,46 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         return;
     }
     let request = selected_request(snapshot, local);
+    let waiting = snapshot.gate.as_ref().filter(|gate| gate.pending);
+    let selected_agent = local
+        .agent_id
+        .as_ref()
+        .and_then(|id| snapshot.agents.iter().find(|agent| &agent.info.id == id));
+    let selected_thread = selected_agent
+        .map(|agent| agent.info.id.as_str())
+        .or(snapshot.thread_id.as_deref())
+        .unwrap_or("");
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(if area.height > 16 { 4 } else { 3 }),
             Constraint::Min(1),
-            Constraint::Length(if request.is_some() || snapshot.last_error.is_some() {
-                6
-            } else {
-                2
-            }),
+            Constraint::Length(
+                if area.height > 16
+                    && (request.is_some() || snapshot.last_error.is_some() || waiting.is_some())
+                {
+                    6
+                } else {
+                    2
+                },
+            ),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
     let status = format!(
-        "{:?} | {} | turns: {} | tokens: {}",
+        "{:?} | turns: {} | children: {} | queued: {}",
         snapshot.phase,
-        snapshot.model.as_deref().unwrap_or("model pending"),
         snapshot.root_turn_count,
-        snapshot
-            .total_tokens
-            .map_or_else(|| "unknown".into(), |tokens| tokens.to_string())
+        snapshot.agents.len(),
+        snapshot.queued_inputs,
     );
     let settings = format!(
-        "{} | {} | {}",
-        snapshot.cwd, snapshot.sandbox, snapshot.approval_policy
+        "{} | {} | {} | {}",
+        snapshot.model.as_deref().unwrap_or("model pending"),
+        snapshot.cwd,
+        snapshot.sandbox,
+        snapshot.approval_policy
     );
     frame.render_widget(
         Paragraph::new(vec![
@@ -357,12 +392,65 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         chunks[0],
     );
 
-    let width = chunks[1].width.saturating_sub(2) as usize;
+    let conversation_area = if area.width >= 100 && !snapshot.agents.is_empty() {
+        let panels = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(32), Constraint::Min(1)])
+            .split(chunks[1]);
+        let mut agents = vec![Line::from(if selected_agent.is_none() {
+            "> root"
+        } else {
+            "  root"
+        })];
+        for agent in &snapshot.agents {
+            let status = if agent.awaiting_turn {
+                "starting".into()
+            } else {
+                agent
+                    .outcome
+                    .as_ref()
+                    .map_or_else(|| "running".into(), |outcome| format!("{outcome:?}"))
+            };
+            let name = agent
+                .info
+                .path
+                .as_deref()
+                .or(agent.info.nickname.as_deref())
+                .unwrap_or(&agent.info.id);
+            agents.push(Line::from(display_text(&format!(
+                "{} {name}",
+                if Some(agent.info.id.as_str())
+                    == selected_agent.map(|agent| agent.info.id.as_str())
+                {
+                    ">"
+                } else {
+                    " "
+                }
+            ))));
+            agents.push(Line::from(format!(
+                "    {status} / gen {}",
+                agent.generation
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(agents).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Agents · F3 "),
+            ),
+            panels[0],
+        );
+        panels[1]
+    } else {
+        chunks[1]
+    };
+    let width = conversation_area.width.saturating_sub(2) as usize;
     let mut transcript = Vec::new();
-    if snapshot.messages.is_empty() {
-        transcript.push("Type a task below and press Enter.".into());
-    }
-    for message in &snapshot.messages {
+    for message in snapshot
+        .messages
+        .iter()
+        .filter(|message| message.thread_id == selected_thread)
+    {
         transcript.push(format!(
             "{}{}",
             message.role,
@@ -375,18 +463,41 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         transcript.extend(wrap(&message.text, width));
         transcript.push(String::new());
     }
+    if transcript.is_empty() {
+        transcript.push(
+            if selected_agent.is_some() {
+                "Waiting for child output."
+            } else {
+                "Type a task below and press Enter."
+            }
+            .into(),
+        );
+    }
     if transcript.last().is_some_and(|line| line.is_empty()) {
         transcript.pop();
     }
-    let height = chunks[1].height.saturating_sub(2) as usize;
+    let height = conversation_area.height.saturating_sub(2) as usize;
     let max_scroll = transcript.len().saturating_sub(height);
     let scroll = local.scroll_from_bottom.min(max_scroll);
     let start = max_scroll.saturating_sub(scroll);
-    let title = if snapshot.history_truncated {
-        " Conversation [older content truncated] "
-    } else {
-        " Conversation "
-    };
+    let name = selected_agent
+        .map(|agent| {
+            agent
+                .info
+                .path
+                .as_deref()
+                .or(agent.info.nickname.as_deref())
+                .unwrap_or(&agent.info.id)
+        })
+        .unwrap_or("root");
+    let title = display_text(&format!(
+        " {name} · F3 switch{} ",
+        if snapshot.history_truncated {
+            " [older content truncated]"
+        } else {
+            ""
+        }
+    ));
     let visible: Vec<_> = transcript
         .into_iter()
         .skip(start)
@@ -395,7 +506,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .collect();
     frame.render_widget(
         Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
-        chunks[1],
+        conversation_area,
     );
 
     let notice = local
@@ -404,7 +515,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.last_error.as_ref())
         .or(snapshot.notice.as_ref());
     let activity = if local.help {
-        "Enter submit | Shift+Enter newline | Ctrl+C interrupt | Ctrl+Q quit | PgUp/PgDn scroll | Ctrl+U clear | F2 next request".to_owned()
+        "Enter root task (queues during wait) | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | PgUp/PgDn scroll | Ctrl+U clear | F2 next request | F3 next agent".to_owned()
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {
@@ -421,7 +532,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                     })
                     .unwrap_or_default();
                 format!(
-                    "{} ({}/{})\n{}\n{}",
+                    "{} · {} ({}/{})\n{}\n{}",
+                    request.thread_id,
                     question.header,
                     local.question_index + 1,
                     questions.len(),
@@ -430,12 +542,23 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                 )
             }
             _ => format!(
-                "{}\nCtrl+Y approve once | Ctrl+N decline | F2 next request",
-                request.summary
+                "{} · {}\nCtrl+Y approve once | Ctrl+N decline | F2 next request",
+                request.thread_id, request.summary
             ),
         }
     } else if let Some(notice) = notice {
-        notice.clone()
+        if let Some(gate) = waiting {
+            format!("{}\n{notice}", gate_status(snapshot, gate))
+        } else {
+            notice.clone()
+        }
+    } else if let Some(gate) = waiting {
+        gate_status(snapshot, gate)
+    } else if snapshot.queued_inputs > 0 {
+        format!(
+            "{} root tasks queued for the current turn to finish.",
+            snapshot.queued_inputs
+        )
     } else {
         snapshot.tool_activity.clone().unwrap_or_default()
     };
@@ -494,16 +617,63 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
             if request.is_some_and(|r| matches!(r.kind, RequestKind::UserInput { .. })) {
                 " Answer "
             } else {
-                " Task "
+                if waiting.is_some() {
+                    " Root task · Enter to queue "
+                } else {
+                    " Root task "
+                }
             },
         )),
         chunks[3],
     );
     frame.set_cursor_position((chunks[3].x + 1 + cursor as u16, chunks[3].y + 1));
     frame.render_widget(
-        Paragraph::new("Enter send  Ctrl+C interrupt  Ctrl+Q quit  PgUp/PgDn scroll  F1 help"),
+        Paragraph::new("Enter send  Ctrl+C interrupt  Ctrl+Q quit  F3 agent  F1 help"),
         chunks[4],
     );
+}
+
+fn gate_status(snapshot: &CoreSnapshot, gate: &crate::state::GateSnapshot) -> String {
+    let done = gate
+        .targets
+        .iter()
+        .filter(|target| target.outcome.is_some())
+        .count();
+    let mut lines = vec![format!(
+        "Waiting children: {done}/{} | queued: {} | root starts during wait: {}",
+        gate.targets.len(),
+        snapshot.queued_inputs,
+        snapshot
+            .root_start_requests
+            .saturating_sub(gate.root_starts_at_enter)
+    )];
+    for target in gate.targets.iter().take(3) {
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.info.id == target.id);
+        let name = agent
+            .and_then(|agent| {
+                agent
+                    .info
+                    .path
+                    .as_deref()
+                    .or(agent.info.nickname.as_deref())
+            })
+            .unwrap_or(&target.id);
+        let status = target.outcome.as_ref().map_or_else(
+            || {
+                if target.turn_id.is_some() {
+                    "running".into()
+                } else {
+                    "awaiting turn".into()
+                }
+            },
+            |outcome| format!("{outcome:?}"),
+        );
+        lines.push(format!("{name}: {status} (gen {})", target.generation));
+    }
+    lines.join("\n")
 }
 
 struct TerminalGuard {
@@ -549,6 +719,119 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn gate_view_shows_waiting_progress_and_agent_switching_only_changes_the_local_view() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+        use crate::gate::WaitTarget;
+        use crate::state::GateSnapshot;
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::GatePending,
+            thread_id: Some("root".into()),
+            root_start_requests: 1,
+            queued_inputs: 2,
+            agents: vec![AgentSnapshot {
+                info: AgentInfo {
+                    id: "a".into(),
+                    parent_id: "root".into(),
+                    path: Some("/root/a".into()),
+                    nickname: None,
+                    role: None,
+                    model: None,
+                    confirmed: true,
+                },
+                generation: 1,
+                turn_id: Some("a-1".into()),
+                outcome: None,
+                awaiting_turn: false,
+            }],
+            gate: Some(GateSnapshot {
+                targets: vec![WaitTarget {
+                    id: "a".into(),
+                    generation: 1,
+                    turn_id: Some("a-1".into()),
+                    outcome: None,
+                }],
+                pending: true,
+                root_starts_at_enter: 1,
+                root_starts_at_release: None,
+            }),
+            ..Default::default()
+        };
+        for (thread, text) in [("root", "ROOT_OUTPUT"), ("a", "CHILD_OUTPUT 中文")] {
+            snapshot.messages.push(ConversationItem {
+                id: "shared".into(),
+                thread_id: thread.into(),
+                turn_id: "one".into(),
+                role: "Agent".into(),
+                text: text.into(),
+                complete: true,
+                truncated: false,
+            });
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        handle_key(
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.agent_id.as_deref(), Some("a"));
+        assert!(rx.try_recv().is_err());
+        for (width, height) in [(80, 24), (160, 45), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("CHILD_OUTPUT"), "{rendered}");
+            assert!(!rendered.contains("ROOT_OUTPUT"));
+            assert!(rendered.contains("Waiting children: 0/1"));
+            if width >= 80 {
+                assert!(rendered.contains("queued: 2"));
+            }
+            if width >= 100 {
+                assert!(rendered.contains("Agents · F3"));
+            }
+        }
+        local.editor.insert("root task");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::SubmitRootInput {
+                text: "root task".into()
+            }
+        );
+        snapshot.queued_inputs = 8;
+        local.editor.insert("retained draft");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.editor.text, "retained draft");
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.agent_id.is_none());
+    }
+
+    #[test]
     fn editor_deletes_whole_combining_characters_and_emoji_and_retains_utf8_cursor() {
         let mut editor = Editor::default();
         editor.insert("中e\u{301}👨‍👩‍👧‍👦");
@@ -569,6 +852,7 @@ mod tests {
         };
         snapshot.messages.push(ConversationItem {
             id: "a".into(),
+            thread_id: String::new(),
             turn_id: "t".into(),
             role: "Agent".into(),
             text: "READY 中文".into(),
