@@ -42,6 +42,16 @@ pub enum CliCommand {
     Version,
     CheckShell(Config),
     Sessions(Config),
+    History {
+        session: Option<String>,
+        config: Config,
+    },
+    Export {
+        session: String,
+        since: u64,
+        output: Option<PathBuf>,
+        config: Config,
+    },
     Replay {
         session: String,
         since: u64,
@@ -71,14 +81,16 @@ pub enum CliError {
     UnknownOption(String),
     #[error("{0} requires a value")]
     MissingValue(String),
-    #[error("choose one execution, --sessions, or --replay mode; --headless requires --workflow")]
+    #[error("choose one execution or history mode; --headless requires --workflow")]
     ConflictingModes,
     #[error("invalid value for {option}: {value}")]
     InvalidValue { option: String, value: String },
     #[error("{0}")]
     Attention(String),
-    #[error("--since requires --replay SESSION_ID")]
+    #[error("--since requires --replay or --export SESSION_ID")]
     ReplayOptions,
+    #[error("--output requires --export SESSION_ID")]
+    ExportOptions,
     #[error(
         "--json-events requires --run TASK, --workflow FILE --headless, or --replay SESSION_ID"
     )]
@@ -100,20 +112,23 @@ where
     let mut attention_overrides = Vec::new();
     let mut since = None;
     let mut json_events = false;
+    let mut output = None;
     while index < args.len() {
         let option = &args[index];
         index += 1;
         match option.as_str() {
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
-            "--run" | "--tui" | "--check-shell" | "--workflow" | "--sessions" | "--replay" => {
+            "--run" | "--tui" | "--check-shell" | "--workflow" | "--sessions" | "--replay"
+            | "--history" | "--export" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
                 if option == "--run"
                     || option == "--replay"
                     || option == "--workflow"
-                    || (option == "--tui"
+                    || option == "--export"
+                    || (matches!(option.as_str(), "--tui" | "--history")
                         && args.get(index).is_some_and(|next| !next.starts_with('-')))
                 {
                     goal = Some(value(&args, &mut index, option)?);
@@ -125,6 +140,9 @@ where
             "--model" => config.model = Some(value(&args, &mut index, option)?),
             "--journal-dir" => config.journal.root = Some(value(&args, &mut index, option)?.into()),
             "--json-events" if !json_events => json_events = true,
+            "--output" if output.is_none() => {
+                output = Some(PathBuf::from(value(&args, &mut index, option)?))
+            }
             "--since" if since.is_none() => {
                 let val = value(&args, &mut index, option)?;
                 since = Some(val.parse::<u64>().map_err(|_| CliError::InvalidValue {
@@ -188,8 +206,11 @@ where
     if headless && mode != Some("--workflow") {
         return Err(CliError::ConflictingModes);
     }
-    if since.is_some() && mode != Some("--replay") {
+    if since.is_some() && !matches!(mode, Some("--replay" | "--export")) {
         return Err(CliError::ReplayOptions);
+    }
+    if output.is_some() && mode != Some("--export") {
+        return Err(CliError::ExportOptions);
     }
     if json_events
         && !(matches!(mode, Some("--replay" | "--run")) || mode == Some("--workflow") && headless)
@@ -214,6 +235,16 @@ where
     }
     Ok(match mode {
         Some("--sessions") => CliCommand::Sessions(config),
+        Some("--history") => CliCommand::History {
+            session: goal,
+            config,
+        },
+        Some("--export") => CliCommand::Export {
+            session: goal.unwrap(),
+            since: since.unwrap_or(0),
+            output,
+            config,
+        },
         Some("--replay") => CliCommand::Replay {
             session: goal.unwrap(),
             since: since.unwrap_or(0),
@@ -248,6 +279,49 @@ fn value(args: &[String], index: &mut usize, option: &str) -> Result<String, Cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_and_export_modes_cannot_launch_execution_or_mix_input_channels() {
+        assert!(matches!(
+            parse_args(["--history"]).unwrap(),
+            CliCommand::History { session: None, .. }
+        ));
+        assert!(
+            matches!(parse_args(["--history", "session-1", "--codex", "missing"]).unwrap(), CliCommand::History { session: Some(session), .. } if session == "session-1")
+        );
+        let CliCommand::Export {
+            session,
+            since,
+            output,
+            ..
+        } = parse_args([
+            "--output",
+            "中文 export.jsonl",
+            "--export",
+            "session-1",
+            "--since",
+            "2",
+        ])
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(session, "session-1");
+        assert_eq!(since, 2);
+        assert_eq!(output, Some(PathBuf::from("中文 export.jsonl")));
+        for args in [
+            vec!["--export"],
+            vec!["--history", "--run", "task"],
+            vec!["--history", "--since", "1"],
+            vec!["--export", "s", "--json-events"],
+            vec!["--export", "s", "--headless"],
+            vec!["--run", "task", "--output", "out"],
+            vec!["--output", "out"],
+            vec!["--export", "s", "--output", "one", "--output", "two"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
+    }
 
     #[test]
     fn replay_and_sessions_are_explicit_read_only_modes_with_a_journal_override() {

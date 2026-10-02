@@ -349,7 +349,7 @@ impl Record {
         Ok(frame)
     }
 
-    fn into_history(mut self) -> Self {
+    pub(crate) fn into_history(mut self) -> Self {
         self.historical = Some(true);
         if let Payload::Snapshot(snapshot) = &mut self.payload {
             for activity in &mut snapshot.observation.activities {
@@ -972,24 +972,52 @@ impl Replay {
         })
     }
 
-    pub fn write_jsonl(mut self, writer: &mut impl Write) -> Result<(), JournalError> {
+    pub(crate) fn visit_records(
+        &mut self,
+        mut visit: impl FnMut(Record) -> Result<(), JournalError>,
+    ) -> Result<(), JournalError> {
+        self.reader.get_mut().get_mut().seek(SeekFrom::Start(0))?;
+        self.reader = BufReader::new(
+            self.reader
+                .get_mut()
+                .get_mut()
+                .try_clone()?
+                .take(self.info.committed_bytes),
+        );
         let mut baseline = self.baseline.clone();
         baseline.kind = RecordKind::Snapshot;
         baseline = baseline.into_history();
-        write_record(writer, &baseline)?;
+        visit(baseline)?;
         let mut sequence = 0;
+        let mut previous_version = 0;
         while let Some(mut record) = read_record(&mut self.reader)? {
             validate_record(&record, &self.info, sequence)?;
-            sequence += 1;
+            if record.snapshot_version < previous_version
+                || record.event_seq == self.since && record != self.baseline
+                || record.event_seq == self.info.committed_seq && record != self.latest
+            {
+                return Err(JournalError::Corrupt);
+            }
+            previous_version = record.snapshot_version;
+            sequence = sequence.checked_add(1).ok_or(JournalError::Corrupt)?;
             if record.event_seq > self.since {
                 record = record.into_history();
-                write_record(writer, &record)?;
+                visit(record)?;
             }
+        }
+        if sequence
+            != self
+                .info
+                .committed_seq
+                .checked_add(1)
+                .ok_or(JournalError::Corrupt)?
+        {
+            return Err(JournalError::Corrupt);
         }
         let mut latest = self.latest.clone();
         latest.kind = RecordKind::Snapshot;
         latest = latest.into_history();
-        write_record(writer, &latest)?;
+        visit(latest.clone())?;
         let end = Record {
             kind: RecordKind::ReplayEnd,
             payload: Payload::ReplayEnd(ReplayEnd {
@@ -1002,7 +1030,11 @@ impl Replay {
             }),
             ..latest
         };
-        write_record(writer, &end)?;
+        visit(end)
+    }
+
+    pub fn write_jsonl(mut self, writer: &mut impl Write) -> Result<(), JournalError> {
+        self.visit_records(|record| write_record(writer, &record))?;
         writer.flush().map_err(|_| JournalError::Output)
     }
 

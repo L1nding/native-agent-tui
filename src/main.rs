@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use native_agent_tui::client::Command;
 use native_agent_tui::config::{self, CliCommand, Config};
+use native_agent_tui::history::{HistoryHandle, HistoryRequest, HistoryResult};
 use native_agent_tui::journal::{self, JournalError, Replay};
 use native_agent_tui::scheduler::{RootTaskSpec, WorkflowPlan, WORKFLOW_BYTES};
 use native_agent_tui::state::{display_text_for_cli, SessionPhase};
@@ -25,6 +26,8 @@ Usage:
   native-agent-tui --check-shell [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
   native-agent-tui --replay SESSION_ID [--since SEQ] [--json-events] [OPTIONS]
+  native-agent-tui --history [SESSION_ID] [OPTIONS]
+  native-agent-tui --export SESSION_ID [--since SEQ] [--output NEW_FILE] [OPTIONS]
 
 Options:
   --cwd PATH       Working directory (default: current directory)
@@ -44,13 +47,15 @@ Options:
 Workflow files contain a JSON task DAG, validated before launching.
 Sessions persist redacted snapshots by default. Replay is read-only and
 never launches app-server. --json-events streams committed redacted state.
+--history opens offline read-only observation. --export previews the range;
+--output writes that captured range with stable identity aliases to a new file.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
 See docs/scheduler-usage.md and docs/workflow-example.json.
 
 TUI: Enter send, Ctrl+Enter queue, Shift+Enter newline, Ctrl+C interrupt,
      Ctrl+Q quit, PgUp/PgDn scroll, Ctrl+Y approve, Ctrl+N decline,
      F1 help, F2 request, F3 agent, F4 tasks, F5 pause dispatch.
-     F10 attention thresholds, F11 activity evidence.
+     F10 attention thresholds, F11 activity evidence, F12 history/export.
 Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat
        side effects), +/- priority, F9 twice stop workflow.
 
@@ -85,6 +90,42 @@ async fn execute() -> Result<(), (u8, String)> {
     })? {
         CliCommand::Help => print_help(),
         CliCommand::Version => println!("native-agent-tui {}", env!("CARGO_PKG_VERSION")),
+        CliCommand::History { session, config } => {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return Err((2, "History browsing needs an interactive terminal. Use --replay for text or --export to save retained evidence.".into()));
+            }
+            let history = HistoryHandle::start(config.journal, config.cwd)
+                .map_err(|error| (2, error.to_string()))?;
+            ui::run_history(history, session)
+                .await
+                .map_err(|error| (2, error.to_string()))?;
+        }
+        CliCommand::Export {
+            session,
+            since,
+            output,
+            config,
+        } => {
+            let mut history = HistoryHandle::start(config.journal, config.cwd)
+                .map_err(|error| (2, error.to_string()))?;
+            let result = async {
+                let id = history.request(HistoryRequest::Preview { session, since })?;
+                if let HistoryResult::Preview(preview) = history.response(id).await? {
+                    println!("{}", serde_json::to_string_pretty(&preview.manifest).expect("export manifest"));
+                    if let Some(destination) = output {
+                        let id = history.request(HistoryRequest::Export { destination })?;
+                        if let HistoryResult::Exported { bytes } = history.response(id).await? { println!("Export saved: {bytes} bytes."); }
+                    } else {
+                        println!("Redacted preview excerpt (up to 8 KiB; prompts and full text unavailable):\n{}", preview.excerpt);
+                    }
+                }
+                Ok::<_, native_agent_tui::history::HistoryError>(())
+            }.await;
+            let stopped = history.shutdown().await;
+            result
+                .and(stopped)
+                .map_err(|error| (2, error.to_string()))?;
+        }
         CliCommand::Sessions(config) => {
             let sessions = journal::sessions(&config.journal, &config.cwd).map_err(replay_error)?;
             if sessions.is_empty() {
@@ -191,10 +232,12 @@ async fn execute() -> Result<(), (u8, String)> {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err((2, "The workflow TUI needs an interactive terminal. Add --headless for scripted execution.".into()));
             }
+            let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
+                .map_err(|error| (3, error.to_string()))?;
             let client = ClientHandle::spawn(config)
                 .await
                 .map_err(|error| (3, error.to_string()))?;
-            ui::run_tasks(client, tasks)
+            ui::run_tasks_with_history(client, tasks, history)
                 .await
                 .map_err(|error| (3, error.to_string()))?;
         }
@@ -210,12 +253,18 @@ async fn execute() -> Result<(), (u8, String)> {
                         .into(),
                 ));
             }
+            let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
+                .map_err(|error| (3, error.to_string()))?;
             let client = ClientHandle::spawn(config)
                 .await
                 .map_err(|error| (3, error.to_string()))?;
-            ui::run(client, goal)
-                .await
-                .map_err(|error| (3, error.to_string()))?;
+            ui::run_tasks_with_history(
+                client,
+                goal.into_iter().map(RootTaskSpec::input).collect(),
+                history,
+            )
+            .await
+            .map_err(|error| (3, error.to_string()))?;
         }
     }
     Ok(())

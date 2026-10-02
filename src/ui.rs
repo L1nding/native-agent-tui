@@ -18,6 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::client::{ClientHandle, Command};
+use crate::history::HistoryHandle;
 use crate::interactions::{ApprovalDecision, RequestKind, RequestView};
 use crate::observation::{
     ActivityScope, ActivitySnapshot, AttentionClass, AttentionLevel, ExecutionState,
@@ -28,8 +29,12 @@ use crate::scheduler::{
 };
 use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 
+mod history;
+
 #[derive(Debug, Error)]
 pub enum UiError {
+    #[error(transparent)]
+    History(#[from] crate::history::HistoryError),
     #[error("terminal I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("Core shutdown failed: {0}")]
@@ -134,7 +139,25 @@ pub async fn run(client: ClientHandle, goal: Option<String>) -> Result<(), UiErr
     run_tasks(client, goal.into_iter().map(RootTaskSpec::input).collect()).await
 }
 
-pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Result<(), UiError> {
+pub async fn run_tasks(client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Result<(), UiError> {
+    run_tasks_inner(client, tasks, None).await
+}
+
+pub async fn run_tasks_with_history(
+    client: ClientHandle,
+    tasks: Vec<RootTaskSpec>,
+    history: HistoryHandle,
+) -> Result<(), UiError> {
+    run_tasks_inner(client, tasks, Some(history)).await
+}
+
+async fn run_tasks_inner(
+    mut client: ClientHandle,
+    tasks: Vec<RootTaskSpec>,
+    mut history: Option<HistoryHandle>,
+) -> Result<(), UiError> {
+    let mut history_panel = history::HistoryPanel::default();
+    let mut history_open = history.is_some();
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
         let mut local = LocalState::default();
@@ -150,10 +173,20 @@ pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Re
                 let snapshot = client.snapshots.borrow().clone();
                 let request = selected_request(&snapshot, &local).cloned();
                 sync_questions(&mut local, request);
-                terminal.terminal.draw(|frame| draw(frame, &snapshot, &local))?;
+                terminal.terminal.draw(|frame| {
+                    if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
+                    else { draw(frame, &snapshot, &local); }
+                })?;
                 dirty = false;
             }
             tokio::select! {
+                change = async {
+                    match &mut history { Some(history) => history.status.changed().await, None => std::future::pending().await }
+                }, if history_open => {
+                    if change.is_ok() { history_panel.updated(history.as_ref().unwrap()); }
+                    else { history_open = false; history_panel.notice = Some("History reader closed; return to live execution.".into()); }
+                    dirty = true;
+                }
                 change = client.snapshots.changed(), if snapshots_open => {
                     snapshots_open = change.is_ok();
                     dirty = true;
@@ -164,10 +197,16 @@ pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Re
                         match event::read()? {
                             Event::Key(key) if key.kind != KeyEventKind::Release => {
                                 let snapshot = client.snapshots.borrow().clone();
-                                if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
+                                if history_panel.visible {
+                                    if history_panel.key(key, history.as_mut().unwrap(), false) { return Ok(()); }
+                                } else if key.code == KeyCode::F(12) {
+                                    if let Some(history) = &mut history { history_panel.open(history, None); }
+                                    else { local.notice = Some("History browsing is unavailable for this client.".into()); }
+                                } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 dirty = true;
                             }
                             Event::Paste(text) => {
+                                if history_panel.visible { history_panel.paste(&text); dirty = true; continue; }
                                 let snapshot = client.snapshots.borrow().clone();
                                 let request = selected_request(&snapshot, &local).cloned();
                                 sync_questions(&mut local, request);
@@ -191,13 +230,58 @@ pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Re
         .join
         .await
         .map_err(|error| UiError::Shutdown(error.to_string()))?;
+    let history_result = if let Some(history) = &mut history {
+        history.shutdown().await.map_err(UiError::from)
+    } else {
+        Ok(())
+    };
     if let Some(error) = report.cleanup_error {
         return Err(UiError::Shutdown(error));
     }
     if let Some(error) = report.journal_error {
         return Err(UiError::Shutdown(error.to_string()));
     }
-    result
+    result.and(history_result)
+}
+
+/// Offline observation recovery. This runtime has no ClientHandle or execution sender.
+pub async fn run_history(
+    mut service: HistoryHandle,
+    session: Option<String>,
+) -> Result<(), UiError> {
+    let result = async {
+        let mut terminal = TerminalGuard::enter()?;
+        let mut panel = history::HistoryPanel::default();
+        panel.open(&mut service, session);
+        let mut dirty = true;
+        let mut reader_open = true;
+        let mut tick = tokio::time::interval(Duration::from_millis(25));
+        loop {
+            if dirty { terminal.terminal.draw(|frame| panel.draw(frame, None))?; dirty = false; }
+            tokio::select! {
+                changed = service.status.changed(), if reader_open => {
+                    if changed.is_ok() { panel.updated(&service); }
+                    else { reader_open = false; panel.notice = Some("History reader closed. Ctrl+Q exits.".into()); }
+                    dirty = true;
+                }
+                _ = tick.tick() => {
+                    while event::poll(Duration::ZERO)? {
+                        match event::read()? {
+                            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                if panel.key(key, &mut service, true) { return Ok(()); }
+                                dirty = true;
+                            }
+                            Event::Paste(text) => { panel.paste(&text); dirty = true; }
+                            Event::Resize(_, _) => dirty = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }.await;
+    let stopped = service.shutdown().await.map_err(UiError::from);
+    result.and(stopped)
 }
 
 fn selected_request<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&'a RequestView> {
@@ -790,7 +874,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence".to_owned()
+        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {
@@ -908,7 +992,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         } else if local.evidence {
             "PgUp/PgDn evidence  F10 thresholds  F11 close  F3 agent"
         } else {
-            "Enter send  Ctrl+Enter queue  Ctrl+C interrupt  Ctrl+Q quit  F3 agent  F4 tasks"
+            "Enter send | Ctrl+C interrupt | Ctrl+Q quit | F3 agent | F4 tasks | F12 history"
         }),
         chunks[4],
     );

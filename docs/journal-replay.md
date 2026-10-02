@@ -9,6 +9,8 @@ cargo run --locked -- --sessions
 cargo run --locked -- --replay SESSION_ID
 cargo run --locked -- --replay SESSION_ID --since 10 --json-events
 cargo run --locked -- --sessions --cwd PATH --journal-dir PATH
+cargo run --locked -- --history SESSION_ID
+cargo run --locked -- --export SESSION_ID --output diagnostic.jsonl
 ```
 
 `--cwd` 选择原工作区。工作区键由规范化路径的原生字节确定，用于目录隔离，不是安全认证或加密摘要。`--journal-dir` 可指定专用存储目录；相对路径从应用启动目录解析。
@@ -41,3 +43,5 @@ cargo run --locked -- --sessions --cwd PATH --journal-dir PATH
 存储 typed 身份、执行状态、任务关系、请求 ID、证据计数和 attention。排除任务正文/标题、对话正文、命令、问题/答案、模型配置、工作区原始路径和原始错误；保留的协议身份字段仍属于本地数据。错误仅保存固定分类。这里不提供完整 transcript 或凭据存储。
 
 `--run TASK --json-events` 与 `--workflow FILE --headless --json-events` 已接入实时脱敏流、日志追赶和断管清理；使用方式见[实时 JSONL](jsonl-events.md)。日志验证方法见[回放验证](journal-validation.md)。
+
+F12 或离线 `--history` 可浏览历史证据与等待关系；`--export` 支持范围预览和原子保存到新文件。导出进一步将原始身份替换为稳定别名。操作和限制见[观察恢复与导出](history-export.md)。

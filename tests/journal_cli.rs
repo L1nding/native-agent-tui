@@ -76,6 +76,72 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn export_cli_previews_and_saves_retained_unknown_state_without_starting_codex() {
+    let fixture = Fixture::new();
+    let destination = Fixture::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let now = tokio::time::Instant::now();
+    let observer = Observer::new_at("export-session".into(), Default::default(), now, Some(1000));
+    let core = CoreSnapshot {
+        phase: SessionPhase::Running,
+        observation: observer.snapshot_at(0, now),
+        ..Default::default()
+    };
+    let journal = Journal::open(&fixture.settings(), cwd, StoredSnapshot::capture(&core)).unwrap();
+    let mut terminal = StoredSnapshot::capture(&core);
+    terminal.observation.snapshot_version = 1;
+    terminal.close(SessionPhase::Unknown, true);
+    journal.finish(terminal).await.unwrap();
+    let before = fixture.contents();
+    let preview = fixture.run(&["--export", "export-session"]);
+    assert!(preview.status.success());
+    assert!(!String::from_utf8(preview.stdout)
+        .unwrap()
+        .contains("export-session"));
+    let path = destination.0.join("中文 export.jsonl");
+    let output = fixture.run(&[
+        "--export",
+        "export-session",
+        "--since",
+        "1",
+        "--output",
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let bytes = fs::read(&path).unwrap();
+    let records: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["kind"], "export_manifest");
+    assert_eq!(records[0]["high_watermark"], 1);
+    assert_eq!(records[0]["execution_result"], "unknown");
+    assert_eq!(records.len(), 4);
+    assert!(records[1..]
+        .iter()
+        .all(|record| record["historical"] == true));
+    assert_eq!(
+        fixture
+            .run(&[
+                "--export",
+                "export-session",
+                "--output",
+                path.to_str().unwrap()
+            ])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        fixture.run(&["--history", "export-session"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(fixture.contents(), before);
+}
+
+#[tokio::test]
 async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_from_task_result() {
     let fixture = Fixture::new();
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));

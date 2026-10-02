@@ -7,6 +7,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod gate;
 pub mod headless;
+pub mod history;
 pub mod interactions;
 pub mod journal;
 pub mod json_events;

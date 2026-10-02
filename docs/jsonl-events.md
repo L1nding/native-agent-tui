@@ -10,7 +10,7 @@ cargo run --locked -- --run "Inspect this repository" --json-events | python tes
 
 stdout 只输出脱敏 JSONL，stderr 显示 session ID 和固定诊断。流包含状态、身份、证据计数、等待关系与 attention；任务正文、命令、完整模型输出和问题/答案均不进入流。普通 `--run` 继续显示模型文本。
 
-`--json-events` 可与 `--run`、`--workflow --headless` 或 `--replay` 使用。`--since` 只支持指定 session 的回放；它不附着当前进程的 stdout。回放说明见[日志与回放](journal-replay.md)。
+`--json-events` 可与 `--run`、`--workflow --headless` 或 `--replay` 使用。`--since` 指定 session 的回放或导出范围；它不附着当前进程的 stdout，也不能与新执行混用。回放说明见[日志与回放](journal-replay.md)，导出见[观察恢复与导出](history-export.md)。
 
 ## 记录顺序和 schema
 

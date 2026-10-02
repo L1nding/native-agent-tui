@@ -1987,6 +1987,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_export_failure_cannot_stop_a_live_turn_or_answer_its_pending_request() {
+        use crate::history::{HistoryError, HistoryHandle, HistoryRequest};
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        running_root(&mut client, &mut server).await;
+        observation_event(&mut client, &mut server, json!({"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"root-turn","command":"PRIVATE_COMMAND"}})).await;
+        journal_committed(&mut client).await;
+        let mut history = HistoryHandle::start(config.journal.clone(), config.cwd.clone()).unwrap();
+        let id = history
+            .request(HistoryRequest::Preview { session, since: 0 })
+            .unwrap();
+        history.response(id).await.unwrap();
+        let id = history
+            .request(HistoryRequest::Export {
+                destination: fixture.root.join("missing-directory/export.jsonl"),
+            })
+            .unwrap();
+        assert!(matches!(
+            history.response(id).await,
+            Err(HistoryError::ExportIo)
+        ));
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Running);
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert!(!client.snapshots.borrow().requests[0].responding);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client
+            .commands
+            .send(Command::AnswerApproval {
+                request_id: RpcId::Number(7),
+                decision: ApprovalDecision::Decline,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next(&mut server).await["result"]["decision"], "decline");
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        phase(&mut client, SessionPhase::Completed).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        assert!(client.join.await.unwrap().journal_error.is_none());
+        history.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn workflow_journal_reports_earlier_failure_after_the_last_root_succeeds() {
         use crate::scheduler::TaskState;
         let fixture = JournalFixture::new();

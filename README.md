@@ -48,6 +48,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F9 twice | Stop new dispatch and interrupt known workflow tasks |
 | F10 | Edit temporary attention thresholds; Up/Down class, Tab field, Enter apply |
 | F11 / PageUp, PageDown | Open activity evidence / scroll its details |
+| F12 | Browse retained sessions and export redacted historical evidence |
 | Ctrl+Enter | Explicitly queue a root task during a running turn |
 | Escape | Close help/tasks and clear input |
 
@@ -72,6 +73,18 @@ Activity evidence and silence attention are now projected by Core for each agent
 Sessions now persist redacted state in the OS user data directory. `--sessions` lists this workspace's history; `--replay SESSION_ID [--since SEQ] --json-events` reads a fixed committed prefix without launching Codex or answering historical requests. F11 shows the session and committed sequence. Select a storage directory with `--journal-dir PATH`.
 
 Default retention is 30 days / 500 MiB; active and uncertain sessions are protected. Missing terminal records remain unknown. New sessions use schema 2; schema 1 history stays readable. See [storage and replay](docs/journal-replay.md) and [validation](docs/journal-validation.md).
+
+## History and export
+
+F12 opens retained sessions while live execution continues. `--history [SESSION_ID]` opens the same read-only view without launching Codex. Browse events with Left/Right or `g`; press `e` to preview a range and save it to a new file.
+
+```text
+cargo run --locked -- --history
+cargo run --locked -- --export SESSION_ID --since 0
+cargo run --locked -- --export SESSION_ID --since 0 --output diagnostic.jsonl
+```
+
+Exports preserve recorded states and relationships, replace string identities with stable aliases, and exclude prompts, answers, and full text. Historical ages stay frozen; uncertain outcomes require review before starting a new task. See [history and export](docs/history-export.md) and [validation](docs/history-validation.md).
 
 ## Live JSONL
 
