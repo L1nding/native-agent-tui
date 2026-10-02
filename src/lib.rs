@@ -1,5 +1,6 @@
 //! Public module boundaries for the native agent TUI.
 
+pub mod app_server;
 pub mod client;
 pub mod config;
 pub mod diagnostics;
@@ -12,4 +13,4 @@ pub mod state;
 pub mod transport;
 pub mod ui;
 
-pub use client::{ClientHandle, Command, ExitReport, StopMode};
+pub use client::{ClientHandle, Command, ExitReport};

@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use thiserror::Error;
+use crate::interactions::RequestView;
+
+pub const MESSAGE_BYTES: usize = 32 * 1024;
+pub const HISTORY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPhase {
@@ -9,14 +11,26 @@ pub enum SessionPhase {
     Launching,
     Initializing,
     Ready,
+    StartingTurn,
     Running,
     GatePending,
     Completed,
+    Interrupted,
     Stopping,
     ClosingTransport,
     Stopped,
     Disconnected,
     Failed,
+    Unknown,
+}
+
+impl SessionPhase {
+    pub fn can_submit(self) -> bool {
+        matches!(
+            self,
+            Self::Ready | Self::Completed | Self::Interrupted | Self::Failed
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,12 +41,35 @@ pub struct AgentSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationItem {
+    pub id: String,
+    pub turn_id: String,
+    pub role: String,
+    pub text: String,
+    pub complete: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreSnapshot {
     pub version: u64,
     pub phase: SessionPhase,
     pub root_turn_count: u64,
     pub gate_pending: bool,
     pub agents: Vec<AgentSnapshot>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub model: Option<String>,
+    pub cwd: String,
+    pub sandbox: String,
+    pub approval_policy: String,
+    pub messages: Vec<ConversationItem>,
+    pub requests: Vec<RequestView>,
+    pub notice: Option<String>,
+    pub last_error: Option<String>,
+    pub tool_activity: Option<String>,
+    pub total_tokens: Option<u64>,
+    pub history_truncated: bool,
 }
 
 impl Default for CoreSnapshot {
@@ -43,183 +80,202 @@ impl Default for CoreSnapshot {
             root_turn_count: 0,
             gate_pending: false,
             agents: Vec::new(),
+            thread_id: None,
+            turn_id: None,
+            model: None,
+            cwd: String::new(),
+            sandbox: String::new(),
+            approval_policy: String::new(),
+            messages: Vec::new(),
+            requests: Vec::new(),
+            notice: None,
+            last_error: None,
+            tool_activity: None,
+            total_tokens: None,
+            history_truncated: false,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoreEvent {
-    LaunchRequested,
-    Initialized,
-    RootTurnStarted,
-    RootTurnCompleted,
-    GateEntered,
-    GateReleased,
-    StopRequested,
-    TransportClosed,
-    Failed,
-    AgentTurnStarted { id: String, generation: u64 },
-    AgentTurnCompleted { id: String, generation: u64 },
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum StateError {
-    #[error("invalid transition from {from:?} for event {event:?}")]
-    InvalidTransition {
-        from: SessionPhase,
-        event: CoreEvent,
-    },
-    #[error("stale generation {generation} for agent {id}; current generation is {current}")]
-    StaleGeneration {
-        id: String,
-        generation: u64,
-        current: u64,
-    },
-}
-
+/// Modified only by the Core command/event owner.
 #[derive(Debug, Default)]
-pub struct SessionState {
-    snapshot: CoreSnapshot,
-    agents: BTreeMap<String, AgentSnapshot>,
+pub(crate) struct SessionState {
+    pub view: CoreSnapshot,
 }
 
 impl SessionState {
-    pub fn snapshot(&self) -> Arc<CoreSnapshot> {
-        Arc::new(self.snapshot.clone())
+    pub fn snapshot(&mut self) -> Arc<CoreSnapshot> {
+        self.view.version += 1;
+        Arc::new(self.view.clone())
     }
 
-    pub fn apply(&mut self, event: CoreEvent) -> Result<Arc<CoreSnapshot>, StateError> {
-        let current = self.snapshot.phase;
-        match event.clone() {
-            CoreEvent::LaunchRequested if current == SessionPhase::Created => {
-                self.snapshot.phase = SessionPhase::Launching;
+    pub fn submission(&mut self, text: &str) {
+        self.view.phase = SessionPhase::StartingTurn;
+        self.view.last_error = None;
+        self.view.notice = None;
+        self.view.messages.push(ConversationItem {
+            id: format!("user-{}", self.view.root_turn_count + 1),
+            turn_id: String::new(),
+            role: "You".into(),
+            text: text.to_owned(),
+            complete: true,
+            truncated: false,
+        });
+        self.bound_history();
+    }
+
+    pub fn turn_started(&mut self, id: String) {
+        if self.view.turn_id.as_ref() != Some(&id) {
+            self.view.root_turn_count += 1;
+        }
+        self.view.turn_id = Some(id);
+        self.view.phase = SessionPhase::Running;
+        self.view.tool_activity = None;
+    }
+
+    pub fn message(&mut self, turn: &str, id: &str, text: &str, complete: bool) -> bool {
+        if self.view.turn_id.as_deref() != Some(turn)
+            || (!complete
+                && !matches!(
+                    self.view.phase,
+                    SessionPhase::Running | SessionPhase::GatePending
+                ))
+        {
+            return false;
+        }
+        let item = match self
+            .view
+            .messages
+            .iter_mut()
+            .find(|m| m.turn_id == turn && m.id == id && m.role == "Agent")
+        {
+            Some(item) => item,
+            None => {
+                self.view.messages.push(ConversationItem {
+                    id: id.into(),
+                    turn_id: turn.into(),
+                    role: "Agent".into(),
+                    text: String::new(),
+                    complete: false,
+                    truncated: false,
+                });
+                self.view.messages.last_mut().unwrap()
             }
-            CoreEvent::Initialized
-                if matches!(
-                    current,
-                    SessionPhase::Launching | SessionPhase::Initializing
-                ) =>
-            {
-                self.snapshot.phase = SessionPhase::Ready;
-            }
-            CoreEvent::RootTurnStarted
-                if matches!(current, SessionPhase::Ready | SessionPhase::Completed) =>
-            {
-                self.snapshot.phase = SessionPhase::Running;
-                self.snapshot.root_turn_count += 1;
-            }
-            CoreEvent::RootTurnCompleted if current == SessionPhase::Running => {
-                self.snapshot.phase = SessionPhase::Completed;
-            }
-            CoreEvent::GateEntered if current == SessionPhase::Running => {
-                self.snapshot.phase = SessionPhase::GatePending;
-                self.snapshot.gate_pending = true;
-            }
-            CoreEvent::GateReleased if current == SessionPhase::GatePending => {
-                self.snapshot.phase = SessionPhase::Running;
-                self.snapshot.gate_pending = false;
-            }
-            CoreEvent::StopRequested
-                if !matches!(
-                    current,
-                    SessionPhase::Stopped | SessionPhase::ClosingTransport
-                ) =>
-            {
-                self.snapshot.phase = SessionPhase::Stopping;
-            }
-            CoreEvent::TransportClosed
-                if matches!(
-                    current,
-                    SessionPhase::Stopping | SessionPhase::ClosingTransport
-                ) =>
-            {
-                self.snapshot.phase = SessionPhase::Stopped;
-                self.snapshot.gate_pending = false;
-            }
-            CoreEvent::Failed if current != SessionPhase::Stopped => {
-                self.snapshot.phase = SessionPhase::Failed;
-                self.snapshot.gate_pending = false;
-            }
-            CoreEvent::AgentTurnStarted { id, generation } => {
-                let agent = self
-                    .agents
-                    .entry(id.clone())
-                    .or_insert_with(|| AgentSnapshot {
-                        id,
-                        generation,
-                        completed: false,
-                    });
-                if generation < agent.generation {
-                    return Err(StateError::StaleGeneration {
-                        id: agent.id.clone(),
-                        generation,
-                        current: agent.generation,
-                    });
-                }
-                agent.generation = generation;
-                agent.completed = false;
-            }
-            CoreEvent::AgentTurnCompleted { id, generation } => {
-                let agent = self
-                    .agents
-                    .entry(id.clone())
-                    .or_insert_with(|| AgentSnapshot {
-                        id,
-                        generation,
-                        completed: false,
-                    });
-                if generation != agent.generation {
-                    return Err(StateError::StaleGeneration {
-                        id: agent.id.clone(),
-                        generation,
-                        current: agent.generation,
-                    });
-                }
-                agent.completed = true;
-            }
-            _ => {
-                return Err(StateError::InvalidTransition {
-                    from: current,
-                    event,
-                })
+        };
+        if item.complete && !complete {
+            return false;
+        }
+        if complete {
+            item.text = text.to_owned();
+            item.complete = true;
+        } else {
+            item.text.push_str(text);
+        }
+        if item.text.len() > MESSAGE_BYTES {
+            trim_front(&mut item.text, MESSAGE_BYTES);
+            item.truncated = true;
+        }
+        self.bound_history();
+        true
+    }
+
+    fn bound_history(&mut self) {
+        for item in &mut self.view.messages {
+            if item.text.len() > MESSAGE_BYTES {
+                trim_front(&mut item.text, MESSAGE_BYTES);
+                item.truncated = true;
             }
         }
-
-        self.snapshot.version += 1;
-        self.snapshot.agents = self.agents.values().cloned().collect();
-        Ok(self.snapshot())
+        while self.view.messages.len() > 128
+            || self
+                .view
+                .messages
+                .iter()
+                .map(|m| m.text.len())
+                .sum::<usize>()
+                > HISTORY_BYTES
+        {
+            self.view.messages.remove(0);
+            self.view.history_truncated = true;
+        }
     }
+
+    pub fn error(&mut self, phase: SessionPhase, error: impl Into<String>) {
+        self.view.phase = phase;
+        self.view.last_error = Some(error.into());
+        self.view.tool_activity = None;
+    }
+}
+
+pub(crate) fn trim_front(text: &mut String, max_bytes: usize) {
+    let mut cut = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text.drain(..cut);
+}
+
+pub(crate) fn display_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+pub fn display_text_for_cli(text: &str) -> String {
+    display_text(text)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreEvent, SessionPhase, SessionState, StateError};
+    use super::*;
 
     #[test]
-    fn publishes_monotonic_snapshots() {
+    fn final_item_corrects_deltas_without_duplicates_and_old_turn_is_ignored() {
         let mut state = SessionState::default();
-        let first = state.apply(CoreEvent::LaunchRequested).unwrap();
-        let second = state.apply(CoreEvent::Initialized).unwrap();
-        assert_eq!(first.version, 1);
-        assert_eq!(second.version, 2);
-        assert_eq!(second.phase, SessionPhase::Ready);
+        state.turn_started("turn-2".into());
+        assert!(!state.message("turn-1", "item", "late", false));
+        state.message("turn-2", "item", "hel", false);
+        state.message("turn-2", "item", "lo", false);
+        state.message("turn-2", "item", "hello!", true);
+        state.message("turn-2", "item", "late", false);
+        assert_eq!(state.view.messages.len(), 1);
+        assert_eq!(state.view.messages[0].text, "hello!");
     }
 
     #[test]
-    fn rejects_stale_agent_generation() {
+    fn truncates_chinese_on_character_boundaries_and_bounds_total_history() {
         let mut state = SessionState::default();
-        state
-            .apply(CoreEvent::AgentTurnStarted {
-                id: "child".into(),
-                generation: 2,
-            })
-            .unwrap();
-        assert!(matches!(
-            state.apply(CoreEvent::AgentTurnCompleted {
-                id: "child".into(),
-                generation: 1,
-            }),
-            Err(StateError::StaleGeneration { .. })
-        ));
+        state.turn_started("turn".into());
+        for i in 0..30 {
+            state.message("turn", &i.to_string(), &"中文".repeat(12000), true);
+        }
+        assert!(state.view.history_truncated);
+        assert!(
+            state
+                .view
+                .messages
+                .iter()
+                .map(|m| m.text.len())
+                .sum::<usize>()
+                <= HISTORY_BYTES
+        );
+        assert!(state
+            .view
+            .messages
+            .iter()
+            .all(|m| m.text.len() <= MESSAGE_BYTES && m.truncated));
+    }
+
+    #[test]
+    fn terminal_turn_ignores_late_deltas_but_accepts_authoritative_final_text() {
+        let mut state = SessionState::default();
+        state.turn_started("one".into());
+        state.message("one", "a", "partial", false);
+        state.view.phase = SessionPhase::Completed;
+        assert!(!state.message("one", "a", "late", false));
+        assert!(!state.message("one", "new", "late", false));
+        assert!(state.message("one", "a", "final", true));
+        assert_eq!(state.view.messages.len(), 1);
+        assert_eq!(state.view.messages[0].text, "final");
     }
 }

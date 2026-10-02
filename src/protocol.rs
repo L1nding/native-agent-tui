@@ -13,16 +13,26 @@ pub enum RpcId {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RpcId>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
+}
+
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 impl Envelope {
@@ -51,8 +61,21 @@ impl Envelope {
             id: Some(id),
             method: None,
             params: None,
-            result,
+            result: Some(result.unwrap_or(Value::Null)),
             error: None,
+        }
+    }
+
+    pub fn error_response(id: RpcId, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            id: Some(id),
+            method: None,
+            params: None,
+            result: None,
+            error: Some(serde_json::json!({
+                "code": code,
+                "message": message.into(),
+            })),
         }
     }
 }
@@ -67,6 +90,71 @@ pub enum ProtocolError {
     NotAnObject,
     #[error("JSON-RPC envelope has neither an id nor a method")]
     MissingIdentity,
+    #[error("invalid JSON-RPC envelope: {0}")]
+    InvalidEnvelope(&'static str),
+}
+
+fn validate(value: &Value) -> Result<(), ProtocolError> {
+    let object = value.as_object().ok_or(ProtocolError::NotAnObject)?;
+    if object
+        .get("jsonrpc")
+        .is_some_and(|version| version != "2.0")
+    {
+        return Err(ProtocolError::InvalidEnvelope(
+            "unsupported jsonrpc version",
+        ));
+    }
+    let has_id = object.contains_key("id");
+    let has_method = object.contains_key("method");
+    if !has_id && !has_method {
+        return Err(ProtocolError::MissingIdentity);
+    }
+    if has_id && serde_json::from_value::<RpcId>(object["id"].clone()).is_err() {
+        return Err(ProtocolError::InvalidEnvelope(
+            "id must be a string or integer",
+        ));
+    }
+    if has_method {
+        if object["method"]
+            .as_str()
+            .is_none_or(|method| method.trim().is_empty())
+        {
+            return Err(ProtocolError::InvalidEnvelope(
+                "method must be a nonempty string",
+            ));
+        }
+        if object.contains_key("result") || object.contains_key("error") {
+            return Err(ProtocolError::InvalidEnvelope(
+                "request contains response fields",
+            ));
+        }
+        if object
+            .get("params")
+            .is_some_and(|params| !params.is_null() && !params.is_object() && !params.is_array())
+        {
+            return Err(ProtocolError::InvalidEnvelope(
+                "params must be an object or array",
+            ));
+        }
+    } else {
+        if object.contains_key("params")
+            || object.contains_key("result") == object.contains_key("error")
+        {
+            return Err(ProtocolError::InvalidEnvelope(
+                "response needs exactly one result or error",
+            ));
+        }
+        if let Some(error) = object.get("error") {
+            if error.get("code").and_then(Value::as_i64).is_none()
+                || error.get("message").and_then(Value::as_str).is_none()
+            {
+                return Err(ProtocolError::InvalidEnvelope(
+                    "error needs an integer code and string message",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn decode_line(line: &str) -> Result<Envelope, ProtocolError> {
@@ -75,19 +163,17 @@ pub fn decode_line(line: &str) -> Result<Envelope, ProtocolError> {
     }
 
     let value: Value = serde_json::from_str(line)?;
-    if !value.is_object() {
-        return Err(ProtocolError::NotAnObject);
-    }
-
-    let envelope: Envelope = serde_json::from_value(value)?;
-    if envelope.id.is_none() && envelope.method.is_none() {
-        return Err(ProtocolError::MissingIdentity);
-    }
-    Ok(envelope)
+    validate(&value)?;
+    Ok(serde_json::from_value(value)?)
 }
 
 pub fn encode_line(envelope: &Envelope) -> Result<String, ProtocolError> {
-    let mut line = serde_json::to_string(envelope)?;
+    let value = serde_json::to_value(envelope)?;
+    validate(&value)?;
+    let mut line = serde_json::to_string(&value)?;
+    if line.len() > MAX_LINE_BYTES {
+        return Err(ProtocolError::LineTooLarge);
+    }
     line.push('\n');
     Ok(line)
 }
@@ -119,11 +205,52 @@ mod tests {
     #[test]
     fn encodes_a_notification_as_one_jsonl_frame() {
         let line = encode_line(&Envelope::notification("initialized", None)).unwrap();
+        assert_eq!(line, r#"{"method":"initialized"}"#.to_owned() + "\n");
+    }
+
+    #[test]
+    fn null_results_round_trip_and_unknown_fields_are_allowed() {
+        let response =
+            decode_line(r#"{"jsonrpc":"2.0","id":1,"result":null,"future":true}"#).unwrap();
+        assert_eq!(response.result, Some(serde_json::Value::Null));
         assert_eq!(
-            line,
-            r#"{"id":null,"method":"initialized","params":null,"result":null,"error":null}"#
-                .to_owned()
-                + "\n"
+            decode_line(&encode_line(&response).unwrap()).unwrap(),
+            response
         );
+        assert_eq!(
+            Envelope::response(RpcId::Number(1), None).result,
+            response.result
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_malformed_envelopes() {
+        for line in [
+            r#"{"id":1}"#,
+            r#"{"id":null,"result":null}"#,
+            r#"{"id":true,"result":null}"#,
+            r#"{"method":""}"#,
+            r#"{"method":null}"#,
+            r#"{"method":"x","params":false}"#,
+            r#"{"id":1,"method":"x","result":null}"#,
+            r#"{"id":1,"result":null,"error":null}"#,
+            r#"{"id":1,"error":{"message":"failed"}}"#,
+            r#"{"id":1,"error":{"code":-1,"message":false}}"#,
+            r#"{"id":1,"result":null,"jsonrpc":"1.0"}"#,
+        ] {
+            assert!(decode_line(line).is_err(), "accepted {line}");
+        }
+    }
+
+    #[test]
+    fn refuses_oversized_outbound_frames() {
+        let envelope = Envelope::response(
+            RpcId::Number(1),
+            Some(serde_json::Value::String("x".repeat(super::MAX_LINE_BYTES))),
+        );
+        assert!(matches!(
+            encode_line(&envelope),
+            Err(ProtocolError::LineTooLarge)
+        ));
     }
 }
