@@ -52,6 +52,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        try:
+            self.respond()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # turn/interrupt deliberately closes a held child's provider stream.
+            return
+
+    def respond(self):
         if self.path in ("/release/0", "/release/1"):
             releases[int(self.path[-1])].set()
             self.send_response(200)

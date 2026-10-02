@@ -1,0 +1,13 @@
+{
+  "tasks": [
+    {
+      "id": 1,
+      "text": "Inspect the repository and summarize its structure. Do not change files."
+    },
+    {
+      "id": 2,
+      "text": "Using the previous findings, suggest the next improvement and explain how to verify it. Do not change files.",
+      "dependencies": [1]
+    }
+  ]
+}

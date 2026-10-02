@@ -1,9 +1,12 @@
 use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use native_agent_tui::client::Command;
 use native_agent_tui::config::{self, CliCommand, Config};
+use native_agent_tui::scheduler::{
+    RootTaskSpec, TaskKind, TaskState, WorkflowPlan, WORKFLOW_BYTES,
+};
 use native_agent_tui::state::{display_text_for_cli, SessionPhase};
 use native_agent_tui::{ui, ClientHandle};
 
@@ -13,8 +16,36 @@ fn print_help() {
     } else {
         ""
     };
-    println!("Native Agent TUI {}\n\nUsage:\n  native-agent-tui [--tui [TASK]] [OPTIONS]\n  native-agent-tui --run TASK [OPTIONS]\n  native-agent-tui --check-shell [OPTIONS]\n\nOptions:\n  --cwd PATH       Working directory (default: current directory)\n  --codex PATH     Codex executable (or CODEX_BIN)\n  --model NAME     Requested model; uses Codex configuration when omitted\n  --sandbox MODE   read-only | workspace-write | danger-full-access\n  --approval MODE  untrusted | on-request | never (default: on-request)\n  --help, -h       Show this help\n  --version, -V    Show version\n\nTUI: Enter send, Shift+Enter newline, Ctrl+C interrupt, Ctrl+Q quit,\n     PgUp/PgDn scroll, Ctrl+Y approve, Ctrl+N decline, F1 help, F2 next request.\n\nHeadless runs decline interactive approval requests; use the TUI to review them.",
-        env!("CARGO_PKG_VERSION"));
+    println!("Native Agent TUI {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        r#"
+Usage:
+  native-agent-tui [--tui [TASK]] [OPTIONS]
+  native-agent-tui --run TASK [OPTIONS]
+  native-agent-tui --workflow FILE [--headless] [OPTIONS]
+  native-agent-tui --check-shell [OPTIONS]
+
+Options:
+  --cwd PATH       Working directory (default: current directory)
+  --codex PATH     Codex executable (or CODEX_BIN)
+  --model NAME     Requested model; uses Codex configuration when omitted
+  --sandbox MODE   read-only | workspace-write | danger-full-access
+  --approval MODE  untrusted | on-request | never (default: on-request)
+  --help, -h       Show this help
+  --version, -V    Show version
+
+Workflow files contain a JSON task DAG, validated before launching.
+Default is the TUI; --headless returns 0 only when all root tasks succeed.
+See docs/scheduler-usage.md and docs/workflow-example.json.
+
+TUI: Enter send, Ctrl+Enter queue, Shift+Enter newline, Ctrl+C interrupt,
+     Ctrl+Q quit, PgUp/PgDn scroll, Ctrl+Y approve, Ctrl+N decline,
+     F1 help, F2 request, F3 agent, F4 tasks, F5 pause dispatch.
+Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat
+       side effects), +/- priority, F9 twice stop workflow.
+
+Headless runs decline interactive approvals; use the TUI to review them."#
+    );
     print!("{windows}");
 }
 
@@ -33,8 +64,36 @@ async fn execute() -> Result<(), (u8, String)> {
     match config::parse_args(env::args().skip(1)).map_err(|error| (2, error.to_string()))? {
         CliCommand::Help => print_help(),
         CliCommand::Version => println!("native-agent-tui {}", env!("CARGO_PKG_VERSION")),
-        CliCommand::Run { goal, config } => return run_headless(config, Some(goal), false).await,
-        CliCommand::CheckShell(config) => return run_headless(config, None, true).await,
+        CliCommand::Run { goal, config } => {
+            return run_headless(config, vec![RootTaskSpec::input(goal)], false).await
+        }
+        CliCommand::CheckShell(config) => return run_headless(config, Vec::new(), true).await,
+        CliCommand::Workflow {
+            path,
+            headless,
+            config,
+        } => {
+            // Validate the whole plan before starting an execution owner or model turn.
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|file| file.take(WORKFLOW_BYTES as u64 + 1).read_to_end(&mut bytes))
+                .map_err(|error| (2, format!("Cannot read workflow: {error}")))?;
+            let tasks = WorkflowPlan::parse(&bytes)
+                .map_err(|error| (2, error))?
+                .tasks;
+            if headless {
+                return run_headless(config, tasks, false).await;
+            }
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return Err((2, "The workflow TUI needs an interactive terminal. Add --headless for scripted execution.".into()));
+            }
+            let client = ClientHandle::spawn(config)
+                .await
+                .map_err(|error| (1, error.to_string()))?;
+            ui::run_tasks(client, tasks)
+                .await
+                .map_err(|error| (1, error.to_string()))?;
+        }
         CliCommand::Tui { goal, config } => {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 if goal.is_none() {
@@ -60,7 +119,7 @@ async fn execute() -> Result<(), (u8, String)> {
 
 async fn run_headless(
     config: Config,
-    goal: Option<String>,
+    tasks: Vec<RootTaskSpec>,
     check_only: bool,
 ) -> Result<(), (u8, String)> {
     let mut client = if check_only {
@@ -69,10 +128,10 @@ async fn run_headless(
         ClientHandle::spawn(config).await
     }
     .map_err(|error| (1, error.to_string()))?;
-    if let Some(text) = goal {
+    if !tasks.is_empty() {
         client
             .commands
-            .send(Command::SubmitRootInput { text })
+            .send(Command::QueueRootTasks { tasks })
             .await
             .map_err(|error| (1, error.to_string()))?;
     }
@@ -134,7 +193,16 @@ async fn run_headless(
             }
             SessionPhase::Completed => {
                 println!();
-                break Ok(());
+                let roots: Vec<_> = snapshot
+                    .scheduler
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::RootTurn)
+                    .collect();
+                if roots.iter().all(|task| task.state == TaskState::Succeeded) {
+                    break Ok(());
+                }
+                break Err((1, "Workflow ended with failed, cancelled, or blocked tasks. Use the TUI task panel to inspect or explicitly retry them.".into()));
             }
             SessionPhase::Interrupted => break Err((130, "Turn interrupted.".into())),
             SessionPhase::Failed | SessionPhase::Unknown | SessionPhase::Disconnected => {

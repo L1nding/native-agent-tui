@@ -13,7 +13,7 @@
 - 启动前读取有效模型目录，生成仅将 `tool_mode` 改为 `direct` 的临时副本；app-server 持有副本并在退出时清理，不修改用户配置。
 - Core 登记真实子代理身份、直属关系和当前 turn/generation。原生 `subAgentActivity` 可先提供临时身份，首次 `turn/started` 后用一次 `thread/read` 补齐元数据；补齐期间不提前释放等待。
 - 根线程注册 `wait_for_subagent_completion`：目标集合在接受时固定，无等待超时；全部当前轮次完成或任一失败/中断才回复，重复和旧轮事件不能释放新等待。
-- 等待期间子代理审批/问题继续处理；根输入最多排队 8 项，当前根轮成功结束后依次提交，失败/中断清空队列并提示。断连不伪造子代理完成。
+- 等待期间子代理审批/问题继续处理；根输入最多排队 8 项，当前根轮成功结束后按依赖提交，失败/中断保留为阻塞任务供检查、取消或显式重试。断连不伪造子代理完成。
 - F3 切换根/子代理对话；宽屏显示代理列表，状态区显示等待进度、排队数和等待期间根 `turn/start` 增量。输入框明确标示根任务。
 - Windows Job Object 清理 app-server 的已纳入进程树；终端退出恢复 raw mode、alternate screen 和 bracketed paste。
 
@@ -78,11 +78,11 @@ Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入�
 
 ## 尚未完成的设计要求
 
-1. 将 scheduler 的任务 DAG、资源槽、等待和手动命令连接到真实执行。
+1. 在已接入的 DAG、根槽位、Gate 和任务控制之上，实现完整资源预算、原生并发/深度限制及持久调度恢复。当前能力和验收见[调度接入验证](scheduler-validation.md)。
 2. 提供持久化日志、恢复语义、上下文压缩及 skill 的服务端事实记录。
 3. 扩展协议兼容快照，验证一层子代理限制、整棵代理树停止，以及正在运行的子代理收到普通消息时的轮次语义。
 4. 提供代理/任务树、搜索、详细工具轨迹、usage/context 面板和诊断指标。
 
-`scheduler.rs`、`rpc.rs` 和 `diagnostics.rs` 的独立接口不能作为上述功能已在真实运行中工作的证据。现有本地 provider 验证的是同一直属子代理的两轮；8 子代理场景通过内存 transport 验证，尚未扩展到真实 provider 并行计数。
+`scheduler.rs` 已接入真实 Core 和 UI，具体证据见[调度接入验证](scheduler-validation.md)。`rpc.rs` 和 `diagnostics.rs` 的独立接口仍不能作为完整诊断已接入的证据。本地 provider 验证同一直属子代理的两轮；8 子代理场景通过内存 transport 验证，尚未扩展到真实 provider 并行计数。
 
 Job 在进程创建后附加。现有清理测试覆盖附加后的后代；创建与附加之间的竞态仍需进一步消除或验证。

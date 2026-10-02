@@ -13,6 +13,9 @@ use crate::config::Config;
 use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequest, WaitToken};
 use crate::interactions::{ApprovalDecision, RequestView};
 use crate::protocol::{self, Envelope, RpcId};
+use crate::scheduler::{
+    ExternalTurn, InterruptEffect, RootTaskSpec, Scheduler, SchedulerCommand, TaskAttempt, TaskKind,
+};
 use crate::state::{CoreSnapshot, GateSnapshot, SessionPhase, SessionState, MESSAGE_BYTES};
 use crate::transport::{PipeTransport, TransportError};
 
@@ -20,6 +23,14 @@ use crate::transport::{PipeTransport, TransportError};
 pub enum Command {
     SubmitRootInput {
         text: String,
+    },
+    QueueRootTasks {
+        tasks: Vec<RootTaskSpec>,
+    },
+    Schedule(SchedulerCommand),
+    ScheduleTask {
+        attempt: TaskAttempt,
+        command: SchedulerCommand,
     },
     AnswerApproval {
         request_id: RpcId,
@@ -89,7 +100,8 @@ impl ClientHandle {
                 },
                 pending: HashMap::new(),
                 next_id: 1,
-                initial_input: None,
+                scheduler: Scheduler::default(),
+                child_interrupts: VecDeque::new(),
                 interrupt_requested: false,
                 interrupt_sent: false,
                 preflight_passed: false,
@@ -101,7 +113,6 @@ impl ClientHandle {
                 collab_starts: HashMap::new(),
                 completed_collab: VecDeque::new(),
                 completed_waits: VecDeque::new(),
-                queued_inputs: VecDeque::new(),
                 identity_pending: BTreeSet::new(),
                 identity_requested: BTreeSet::new(),
                 check_only,
@@ -124,6 +135,7 @@ enum RpcKind {
     AgentRead,
     StartTurn { generation: u64 },
     Interrupt { generation: u64 },
+    ChildInterrupt { attempt: TaskAttempt },
 }
 
 impl RpcKind {
@@ -150,7 +162,8 @@ struct Core {
     state: SessionState,
     pending: HashMap<RpcId, PendingRpc>,
     next_id: i64,
-    initial_input: Option<String>,
+    scheduler: Scheduler,
+    child_interrupts: VecDeque<InterruptEffect>,
     interrupt_requested: bool,
     interrupt_sent: bool,
     preflight_passed: bool,
@@ -162,7 +175,6 @@ struct Core {
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
-    queued_inputs: VecDeque<String>,
     identity_pending: BTreeSet<String>,
     identity_requested: BTreeSet<String>,
     check_only: bool,
@@ -185,6 +197,7 @@ impl Core {
         }
         self.publish();
         let mut clock = tokio::time::interval(Duration::from_millis(250));
+        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 command = self.command_rx.recv() => {
@@ -198,12 +211,13 @@ impl Core {
                         Ok(envelope) => self.envelope(envelope),
                         Err(error) => {
                             self.state.error(SessionPhase::Disconnected, format!("{error}; any active external outcome is unknown"));
+                            self.scheduler.disconnected();
                             self.publish();
                             break;
                         }
                     }
                 }
-                _ = clock.tick(), if !self.pending.is_empty() => {
+                _ = clock.tick(), if !self.pending.is_empty() || !self.child_interrupts.is_empty() => {
                     let expired = self.pending.iter().find(|(_, rpc)| rpc.deadline <= Instant::now()).map(|(id, rpc)| (id.clone(), rpc.kind));
                     if let Some((id, kind)) = expired {
                         self.pending.remove(&id);
@@ -217,6 +231,14 @@ impl Core {
                     }
                 }
             }
+            self.flush_child_interrupt();
+            self.dispatch_root();
+            if matches!(
+                self.state.view.phase,
+                SessionPhase::Unknown | SessionPhase::Disconnected
+            ) {
+                self.scheduler.disconnected();
+            }
             self.publish();
             if self.state.view.phase == SessionPhase::Unknown {
                 // A late reply cannot turn an uncertain side effect into a fresh success.
@@ -226,6 +248,7 @@ impl Core {
         }
 
         let outcome = self.state.view.phase;
+        self.scheduler.disconnected();
         self.gate.disconnect();
         self.wait = None;
         if let Some(gate) = &mut self.state.view.gate {
@@ -265,7 +288,9 @@ impl Core {
                 gate.targets = targets;
             }
         }
-        self.state.view.queued_inputs = self.queued_inputs.len();
+        self.scheduler.interactions(&self.state.view.requests);
+        self.state.view.scheduler = self.scheduler.snapshot();
+        self.state.view.queued_inputs = self.state.view.scheduler.queued_roots;
         self.snapshot_tx.send_replace(self.state.snapshot());
     }
 
@@ -281,7 +306,7 @@ impl Core {
                 self.state.view.thread_id.as_deref().unwrap_or(""),
                 self.state.view.turn_id.as_deref().unwrap_or(""),
             ),
-            RpcKind::StartTurn { .. } | RpcKind::AgentRead => {
+            RpcKind::StartTurn { .. } | RpcKind::AgentRead | RpcKind::ChildInterrupt { .. } => {
                 return Err(TransportError::Failed(
                     "start-turn requires typed user input".into(),
                 ))
@@ -312,43 +337,60 @@ impl Core {
                         Some(format!("Enter a task of 1-{MESSAGE_BYTES} UTF-8 bytes."));
                     return;
                 }
-                if matches!(
+                let initializing = matches!(
                     self.state.view.phase,
                     SessionPhase::Launching
                         | SessionPhase::Initializing
                         | SessionPhase::CheckingShell
-                ) {
-                    if self.initial_input.is_none() {
-                        self.initial_input = Some(text);
-                    } else {
-                        self.state.view.notice = Some("An initial task is already queued.".into());
-                    }
-                    return;
-                }
-                if !self.preflight_passed {
+                );
+                if !self.preflight_passed && !initializing {
                     self.state.view.notice = Some(
                         "Shell preflight has not passed; restart after fixing the startup error."
                             .into(),
                     );
                     return;
                 }
-                if self.wait.is_some() {
-                    if self.queued_inputs.len() < 8 {
-                        self.queued_inputs.push_back(text);
-                        self.state.view.notice =
-                            Some("Task queued until the current root turn finishes.".into());
-                    } else {
-                        self.state.view.notice = Some("The task queue is full (8 tasks).".into());
-                    }
-                    return;
-                }
-                if !self.state.view.phase.can_submit() || self.state.view.thread_id.is_none() {
+                if !initializing && self.wait.is_none() && !self.state.view.phase.can_submit() {
                     self.state.view.notice = Some(
                         "Wait for the current turn to finish, or interrupt it with Ctrl+C.".into(),
                     );
                     return;
                 }
-                self.submit(&text);
+                let mut spec = RootTaskSpec::input(text);
+                if self.wait.is_some() {
+                    if let Some(dependency) = self
+                        .scheduler
+                        .last_pending_root()
+                        .or(self.scheduler.active_root().map(|attempt| attempt.task))
+                    {
+                        spec.dependencies.push(dependency);
+                    }
+                }
+                self.queue_tasks(vec![spec]);
+            }
+            Command::QueueRootTasks { tasks } => self.queue_tasks(tasks),
+            Command::Schedule(command) => self.schedule(command),
+            Command::ScheduleTask { attempt, command } => {
+                let target = match command {
+                    SchedulerCommand::Pause(id)
+                    | SchedulerCommand::Resume(id)
+                    | SchedulerCommand::Cancel(id)
+                    | SchedulerCommand::Retry(id) => Some(id),
+                    SchedulerCommand::Reprioritize { task_id, .. } => Some(task_id),
+                    _ => None,
+                };
+                if target != Some(attempt.task)
+                    || self
+                        .scheduler
+                        .task(attempt.task)
+                        .is_none_or(|task| task.attempt != attempt.attempt)
+                {
+                    self.state.view.notice = Some(
+                        "Scheduler command rejected: the selected task attempt changed.".into(),
+                    );
+                    return;
+                }
+                self.schedule(command);
             }
             Command::Interrupt => {
                 if matches!(
@@ -356,6 +398,12 @@ impl Core {
                     SessionPhase::StartingTurn | SessionPhase::Running | SessionPhase::GatePending
                 ) && !self.interrupt_requested
                 {
+                    if let Some(attempt) = self.scheduler.active_root() {
+                        // Ctrl+C retains its existing root-turn interrupt semantics.
+                        let _ = self
+                            .scheduler
+                            .command(SchedulerCommand::Cancel(attempt.task));
+                    }
                     self.interrupt_requested = true;
                     self.state.view.notice = Some(
                         "Interrupt requested; waiting for the server's terminal event.".into(),
@@ -395,6 +443,121 @@ impl Core {
             }
             Command::Quit => {}
         }
+    }
+
+    fn queue_tasks(&mut self, tasks: Vec<RootTaskSpec>) {
+        if self.check_only
+            || (!self.preflight_passed
+                && !matches!(
+                    self.state.view.phase,
+                    SessionPhase::Launching
+                        | SessionPhase::Initializing
+                        | SessionPhase::CheckingShell
+                ))
+        {
+            self.state.view.notice =
+                Some("Task dispatch requires a successful shell preflight.".into());
+            return;
+        }
+        match self.scheduler.enqueue(tasks) {
+            Ok(ids) => {
+                self.state.view.notice = Some(format!(
+                    "Queued {} root tasks; dependencies remain enforced.",
+                    ids.len()
+                ))
+            }
+            Err(error) => self.state.view.notice = Some(error.to_string()),
+        }
+    }
+
+    fn schedule(&mut self, command: SchedulerCommand) {
+        match self.scheduler.command(command) {
+            Ok(effects) => {
+                self.state.view.notice = Some("Scheduler command accepted; running turns stop only on a server terminal event.".into());
+                for effect in effects {
+                    match effect.kind {
+                        TaskKind::RootTurn => {
+                            self.interrupt_requested = true;
+                            self.issue_interrupt();
+                        }
+                        TaskKind::NativeChild => self.queue_child_interrupt(effect),
+                    }
+                }
+                self.flush_gate();
+            }
+            Err(error) => {
+                self.state.view.notice = Some(format!("Scheduler command rejected: {error}"))
+            }
+        }
+    }
+
+    fn dispatch_root(&mut self) {
+        if !self.preflight_passed
+            || self.check_only
+            || self.wait.is_some()
+            || !self.state.view.phase.can_submit()
+            || self.state.view.thread_id.is_none()
+        {
+            return;
+        }
+        if let Some(dispatch) = self.scheduler.dispatch() {
+            self.submit(&dispatch.text);
+        }
+    }
+
+    fn flush_child_interrupt(&mut self) {
+        // Limit writes per Core turn; StopWorkflow can target many observed children.
+        if self
+            .pending
+            .values()
+            .any(|rpc| matches!(rpc.kind, RpcKind::ChildInterrupt { .. }))
+        {
+            return;
+        }
+        let Some(effect) = self.child_interrupts.pop_front() else {
+            return;
+        };
+        let Some(task) = self.scheduler.task(effect.attempt.task) else {
+            return;
+        };
+        if task.attempt != effect.attempt.attempt || !task.state.active() || !task.cancel_requested
+        {
+            return;
+        }
+        let Some(external) = effect.external else {
+            return;
+        }; // Deferred until turn/started.
+        if task.external.as_ref() != Some(&external) {
+            return;
+        }
+        let id = RpcId::Number(self.next_id);
+        self.next_id += 1;
+        match self.pipe.send(app_server::interrupt(
+            id.clone(),
+            &external.thread_id,
+            &external.turn_id,
+        )) {
+            Ok(()) => {
+                self.pending.insert(
+                    id,
+                    PendingRpc {
+                        kind: RpcKind::ChildInterrupt {
+                            attempt: effect.attempt,
+                        },
+                        deadline: Instant::now() + Duration::from_secs(30),
+                        identity_thread: None,
+                    },
+                );
+            }
+            Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
+        }
+    }
+
+    fn queue_child_interrupt(&mut self, effect: InterruptEffect) {
+        // Only the latest intent for each bounded task record can remain queued.
+        self.child_interrupts
+            .retain(|old| old.attempt.task != effect.attempt.task);
+        self.child_interrupts.push_back(effect);
     }
 
     fn respond(&mut self, id: RpcId, result: Result<Value, String>) {
@@ -487,6 +650,19 @@ impl Core {
         } else if self.state.view.phase == SessionPhase::StartingTurn {
             self.state.turn_started(id.into());
         }
+        if let Some(attempt) = self.scheduler.active_root() {
+            if let Err(error) = self.scheduler.started_root(
+                attempt,
+                ExternalTurn {
+                    thread_id: self.state.view.thread_id.clone().unwrap_or_default(),
+                    turn_id: id.into(),
+                    generation: self.generation,
+                },
+            ) {
+                self.state.error(SessionPhase::Unknown, error.to_string());
+                return;
+            }
+        }
         self.issue_interrupt();
     }
 
@@ -568,6 +744,27 @@ impl Core {
                 {
                     return;
                 }
+                if let RpcKind::ChildInterrupt { attempt } = pending.kind {
+                    if !self
+                        .scheduler
+                        .task(attempt.task)
+                        .is_some_and(|task| task.attempt == attempt.attempt && task.state.active())
+                    {
+                        return;
+                    }
+                    if let Some(error) = envelope.error {
+                        self.scheduler.interrupt_rejected(attempt);
+                        self.state.view.notice = Some(format!(
+                            "Child interrupt was not accepted: {}",
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("RPC failed")
+                        ));
+                    }
+                    // Acknowledgement never completes a child or releases its Gate.
+                    return;
+                }
                 if let Some(error) = envelope.error {
                     let message = error
                         .get("message")
@@ -578,6 +775,9 @@ impl Core {
                         // Rejection proves the interrupt was not accepted, not that the turn ended.
                         self.interrupt_requested = false;
                         self.interrupt_sent = false;
+                        if let Some(attempt) = self.scheduler.active_root() {
+                            self.scheduler.interrupt_rejected(attempt);
+                        }
                         self.state.view.notice = Some(format!("Interrupt was not accepted: {message}. Waiting for turn status; Ctrl+C can request another interrupt."));
                         return;
                     }
@@ -589,6 +789,13 @@ impl Core {
                     } else {
                         SessionPhase::Failed
                     };
+                    if phase == SessionPhase::Failed
+                        && matches!(pending.kind, RpcKind::StartTurn { .. })
+                    {
+                        if let Some(attempt) = self.scheduler.active_root() {
+                            self.scheduler.finish(attempt, ChildOutcome::Failed);
+                        }
+                    }
                     self.state.error(phase, message);
                     return;
                 }
@@ -665,9 +872,6 @@ impl Core {
                 self.state.view.phase = SessionPhase::Ready;
                 self.state.view.notice = None;
                 self.preflight_passed = true;
-                if let Some(text) = self.initial_input.take() {
-                    self.submit(&text);
-                }
                 None
             }
             RpcKind::StartTurn { .. } => {
@@ -683,6 +887,7 @@ impl Core {
             }
             RpcKind::Interrupt { .. } => None, // An RPC acknowledgement is not a terminal turn event.
             RpcKind::AgentRead => None, // The response is handled with its captured thread identity.
+            RpcKind::ChildInterrupt { .. } => None,
         };
         if let Some(kind) = action {
             if let Err(error) = self.send_rpc(kind) {
@@ -743,11 +948,20 @@ impl Core {
                 return;
             }
         };
+        let Some(attempt) = self.scheduler.active_root() else {
+            self.reject_wait(id, "No scheduler attempt owns the root turn".into());
+            return;
+        };
+        if let Err(error) = self.scheduler.wait_for_children(attempt, &targets) {
+            self.reject_wait(id, error.to_string());
+            return;
+        }
         let token = match self.gate.accept_wait(WaitRequest {
             targets: targets.clone(),
         }) {
             Ok(token) => token,
             Err(error) => {
+                let _ = self.scheduler.released_wait(attempt);
                 self.reject_wait(id, format!("Invalid child wait: {error:?}"));
                 return;
             }
@@ -776,11 +990,39 @@ impl Core {
     }
 
     fn apply_child_event(&mut self, event: GateEvent) {
+        if let Err(error) = self.scheduler.child_event(&event) {
+            self.state.error(SessionPhase::Unknown, error.to_string());
+            return;
+        }
+        if let Some(task) = self.scheduler.child_task(&event.target) {
+            let attempt = TaskAttempt {
+                task: task.id,
+                attempt: task.attempt,
+            };
+            if task.cancel_requested && event.outcome.is_none() {
+                self.queue_child_interrupt(InterruptEffect {
+                    attempt,
+                    external: task.external.clone(),
+                    kind: TaskKind::NativeChild,
+                });
+            }
+            if event.outcome.is_some() {
+                self.pending.retain(|_, rpc| !matches!(rpc.kind, RpcKind::ChildInterrupt { attempt: pending } if pending == attempt));
+            }
+            // A newer authoritative turn retires control RPCs for the old attempt too.
+            self.pending.retain(|_, rpc| !matches!(rpc.kind, RpcKind::ChildInterrupt { attempt: pending } if pending.task == attempt.task && pending.attempt != attempt.attempt));
+        }
         self.gate.apply(&event);
         self.flush_gate();
     }
 
     fn flush_gate(&mut self) {
+        let Some(attempt) = self.scheduler.active_root() else {
+            return;
+        };
+        if !self.scheduler.can_release_wait(attempt) {
+            return;
+        }
         if self
             .gate
             .targets()
@@ -838,6 +1080,9 @@ impl Core {
                     self.completed_waits.pop_front();
                 }
                 self.state.view.phase = SessionPhase::Running;
+                if let Err(error) = self.scheduler.released_wait(attempt) {
+                    self.state.error(SessionPhase::Unknown, error.to_string());
+                }
             }
             Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
         }
@@ -857,6 +1102,9 @@ impl Core {
         }
         if self.state.view.phase == SessionPhase::GatePending {
             self.state.view.phase = SessionPhase::Running;
+        }
+        if let Some(attempt) = self.scheduler.active_root() {
+            let _ = self.scheduler.released_wait(attempt);
         }
     }
 
@@ -936,6 +1184,9 @@ impl Core {
             } else if rearm {
                 self.state.agents.rearm(receiver, seq);
             }
+            if self.state.agents.known(receiver) {
+                self.register_task_child(receiver, self.scheduler.active_root(), receiver);
+            }
         }
     }
 
@@ -962,6 +1213,7 @@ impl Core {
         if !self.state.agents.confirmed(id) {
             self.identity_pending.insert(id.into());
         }
+        self.register_task_child(id, self.scheduler.active_root(), path);
         if item["kind"] == "interacted" {
             if let Some(item_id) = item["id"].as_str() {
                 if item_id.is_empty() || item_id.len() > 1024 {
@@ -1031,10 +1283,17 @@ impl Core {
 
     fn confirm_agent(&mut self, info: AgentInfo) {
         let id = info.id.clone();
+        let title = info
+            .path
+            .clone()
+            .or(info.nickname.clone())
+            .unwrap_or_else(|| id.clone());
         if let Err(error) = self.state.agents.register(info) {
             self.state.error(SessionPhase::Unknown, error.to_string());
             return;
         }
+        // thread/started proves thread parentage, not which submitted root task created it.
+        self.register_task_child(&id, None, &title);
         self.identity_pending.remove(&id);
         self.pending
             .retain(|_, rpc| rpc.identity_thread.as_deref() != Some(&id));
@@ -1058,6 +1317,12 @@ impl Core {
             }
         }
         self.flush_gate();
+    }
+
+    fn register_task_child(&mut self, thread: &str, parent: Option<TaskAttempt>, title: &str) {
+        if let Err(error) = self.scheduler.register_child(thread, parent, title) {
+            self.state.error(SessionPhase::Unknown, error.to_string());
+        }
     }
 
     fn notification(&mut self, method: &str, params: Value) {
@@ -1207,17 +1472,18 @@ impl Core {
                     self.retired_turns.pop_front();
                 }
                 self.cancel_wait();
-                if self.state.view.phase == SessionPhase::Completed {
-                    if let Some(text) = self.queued_inputs.pop_front() {
-                        self.submit(&text);
+                if let Some(attempt) = self.scheduler.active_root() {
+                    let outcome = match self.state.view.phase {
+                        SessionPhase::Completed => ChildOutcome::Completed,
+                        SessionPhase::Interrupted => ChildOutcome::Interrupted,
+                        _ => ChildOutcome::Failed,
+                    };
+                    self.scheduler.finish(attempt, outcome);
+                    if self.state.view.phase != SessionPhase::Completed
+                        && self.scheduler.pending_count() > 0
+                    {
+                        self.state.view.notice = Some("Dependent tasks remain blocked; retry the failed task or cancel queued work in F4.".into());
                     }
-                } else if !self.queued_inputs.is_empty() {
-                    self.state.view.notice = Some(format!(
-                        "Cleared {} queued root tasks after {:?}.",
-                        self.queued_inputs.len(),
-                        self.state.view.phase
-                    ));
-                    self.queued_inputs.clear();
                 }
             }
             "item/agentMessage/delta" => {
@@ -1436,7 +1702,72 @@ mod tests {
                 if client.snapshots.borrow().phase != SessionPhase::GatePending {
                     return Err("Gate released before the child response was released".into());
                 }
-                http(port, "POST", &format!("/release/{round}"));
+                client
+                    .commands
+                    .send(Command::Schedule(SchedulerCommand::PauseWorkflow))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client.snapshots.wait_for(|s| s.scheduler.paused),
+                )
+                .await
+                .map_err(|_| "pause was not applied".to_owned())?
+                .map_err(|error| error.to_string())?;
+                if round == 0 {
+                    http(port, "POST", "/release/0");
+                } else {
+                    let task = client
+                        .snapshots
+                        .borrow()
+                        .scheduler
+                        .tasks
+                        .iter()
+                        .find(|task| task.kind == TaskKind::NativeChild)
+                        .unwrap()
+                        .id;
+                    client
+                        .commands
+                        .send(Command::Schedule(SchedulerCommand::Cancel(task)))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                let terminal = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.snapshots.wait_for(|s| {
+                        s.agents[0].outcome.is_some()
+                            || matches!(s.phase, SessionPhase::Unknown | SessionPhase::Disconnected)
+                    }),
+                )
+                .await
+                .map_err(|_| "child did not terminate after completion/interrupt".to_owned())?
+                .map_err(|error| error.to_string())?
+                .clone();
+                let expected = if round == 0 {
+                    ChildOutcome::Completed
+                } else {
+                    ChildOutcome::Interrupted
+                };
+                if terminal.agents[0].outcome != Some(expected)
+                    || terminal.phase != SessionPhase::GatePending
+                {
+                    return Err(format!(
+                        "wrong child terminal fact while paused: {:?}; {:?}",
+                        terminal.phase, terminal.agents[0].outcome
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if http(port, "GET", "/stats")["root_requests"] != 2 * (round + 1) {
+                    return Err("ready Gate resumed the parent while paused".into());
+                }
+                if round == 1 {
+                    http(port, "POST", "/release/1");
+                }
+                client
+                    .commands
+                    .send(Command::Schedule(SchedulerCommand::ResumeWorkflow))
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
             let done = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -1466,6 +1797,12 @@ mod tests {
                     done.phase, done.last_error
                 ));
             }
+            let tasks = crate::scheduler::WorkflowPlan::parse(br#"{"tasks":[{"id":100,"text":"WORKFLOW_FIRST"},{"id":101,"text":"WORKFLOW_SECOND","dependencies":[100]}]}"#)?.tasks;
+            client.commands.send(Command::QueueRootTasks { tasks }).await.map_err(|error| error.to_string())?;
+            let workflow = tokio::time::timeout(Duration::from_secs(10), client.snapshots.wait_for(|s| s.scheduler.tasks.iter().filter(|task| task.id.0 >= 100).filter(|task| task.state == crate::scheduler::TaskState::Succeeded).count() == 2 || matches!(s.phase, SessionPhase::Unknown | SessionPhase::Failed | SessionPhase::Disconnected))).await.map_err(|_| "sequential workflow did not complete".to_owned())?.map_err(|error| error.to_string())?.clone();
+            if workflow.phase != SessionPhase::Completed || workflow.root_start_requests != 3 || http(port, "GET", "/stats")["root_requests"] != 7 {
+                return Err(format!("workflow did not dispatch exactly two more turns: {:?}; {:?}", workflow.phase, workflow.last_error));
+            }
             Ok(())
         }
         .await;
@@ -1480,6 +1817,301 @@ mod tests {
         observation.unwrap_or_else(|error| panic!("{error}; provider counters: {counts}"));
         assert!(exit.unwrap().cleanup_error.is_none());
         assert!(provider_exit.unwrap().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn paused_gate_observes_children_and_approvals_but_replies_only_after_resume() {
+        use crate::scheduler::TaskState;
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        wait_call(&mut server, "pause-gate", vec![]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        assert_eq!(client.snapshots.borrow().scheduler.root_slots_reserved, 0);
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::PauseWorkflow))
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.scheduler.paused)
+            .await
+            .unwrap();
+        send(&mut server, json!({"id":"approval-paused","method":"item/commandExecution/requestApproval","params":{"threadId":"a","turnId":"a-1","itemId":"shell","command":"echo test","cwd":"."}})).await;
+        client
+            .snapshots
+            .wait_for(|s| !s.requests.is_empty())
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::AnswerApproval {
+                request_id: RpcId::String("approval-paused".into()),
+                decision: ApprovalDecision::Accept,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next(&mut server).await["id"], "approval-paused");
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"a-1","status":"completed"}}})).await;
+        client
+            .snapshots
+            .wait_for(|s| s.agents[0].outcome.is_some())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.snapshots.borrow().scheduler.tasks[1].state,
+            TaskState::Succeeded
+        );
+        assert!(client.snapshots.borrow().gate.as_ref().unwrap().pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::ResumeWorkflow))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut server).await["id"], "pause-gate");
+        phase(&mut client, SessionPhase::Running).await;
+        assert_eq!(client.snapshots.borrow().scheduler.root_slots_reserved, 1);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_cancel_is_deferred_until_identity_and_acknowledgement_never_releases_gate() {
+        use crate::scheduler::TaskState;
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        send(&mut server, json!({"method":"thread/started","params":{"thread":{"id":"a","parentThreadId":"root"}}})).await;
+        let task = client
+            .snapshots
+            .wait_for(|s| s.scheduler.tasks.len() == 2)
+            .await
+            .unwrap()
+            .scheduler
+            .tasks[1]
+            .id;
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::Cancel(task)))
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.scheduler.tasks[1].cancel_requested)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"a","turn":{"id":"a-1"}}}),
+        )
+        .await;
+        let interrupt = next(&mut server).await;
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(interrupt["params"], json!({"threadId":"a","turnId":"a-1"}));
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        wait_call(&mut server, "cancel-child", vec![]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        assert_eq!(
+            client.snapshots.borrow().scheduler.tasks[1].state,
+            TaskState::Cancelling
+        );
+        assert_eq!(client.snapshots.borrow().agents[0].outcome, None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"a-1","status":"interrupted"}}})).await;
+        assert_eq!(next(&mut server).await["id"], "cancel-child");
+        phase(&mut client, SessionPhase::Running).await;
+        assert_eq!(
+            client.snapshots.borrow().scheduler.tasks[1].state,
+            TaskState::Cancelled
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dag_dispatch_waits_for_preflight_pause_and_dependencies_and_uses_new_retry_attempts() {
+        use crate::scheduler::{TaskId, TaskState};
+        let (mut client, mut server) = harness().await;
+        let mut first = RootTaskSpec::input("first".into());
+        first.id = Some(TaskId(1));
+        let mut second = RootTaskSpec::input("second".into());
+        second.id = Some(TaskId(2));
+        second.dependencies.push(TaskId(1));
+        second.priority = 1000;
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::PauseWorkflow))
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::QueueRootTasks {
+                tasks: vec![second, first],
+            })
+            .await
+            .unwrap();
+        let preflight = initialized(&mut server).await;
+        client
+            .snapshots
+            .wait_for(|s| s.scheduler.tasks.len() == 2)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        send(&mut server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::ResumeWorkflow))
+            .await
+            .unwrap();
+        let first = next(&mut server).await;
+        assert_eq!(first["params"]["input"][0]["text"], "first");
+        send(
+            &mut server,
+            json!({"id":first["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one","status":"failed"}}})).await;
+        phase(&mut client, SessionPhase::Failed).await;
+        assert_eq!(
+            client.snapshots.borrow().scheduler.tasks[1].state,
+            TaskState::Blocked
+        );
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::Retry(TaskId(1))))
+            .await
+            .unwrap();
+        let retry = next(&mut server).await;
+        assert_eq!(retry["params"]["input"][0]["text"], "first");
+        send(
+            &mut server,
+            json!({"id":retry["id"],"result":{"turn":{"id":"one-retry"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .scheduler
+                .active_root
+                .unwrap()
+                .attempt,
+            2
+        );
+        client
+            .commands
+            .send(Command::ScheduleTask {
+                attempt: TaskAttempt {
+                    task: TaskId(1),
+                    attempt: 1,
+                },
+                command: SchedulerCommand::Cancel(TaskId(1)),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("attempt changed"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            client.snapshots.borrow().scheduler.tasks[0].state,
+            TaskState::Running
+        );
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one","status":"completed"}}})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one-retry","status":"completed"}}})).await;
+        let second = next(&mut server).await;
+        assert_eq!(second["params"]["input"][0]["text"], "second");
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_cancels_the_root_and_each_observed_child_without_a_writer_burst() {
+        use crate::scheduler::TaskState;
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        for name in ["a", "b", "c"] {
+            child(&mut server, name, &format!("{name}-1")).await;
+        }
+        wait_call(&mut server, "stop-gate", vec![]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        client
+            .commands
+            .send(Command::Schedule(SchedulerCommand::StopWorkflow))
+            .await
+            .unwrap();
+        let root_interrupt = next(&mut server).await;
+        assert_eq!(root_interrupt["params"]["threadId"], "root");
+        send(&mut server, json!({"id":root_interrupt["id"],"result":{}})).await;
+        for name in ["a", "b", "c"] {
+            let interrupt = next(&mut server).await;
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            assert_eq!(interrupt["params"]["threadId"], name);
+            send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+            send(&mut server, json!({"method":"turn/completed","params":{"threadId":name,"turn":{"id":format!("{name}-1"),"status":"interrupted"}}})).await;
+        }
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}})).await;
+        phase(&mut client, SessionPhase::Interrupted).await;
+        assert!(client.snapshots.borrow().scheduler.stopping);
+        assert!(client
+            .snapshots
+            .borrow()
+            .scheduler
+            .tasks
+            .iter()
+            .all(|task| task.state == TaskState::Cancelled));
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .gate
+                .as_ref()
+                .unwrap()
+                .root_starts_at_release,
+            None
+        );
+        // A late spawn is also stopped once its real external turn arrives.
+        child(&mut server, "late", "late-1").await;
+        let interrupt = next(&mut server).await;
+        assert_eq!(interrupt["params"]["threadId"], "late");
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     async fn running_root(
@@ -1648,7 +2280,14 @@ mod tests {
         child(&mut server, "a", "a-1").await;
         wait_call(&mut server, "long-wait", vec![]).await;
         phase(&mut client, SessionPhase::GatePending).await;
+        let version = client.snapshots.borrow().version;
         tokio::time::advance(Duration::from_secs(3600)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            client.snapshots.borrow().version,
+            version,
+            "An idle Gate must not publish timer-only snapshots"
+        );
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -1707,7 +2346,18 @@ mod tests {
                 send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
                 send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}})).await;
                 phase(&mut client, SessionPhase::Interrupted).await;
-                assert_eq!(client.snapshots.borrow().queued_inputs, 0);
+                assert_eq!(client.snapshots.borrow().queued_inputs, 1);
+                assert_eq!(
+                    client
+                        .snapshots
+                        .borrow()
+                        .scheduler
+                        .tasks
+                        .last()
+                        .unwrap()
+                        .state,
+                    crate::scheduler::TaskState::Blocked
+                );
                 assert!(
                     tokio::time::timeout(Duration::from_millis(50), next(&mut server))
                         .await

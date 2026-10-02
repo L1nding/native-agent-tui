@@ -20,6 +20,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::client::{ClientHandle, Command};
 use crate::interactions::{ApprovalDecision, RequestKind, RequestView};
 use crate::protocol::RpcId;
+use crate::scheduler::{
+    RootTaskSpec, SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, ROOT_QUEUE_LIMIT,
+};
 use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 
 #[derive(Debug, Error)]
@@ -80,6 +83,9 @@ struct LocalState {
     scroll_from_bottom: usize,
     notice: Option<String>,
     help: bool,
+    tasks: bool,
+    task_id: Option<TaskId>,
+    confirm_stop: bool,
     request_index: usize,
     agent_id: Option<String>,
     answering: Option<RpcId>,
@@ -87,12 +93,16 @@ struct LocalState {
     answers: BTreeMap<String, Vec<String>>,
 }
 
-pub async fn run(mut client: ClientHandle, goal: Option<String>) -> Result<(), UiError> {
+pub async fn run(client: ClientHandle, goal: Option<String>) -> Result<(), UiError> {
+    run_tasks(client, goal.into_iter().map(RootTaskSpec::input).collect()).await
+}
+
+pub async fn run_tasks(mut client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Result<(), UiError> {
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
         let mut local = LocalState::default();
-        if let Some(text) = goal {
-            client.commands.send(Command::SubmitRootInput { text }).await
+        if !tasks.is_empty() {
+            client.commands.send(Command::QueueRootTasks { tasks }).await
                 .map_err(|_| UiError::Shutdown("client is closed".into()))?;
         }
         let mut dirty = true;
@@ -194,6 +204,9 @@ fn handle_key(
 ) -> bool {
     sync_questions(local, selected_request(snapshot, local).cloned());
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code != KeyCode::F(9) {
+        local.confirm_stop = false;
+    }
     if control {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('d') => return true,
@@ -226,6 +239,80 @@ fn handle_key(
         }
     }
     match key.code {
+        KeyCode::F(4) => local.tasks = !local.tasks,
+        KeyCode::F(5) => {
+            send(
+                Command::Schedule(if snapshot.scheduler.paused {
+                    SchedulerCommand::ResumeWorkflow
+                } else {
+                    SchedulerCommand::PauseWorkflow
+                }),
+                tx,
+                local,
+            );
+        }
+        KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) if local.tasks => {
+            if let Some(task) = selected_task(snapshot, local) {
+                let command = match key.code {
+                    KeyCode::F(6) if task.pause_requested => SchedulerCommand::Resume(task.id),
+                    KeyCode::F(6) => SchedulerCommand::Pause(task.id),
+                    KeyCode::F(7) => SchedulerCommand::Cancel(task.id),
+                    _ => SchedulerCommand::Retry(task.id),
+                };
+                let attempt = TaskAttempt {
+                    task: task.id,
+                    attempt: task.attempt,
+                };
+                send(Command::ScheduleTask { attempt, command }, tx, local);
+            }
+        }
+        KeyCode::F(9) if local.tasks => {
+            if local.confirm_stop {
+                send(Command::Schedule(SchedulerCommand::StopWorkflow), tx, local);
+                local.confirm_stop = false;
+            } else {
+                local.confirm_stop = true;
+                local.notice = Some("Press F9 again to cancel all workflow tasks. Any other key cancels this action.".into());
+            }
+        }
+        KeyCode::Up | KeyCode::Down if local.tasks => {
+            let tasks = &snapshot.scheduler.tasks;
+            if !tasks.is_empty() {
+                let index = selected_task(snapshot, local)
+                    .and_then(|task| tasks.iter().position(|other| other.id == task.id))
+                    .unwrap_or(0);
+                let next = if key.code == KeyCode::Up {
+                    index.saturating_sub(1)
+                } else {
+                    (index + 1).min(tasks.len() - 1)
+                };
+                local.task_id = Some(tasks[next].id);
+            }
+        }
+        KeyCode::Char('+') | KeyCode::Char('-') if local.tasks && !control => {
+            if let Some(task) = selected_task(snapshot, local) {
+                let priority = task.priority
+                    + if key.code == KeyCode::Char('+') {
+                        1
+                    } else {
+                        -1
+                    };
+                send(
+                    Command::ScheduleTask {
+                        attempt: TaskAttempt {
+                            task: task.id,
+                            attempt: task.attempt,
+                        },
+                        command: SchedulerCommand::Reprioritize {
+                            task_id: task.id,
+                            priority,
+                        },
+                    },
+                    tx,
+                    local,
+                );
+            }
+        }
         KeyCode::F(1) => local.help = !local.help,
         KeyCode::F(2) => {
             local.request_index += 1;
@@ -247,6 +334,7 @@ fn handle_key(
         }
         KeyCode::Esc => {
             local.help = false;
+            local.tasks = false;
             local.editor.clear();
         }
         KeyCode::PageUp => local.scroll_from_bottom = local.scroll_from_bottom.saturating_add(8),
@@ -284,16 +372,30 @@ fn handle_key(
                     return false;
                 }
             }
+            let explicit_queue = control && key.code == KeyCode::Enter;
             if !(snapshot.phase.can_submit()
-                || snapshot.phase == crate::state::SessionPhase::GatePending)
+                || snapshot.phase == crate::state::SessionPhase::GatePending
+                || explicit_queue)
                 || snapshot.thread_id.is_none()
             {
                 local.notice =
                     Some("Wait for the current turn, or use Ctrl+C to interrupt.".into());
-            } else if snapshot.queued_inputs >= 8 {
+            } else if snapshot.queued_inputs >= ROOT_QUEUE_LIMIT {
                 local.notice =
                     Some("The task queue is full (8 tasks); your draft is retained.".into());
-            } else if send(Command::SubmitRootInput { text }, tx, local) {
+            } else if send(
+                if explicit_queue {
+                    let mut task = RootTaskSpec::input(text);
+                    if let Some(active) = snapshot.scheduler.active_root {
+                        task.dependencies.push(active.task);
+                    }
+                    Command::QueueRootTasks { tasks: vec![task] }
+                } else {
+                    Command::SubmitRootInput { text }
+                },
+                tx,
+                local,
+            ) {
                 local.editor.clear();
                 local.scroll_from_bottom = 0;
             }
@@ -304,6 +406,13 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+fn selected_task<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&'a TaskSnapshot> {
+    local
+        .task_id
+        .and_then(|id| snapshot.scheduler.tasks.iter().find(|task| task.id == id))
+        .or_else(|| snapshot.scheduler.tasks.first())
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -366,11 +475,18 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         ])
         .split(area);
     let status = format!(
-        "{:?} | turns: {} | children: {} | queued: {}",
+        "{:?} | turns: {} | children: {} | queued: {}{}",
         snapshot.phase,
         snapshot.root_turn_count,
         snapshot.agents.len(),
         snapshot.queued_inputs,
+        if snapshot.scheduler.stopping {
+            " | stopping"
+        } else if snapshot.scheduler.paused {
+            " | dispatch paused"
+        } else {
+            ""
+        },
     );
     let settings = format!(
         "{} | {} | {} | {}",
@@ -508,14 +624,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
         conversation_area,
     );
+    if local.tasks {
+        draw_tasks(frame, chunks[1], snapshot, local);
+    }
 
     let notice = local
         .notice
         .as_ref()
-        .or(snapshot.last_error.as_ref())
-        .or(snapshot.notice.as_ref());
+        .or(snapshot.notice.as_ref())
+        .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Enter root task (queues during wait) | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | PgUp/PgDn scroll | Ctrl+U clear | F2 next request | F3 next agent".to_owned()
+        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow".to_owned()
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {
@@ -556,7 +675,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         gate_status(snapshot, gate)
     } else if snapshot.queued_inputs > 0 {
         format!(
-            "{} root tasks queued for the current turn to finish.",
+            "{} root tasks pending; see dependencies and controls in F4.",
             snapshot.queued_inputs
         )
     } else {
@@ -628,8 +747,92 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     );
     frame.set_cursor_position((chunks[3].x + 1 + cursor as u16, chunks[3].y + 1));
     frame.render_widget(
-        Paragraph::new("Enter send  Ctrl+C interrupt  Ctrl+Q quit  F3 agent  F1 help"),
+        Paragraph::new(if local.tasks {
+            "Up/Down select  F5 workflow  F6 pause  F7 cancel  F8 retry  +/- priority  F9 stop"
+        } else {
+            "Enter send  Ctrl+Enter queue  Ctrl+C interrupt  Ctrl+Q quit  F3 agent  F4 tasks"
+        }),
         chunks[4],
+    );
+}
+
+fn draw_tasks(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    snapshot: &CoreSnapshot,
+    local: &LocalState,
+) {
+    let scheduler = &snapshot.scheduler;
+    let selected = selected_task(snapshot, local);
+    let height = area.height.saturating_sub(2) as usize;
+    let details = if height >= 6 { 3 } else { 0 };
+    let capacity = height
+        .saturating_sub(details + usize::from(height > 1))
+        .max(1);
+    let index = selected
+        .and_then(|task| scheduler.tasks.iter().position(|other| other.id == task.id))
+        .unwrap_or(0);
+    let start = index.saturating_sub(capacity.saturating_sub(1));
+    let mut lines = Vec::new();
+    if height > 1 {
+        lines.push(Line::from(format!(
+            "Root slots: {} | native turns observed: {}",
+            scheduler.root_slots_reserved, scheduler.native_turns_observed
+        )));
+    }
+    for task in scheduler.tasks.iter().skip(start).take(capacity) {
+        lines.push(Line::from(display_text(&format!(
+            "{} #{} {:?} a{} p{} {}{} {}",
+            if selected.is_some_and(|selected| selected.id == task.id) {
+                ">"
+            } else {
+                " "
+            },
+            task.id.0,
+            task.state,
+            task.attempt,
+            task.priority,
+            if task.pause_requested {
+                "pause requested "
+            } else {
+                ""
+            },
+            if task.cancel_requested {
+                "cancel requested "
+            } else {
+                ""
+            },
+            task.title
+        ))));
+    }
+    if let Some(task) = selected.filter(|_| details > 0) {
+        lines.push(Line::from(format!(
+            "Dependencies: {:?} | wait: {:?}",
+            task.dependencies, task.wait_targets
+        )));
+        lines.push(Line::from(format!(
+            "Blocked: {:?} | requests: {}",
+            task.blocked_reason, task.pending_requests
+        )));
+        lines.push(Line::from(display_text(
+            &task.external.as_ref().map_or_else(
+                || "External turn: pending".into(),
+                |external| {
+                    format!(
+                        "External: {} / {} / gen {}",
+                        external.thread_id, external.turn_id, external.generation
+                    )
+                },
+            ),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Tasks · F4 close · F5 pause dispatch "),
+        ),
+        area,
     );
 }
 
@@ -717,6 +920,135 @@ mod tests {
     use super::*;
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn task_controls_use_captured_attempts_and_render_without_mutating_core_facts() {
+        use crate::scheduler::{Scheduler, TaskState};
+        let mut scheduler = Scheduler::default();
+        scheduler
+            .enqueue(vec![
+                RootTaskSpec::input("任务一 中文".into()),
+                RootTaskSpec::input("queued task".into()),
+            ])
+            .unwrap();
+        let first = scheduler.dispatch().unwrap().attempt;
+        scheduler
+            .started_root(
+                first,
+                crate::scheduler::ExternalTurn {
+                    thread_id: "root".into(),
+                    turn_id: "one".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            scheduler: scheduler.snapshot(),
+            ..Default::default()
+        };
+        let original = snapshot.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        handle_key(
+            KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.tasks);
+        assert!(rx.try_recv().is_err());
+        for (width, height) in [(40, 12), (80, 24), (160, 45)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Tasks · F4"), "{rendered}");
+            assert!(rendered.contains("#1 Running"), "{rendered}");
+            if width >= 80 {
+                assert!(rendered.replace(' ', "").contains("任务一中文"));
+            }
+        }
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        let selected = selected_task(&snapshot, &local).unwrap();
+        assert_eq!(selected.state, TaskState::Ready);
+        let attempt = TaskAttempt {
+            task: selected.id,
+            attempt: selected.attempt,
+        };
+        handle_key(
+            KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::ScheduleTask {
+                attempt,
+                command: SchedulerCommand::Cancel(attempt.task)
+            }
+        );
+        assert_eq!(snapshot, original);
+        handle_key(
+            KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::Schedule(SchedulerCommand::StopWorkflow)
+        );
+        local.editor.insert("explicit followup");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        let Command::QueueRootTasks { tasks } = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(tasks[0].dependencies, vec![first.task]);
+        assert!(local.editor.text.is_empty());
+        let failed = CoreSnapshot {
+            last_error: Some("old turn failed".into()),
+            notice: Some("Scheduler command rejected: attempt changed".into()),
+            ..snapshot
+        };
+        local.notice = None;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &failed, &local)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("attempt changed"));
+    }
 
     #[test]
     fn gate_view_shows_waiting_progress_and_agent_switching_only_changes_the_local_view() {

@@ -10,6 +10,7 @@ Install Rust and make an authenticated Codex CLI available on `PATH`. The curren
 cargo run --locked -- --check-shell
 cargo run --locked
 cargo run --locked -- --tui "Inspect this repository"
+cargo run --locked -- --workflow docs/workflow-example.json
 cargo run --locked -- --run "Reply with exactly READY" --sandbox read-only
 cargo run --locked -- --help
 ```
@@ -40,7 +41,13 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | Ctrl+Y / Ctrl+N | Approve once / decline the selected request |
 | F1 / F2 | Show help / select next pending request |
 | F3 | Cycle root and child conversations; input still submits a root task |
-| Escape | Close help and clear input |
+| F4 / Up, Down | Open tasks / select a task |
+| F5 / F6 | Pause workflow dispatch / pause the selected root task |
+| F7 / F8 | Cancel selected task / explicitly retry a failed root task |
+| + / - | Adjust queued root priority in the task panel |
+| F9 twice | Stop new dispatch and interrupt known workflow tasks |
+| Ctrl+Enter | Explicitly queue a root task during a running turn |
+| Escape | Close help/tasks and clear input |
 
 Chinese, combining characters, and emoji are edited as whole graphemes. Secret answers are masked and kept outside conversation history. A task draft is saved while answering questions. Messages and queues have byte limits; history truncation is visible.
 
@@ -48,11 +55,11 @@ Chinese, combining characters, and emoji are edited as whole graphemes. Secret a
 
 Live execution covers startup checks, repeated conversation turns, streamed/final root and child messages, approvals, questions, usage, interruption, disconnects, and Windows process cleanup. The UI sends typed commands and reads Core snapshots.
 
-The root can call `wait_for_subagent_completion` with `{"targets":[]}` to capture all currently known direct children, or list child thread IDs, paths, or registered nicknames. Waiting has no deadline. Current child turns release it when all complete or any fails/is interrupted; old completions and status messages cannot release a new turn. Child requests remain answerable, and root input queues until the current root turn completes (at most eight tasks). Interruption or failure clears queued tasks with a notice.
+The root can call `wait_for_subagent_completion` with `{"targets":[]}` to capture all currently known direct children, or list child thread IDs, paths, or registered nicknames. Waiting has no deadline. Current child turns release it when all complete or any fails/is interrupted; old completions and status messages cannot release a new turn. Child requests remain answerable, and root input queues until the current root turn completes (at most eight tasks). Interruption or failure retains dependent tasks as blocked for inspection or explicit retry.
 
 Startup obtains the effective catalog with `codex debug models`, writes a private temporary copy with `tool_mode: direct`, and removes it when the app-server owner exits. User configuration stays intact. This requires a Codex version supporting that command and the pinned protocol.
 
-Dependency scheduling, workflow controls, durable recovery, and detailed diagnostic views remain planned work. See [validation and remaining work](docs/implementation-status.md).
+Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Durable recovery, enforced native capacity, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
 
 ## Verify
 

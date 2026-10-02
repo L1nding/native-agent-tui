@@ -34,6 +34,11 @@ pub enum CliCommand {
     Help,
     Version,
     CheckShell(Config),
+    Workflow {
+        path: PathBuf,
+        headless: bool,
+        config: Config,
+    },
     Run {
         goal: String,
         config: Config,
@@ -50,7 +55,9 @@ pub enum CliError {
     UnknownOption(String),
     #[error("{0} requires a value")]
     MissingValue(String),
-    #[error("choose one of --run, --tui, or --check-shell")]
+    #[error(
+        "choose one of --run, --tui, --workflow, or --check-shell; --headless requires --workflow"
+    )]
     ConflictingModes,
     #[error("invalid value for {option}: {value}")]
     InvalidValue { option: String, value: String },
@@ -65,6 +72,7 @@ where
     let mut config = Config::default();
     let mut mode = None;
     let mut goal = None;
+    let mut headless = false;
     let mut index = 0;
     while index < args.len() {
         let option = &args[index];
@@ -72,17 +80,19 @@ where
         match option.as_str() {
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
-            "--run" | "--tui" | "--check-shell" => {
+            "--run" | "--tui" | "--check-shell" | "--workflow" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
                 if option == "--run"
+                    || option == "--workflow"
                     || (option == "--tui"
                         && args.get(index).is_some_and(|next| !next.starts_with('-')))
                 {
                     goal = Some(value(&args, &mut index, option)?);
                 }
             }
+            "--headless" if !headless => headless = true,
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
             "--codex" => config.executable = value(&args, &mut index, option)?.into(),
             "--model" => config.model = Some(value(&args, &mut index, option)?),
@@ -118,7 +128,15 @@ where
             _ => return Err(CliError::UnknownOption(option.clone())),
         }
     }
+    if headless && mode != Some("--workflow") {
+        return Err(CliError::ConflictingModes);
+    }
     Ok(match mode {
+        Some("--workflow") => CliCommand::Workflow {
+            path: goal.unwrap().into(),
+            headless,
+            config,
+        },
         Some("--run") => CliCommand::Run {
             goal: goal.unwrap(),
             config,
@@ -182,6 +200,30 @@ mod tests {
             parse_args(Vec::<String>::new()).unwrap(),
             CliCommand::Tui { goal: None, .. }
         ));
+    }
+
+    #[test]
+    fn workflow_modes_are_explicit_and_cannot_mix_with_single_task_modes() {
+        assert!(matches!(
+            parse_args(["--workflow", "plan.json"]).unwrap(),
+            CliCommand::Workflow {
+                headless: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_args(["--headless", "--workflow", "plan.json"]).unwrap(),
+            CliCommand::Workflow { headless: true, .. }
+        ));
+        for args in [
+            vec!["--headless"],
+            vec!["--workflow"],
+            vec!["--workflow", "plan.json", "--run", "a"],
+            vec!["--workflow", "plan.json", "--tui"],
+            vec!["--headless", "--headless", "--workflow", "plan.json"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
     }
 
     #[cfg(windows)]
