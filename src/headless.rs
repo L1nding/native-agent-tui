@@ -53,10 +53,11 @@ pub async fn run(
                 .iter()
                 .any(|message| &message.turn_id == turn && &message.id == id)
         });
-        declined.retain(|(thread, turn, id)| {
-            snapshot.requests.iter().any(|request| {
-                &request.id == id && &request.thread_id == thread && &request.turn_id == turn
-            })
+        declined.retain(|reference| {
+            snapshot
+                .requests
+                .iter()
+                .any(|request| request.matches(reference))
         });
         if !json_events {
             for message in snapshot.messages.iter().filter(|message| {
@@ -78,13 +79,7 @@ pub async fn run(
             }
         }
         for request in &snapshot.requests {
-            if request.responding
-                || !declined.insert((
-                    request.thread_id.clone(),
-                    request.turn_id.clone(),
-                    request.id.clone(),
-                ))
-            {
+            if request.responding || !declined.insert(request.reference()) {
                 continue;
             }
             match &request.kind {
@@ -109,9 +104,7 @@ pub async fn run(
             let _ = client
                 .commands
                 .send(Command::HeadlessRequest {
-                    request_id: request.id.clone(),
-                    thread_id: request.thread_id.clone(),
-                    turn_id: request.turn_id.clone(),
+                    request: request.reference(),
                 })
                 .await;
         }

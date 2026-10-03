@@ -89,6 +89,7 @@ def main():
 
         for mode, expected_code, result in [("success", 0, "completed"), ("approval", 0, "completed"),
                                             ("approval_no_decline", 130, "interrupted"),
+                                            ("request_details", 130, "interrupted"),
                                             ("input", 130, "interrupted"), ("input_hang", 4, "unknown"),
                                             ("failure", 1, "failed"), ("workflow", 1, "failed"),
                                             ("disconnect", 4, "unknown")]:
@@ -138,6 +139,12 @@ def main():
                 assert any(a and a["action"] == "interruptForInput" and a["request_id"] == "input-request" for a in actions)
             if mode == "approval_no_decline":
                 assert any(a and a["action"] == "interruptForApproval" and a["request_id"] == 7 for a in actions)
+            if mode == "request_details":
+                rpc = [json.loads(line) for line in (root / "rpc.jsonl").read_text().splitlines()]
+                assert sum(r["id"] == 7 and r["decision"] == "decline" for r in rpc) == 2
+                assert any(a and a["action"] == "declineApproval" and a["request_id"] == "file-detail" for a in actions)
+                assert any(a and a["action"] == "interruptForInput" for a in actions)
+                assert not (root / "answers.json").exists()
             check_clean(root)
             print(f"Live JSONL {mode}: passed (exit {expected_code}, durable {result})")
 

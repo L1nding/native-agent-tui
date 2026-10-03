@@ -51,6 +51,9 @@ child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
 record_processes(root, [os.getpid(), child.pid])
 turn_count = 0
 turn_id = "turn"
+detail_stage = 0
+file_done = False
+input_sent = False
 
 
 def send(value):
@@ -65,10 +68,25 @@ def terminal(status="completed"):
 
 def approval(request_id):
     params = {"threadId": "root", "turnId": turn_id, "command": "PRIVATE_COMMAND"}
+    if mode == "request_details":
+        params.update(itemId="shell-detail", kind="command", startedAtMs=123,
+                      cwd="PRIVATE_COMMAND_DIRECTORY", reason="Review command 中文👋",
+                      availableDecisions=["accept", "decline", "acceptForSession"],
+                      additionalPermissions={"network": {"enabled": True}})
     if mode == "approval_no_decline":
         params["availableDecisions"] = ["accept"]
     send({"id": request_id, "method": "item/commandExecution/requestApproval",
           "params": params})
+
+
+def details_input():
+    global input_sent
+    if detail_stage == 2 and file_done and not input_sent:
+        input_sent = True
+        send({"id": "input-request", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "root", "turnId": turn_id, "itemId": "input-detail", "questions": [
+                {"id": "question", "header": "Secret", "question": "Enter fixture secret 中文👋",
+                 "isSecret": True, "options": [{"label": "Fixture", "description": "PRIVATE_OPTION_DETAIL"}]}]}})
 
 
 try:
@@ -93,7 +111,7 @@ try:
             turn_id = f"turn-{turn_count}"
             send({"id": message["id"], "result": {"turn": {"id": turn_id}}})
             send({"method": "item/agentMessage/delta", "params": {"threadId": "root", "turnId": turn_id, "itemId": "message", "delta": "PRIVATE_OUTPUT 中文"}})
-            if mode.startswith("approval"):
+            if mode.startswith("approval") or mode == "request_details":
                 approval(7)
             elif mode in ("input", "input_hang"):
                 send({"id": "input-request", "method": "item/tool/requestUserInput",
@@ -109,6 +127,32 @@ try:
             send({"id": message["id"], "result": {}})
             if mode != "input_hang":
                 terminal("interrupted")
+        elif not method and mode == "request_details" and message.get("id") == 7:
+            assert message["result"]["decision"] in ("accept", "decline")
+            detail_stage += 1
+            assert detail_stage <= 2
+            send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": 7}})
+            if detail_stage == 1:
+                send({"method": "item/started", "params": {"threadId": "root", "turnId": turn_id, "item": {
+                    "id": "file-detail", "type": "fileChange", "status": "inProgress", "changes": [
+                        {"path": "PRIVATE_FILE_中文.rs", "kind": {"type": "update", "move_path": None},
+                         "diff": "-PRIVATE_BEFORE\n+PRIVATE_AFTER 中文👋\n"}]}}})
+                send({"id": "file-detail", "method": "item/fileChange/requestApproval", "params": {
+                    "threadId": "root", "turnId": turn_id, "itemId": "file-detail", "startedAtMs": 124,
+                    "reason": "Review file change", "grantRoot": "PRIVATE_PROPOSED_ROOT"}})
+                approval(7)  # Same RPC ID and turn; this is a new accepted delivery.
+            details_input()
+        elif not method and mode == "request_details" and message.get("id") == "file-detail":
+            assert message["result"]["decision"] in ("accept", "decline")
+            assert not file_done
+            file_done = True
+            send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": "file-detail"}})
+            details_input()
+        elif not method and mode == "request_details" and message.get("id") == "input-request":
+            answers = message["result"]["answers"]
+            (root / "answers.json").write_text(json.dumps({"valid_fixture_answer": answers == {
+                "question": {"answers": ["秘密回答中文👋"]}}}))
+            send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": "input-request"}})
         elif not method and message.get("id") == 7:
             assert message["result"]["decision"] == "decline"
             send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": 7}})

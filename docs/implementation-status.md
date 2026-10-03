@@ -151,3 +151,11 @@ Ctrl+W 关闭/恢复所选代理当前的静默提醒；记录仅在 UI 内绑�
 15 项 UI 测试通过，其中四项新增回归覆盖活动隔离、身份/证据更新、无命令副作用、草稿和宽窄终端呈现。完整 `python scripts/verify.py` 通过 147 项默认 Rust 测试与全部原生夹具，fmt/check/clippy/doctest/release 通过。Windows 终端使用持续运行的 Python fixture 验证中文/emoji 草稿、F11、提醒关闭/恢复；切换前后只有一个根请求、零中断请求，静默进展序号保持 3。随后明确中断、退出，确认进程清理、journal 关闭和只读回放的 Interrupted。最终 CLI 帮助也已同步并完成 fmt/check/clippy/release 验证。
 
 使用与范围见[活动观察](activity-observation.md)和[本地提醒验证](attention-reminders-validation.md)。本次终端检查没有调用真实模型，前一项启动修复的五项真实 Codex 验证保持独立记录。搜索、完整请求详情、更广终端和试用验收，以及 Alpha/V2 仍待完成。
+
+## S4 请求身份与 UI 详情
+
+审批、输入和 headless 动作改为携带 RPC ID、线程、轮次与接收序号；Core 校验完整身份、当前轮次和 responding。同轮次复用 ID 产生新身份，重复投递仍保留原身份。UI 固定选择，过期后需明确选择当前请求；每个提交立即锁定，输入草稿分别绑定完整身份。
+
+F2 已接入可滚动请求详情，显示命令/目录、允许决策、策略及权限提案、输入问题和选项。文件 diff 只关联同一线程/轮次/item 的服务端事件，缓存与预览有界，缺失或裁剪明确可见；详情不进入 journal、JSONL 或历史。Esc 关闭详情并保留草稿；答案超限可修正，秘密仍保持掩码。目前支持 accept/decline，其他决策表单、风险事实与子代理独立策略保持 unavailable。
+
+最终 `python scripts/verify.py` 通过 155 项默认 Rust 测试和全部原生夹具，fmt/check/clippy/doctest/release 通过。新增原生 JSONL 场景验证同 ID 两次独立审批、文件请求、秘密输入中断及脱敏持久结果。Windows ConPTY 使用假 app-server 验证详情导航、重复提交锁定、过期选择、中文/emoji 秘密回答、Esc 保留和任务草稿恢复；一个根请求、一个 shell 检查、一个明确中断，退出后确认进程清理、journal 关闭和只读 Interrupted 回放。使用、内存边界与验证范围见[请求详情](request-details.md)。真实审批兼容性、更广终端/IME、搜索、试用与 Alpha/V2 发布验收仍待完成。

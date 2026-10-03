@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, stdout, Stdout};
 use std::time::Duration;
 
@@ -19,11 +19,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::client::{ClientHandle, Command};
 use crate::history::HistoryHandle;
-use crate::interactions::{ApprovalDecision, RequestKind, RequestView};
+use crate::interactions::{ApprovalDecision, RequestKind, RequestRef, RequestView};
 use crate::observation::{
     ActivityScope, ActivitySnapshot, AttentionClass, AttentionLevel, ExecutionState,
 };
-use crate::protocol::RpcId;
 use crate::scheduler::{
     RootTaskSpec, SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, ROOT_QUEUE_LIMIT,
 };
@@ -31,6 +30,7 @@ use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 
 mod history;
 mod reminders;
+mod requests;
 
 #[derive(Debug, Error)]
 pub enum UiError {
@@ -99,9 +99,20 @@ struct LocalState {
     tasks: bool,
     task_id: Option<TaskId>,
     confirm_stop: bool,
-    request_index: usize,
+    request_selection: Option<RequestRef>,
+    request_panel: bool,
+    request_scroll: usize,
+    submitted: HashSet<RequestRef>,
+    input_drafts: HashMap<RequestRef, InputDraft>,
     agent_id: Option<String>,
-    answering: Option<RpcId>,
+    answering: Option<RequestRef>,
+    question_index: usize,
+    answers: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Default)]
+struct InputDraft {
+    editor: Editor,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
 }
@@ -174,8 +185,7 @@ async fn run_tasks_inner(
             if dirty {
                 let snapshot = client.snapshots.borrow().clone();
                 local.reminders.sync(&snapshot.observation);
-                let request = selected_request(&snapshot, &local).cloned();
-                sync_questions(&mut local, request);
+                sync_local_requests(&mut local, &snapshot);
                 terminal.terminal.draw(|frame| {
                     if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
@@ -211,8 +221,7 @@ async fn run_tasks_inner(
                             Event::Paste(text) => {
                                 if history_panel.visible { history_panel.paste(&text); dirty = true; continue; }
                                 let snapshot = client.snapshots.borrow().clone();
-                                let request = selected_request(&snapshot, &local).cloned();
-                                sync_questions(&mut local, request);
+                                sync_local_requests(&mut local, &snapshot);
                                 if let Some(editor) = &mut local.attention_editor {
                                     for digit in text.chars().filter(char::is_ascii_digit).take(10) {
                                         if editor.input().len() < 10 { editor.input().push(digit); }
@@ -288,30 +297,81 @@ pub async fn run_history(
 }
 
 fn selected_request<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&'a RequestView> {
-    let requests: Vec<_> = snapshot
-        .requests
-        .iter()
-        .filter(|request| !request.responding)
-        .collect();
-    requests
-        .get(local.request_index % requests.len().max(1))
-        .copied()
+    match &local.request_selection {
+        Some(reference) => snapshot
+            .requests
+            .iter()
+            .find(|request| request.matches(reference)),
+        None => snapshot.requests.iter().find(|request| !request.responding),
+    }
+}
+
+fn sync_local_requests(local: &mut LocalState, snapshot: &CoreSnapshot) {
+    if local.request_selection.is_none() {
+        local.request_selection = selected_request(snapshot, local).map(RequestView::reference);
+    } else if snapshot.requests.is_empty() && !local.request_panel {
+        local.request_selection = None;
+    }
+    sync_questions(local, selected_request(snapshot, local).cloned());
+    local.input_drafts.retain(|reference, _| {
+        snapshot
+            .requests
+            .iter()
+            .any(|request| request.matches(reference) && !request.responding)
+    });
+    local.submitted.retain(|reference| {
+        snapshot
+            .requests
+            .iter()
+            .any(|request| request.matches(reference))
+    });
+}
+
+fn request_locked(snapshot: &CoreSnapshot, local: &LocalState, request: &RequestView) -> bool {
+    request.responding
+        || local.submitted.contains(&request.reference())
+        || matches!(
+            snapshot.phase,
+            crate::state::SessionPhase::Unknown
+                | crate::state::SessionPhase::Disconnected
+                | crate::state::SessionPhase::Stopping
+                | crate::state::SessionPhase::ClosingTransport
+                | crate::state::SessionPhase::Stopped
+        )
 }
 
 fn sync_questions(local: &mut LocalState, request: Option<RequestView>) {
     let id = request
         .filter(|r| matches!(r.kind, RequestKind::UserInput { .. }))
-        .map(|r| r.id);
+        .map(|r| r.reference());
     if local.answering != id {
-        match (local.answering.is_some(), id.is_some()) {
+        if let Some(reference) = local.answering.take() {
+            local.input_drafts.insert(
+                reference,
+                InputDraft {
+                    editor: std::mem::take(&mut local.editor),
+                    question_index: local.question_index,
+                    answers: std::mem::take(&mut local.answers),
+                },
+            );
+        }
+        match (local.task_draft.is_some(), id.is_some()) {
             (false, true) => local.task_draft = Some(std::mem::take(&mut local.editor)),
             (true, false) => local.editor = local.task_draft.take().unwrap_or_default(),
             (true, true) => local.editor.clear(),
             (false, false) => {}
         }
-        local.answering = id;
         local.answers.clear();
         local.question_index = 0;
+        if let Some(draft) = id
+            .as_ref()
+            .and_then(|reference| local.input_drafts.remove(reference))
+        {
+            local.editor = draft.editor;
+            local.question_index = draft.question_index;
+            local.answers = draft.answers;
+        }
+        local.answering = id;
     }
 }
 
@@ -335,7 +395,7 @@ fn handle_key(
     tx: &tokio::sync::mpsc::Sender<Command>,
 ) -> bool {
     local.reminders.sync(&snapshot.observation);
-    sync_questions(local, selected_request(snapshot, local).cloned());
+    sync_local_requests(local, snapshot);
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     if let Some(editor) = &mut local.attention_editor {
         match key.code {
@@ -421,17 +481,30 @@ fn handle_key(
             }
             KeyCode::Char('y') | KeyCode::Char('n') => {
                 if let Some(request) = selected_request(snapshot, local) {
-                    send(
+                    let decision = if key.code == KeyCode::Char('y') {
+                        ApprovalDecision::Accept
+                    } else {
+                        ApprovalDecision::Decline
+                    };
+                    if request_locked(snapshot, local, request) {
+                        local.notice = Some(
+                            "Request is submitted or unavailable; wait for resolution.".into(),
+                        );
+                    } else if let Err(error) = request.approval_result(decision) {
+                        local.notice = Some(error.to_string());
+                    } else if send(
                         Command::AnswerApproval {
-                            request_id: request.id.clone(),
-                            decision: if key.code == KeyCode::Char('y') {
-                                ApprovalDecision::Accept
-                            } else {
-                                ApprovalDecision::Decline
-                            },
+                            request: request.reference(),
+                            decision,
                         },
                         tx,
                         local,
+                    ) {
+                        local.submitted.insert(request.reference());
+                    }
+                } else {
+                    local.notice = Some(
+                        "Selected request expired; press F2 to select a current request.".into(),
                     );
                 }
                 return false;
@@ -440,8 +513,17 @@ fn handle_key(
         }
     }
     match key.code {
+        KeyCode::PageUp if local.request_panel => {
+            local.request_scroll = local.request_scroll.saturating_sub(1)
+        }
+        KeyCode::PageDown if local.request_panel => {
+            local.request_scroll = local.request_scroll.saturating_add(1)
+        }
+        KeyCode::Home if local.request_panel && control => local.request_scroll = 0,
+        KeyCode::End if local.request_panel && control => local.request_scroll = usize::MAX,
         KeyCode::F(10) => local.attention_editor = Some(AttentionEditor::new(snapshot, 0)),
         KeyCode::F(11) => {
+            local.request_panel = false;
             local.evidence = !local.evidence;
             local.evidence_scroll = 0;
         }
@@ -451,7 +533,10 @@ fn handle_key(
         KeyCode::PageDown if local.evidence => {
             local.evidence_scroll = local.evidence_scroll.saturating_add(8)
         }
-        KeyCode::F(4) => local.tasks = !local.tasks,
+        KeyCode::F(4) => {
+            local.request_panel = false;
+            local.tasks = !local.tasks;
+        }
         KeyCode::F(5) => {
             send(
                 Command::Schedule(if snapshot.scheduler.paused {
@@ -527,8 +612,23 @@ fn handle_key(
         }
         KeyCode::F(1) => local.help = !local.help,
         KeyCode::F(2) => {
-            local.request_index += 1;
-            sync_questions(local, selected_request(snapshot, local).cloned());
+            if local.request_panel || selected_request(snapshot, local).is_none() {
+                let next = selected_request(snapshot, local)
+                    .and_then(|request| {
+                        snapshot
+                            .requests
+                            .iter()
+                            .position(|r| r.matches(&request.reference()))
+                    })
+                    .map_or(0, |index| (index + 1) % snapshot.requests.len().max(1));
+                local.request_selection = snapshot.requests.get(next).map(RequestView::reference);
+            }
+            local.request_panel = true;
+            local.request_scroll = 0;
+            local.notice = None;
+            local.tasks = false;
+            local.evidence = false;
+            sync_local_requests(local, snapshot);
         }
         KeyCode::F(3) => {
             let next = local
@@ -545,6 +645,10 @@ fn handle_key(
             local.scroll_from_bottom = 0;
         }
         KeyCode::Esc => {
+            if local.request_panel {
+                local.request_panel = false;
+                return false;
+            }
             local.help = false;
             local.tasks = false;
             local.evidence = false;
@@ -565,25 +669,47 @@ fn handle_key(
             let text = local.editor.text.clone();
             if let Some(request) = selected_request(snapshot, local) {
                 if let RequestKind::UserInput { questions } = &request.kind {
+                    if request_locked(snapshot, local, request) {
+                        local.notice = Some(
+                            "Request is submitted or unavailable; wait for resolution.".into(),
+                        );
+                        return false;
+                    }
                     local
                         .answers
                         .insert(questions[local.question_index].id.clone(), vec![text]);
+                    if let Err(error) = request.validate_input_answers(
+                        &local.answers,
+                        local.question_index + 1 == questions.len(),
+                    ) {
+                        local.answers.remove(&questions[local.question_index].id);
+                        local.notice = Some(error.to_string());
+                        return false;
+                    }
                     if local.question_index + 1 < questions.len() {
                         local.question_index += 1;
                         local.editor.clear();
                     } else if send(
                         Command::AnswerUserInput {
-                            request_id: request.id.clone(),
+                            request: request.reference(),
                             answers: local.answers.clone(),
                         },
                         tx,
                         local,
                     ) {
+                        local.submitted.insert(request.reference());
                         local.editor.clear();
                         local.answers.clear();
                     }
                     return false;
                 }
+            }
+            if local.request_panel
+                || local.request_selection.is_some() && selected_request(snapshot, local).is_none()
+            {
+                local.notice =
+                    Some("Close request details with Esc before submitting a root task.".into());
+                return false;
             }
             let explicit_queue = control && key.code == KeyCode::Enter;
             if !(snapshot.phase.can_submit()
@@ -917,6 +1043,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
         "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+    } else if let Some(notice) = &local.notice {
+        notice.clone()
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {
@@ -943,8 +1071,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                 )
             }
             _ => format!(
-                "{} · {}\nCtrl+Y approve once | Ctrl+N decline | F2 next request",
-                request.thread_id, request.summary
+                "{} · {}\n{}",
+                request.thread_id,
+                request.summary,
+                requests::actions(snapshot, local, request)
             ),
         }
     } else if let Some(notice) = notice {
@@ -1040,6 +1170,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     );
     if let Some(editor) = &local.attention_editor {
         draw_attention_editor(frame, snapshot, editor);
+    }
+    if local.request_panel && local.attention_editor.is_none() {
+        requests::draw(frame, snapshot, local);
     }
 }
 
@@ -1447,6 +1580,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::RpcId;
 
     fn observed_snapshot() -> CoreSnapshot {
         use crate::observation::{ObservationFacts, Observer};
@@ -2126,6 +2260,302 @@ mod tests {
         );
         assert_eq!(local.editor.text, "draft");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn approval_selection_is_pinned_and_each_submission_locks_before_core_redraw() {
+        let make = |id, seq, decisions| {
+            let mut request = RequestView::decode(RpcId::Number(id), "item/commandExecution/requestApproval", &serde_json::json!({"threadId":"root","turnId":"one","command":"review","availableDecisions":decisions})).unwrap();
+            request.received_seq = seq;
+            request
+        };
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![
+                make(1, 1, vec!["decline"]),
+                make(2, 2, vec!["accept", "decline"]),
+            ],
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        local.editor.insert("TASK_DRAFT");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        handle_key(
+            key(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            local.request_selection,
+            Some(snapshot.requests[0].reference())
+        );
+        handle_key(
+            key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: snapshot.requests[0].reference(),
+                decision: ApprovalDecision::Decline
+            }
+        );
+        handle_key(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            key(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: snapshot.requests[1].reference(),
+                decision: ApprovalDecision::Accept
+            }
+        );
+        handle_key(
+            key(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        snapshot.requests[0] = make(1, 3, vec!["accept", "decline"]);
+        handle_key(
+            key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(selected_request(&snapshot, &local).is_none());
+        handle_key(
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert!(!local.request_panel);
+        handle_key(
+            key(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: snapshot.requests[0].reference(),
+                decision: ApprovalDecision::Accept
+            }
+        );
+    }
+
+    #[test]
+    fn input_drafts_follow_request_deliveries_and_esc_only_closes_details() {
+        let make = |id, seq| {
+            let mut request = RequestView::decode(RpcId::Number(id), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root","turnId":"one","questions":[{"id":"secret","header":"Secret","question":"Value?","isSecret":true}]})).unwrap();
+            request.received_seq = seq;
+            request
+        };
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![make(1, 1), make(2, 2)],
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        local.editor.insert("TASK_DRAFT");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let f2 = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        handle_key(f2, &snapshot, &mut local, &tx);
+        local.editor.insert("SECRET_A中文👋");
+        handle_key(f2, &snapshot, &mut local, &tx);
+        assert!(local.editor.text.is_empty());
+        local.editor.insert("SECRET_B");
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.editor.text, "SECRET_B");
+        handle_key(f2, &snapshot, &mut local, &tx);
+        handle_key(f2, &snapshot, &mut local, &tx);
+        assert_eq!(local.editor.text, "SECRET_A中文👋");
+        assert_eq!(local.task_draft.as_ref().unwrap().text, "TASK_DRAFT");
+        snapshot.requests[0] = make(1, 3);
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        handle_key(f2, &snapshot, &mut local, &tx);
+        assert!(local.editor.text.is_empty());
+        assert!(!local
+            .input_drafts
+            .keys()
+            .any(|reference| reference.received_seq == 1));
+    }
+
+    #[test]
+    fn request_context_is_scrollable_at_all_supported_sizes_and_never_exposes_secret_drafts() {
+        let request = RequestView::decode(RpcId::Number(1), "item/commandExecution/requestApproval", &serde_json::json!({"threadId":"root","turnId":"one","itemId":"shell","command":"printf 中文👋\nSECOND_LINE\u{001b}[31m","cwd":"COMMAND_DIRECTORY","startedAtMs":123,"availableDecisions":["accept","decline","acceptForSession"],"additionalPermissions":{"network":{"enabled":true}}})).unwrap();
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            sandbox: "workspace-write".into(),
+            approval_policy: "never".into(),
+            cwd: "SESSION_DIRECTORY".into(),
+            requests: vec![request],
+            ..Default::default()
+        };
+        for (width, height) in [
+            (30, 10),
+            (60, 20),
+            (80, 24),
+            (100, 30),
+            (120, 40),
+            (160, 50),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut local = LocalState {
+                request_panel: true,
+                ..Default::default()
+            };
+            sync_local_requests(&mut local, &snapshot);
+            let mut seen = String::new();
+            for scroll in 0..120 {
+                local.request_scroll = scroll;
+                terminal
+                    .draw(|frame| draw(frame, &snapshot, &local))
+                    .unwrap();
+                seen.extend(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol()),
+                );
+            }
+            for value in [
+                "SECOND_LINE",
+                "COMMAND_DIRECTORY",
+                "never",
+                "acceptForSession",
+                "not applied",
+                "Ctrl+Y",
+                "Ctrl+N",
+            ] {
+                assert!(seen.contains(value), "missing {value} at {width}x{height}");
+            }
+            assert!(!seen.contains('\u{001b}'));
+        }
+        snapshot.requests = vec![RequestView::decode(RpcId::Number(2),"item/tool/requestUserInput",&serde_json::json!({"threadId":"root","turnId":"one","questions":[{"id":"secret","header":"Secret","question":"Long question 中文👋","isSecret":true,"options":[{"label":"Choice","description":"OPTION_DETAIL"}]}]})).unwrap()];
+        let mut local = LocalState {
+            request_panel: true,
+            ..Default::default()
+        };
+        sync_local_requests(&mut local, &snapshot);
+        local.editor.insert("PRIVATE_ANSWER");
+        for scroll in 0..60 {
+            let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+            local.request_scroll = scroll;
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(!rendered.contains("PRIVATE_ANSWER"));
+        }
+    }
+
+    #[test]
+    fn oversized_multi_question_answers_keep_the_draft_and_can_be_corrected() {
+        let request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root","turnId":"one","questions":[{"id":"a","header":"A","question":"First"},{"id":"b","header":"B","question":"Second"}]})).unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        sync_local_requests(&mut local, &snapshot);
+        local.editor.insert(&"a".repeat(20000));
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        local.editor.insert(&"b".repeat(20000));
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text.len(), 20000);
+        assert!(local.notice.as_ref().unwrap().contains("32 KiB"));
+        local.editor.clear();
+        local.editor.insert("short answer");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::AnswerUserInput { .. }
+        ));
+        assert!(local.submitted.contains(&snapshot.requests[0].reference()));
     }
 
     #[test]

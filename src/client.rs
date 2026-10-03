@@ -11,7 +11,7 @@ use crate::agents::AgentInfo;
 use crate::app_server::{self, AppServer, AppServerError};
 use crate::config::Config;
 use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequest, WaitToken};
-use crate::interactions::{ApprovalDecision, RequestView};
+use crate::interactions::{files::FilePreviews, ApprovalDecision, RequestRef, RequestView};
 use crate::journal::{Journal, JournalError, StoredSnapshot};
 use crate::observation::{AttentionClass, ChildFact, ObservationFacts, Observer};
 use crate::protocol::{self, Envelope, RpcId};
@@ -36,11 +36,11 @@ pub enum Command {
         command: SchedulerCommand,
     },
     AnswerApproval {
-        request_id: RpcId,
+        request: RequestRef,
         decision: ApprovalDecision,
     },
     AnswerUserInput {
-        request_id: RpcId,
+        request: RequestRef,
         answers: BTreeMap<String, Vec<String>>,
     },
     Interrupt,
@@ -50,9 +50,7 @@ pub enum Command {
         attention_ms: u64,
     },
     HeadlessRequest {
-        request_id: RpcId,
-        thread_id: String,
-        turn_id: String,
+        request: RequestRef,
     },
     OutputUnavailable,
     UnconfirmedHeadlessInteraction,
@@ -201,6 +199,7 @@ impl ClientHandle {
                 gate: PendingGate::default(),
                 wait: None,
                 ingress_seq: 0,
+                file_previews: FilePreviews::default(),
                 collab_starts: HashMap::new(),
                 completed_collab: VecDeque::new(),
                 completed_waits: VecDeque::new(),
@@ -271,6 +270,7 @@ struct Core {
     gate: PendingGate,
     wait: Option<PendingTool>,
     ingress_seq: u64,
+    file_previews: FilePreviews,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -619,21 +619,16 @@ impl Core {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::HeadlessRequest {
-                request_id,
-                thread_id,
-                turn_id,
-            } => {
+            Command::HeadlessRequest { request: reference } => {
                 let Some(request) = self
                     .state
                     .view
                     .requests
                     .iter()
                     .find(|request| {
-                        request.id == request_id
-                            && request.thread_id == thread_id
-                            && request.turn_id == turn_id
+                        request.matches(&reference)
                             && !request.responding
+                            && self.request_is_live(request)
                     })
                     .cloned()
                 else {
@@ -644,19 +639,19 @@ impl Core {
                     crate::interactions::RequestKind::UserInput { .. }
                 ) {
                     crate::interactions::HeadlessAction::InterruptForInput {
-                        request_id,
+                        request_id: reference.id.clone(),
                         thread_id: request.thread_id,
                         turn_id: request.turn_id,
                     }
                 } else if !request.allow_decline {
                     crate::interactions::HeadlessAction::InterruptForApproval {
-                        request_id,
+                        request_id: reference.id.clone(),
                         thread_id: request.thread_id,
                         turn_id: request.turn_id,
                     }
                 } else {
                     crate::interactions::HeadlessAction::DeclineApproval {
-                        request_id: request_id.clone(),
+                        request_id: reference.id.clone(),
                         thread_id: request.thread_id,
                         turn_id: request.turn_id,
                     }
@@ -669,7 +664,7 @@ impl Core {
                     self.command(Command::Interrupt);
                 } else {
                     self.command(Command::AnswerApproval {
-                        request_id: request.id,
+                        request: reference,
                         decision: ApprovalDecision::Decline,
                     });
                 }
@@ -767,40 +762,56 @@ impl Core {
                     self.issue_interrupt();
                 }
             }
-            Command::AnswerApproval {
-                request_id,
-                decision,
-            } => {
+            Command::AnswerApproval { request, decision } => {
                 let result = self
                     .state
                     .view
                     .requests
                     .iter()
-                    .find(|r| r.id == request_id)
+                    .find(|r| r.matches(&request) && self.request_is_live(r))
                     .ok_or_else(|| "Request already resolved.".to_owned())
                     .and_then(|request| {
                         request.approval_result(decision).map_err(|e| e.to_string())
                     });
-                self.respond(request_id, result);
+                self.respond(request.id, result);
             }
-            Command::AnswerUserInput {
-                request_id,
-                answers,
-            } => {
+            Command::AnswerUserInput { request, answers } => {
                 let result = self
                     .state
                     .view
                     .requests
                     .iter()
-                    .find(|r| r.id == request_id)
+                    .find(|r| r.matches(&request) && self.request_is_live(r))
                     .ok_or_else(|| "Request already resolved.".to_owned())
                     .and_then(|request| request.input_result(&answers).map_err(|e| e.to_string()));
-                self.respond(request_id, result);
+                self.respond(request.id, result);
             }
             Command::Quit
             | Command::OutputUnavailable
             | Command::UnconfirmedHeadlessInteraction => {}
         }
+    }
+
+    fn request_is_live(&self, request: &RequestView) -> bool {
+        self.preflight_passed
+            && !matches!(
+                self.state.view.phase,
+                SessionPhase::Unknown
+                    | SessionPhase::Disconnected
+                    | SessionPhase::Stopping
+                    | SessionPhase::ClosingTransport
+                    | SessionPhase::Stopped
+            )
+            && ((self.state.view.thread_id.as_deref() == Some(&request.thread_id)
+                && self.state.view.turn_id.as_deref() == Some(&request.turn_id)
+                && matches!(
+                    self.state.view.phase,
+                    SessionPhase::Running | SessionPhase::GatePending
+                ))
+                || self
+                    .state
+                    .agents
+                    .active_turn(&request.thread_id, &request.turn_id))
     }
 
     fn queue_tasks(&mut self, tasks: Vec<RootTaskSpec>) {
@@ -1051,7 +1062,7 @@ impl Core {
                     return;
                 }
                 match RequestView::decode(id.clone(), method, &params) {
-                    Ok(request) => {
+                    Ok(mut request) => {
                         let root_request = request.thread_id
                             == self.state.view.thread_id.as_deref().unwrap_or("")
                             && request.turn_id == self.state.view.turn_id.as_deref().unwrap_or("");
@@ -1076,6 +1087,8 @@ impl Core {
                         } else if self.state.view.requests.iter().any(|r| r.id == id) {
                             // A repeated delivery is still the same pending interaction.
                         } else if self.state.view.requests.len() < 64 {
+                            request.received_seq = self.ingress_seq;
+                            self.file_previews.attach(&mut request);
                             self.state.view.requests.push(request);
                         } else {
                             let _ = self.pipe.send(Envelope::error_response(
@@ -1763,6 +1776,13 @@ impl Core {
                 ))
                 || self.state.agents.active_turn(thread, turn);
             if owned {
+                if matches!(method, "item/started" | "item/completed") {
+                    self.file_previews.observe(
+                        &params,
+                        self.ingress_seq,
+                        &mut self.state.view.requests,
+                    );
+                }
                 if let Some(notice) = protocol::decode_observed_tool(method, &params) {
                     match notice {
                         Ok(notice) => {
@@ -1875,6 +1895,7 @@ impl Core {
                                 };
                             let event = self.state.agents.completed(thread, turn, outcome);
                             if event.is_some() {
+                                self.file_previews.retire(thread, turn);
                                 self.state.view.requests.retain(|request| {
                                     request.thread_id != thread || request.turn_id != turn
                                 });
@@ -1929,6 +1950,9 @@ impl Core {
                     Some(r.thread_id.as_str()) != self.state.view.thread_id.as_deref()
                         || r.turn_id != id.unwrap_or("")
                 });
+                if let Some(thread) = self.state.view.thread_id.as_deref() {
+                    self.file_previews.retire(thread, id.unwrap());
+                }
                 self.state.view.tool_activity = None;
                 self.state.view.notice = None;
                 self.interrupt_requested = false;
@@ -2114,7 +2138,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::Number(7),
+                request: current_request(&client, RpcId::Number(7)),
                 decision: ApprovalDecision::Decline,
             })
             .await
@@ -2218,7 +2242,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::String("approval-id".into()),
+                request: current_request(&client, RpcId::String("approval-id".into())),
                 decision: ApprovalDecision::Decline,
             })
             .await
@@ -2379,9 +2403,7 @@ mod tests {
         client
             .commands
             .send(Command::HeadlessRequest {
-                request_id: RpcId::Number(7),
-                thread_id: "root".into(),
-                turn_id: "root-turn".into(),
+                request: current_request(&client, RpcId::Number(7)),
             })
             .await
             .unwrap();
@@ -2576,9 +2598,10 @@ mod tests {
         client
             .commands
             .send(Command::HeadlessRequest {
-                request_id: RpcId::Number(7),
-                thread_id: "root".into(),
-                turn_id: "old-turn".into(),
+                request: RequestRef {
+                    turn_id: "old-turn".into(),
+                    ..current_request(&client, RpcId::Number(7))
+                },
             })
             .await
             .unwrap();
@@ -2591,13 +2614,214 @@ mod tests {
         client
             .commands
             .send(Command::HeadlessRequest {
-                request_id: RpcId::Number(7),
-                thread_id: "root".into(),
-                turn_id: "root-turn".into(),
+                request: current_request(&client, RpcId::Number(7)),
             })
             .await
             .unwrap();
         assert_eq!(next(&mut server).await["result"]["decision"], "decline");
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    fn current_request(client: &ClientHandle, id: RpcId) -> RequestRef {
+        client
+            .snapshots
+            .borrow()
+            .requests
+            .iter()
+            .find(|request| request.id == id)
+            .unwrap()
+            .reference()
+    }
+
+    #[tokio::test]
+    async fn reused_request_ids_cannot_receive_stale_approval_input_or_headless_actions() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let approval = json!({"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"root-turn","command":"first"}});
+        observation_event(&mut client, &mut server, approval.clone()).await;
+        let old = current_request(&client, RpcId::Number(7));
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"serverRequest/resolved","params":{"threadId":"root","requestId":7}}),
+        )
+        .await;
+        observation_event(&mut client, &mut server, approval.clone()).await;
+        let current = current_request(&client, RpcId::Number(7));
+        assert_ne!(old.received_seq, current.received_seq);
+        observation_event(&mut client, &mut server, approval).await;
+        assert_eq!(current_request(&client, RpcId::Number(7)), current);
+        for reference in [
+            old.clone(),
+            RequestRef {
+                thread_id: "other".into(),
+                ..current.clone()
+            },
+            RequestRef {
+                turn_id: "old-turn".into(),
+                ..current.clone()
+            },
+        ] {
+            client
+                .commands
+                .send(Command::AnswerApproval {
+                    request: reference,
+                    decision: ApprovalDecision::Accept,
+                })
+                .await
+                .unwrap();
+        }
+        client
+            .commands
+            .send(Command::AnswerUserInput {
+                request: old.clone(),
+                answers: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::HeadlessRequest { request: old })
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::ConfigureAttention {
+                class: AttentionClass::Model,
+                quiet_ms: 5000,
+                attention_ms: 10000,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.contains("settings applied"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert!(!client.snapshots.borrow().requests[0].responding);
+        assert!(client.snapshots.borrow().last_headless_action.is_none());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        client
+            .commands
+            .send(Command::AnswerApproval {
+                request: current.clone(),
+                decision: ApprovalDecision::Decline,
+            })
+            .await
+            .unwrap();
+        assert_eq!(next(&mut server).await["result"]["decision"], "decline");
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"serverRequest/resolved","params":{"threadId":"root","requestId":7}}),
+        )
+        .await;
+        observation_event(&mut client, &mut server, json!({"id":7,"method":"item/tool/requestUserInput","params":{"threadId":"root","turnId":"root-turn","questions":[{"id":"secret","header":"Secret","question":"Value?","isSecret":true}]}})).await;
+        let answers = BTreeMap::from([("secret".into(), vec!["answer".into()])]);
+        client
+            .commands
+            .send(Command::AnswerUserInput {
+                request: current,
+                answers: answers.clone(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.notice.as_deref() == Some("Request already resolved."))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client
+            .commands
+            .send(Command::AnswerUserInput {
+                request: current_request(&client, RpcId::Number(7)),
+                answers,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut server).await["result"]["answers"]["secret"]["answers"][0],
+            "answer"
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_approval_context_is_owned_live_only_and_retired_with_its_turn() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let item = json!({"id":"file-1","type":"fileChange","status":"inProgress","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":null},"diff":"PRIVATE_DIFF"}]});
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"other","turnId":"root-turn","item":item}})).await;
+        observation_event(&mut client, &mut server, json!({"id":7,"method":"item/fileChange/requestApproval","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1","reason":"PRIVATE_REASON","grantRoot":"PRIVATE_ROOT"}})).await;
+        assert!(client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .is_none());
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"old-turn","item":item}})).await;
+        assert!(client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .is_none());
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":item}})).await;
+        assert!(client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("PRIVATE_DIFF"));
+        observation_event(&mut client, &mut server, json!({"id":8,"method":"item/fileChange/requestApproval","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1"}})).await;
+        assert!(client.snapshots.borrow().requests[1]
+            .details
+            .file_preview
+            .is_some());
+        let stored =
+            serde_json::to_string(&StoredSnapshot::capture(&client.snapshots.borrow())).unwrap();
+        for private in [
+            "PRIVATE_FILE",
+            "PRIVATE_DIFF",
+            "PRIVATE_REASON",
+            "PRIVATE_ROOT",
+        ] {
+            assert!(!stored.contains(private));
+        }
+        observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        assert!(client.snapshots.borrow().requests.is_empty());
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "next".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"next-turn"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        observation_event(&mut client, &mut server, json!({"id":7,"method":"item/fileChange/requestApproval","params":{"threadId":"root","turnId":"next-turn","itemId":"file-1"}})).await;
+        assert!(client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .is_none());
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }
@@ -3260,7 +3484,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::String("approval-paused".into()),
+                request: current_request(&client, RpcId::String("approval-paused".into())),
                 decision: ApprovalDecision::Accept,
             })
             .await
@@ -3937,7 +4161,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::String("remaining-approval".into()),
+                request: current_request(&client, RpcId::String("remaining-approval".into())),
                 decision: ApprovalDecision::Decline,
             })
             .await
@@ -4018,7 +4242,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::String("child-approval".into()),
+                request: current_request(&client, RpcId::String("child-approval".into())),
                 decision: ApprovalDecision::Decline,
             })
             .await
@@ -4725,7 +4949,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::String("approval".into()),
+                request: current_request(&client, RpcId::String("approval".into())),
                 decision: ApprovalDecision::Decline,
             })
             .await
@@ -4818,7 +5042,7 @@ mod tests {
         client
             .commands
             .send(Command::AnswerApproval {
-                request_id: RpcId::String("active".into()),
+                request: current_request(&client, RpcId::String("active".into())),
                 decision: ApprovalDecision::Decline,
             })
             .await

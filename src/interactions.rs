@@ -67,6 +67,41 @@ pub enum RequestKind {
     UserInput { questions: Vec<InputQuestion> },
 }
 
+/// Identifies one accepted delivery, including reuse of an RPC ID in the same turn.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestRef {
+    pub id: RpcId,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub received_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailField {
+    pub label: &'static str,
+    pub text: String,
+}
+
+/// Live request context. Never included in the journal or diagnostic projection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RequestDetails {
+    pub item_id: Option<String>,
+    pub started_at_ms: Option<i64>,
+    pub fields: Vec<DetailField>,
+    pub available_decisions: Option<Vec<String>>,
+    pub file_preview: Option<FilePreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePreview {
+    pub text: String,
+    pub source_seq: u64,
+    pub truncated: bool,
+    pub unavailable: bool,
+}
+
+pub(crate) mod files;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestView {
     pub id: RpcId,
@@ -77,6 +112,8 @@ pub struct RequestView {
     pub allow_accept: bool,
     pub allow_decline: bool,
     pub responding: bool,
+    pub received_seq: u64,
+    pub details: RequestDetails,
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +129,22 @@ pub enum InteractionError {
 }
 
 impl RequestView {
+    pub fn reference(&self) -> RequestRef {
+        RequestRef {
+            id: self.id.clone(),
+            thread_id: self.thread_id.clone(),
+            turn_id: self.turn_id.clone(),
+            received_seq: self.received_seq,
+        }
+    }
+
+    pub fn matches(&self, reference: &RequestRef) -> bool {
+        self.id == reference.id
+            && self.thread_id == reference.thread_id
+            && self.turn_id == reference.turn_id
+            && self.received_seq == reference.received_seq
+    }
+
     pub fn decode(id: RpcId, method: &str, params: &Value) -> Result<Self, InteractionError> {
         if params.to_string().len() > 32 * 1024 {
             return Err(InteractionError::Invalid("request exceeds 32 KiB".into()));
@@ -108,7 +161,16 @@ impl RequestView {
         let turn_id = string("turnId")?;
         let kind =
             match method {
-                "item/commandExecution/requestApproval" => RequestKind::CommandApproval,
+                "item/commandExecution/requestApproval" => {
+                    if params.get("kind").is_some_and(|kind| {
+                        !matches!(kind.as_str(), Some("command" | "writeStdin"))
+                    }) {
+                        return Err(InteractionError::Invalid(
+                            "unsupported command approval kind".into(),
+                        ));
+                    }
+                    RequestKind::CommandApproval
+                }
                 "item/fileChange/requestApproval" => RequestKind::FileApproval,
                 "item/tool/requestUserInput" => {
                     let questions: Vec<InputQuestion> =
@@ -144,10 +206,33 @@ impl RequestView {
                 .to_owned(),
             RequestKind::UserInput { questions } => questions[0].question.clone(),
         };
-        let decisions = params.get("availableDecisions").and_then(Value::as_array);
+        let decisions = match params.get("availableDecisions") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(values)) => Some(values),
+            _ => {
+                return Err(InteractionError::Invalid(
+                    "invalid availableDecisions".into(),
+                ))
+            }
+        };
         let allows = |decision: &str| {
             decisions.is_none_or(|values| values.iter().any(|v| v.as_str() == Some(decision)))
         };
+        let mut details = RequestDetails::decode(params, decisions)?;
+        if matches!(kind, RequestKind::CommandApproval)
+            && !details
+                .fields
+                .iter()
+                .any(|field| field.label == "Operation")
+        {
+            details.fields.insert(
+                0,
+                DetailField {
+                    label: "Operation",
+                    text: "command (protocol default)".into(),
+                },
+            );
+        }
         Ok(Self {
             id,
             thread_id,
@@ -157,6 +242,8 @@ impl RequestView {
             allow_accept: allows("accept"),
             allow_decline: allows("decline"),
             responding: false,
+            received_seq: 0, // Core stamps this when accepting a request.
+            details,
         })
     }
 
@@ -177,6 +264,18 @@ impl RequestView {
         &self,
         answers: &BTreeMap<String, Vec<String>>,
     ) -> Result<Value, InteractionError> {
+        self.validate_input_answers(answers, true)?;
+        Ok(
+            json!({"answers":answers.iter().map(|(id, answers)| (id.clone(), json!({"answers":answers}))).collect::<serde_json::Map<_,_>>()}),
+        )
+    }
+
+    /// Checks partial drafts as well as final answers without exposing protocol JSON to UI.
+    pub fn validate_input_answers(
+        &self,
+        answers: &BTreeMap<String, Vec<String>>,
+        complete: bool,
+    ) -> Result<(), InteractionError> {
         if self.responding {
             return Err(InteractionError::Resolved);
         }
@@ -190,22 +289,136 @@ impl RequestView {
         {
             return Err(InteractionError::Invalid("answers exceed 32 KiB".into()));
         }
-        if answers.len() != questions.len()
-            || questions.iter().any(|q| !answers.contains_key(&q.id))
+        if (complete && answers.len() != questions.len())
+            || answers
+                .keys()
+                .any(|id| !questions.iter().any(|q| &q.id == id))
         {
             return Err(InteractionError::Invalid(
                 "answer every question using its ID".into(),
             ));
         }
-        Ok(
-            json!({"answers":answers.iter().map(|(id, answers)| (id.clone(), json!({"answers":answers}))).collect::<serde_json::Map<_,_>>()}),
-        )
+        Ok(())
+    }
+}
+
+impl RequestDetails {
+    fn decode(params: &Value, decisions: Option<&Vec<Value>>) -> Result<Self, InteractionError> {
+        let optional_string = |key: &str| match params.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            _ => Err(InteractionError::Invalid(format!("invalid {key}"))),
+        };
+        let started_at_ms = match params.get("startedAtMs") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or_else(|| InteractionError::Invalid("invalid startedAtMs".into()))?,
+            ),
+        };
+        let mut fields = Vec::new();
+        for (key, label) in [
+            ("kind", "Operation"),
+            ("command", "Command"),
+            ("cwd", "Command cwd"),
+            ("reason", "Reason"),
+            ("approvalId", "Approval callback"),
+            ("environmentId", "Environment"),
+            ("grantRoot", "Proposed session write root (not applied)"),
+        ] {
+            if let Some(text) = optional_string(key)? {
+                fields.push(DetailField { label, text });
+            }
+        }
+        // Decode display excerpts at the protocol edge; views never inspect JSON.
+        // These proposals do not grant permission or enable a new decision.
+        for (key, label) in [
+            ("commandActions", "Server command actions"),
+            ("networkApprovalContext", "Network approval context"),
+            (
+                "additionalPermissions",
+                "Additional permission proposal (not applied)",
+            ),
+            (
+                "proposedExecpolicyAmendment",
+                "Execution policy proposal (not applied)",
+            ),
+            (
+                "proposedNetworkPolicyAmendments",
+                "Network policy proposals (not applied)",
+            ),
+        ] {
+            if let Some(value) = params.get(key).filter(|value| !value.is_null()) {
+                fields.push(DetailField {
+                    label,
+                    text: value.to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            item_id: optional_string("itemId")?,
+            started_at_ms,
+            fields,
+            available_decisions: decisions.map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string())
+                    })
+                    .collect()
+            }),
+            file_preview: None,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_context_keeps_proposals_explicit_and_rejects_invalid_identity_field_types() {
+        let params = json!({"threadId":"t","turnId":"u","itemId":"i","kind":"writeStdin","startedAtMs":-1,"command":null,"cwd":null,"approvalId":"callback","additionalPermissions":{"network":{"enabled":true}},"availableDecisions":["acceptForSession",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["echo"]}}]});
+        let request = RequestView::decode(
+            RpcId::Number(1),
+            "item/commandExecution/requestApproval",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(request.details.started_at_ms, Some(-1));
+        assert!(request
+            .details
+            .fields
+            .iter()
+            .any(|field| field.label == "Operation" && field.text == "writeStdin"));
+        assert!(request
+            .details
+            .fields
+            .iter()
+            .any(|field| field.label.contains("not applied") && field.text.contains("network")));
+        assert!(request.approval_result(ApprovalDecision::Accept).is_err());
+        assert!(request.approval_result(ApprovalDecision::Decline).is_err());
+        for (key, value) in [
+            ("kind", json!("newUnknownOperation")),
+            ("itemId", json!(123)),
+            ("startedAtMs", json!("bad")),
+            ("availableDecisions", json!({})),
+            ("cwd", json!([])),
+        ] {
+            let mut invalid = params.clone();
+            invalid[key] = value;
+            assert!(RequestView::decode(
+                RpcId::Number(1),
+                "item/commandExecution/requestApproval",
+                &invalid
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn approvals_respect_available_decisions_and_are_not_user_input() {
