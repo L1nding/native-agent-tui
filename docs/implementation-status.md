@@ -143,3 +143,11 @@ app-server 和目录查询共用私有 `owned_process` 接口。Windows 通过 `
 独立源码/target 的 20 组对照为原路径 18/20、隔离路径 20/20。初次生产接入十次启动通过；补齐响应不确定性后，最终源码另跑五次，全部确认 Ready、零根请求/轮次、进程清理及 journal 关闭。最终 `python scripts/verify.py --live` 全部通过：143 项默认 Rust 测试、五项真实 Codex 测试、十二个兼容场景、八项启动 runner 测试、三项进程身份检查、11 个 Windows 所有权场景及原有原生夹具；fmt/check/clippy/doctest/release 通过。清理 fixture 核对 PID 与创建时间并有界确认退出，覆盖主/辅助父子进程。
 
 详细边界、历史失败和验证限制见[启动可靠性](startup-reliability.md)与[Codex 兼容门禁](codex-compatibility.md)。结果限于本机锁定版本；搜索、提醒关闭、完整请求详情、交互和试用验收，以及 Alpha/V2 仍待完成。
+
+## UI 本地静默提醒
+
+Ctrl+W 关闭/恢复所选代理当前的静默提醒；记录仅在 UI 内绑定活动身份、证据序号和注意级别。新证据只恢复对应活动，新轮次/尝试/时钟来源及注意级别变化重新提示。审批、requires_action 和 Unknown 不能关闭，Core attention、journal、JSONL 及 Gate 保持原事实；任务与秘密草稿保留。
+
+15 项 UI 测试通过，其中四项新增回归覆盖活动隔离、身份/证据更新、无命令副作用、草稿和宽窄终端呈现。完整 `python scripts/verify.py` 通过 147 项默认 Rust 测试与全部原生夹具，fmt/check/clippy/doctest/release 通过。Windows 终端使用持续运行的 Python fixture 验证中文/emoji 草稿、F11、提醒关闭/恢复；切换前后只有一个根请求、零中断请求，静默进展序号保持 3。随后明确中断、退出，确认进程清理、journal 关闭和只读回放的 Interrupted。最终 CLI 帮助也已同步并完成 fmt/check/clippy/release 验证。
+
+使用与范围见[活动观察](activity-observation.md)和[本地提醒验证](attention-reminders-validation.md)。本次终端检查没有调用真实模型，前一项启动修复的五项真实 Codex 验证保持独立记录。搜索、完整请求详情、更广终端和试用验收，以及 Alpha/V2 仍待完成。

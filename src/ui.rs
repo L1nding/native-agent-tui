@@ -30,6 +30,7 @@ use crate::scheduler::{
 use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 
 mod history;
+mod reminders;
 
 #[derive(Debug, Error)]
 pub enum UiError {
@@ -86,6 +87,7 @@ impl Editor {
 
 #[derive(Default)]
 struct LocalState {
+    reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
     evidence_scroll: usize,
@@ -171,6 +173,7 @@ async fn run_tasks_inner(
         loop {
             if dirty {
                 let snapshot = client.snapshots.borrow().clone();
+                local.reminders.sync(&snapshot.observation);
                 let request = selected_request(&snapshot, &local).cloned();
                 sync_questions(&mut local, request);
                 terminal.terminal.draw(|frame| {
@@ -331,6 +334,7 @@ fn handle_key(
     local: &mut LocalState,
     tx: &tokio::sync::mpsc::Sender<Command>,
 ) -> bool {
+    local.reminders.sync(&snapshot.observation);
     sync_questions(local, selected_request(snapshot, local).cloned());
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     if let Some(editor) = &mut local.attention_editor {
@@ -400,6 +404,19 @@ fn handle_key(
             }
             KeyCode::Char('u') => {
                 local.editor.clear();
+                return false;
+            }
+            KeyCode::Char('w') => {
+                let agent = selected_agent_id(snapshot, local);
+                local.notice = if local
+                    .reminders
+                    .toggle_for_agent(&snapshot.observation, agent)
+                    .is_some()
+                {
+                    None
+                } else {
+                    Some("No silence reminders for the selected agent. Pending requests still require an answer.".into())
+                };
                 return false;
             }
             KeyCode::Char('y') | KeyCode::Char('n') => {
@@ -611,6 +628,14 @@ fn selected_task<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&
         .or_else(|| snapshot.scheduler.tasks.first())
 }
 
+fn selected_agent_id<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> &'a str {
+    local
+        .agent_id
+        .as_ref()
+        .and_then(|id| snapshot.agents.iter().find(|agent| &agent.info.id == id))
+        .map_or("root", |agent| agent.info.id.as_str())
+}
+
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut output = Vec::new();
     for source in display_text(text).split('\n') {
@@ -690,11 +715,23 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .iter()
         .filter(|activity| activity.attention.level == AttentionLevel::AttentionNeeded)
         .count();
+    let acknowledged = snapshot
+        .observation
+        .activities
+        .iter()
+        .filter(|activity| local.reminders.is_acknowledged(activity))
+        .count();
+    let reminders_status = if acknowledged > 0 {
+        format!(" | waiting:{acknowledged}")
+    } else {
+        String::new()
+    };
     let status = format!(
-        "{:?} | action:{} attention:{} | turns: {} | children: {} | queued: {}{}",
+        "{:?} | action:{} attention:{}{} | turns: {} | children: {} | queued: {}{}",
         snapshot.phase,
         actions,
         attention,
+        reminders_status,
         snapshot.root_turn_count,
         snapshot.agents.len(),
         snapshot.queued_inputs,
@@ -717,8 +754,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     let selected_activity = focus_activity(snapshot, agent_id);
     let mut header = vec![Line::from(status)];
     if let Some(activity) = selected_activity {
-        header.push(Line::from(display_text(&activity_brief(activity))));
-        header.push(Line::from(display_text(&evidence_brief(activity))));
+        header.push(Line::from(display_text(&reminder_brief(activity, local))));
+        header.push(Line::from(display_text(&evidence_brief(activity, local))));
     }
     header.push(Line::from(display_text(&settings)));
     if area.height <= 16 && selected_activity.is_some() {
@@ -728,8 +765,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         Paragraph::new(header).block(Block::default().borders(Borders::ALL).title(
             if area.height <= 16 && selected_activity.is_some() {
                 format!(
-                    " {:?} action:{actions} attention:{attention} ",
-                    snapshot.phase
+                    " {:?} action:{actions} attention:{attention}{} ",
+                    snapshot.phase,
+                    if acknowledged > 0 {
+                        format!(" wait:{acknowledged}")
+                    } else {
+                        String::new()
+                    }
                 )
             } else {
                 format!(" Native Agent TUI {} ", env!("CARGO_PKG_VERSION"))
@@ -874,7 +916,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {
@@ -990,9 +1032,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         Paragraph::new(if local.tasks {
             "Up/Down select  F5 workflow  F6 pause  F7 cancel  F8 retry  +/- priority  F9 stop"
         } else if local.evidence {
-            "PgUp/PgDn evidence  F10 thresholds  F11 close  F3 agent"
+            "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
         } else {
-            "Enter send | Ctrl+C interrupt | Ctrl+Q quit | F3 agent | F4 tasks | F12 history"
+            "Enter send | Ctrl+C interrupt | Ctrl+Q quit | F3 agent | F4 tasks | F11 evidence | Ctrl+W wait/restore | F12 history"
         }),
         chunks[4],
     );
@@ -1047,16 +1089,26 @@ fn activity_brief(activity: &ActivitySnapshot) -> String {
     )
 }
 
-fn next_action(activity: &ActivitySnapshot) -> &'static str {
+fn reminder_brief(activity: &ActivitySnapshot, local: &LocalState) -> String {
+    let mut text = activity_brief(activity);
+    if local.reminders.is_acknowledged(activity) {
+        text.push_str(" | reminder off locally");
+    }
+    text
+}
+
+fn next_action(activity: &ActivitySnapshot, local: &LocalState) -> &'static str {
     if activity.attention.requires_action {
         "F2 answer request"
     } else if activity.execution_state == ExecutionState::Unknown {
         "inspect unknown outcome"
+    } else if local.reminders.is_acknowledged(activity) {
+        "continuing to wait; Ctrl+W restore"
     } else if matches!(
         activity.attention.level,
         AttentionLevel::Quiet | AttentionLevel::AttentionNeeded
     ) {
-        "F11 inspect; wait or Ctrl+C"
+        "F11 inspect; Ctrl+W wait or Ctrl+C"
     } else if activity.attention.level == AttentionLevel::Ended {
         "review result"
     } else {
@@ -1064,10 +1116,10 @@ fn next_action(activity: &ActivitySnapshot) -> &'static str {
     }
 }
 
-fn evidence_brief(activity: &ActivitySnapshot) -> String {
+fn evidence_brief(activity: &ActivitySnapshot, local: &LocalState) -> String {
     format!(
         "Next: {} | Last: {}",
-        next_action(activity),
+        next_action(activity, local),
         activity.last_evidence.as_ref().map_or_else(
             || "unknown".into(),
             |evidence| format!("{:?} {:?} #{}", evidence.kind, evidence.source, evidence.id)
@@ -1102,6 +1154,9 @@ fn draw_evidence(
             activity.attention.level
         ));
         rows.push(activity_brief(activity));
+        if local.reminders.is_acknowledged(activity) {
+            rows.push("Silence reminder: off locally until new evidence; Ctrl+W restore".into());
+        }
         rows.push(format!(
             "Last: {}",
             activity.last_evidence.as_ref().map_or_else(
@@ -1112,7 +1167,7 @@ fn draw_evidence(
                 )
             )
         ));
-        rows.push(format!("Next: {}", next_action(activity)));
+        rows.push(format!("Next: {}", next_action(activity, local)));
         rows.push(format!(
             "Elapsed {} / progress {} / bytes {}",
             age(activity.elapsed_ms),
@@ -1574,6 +1629,194 @@ mod tests {
         interrupted.observation.activities[0].execution_state = ExecutionState::Interrupted;
         interrupted.observation.activities[0].kind = crate::observation::ActivityKind::Completed;
         assert!(activity_brief(&interrupted.observation.activities[0]).starts_with("Interrupted"));
+    }
+
+    #[test]
+    fn acknowledging_silence_is_local_preserves_requests_and_drafts_and_can_be_restored() {
+        let mut snapshot = observed_snapshot();
+        let mut request = snapshot.observation.activities[0].clone();
+        request.activity_id = "request".into();
+        request.scope = ActivityScope::Interaction;
+        request.attention.level = AttentionLevel::RequiresAction;
+        request.attention.requires_action = true;
+        snapshot.observation.activities.push(request);
+        let mut unknown = snapshot.observation.activities[0].clone();
+        unknown.activity_id = "unknown".into();
+        unknown.execution_state = ExecutionState::Unknown;
+        snapshot.observation.activities.push(unknown);
+        snapshot.requests.push(RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root-thread","turnId":"turn","questions":[{"id":"secret","header":"Secret","question":"Value?","isSecret":true}]})).unwrap());
+        let before = snapshot.observation.clone();
+        let mut local = LocalState::default();
+        local.editor.insert("TASK_DRAFT");
+        sync_questions(&mut local, snapshot.requests.first().cloned());
+        local.editor.insert("SECRET_DRAFT");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let wait = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        handle_key(wait, &snapshot, &mut local, &tx);
+        assert!(local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[0]));
+        assert!(!local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[1]));
+        assert!(!local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[2]));
+        assert_eq!(
+            next_action(&snapshot.observation.activities[1], &local),
+            "F2 answer request"
+        );
+        assert_eq!(
+            next_action(&snapshot.observation.activities[2], &local),
+            "inspect unknown outcome"
+        );
+        assert_eq!(snapshot.observation, before);
+        assert_eq!(snapshot.requests.len(), 1);
+        assert_eq!(local.editor.text, "SECRET_DRAFT");
+        assert_eq!(local.task_draft.as_ref().unwrap().text, "TASK_DRAFT");
+        assert!(rx.try_recv().is_err());
+        handle_key(wait, &snapshot, &mut local, &tx);
+        assert!(!local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[0]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn acknowledgement_survives_redraw_but_new_evidence_only_rearms_its_own_activity() {
+        let mut snapshot = observed_snapshot();
+        let mut tool = snapshot.observation.activities[0].clone();
+        tool.activity_id = "tool".into();
+        tool.item_id = Some("tool".into());
+        tool.scope = ActivityScope::Tool;
+        let mut child = tool.clone();
+        child.activity_id = "child-tool".into();
+        child.identity.agent_id = "child".into();
+        snapshot.observation.activities.extend([tool, child]);
+        let mut local = LocalState::default();
+        assert_eq!(
+            local
+                .reminders
+                .toggle_for_agent(&snapshot.observation, "root"),
+            Some(true)
+        );
+        assert!(!local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[2]));
+        snapshot.observation.snapshot_version += 1;
+        snapshot.observation.activities[0].silence_ms = Some(40000);
+        local.reminders.sync(&snapshot.observation);
+        assert!(local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[0]));
+        assert!(local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[1]));
+        snapshot.observation.activities[0].progress_seq += 1;
+        local.reminders.sync(&snapshot.observation);
+        assert!(!local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[0]));
+        assert!(local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[1]));
+        assert_eq!(
+            local
+                .reminders
+                .toggle_for_agent(&snapshot.observation, "root"),
+            Some(true)
+        );
+        snapshot.observation.activities[1].identity.generation = Some(2);
+        local.reminders.sync(&snapshot.observation);
+        assert!(local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[0]));
+        assert!(!local
+            .reminders
+            .is_acknowledged(&snapshot.observation.activities[1]));
+        snapshot.observation.activities.clear();
+        local.reminders.sync(&snapshot.observation);
+        assert_eq!(
+            local
+                .reminders
+                .toggle_for_agent(&snapshot.observation, "root"),
+            None
+        );
+    }
+
+    #[test]
+    fn silence_acknowledgement_rearms_for_severity_identity_or_clock_changes() {
+        let original = observed_snapshot().observation;
+        let mut changes = Vec::new();
+        let mut changed = original.clone();
+        changed.activities[0].attention.level = AttentionLevel::Quiet;
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.activities[0].clock_epoch.push_str("new");
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.activities[0].session_id.push_str("new");
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.activities[0].identity.turn_id = Some("new-turn".into());
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.activities[0].identity.attempt_id = Some(2);
+        changes.push(changed);
+        for changed in changes {
+            let mut local = LocalState::default();
+            local.reminders.toggle_for_agent(&original, "root");
+            assert!(local.reminders.is_acknowledged(&original.activities[0]));
+            assert!(!local.reminders.is_acknowledged(&changed.activities[0]));
+            local.reminders.sync(&changed);
+            assert!(!local.reminders.is_acknowledged(&original.activities[0]));
+        }
+        // A Quiet reminder cannot suppress a later AttentionNeeded escalation.
+        let mut quiet = original.clone();
+        quiet.activities[0].attention.level = AttentionLevel::Quiet;
+        let mut local = LocalState::default();
+        local.reminders.toggle_for_agent(&quiet, "root");
+        assert!(!local.reminders.is_acknowledged(&original.activities[0]));
+    }
+
+    #[test]
+    fn acknowledged_reminders_show_core_attention_in_compact_and_wide_views() {
+        let snapshot = observed_snapshot();
+        let mut local = LocalState::default();
+        local
+            .reminders
+            .toggle_for_agent(&snapshot.observation, "root");
+        for (width, height) in [(40, 12), (80, 24), (160, 45)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("attention:1"), "{rendered}");
+            assert!(
+                rendered.contains(if height <= 16 { "wait:1" } else { "waiting:1" }),
+                "{rendered}"
+            );
+            local.evidence = true;
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Ctrl+W wait/restore"), "{rendered}");
+            local.evidence = false;
+        }
     }
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;

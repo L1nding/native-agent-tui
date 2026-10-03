@@ -7,10 +7,17 @@ Core 为每个当前 root/child 轮次、工具 item 和交互请求维护独立
 - 顶栏显示所选代理的活动、静默时长，以及全局待操作/需要关注的活动数；宽屏还显示证据和下一步动作。
 - **F3** 切换代理；宽屏代理列表保留各 child 的注意级别。
 - **F11** 打开证据详情，**PageUp/PageDown** 滚动，查看每个工具、thread/turn/generation/attempt、等待对象、恢复条件、最近证据及阈值来源。
+- **Ctrl+W** 关闭所选代理当前的静默提醒，再按一次恢复。顶栏保留 Core 的 attention 数，另显示本地 `waiting` 数；紧凑终端显示 `wait`。F11 中仍可查看原注意级别与证据。
 - **F10** 编辑本次会话的阈值。**Up/Down** 选类别，**Tab** 选字段，输入毫秒，**Ctrl+U** 清空字段，**Enter** 提交，**Esc** 关闭。关闭设置保留任务草稿和秘密回答。
 - 审批和问题立即显示 `requires_action`。回答进入 `Responding`，直到服务端确认 resolved 或 Core 明确结束该交互；其他输出不会清除待操作状态。
 
 40×12 的紧凑布局保留会话和输入区域，完整证据通过 F11 查看。注意计数按活动统计，同一代理可能有多个待关注工具。
+
+## 继续等待与本地提醒
+
+关闭提醒适用于所选代理当前处于 Running/Waiting 的 Quiet 或 AttentionNeeded 活动。它不回答审批、不关闭 requires_action 或 Unknown、不重置静默时间，也不发出模型、重试或中断请求。任务草稿和秘密回答保持原样；JSONL、journal 及其他消费者继续看到 Core 原投影。
+
+新活动证据只恢复对应活动的提醒；新轮次、attempt/generation、会话、时钟来源或注意级别变化也会恢复。单纯计时和重绘不会撤销关闭状态。记录只保存在当前 UI，数量受 Core 当前活动集合约束，退出后丢弃。键盘、宽窄终端与 Windows 验证见[本地提醒验证](attention-reminders-validation.md)。
 
 ## 阈值与配置
 
@@ -38,4 +45,4 @@ child A 输出只更新 A；工具 A 输出也不会刷新工具 B。工具完�
 
 观察投影只保存身份、类型、时间和字节计数，排除任务正文、命令参数、工具输出、问题正文和秘密回答。输出字节计数是接受的通知字节数，包含 final 正文，不能当作去重后的生成长度。每次会话最多保留 1024 个活动/已完成消息身份，每个活动最多保留 8 条最近证据；超限明确进入 Unknown 并关闭执行所有者。
 
-活动投影已接入持久 journal；只读回放和 JSONL 消费方式见[会话日志](journal-replay.md)。原内存 Python fixture 的验收见[观察验证](observation-validation.md)，持久化测试见[日志回放验证](journal-validation.md)。实时 JSONL stdout 仍属后续阶段。
+活动投影已接入持久 journal；只读回放和 JSONL 消费方式见[会话日志](journal-replay.md)。原内存 Python fixture 的验收见[观察验证](observation-validation.md)，持久化测试见[日志回放验证](journal-validation.md)。实时 JSONL stdout 的行为和边界见[实时 JSONL 验证](jsonl-validation.md)。
