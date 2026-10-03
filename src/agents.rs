@@ -6,6 +6,23 @@ use crate::gate::{ChildOutcome, GateEvent, WaitTarget};
 
 const AGENT_LIMIT: usize = 64;
 const ID_BYTES: usize = 1024;
+pub const DEFAULT_MAX_NATIVE_CHILDREN: usize = 8;
+pub const DEFAULT_MAX_NATIVE_DEPTH: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentLimits {
+    pub max_children: usize,
+    pub max_depth: usize,
+}
+
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            max_children: DEFAULT_MAX_NATIVE_CHILDREN,
+            max_depth: DEFAULT_MAX_NATIVE_DEPTH,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentInfo {
@@ -31,6 +48,10 @@ pub struct AgentSnapshot {
 pub enum AgentError {
     #[error("agent identity exceeds its size or count limit")]
     Limit,
+    #[error("native child capacity reached ({0} direct children)")]
+    Capacity(usize),
+    #[error("native agent depth exceeds the configured limit ({0})")]
+    DepthLimit(usize),
     #[error("agent parent identity changed")]
     ParentChanged,
     #[error("unknown child target: {0}")]
@@ -55,9 +76,24 @@ struct Agent {
 #[derive(Debug, Default)]
 pub struct AgentRegistry {
     agents: BTreeMap<String, Agent>,
+    limits: AgentLimits,
 }
 
 impl AgentRegistry {
+    pub fn with_limits(limits: AgentLimits) -> Self {
+        Self {
+            agents: BTreeMap::new(),
+            limits: AgentLimits {
+                max_children: limits.max_children.max(1),
+                max_depth: limits.max_depth.max(1),
+            },
+        }
+    }
+
+    pub fn limits(&self) -> AgentLimits {
+        self.limits
+    }
+
     pub fn register(&mut self, info: AgentInfo) -> Result<(), AgentError> {
         if [&info.id, &info.parent_id]
             .iter()
@@ -68,10 +104,26 @@ impl AgentRegistry {
         {
             return Err(AgentError::Limit);
         }
-        if let Some(agent) = self.agents.get_mut(&info.id) {
+        if let Some(agent) = self.agents.get(&info.id) {
             if agent.info.parent_id != info.parent_id && agent.info.confirmed {
                 return Err(AgentError::ParentChanged);
             }
+            if agent.info.parent_id != info.parent_id {
+                let direct_children = self
+                    .agents
+                    .values()
+                    .filter(|candidate| {
+                        candidate.info.id != info.id && candidate.info.parent_id == info.parent_id
+                    })
+                    .count();
+                if direct_children >= self.limits.max_children {
+                    return Err(AgentError::Capacity(self.limits.max_children));
+                }
+                if self.depth_for_parent(&info.parent_id) > self.limits.max_depth {
+                    return Err(AgentError::DepthLimit(self.limits.max_depth));
+                }
+            }
+            let agent = self.agents.get_mut(&info.id).unwrap();
             if info.confirmed {
                 agent.info.parent_id = info.parent_id;
             }
@@ -84,6 +136,18 @@ impl AgentRegistry {
         }
         if self.agents.len() >= AGENT_LIMIT {
             return Err(AgentError::Limit);
+        }
+        let direct_children = self
+            .agents
+            .values()
+            .filter(|agent| agent.info.parent_id == info.parent_id)
+            .count();
+        if direct_children >= self.limits.max_children {
+            return Err(AgentError::Capacity(self.limits.max_children));
+        }
+        let depth = self.depth_for_parent(&info.parent_id);
+        if depth > self.limits.max_depth {
+            return Err(AgentError::DepthLimit(self.limits.max_depth));
         }
         self.agents.insert(
             info.id.clone(),
@@ -251,6 +315,20 @@ impl AgentRegistry {
             })
             .collect()
     }
+
+    fn depth_for_parent(&self, parent: &str) -> usize {
+        let mut depth: usize = 1;
+        let mut current = parent;
+        let mut seen = BTreeSet::new();
+        while current != "root" && seen.insert(current.to_owned()) {
+            let Some(agent) = self.agents.get(current) else {
+                break;
+            };
+            depth = depth.saturating_add(1);
+            current = &agent.info.parent_id;
+        }
+        depth
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +392,36 @@ mod tests {
             agents.capture("root", &[]).unwrap()[0].turn_id.as_deref(),
             Some("new")
         );
+    }
+
+    #[test]
+    fn limits_direct_children_and_nested_depth_without_affecting_existing_agents() {
+        let mut agents = AgentRegistry::with_limits(AgentLimits {
+            max_children: 2,
+            max_depth: 2,
+        });
+        agents.register(child("a", "root")).unwrap();
+        agents.register(child("b", "root")).unwrap();
+        assert!(matches!(
+            agents.register(child("c", "root")),
+            Err(AgentError::Capacity(2))
+        ));
+        agents.register(child("grandchild", "a")).unwrap();
+        assert!(matches!(
+            agents.register(child("great-grandchild", "grandchild")),
+            Err(AgentError::DepthLimit(2))
+        ));
+        agents
+            .register(AgentInfo {
+                id: "a".into(),
+                parent_id: "root".into(),
+                path: Some("/root/a-renamed".into()),
+                nickname: None,
+                role: None,
+                model: None,
+                confirmed: true,
+            })
+            .unwrap();
+        assert!(agents.known("a"));
     }
 }

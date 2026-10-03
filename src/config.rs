@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use crate::agents::{DEFAULT_MAX_NATIVE_CHILDREN, DEFAULT_MAX_NATIVE_DEPTH};
 use crate::journal::JournalSettings;
 use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
 use thiserror::Error;
@@ -13,6 +14,8 @@ pub struct Config {
     pub sandbox: String,
     pub approval_policy: String,
     pub windows_sandbox: Option<String>,
+    pub max_native_children: usize,
+    pub max_native_depth: usize,
     pub attention: AttentionSettings,
     pub journal: JournalSettings,
 }
@@ -30,6 +33,8 @@ impl Default for Config {
             sandbox: "workspace-write".into(),
             approval_policy: "on-request".into(),
             windows_sandbox: None,
+            max_native_children: DEFAULT_MAX_NATIVE_CHILDREN,
+            max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
             attention: AttentionSettings::default(),
             journal: JournalSettings::default(),
         }
@@ -139,6 +144,12 @@ where
             "--codex" => config.executable = value(&args, &mut index, option)?.into(),
             "--model" => config.model = Some(value(&args, &mut index, option)?),
             "--journal-dir" => config.journal.root = Some(value(&args, &mut index, option)?.into()),
+            "--max-native-children" => {
+                config.max_native_children = bounded_usize(&args, &mut index, option, 1, 64)?;
+            }
+            "--max-native-depth" => {
+                config.max_native_depth = bounded_usize(&args, &mut index, option, 1, 8)?;
+            }
             "--json-events" if !json_events => json_events = true,
             "--output" if output.is_none() => {
                 output = Some(PathBuf::from(value(&args, &mut index, option)?))
@@ -274,6 +285,27 @@ fn value(args: &[String], index: &mut usize, option: &str) -> Result<String, Cli
         .ok_or_else(|| CliError::MissingValue(option.into()))?;
     *index += 1;
     Ok(val.clone())
+}
+
+fn bounded_usize(
+    args: &[String],
+    index: &mut usize,
+    option: &str,
+    min: usize,
+    max: usize,
+) -> Result<usize, CliError> {
+    let raw = value(args, index, option)?;
+    let parsed = raw.parse::<usize>().map_err(|_| CliError::InvalidValue {
+        option: option.into(),
+        value: format!("expected an integer from {min} to {max}"),
+    })?;
+    if !(min..=max).contains(&parsed) {
+        return Err(CliError::InvalidValue {
+            option: option.into(),
+            value: format!("expected an integer from {min} to {max}"),
+        });
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -487,6 +519,35 @@ mod tests {
         assert_eq!(config.cwd, PathBuf::from("a b"));
         assert_eq!(config.sandbox, "read-only");
         assert_eq!(config.model.as_deref(), Some("test-model"));
+    }
+
+    #[test]
+    fn parses_and_bounds_native_agent_limits() {
+        let CliCommand::Run { config, .. } = parse_args([
+            "--run",
+            "任务",
+            "--max-native-children",
+            "3",
+            "--max-native-depth",
+            "1",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(config.max_native_children, 3);
+        assert_eq!(config.max_native_depth, 1);
+        for args in [
+            vec!["--run", "task", "--max-native-children", "0"],
+            vec!["--run", "task", "--max-native-children", "65"],
+            vec!["--run", "task", "--max-native-depth", "0"],
+            vec!["--run", "task", "--max-native-depth", "9"],
+            vec!["--run", "task", "--max-native-depth", "bad"],
+        ] {
+            assert!(matches!(
+                parse_args(args),
+                Err(CliError::InvalidValue { .. })
+            ));
+        }
     }
 
     #[test]

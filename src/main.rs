@@ -40,6 +40,8 @@ Options:
   --sandbox MODE   read-only | workspace-write | danger-full-access
   --approval MODE  untrusted | on-request | never (default: on-request)
   --journal-dir PATH  Override the managed journal data directory
+  --max-native-children N  Maximum direct native children (1-64; default: 8)
+  --max-native-depth N     Maximum observed native depth (1-8; default: 2)
   --attention-config FILE  JSON threshold pairs (milliseconds)
   --attention-model QUIET_MS,ATTENTION_MS  Override model silence thresholds
   --attention-tool QUIET_MS,ATTENTION_MS   Override tool silence thresholds

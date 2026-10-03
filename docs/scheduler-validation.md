@@ -60,7 +60,7 @@ cargo nextest run --locked --run-ignored only live_app_server_gate --no-capture
 
 ## 尚未保证
 
-持久 journal/outbox、重启恢复、硬性 native 并发/深度预算、完整诊断与 Alpha 活动证据仍待实现。根任务共用一个线程，不支持多个根工作流并发。child 计数表示实际观察，不代表容量限制。
+持久 journal/outbox、native turn 并发/资源预算、重启恢复、完整诊断与 Alpha 活动证据仍待实现。直属 child 数量和观察深度已有启动参数硬限制，但根任务共用一个线程，不支持多个根工作流并发。
 
 本次新任务面板通过 TestBackend 验证，尚未新增实际 ConPTY 的 F4 操作录制。整组停止的多 child 行为通过内存 transport 验证；真实 provider 验证的是同一 child 的两轮和一次中断。
 

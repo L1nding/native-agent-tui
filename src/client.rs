@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::agents::AgentInfo;
+use crate::agents::{AgentInfo, AgentLimits, AgentRegistry};
 use crate::app_server::{self, AppServer, AppServerError};
 use crate::config::Config;
 use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequest, WaitToken};
@@ -166,6 +166,10 @@ impl ClientHandle {
         prepared: Option<(Observer, Journal)>,
         shell_source: Option<crate::shell_check::Source>,
     ) -> Self {
+        let agent_limits = AgentLimits {
+            max_children: config.max_native_children,
+            max_depth: config.max_native_depth,
+        };
         let (commands, command_rx) = mpsc::channel(32);
         let (observer, journal) = match prepared {
             Some((observer, journal)) => (observer, Some(journal)),
@@ -188,7 +192,7 @@ impl ClientHandle {
                 snapshot_tx,
                 state: SessionState {
                     view: initial,
-                    ..Default::default()
+                    agents: AgentRegistry::with_limits(agent_limits),
                 },
                 pending: HashMap::new(),
                 next_id: 1,
@@ -4517,6 +4521,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_native_child_capacity_stops_execution_with_an_unknown_outcome() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_native_children: 1,
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        send(
+            &mut server,
+            json!({
+                "method":"thread/started",
+                "params":{"thread":{"id":"b","parentThreadId":"root"}}
+            }),
+        )
+        .await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| snapshot.phase == SessionPhase::Unknown)
+            .await
+            .unwrap()
+            .clone();
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("capacity reached")));
+        assert_eq!(snapshot.agents.len(), 1);
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_child_metadata_hydration_closes_execution_with_an_unknown_outcome() {
         let (mut client, mut server) = harness().await;
         running_root(&mut client, &mut server).await;
@@ -4880,16 +4915,16 @@ mod tests {
     }
 
     async fn harness() -> (ClientHandle, BufReader<tokio::io::DuplexStream>) {
+        harness_with_config(Config::default()).await
+    }
+
+    async fn harness_with_config(
+        config: Config,
+    ) -> (ClientHandle, BufReader<tokio::io::DuplexStream>) {
         let (client, server) = tokio::io::duplex(65536);
         let (read, write) = tokio::io::split(client);
         (
-            ClientHandle::start(
-                PipeTransport::new(read, write),
-                Config::default(),
-                None,
-                false,
-                None,
-            ),
+            ClientHandle::start(PipeTransport::new(read, write), config, None, false, None),
             BufReader::new(server),
         )
     }
