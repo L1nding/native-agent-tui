@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
 use crate::gate::{ChildOutcome, GateEvent, WaitTarget};
+use crate::state::UsageSummary;
 
 const AGENT_LIMIT: usize = 64;
 const ID_BYTES: usize = 1024;
@@ -75,6 +76,7 @@ struct Agent {
     started_seq: u64,
     awaiting_after: Option<u64>,
     outcome: Option<ChildOutcome>,
+    usage: UsageSummary,
     retired: VecDeque<String>,
 }
 
@@ -164,6 +166,7 @@ impl AgentRegistry {
                 started_seq: 0,
                 awaiting_after: None,
                 outcome: None,
+                usage: UsageSummary::default(),
                 retired: VecDeque::new(),
             },
         );
@@ -172,6 +175,25 @@ impl AgentRegistry {
 
     pub fn known(&self, id: &str) -> bool {
         self.agents.contains_key(id)
+    }
+
+    pub fn update_usage(&mut self, id: &str, usage: UsageSummary) -> bool {
+        let Some(agent) = self.agents.get_mut(id) else {
+            return false;
+        };
+        if usage.source != crate::state::FactSource::ServerConfirmed || !usage.has_value() {
+            return false;
+        }
+        agent.usage = usage;
+        true
+    }
+
+    pub fn confirmed_total_tokens(&self) -> u64 {
+        self.agents
+            .values()
+            .filter(|agent| agent.usage.source == crate::state::FactSource::ServerConfirmed)
+            .filter_map(|agent| agent.usage.total_tokens)
+            .fold(0, u64::saturating_add)
     }
     pub fn confirmed(&self, id: &str) -> bool {
         self.agents
@@ -473,5 +495,25 @@ mod tests {
             .completed("a", "a-1", ChildOutcome::Completed)
             .unwrap();
         agents.started("b", "b-1", 3).unwrap().unwrap();
+    }
+
+    #[test]
+    fn confirmed_usage_keeps_latest_known_children_and_ignores_missing_values() {
+        let mut agents = AgentRegistry::default();
+        agents.register(child("a", "root")).unwrap();
+        agents.register(child("nested", "a")).unwrap();
+        agents.register(child("unknown", "root")).unwrap();
+        let usage = |total_tokens| UsageSummary {
+            total_tokens: Some(total_tokens),
+            source: crate::state::FactSource::ServerConfirmed,
+            ..UsageSummary::default()
+        };
+        assert!(agents.update_usage("a", usage(12)));
+        assert!(agents.update_usage("nested", usage(7)));
+        assert!(!agents.update_usage("missing", usage(100)));
+        assert!(!agents.update_usage("unknown", UsageSummary::default()));
+        assert_eq!(agents.confirmed_total_tokens(), 19);
+        assert!(agents.update_usage("a", usage(20)));
+        assert_eq!(agents.confirmed_total_tokens(), 27);
     }
 }

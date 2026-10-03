@@ -201,6 +201,7 @@ impl ClientHandle {
                 child_interrupts: VecDeque::new(),
                 interrupt_requested: false,
                 interrupt_sent: false,
+                token_budget_stop_started: false,
                 preflight_passed: false,
                 shell_source,
                 shell_check: None,
@@ -272,6 +273,7 @@ struct Core {
     child_interrupts: VecDeque<InterruptEffect>,
     interrupt_requested: bool,
     interrupt_sent: bool,
+    token_budget_stop_started: bool,
     preflight_passed: bool,
     shell_source: Option<crate::shell_check::Source>,
     shell_check: Option<crate::shell_check::ShellCheck>,
@@ -308,28 +310,40 @@ impl Core {
 
     fn token_budget_exhausted(&self) -> Option<u64> {
         let limit = self.config.max_total_tokens?;
-        self.state
-            .view
-            .usage
-            .total_tokens
-            .filter(|total| *total >= limit)
-            .map(|_| limit)
+        let root = if self.state.view.usage.source == FactSource::ServerConfirmed {
+            self.state.view.usage.total_tokens.unwrap_or_default()
+        } else {
+            0
+        };
+        (root.saturating_add(self.state.agents.confirmed_total_tokens()) >= limit).then_some(limit)
     }
 
     fn interrupt_for_token_budget(&mut self, limit: u64) {
-        if self.interrupt_requested {
+        if self.token_budget_stop_started {
             return;
         }
-        if let Some(attempt) = self.scheduler.active_root() {
-            let _ = self
-                .scheduler
-                .command(SchedulerCommand::Cancel(attempt.task));
+        self.token_budget_stop_started = true;
+        if let Ok(effects) = self.scheduler.command(SchedulerCommand::StopWorkflow) {
+            for effect in effects {
+                match effect.kind {
+                    TaskKind::RootTurn => {
+                        self.interrupt_requested = true;
+                        self.issue_interrupt();
+                    }
+                    TaskKind::NativeChild => self.queue_child_interrupt(effect),
+                }
+            }
         }
-        self.interrupt_requested = true;
+        if matches!(
+            self.state.view.phase,
+            SessionPhase::StartingTurn | SessionPhase::Running | SessionPhase::GatePending
+        ) {
+            self.interrupt_requested = true;
+            self.issue_interrupt();
+        }
         self.state.view.notice = Some(format!(
             "Token budget {limit} reached; interrupt requested; waiting for the server's terminal event."
         ));
-        self.issue_interrupt();
     }
 
     async fn run(mut self) -> ExitReport {
@@ -922,7 +936,8 @@ impl Core {
             {
                 return;
             }
-            self.scheduler.disconnected();
+            self.token_budget_stop_started = true;
+            let _ = self.scheduler.command(SchedulerCommand::StopWorkflow);
             self.state.error(
                 SessionPhase::Failed,
                 format!("Token budget {limit} reached; start a new session."),
@@ -1826,6 +1841,26 @@ impl Core {
             }
             return;
         }
+        if method == "thread/tokenUsage/updated" {
+            let Some(thread) = params.get("threadId").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(usage) = decode_usage(&params) else {
+                return;
+            };
+            let accepted = if self.state.view.thread_id.as_deref() == Some(thread) {
+                self.state.view.usage = usage;
+                true
+            } else {
+                self.state.agents.update_usage(thread, usage)
+            };
+            if accepted {
+                if let Some(limit) = self.token_budget_exhausted() {
+                    self.interrupt_for_token_budget(limit);
+                }
+            }
+            return;
+        }
         let thread = params.get("threadId").and_then(Value::as_str);
         // Decode observation only for an owned current turn. Unrelated malformed
         // telemetry cannot make this execution uncertain.
@@ -2098,28 +2133,6 @@ impl Core {
                     self.state.view.tool_activity = item["type"].as_str().map(str::to_owned);
                 } else if method == "item/completed" {
                     self.state.view.tool_activity = None;
-                }
-            }
-            "thread/tokenUsage/updated" => {
-                if params
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|thread| self.state.view.thread_id.as_deref() != Some(thread))
-                {
-                    return;
-                }
-                if let Some(usage) = decode_usage(&params) {
-                    self.state.view.usage = usage;
-                    if let Some(limit) = self.token_budget_exhausted() {
-                        if matches!(
-                            self.state.view.phase,
-                            SessionPhase::StartingTurn
-                                | SessionPhase::Running
-                                | SessionPhase::GatePending
-                        ) {
-                            self.interrupt_for_token_budget(limit);
-                        }
-                    }
                 }
             }
             "error" => {
@@ -5741,6 +5754,79 @@ mod tests {
             .commands
             .send(Command::SubmitRootInput {
                 text: "must not dispatch".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_token_budget_sums_confirmed_root_and_child_usage() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_total_tokens: Some(10),
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "child", "child-turn").await;
+        send(
+            &mut server,
+            json!({
+                "method":"thread/tokenUsage/updated",
+                "params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":5}}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"thread/tokenUsage/updated",
+                "params":{"threadId":"child","tokenUsage":{"total":{"totalTokens":5}}}
+            }),
+        )
+        .await;
+
+        let mut interrupted_threads = BTreeSet::new();
+        for _ in 0..2 {
+            let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+                .await
+                .unwrap_or_else(|_| panic!("budget stop did not interrupt every active turn"));
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            interrupted_threads
+                .insert(interrupt["params"]["threadId"].as_str().unwrap().to_owned());
+            send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        }
+        assert_eq!(
+            interrupted_threads,
+            BTreeSet::from(["root".into(), "child".into()])
+        );
+        send(
+            &mut server,
+            json!({
+                "method":"turn/completed",
+                "params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"turn/completed",
+                "params":{"threadId":"child","turn":{"id":"child-turn","status":"interrupted"}}
+            }),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Failed).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "blocked".into(),
             })
             .await
             .unwrap();
