@@ -427,6 +427,10 @@ impl SearchPanel {
         }
     }
 
+    pub fn reject_paste(&mut self) {
+        self.notice = Some(super::PASTE_REJECTED.into());
+    }
+
     fn insert(&mut self, text: &str) {
         let text = display_text(text).replace(['\n', '\t'], " ");
         if self.editor().text.len() + text.len() <= QUERY_BYTES {

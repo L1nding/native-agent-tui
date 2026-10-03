@@ -54,6 +54,7 @@ turn_id = "turn"
 detail_stage = 0
 file_done = False
 input_sent = False
+input_paste_answered = False
 
 
 def send(value):
@@ -116,7 +117,7 @@ try:
             send({"method": "item/agentMessage/delta", "params": {"threadId": "root", "turnId": turn_id, "itemId": "message", "delta": "PRIVATE_OUTPUT 中文"}})
             if mode.startswith("approval") or mode == "request_details":
                 approval(7)
-            elif mode in ("input", "input_hang"):
+            elif mode in ("input", "input_hang", "input_paste"):
                 send({"id": "input-request", "method": "item/tool/requestUserInput",
                       "params": {"threadId": "root", "turnId": turn_id, "questions": [
                           {"id": "question", "header": "PRIVATE_HEADER", "question": "PRIVATE_QUESTION", "isSecret": True}]}})
@@ -160,6 +161,14 @@ try:
             (root / "answers.json").write_text(json.dumps({"valid_fixture_answer": answers == {
                 "question": {"answers": ["秘密回答中文👋"]}}}))
             send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": "input-request"}})
+        elif not method and mode == "input_paste" and message.get("id") == "input-request":
+            assert not input_paste_answered
+            input_paste_answered = True
+            valid = message["result"]["answers"] == {"question": {"answers": ["秘密回答中文👋\n第二行\n第三行"]}}
+            (root / "answers.json").write_text(json.dumps({"valid_fixture_answer": valid, "answer_count": 1}))
+            assert valid
+            send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": "input-request"}})
+            terminal()
         elif not method and message.get("id") == 7:
             assert message["result"]["decision"] == "decline"
             send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": 7}})

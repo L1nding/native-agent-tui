@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, stdout, Stdout};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -29,9 +29,14 @@ use crate::scheduler::{
 use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 
 mod history;
+mod input;
 mod reminders;
 mod requests;
 mod search;
+
+use input::{InputEvent, TerminalInput};
+
+const PASTE_REJECTED: &str = "Paste exceeds 32 KiB; the entire paste was discarded.";
 
 #[derive(Debug, Error)]
 pub enum UiError {
@@ -220,10 +225,11 @@ async fn run_tasks_inner(
                     dirty = true;
                 }
                 _ = tick.tick() => {
-                    // poll with zero timeout; the runtime is never blocked waiting for a key.
-                    while event::poll(Duration::ZERO)? {
-                        match event::read()? {
-                            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    // Bound each input batch so snapshots and redraw remain responsive.
+                    for _ in 0..128 {
+                        let Some(event) = terminal.input.read_ready()? else { break; };
+                        match event {
+                            InputEvent::Key(key) if key.kind != KeyEventKind::Release => {
                                 let snapshot = client.snapshots.borrow().clone();
                                 if history_panel.visible {
                                     if history_panel.key(key, history.as_mut().unwrap(), false) { return Ok(()); }
@@ -234,19 +240,18 @@ async fn run_tasks_inner(
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 dirty = true;
                             }
-                            Event::Paste(text) => {
+                            InputEvent::Paste(text) => {
                                 if history_panel.visible { history_panel.paste(&text); dirty = true; continue; }
                                 let snapshot = client.snapshots.borrow().clone();
-                                sync_local_requests(&mut local, &snapshot);
-                                if local.search.visible { local.search.paste(&text); dirty = true; continue; }
-                                if let Some(editor) = &mut local.attention_editor {
-                                    for digit in text.chars().filter(char::is_ascii_digit).take(10) {
-                                        if editor.input().len() < 10 { editor.input().push(digit); }
-                                    }
-                                } else { local.editor.insert(&text); }
+                                handle_paste(&text, &snapshot, &mut local);
                                 dirty = true;
                             }
-                            Event::Resize(_, _) => dirty = true,
+                            InputEvent::PasteRejected => {
+                                if history_panel.visible { history_panel.notice = Some(PASTE_REJECTED.into()); }
+                                else { reject_paste(&mut local); }
+                                dirty = true;
+                            }
+                            InputEvent::Resize(_, _) => dirty = true,
                             _ => {}
                         }
                     }
@@ -295,14 +300,19 @@ pub async fn run_history(
                     dirty = true;
                 }
                 _ = tick.tick() => {
-                    while event::poll(Duration::ZERO)? {
-                        match event::read()? {
-                            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    for _ in 0..128 {
+                        let Some(event) = terminal.input.read_ready()? else { break; };
+                        match event {
+                            InputEvent::Key(key) if key.kind != KeyEventKind::Release => {
                                 if panel.key(key, &mut service, true) { return Ok(()); }
                                 dirty = true;
                             }
-                            Event::Paste(text) => { panel.paste(&text); dirty = true; }
-                            Event::Resize(_, _) => dirty = true,
+                            InputEvent::Paste(text) => { panel.paste(&text); dirty = true; }
+                            InputEvent::PasteRejected => {
+                                panel.notice = Some(PASTE_REJECTED.into());
+                                dirty = true;
+                            }
+                            InputEvent::Resize(_, _) => dirty = true,
                             _ => {}
                         }
                     }
@@ -312,6 +322,33 @@ pub async fn run_history(
     }.await;
     let stopped = service.shutdown().await.map_err(UiError::from);
     result.and(stopped)
+}
+
+fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
+    sync_local_requests(local, snapshot);
+    if local.search.visible {
+        local.search.paste(text);
+        return;
+    }
+    if let Some(editor) = &mut local.attention_editor {
+        for digit in text.chars().filter(char::is_ascii_digit).take(10) {
+            if editor.input().len() < 10 {
+                editor.input().push(digit);
+            }
+        }
+    } else {
+        local.editor.insert(text);
+    }
+}
+
+fn reject_paste(local: &mut LocalState) {
+    if local.search.visible {
+        local.search.reject_paste();
+    } else if let Some(editor) = &mut local.attention_editor {
+        editor.notice = Some(PASTE_REJECTED.into());
+    } else {
+        local.notice = Some(PASTE_REJECTED.into());
+    }
 }
 
 fn selected_request<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&'a RequestView> {
@@ -544,6 +581,14 @@ fn handle_key(
     if key.code != KeyCode::F(9) {
         local.confirm_stop = false;
     }
+    // These control letters remain distinct when a host drops Enter modifiers.
+    let key = if control && key.code == KeyCode::Char('s') {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
+    } else if control && key.code == KeyCode::Char('o') {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    } else {
+        key
+    };
     if control {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('d') => return true,
@@ -1199,7 +1244,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Ctrl+F retained conversation search | Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Ctrl+F retained conversation search | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
         notice.clone()
     } else if let Some(request) = request {
@@ -1321,7 +1366,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         } else if local.evidence {
             "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
         } else {
-            "Ctrl+F search | Enter send | Ctrl+C interrupt | Ctrl+Q quit | F3 agent | F4 tasks | F11 evidence | Ctrl+W wait/restore | F12 history"
+            "Enter send | Ctrl+O newline | Ctrl+S queue | Ctrl+F search | Ctrl+Q quit | F1 help"
         }),
         chunks[4],
     );
@@ -1700,20 +1745,30 @@ fn gate_status(snapshot: &CoreSnapshot, gate: &crate::state::GateSnapshot) -> St
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    input: TerminalInput,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self, UiError> {
         enable_raw_mode()?;
+        let mut input = match TerminalInput::enter() {
+            Ok(input) => input,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                return Err(error.into());
+            }
+        };
         let mut output = stdout();
         if let Err(error) = execute!(output, EnterAlternateScreen, event::EnableBracketedPaste) {
+            let _ = input.restore();
             let _ = disable_raw_mode();
             let _ = execute!(output, LeaveAlternateScreen, event::DisableBracketedPaste);
             return Err(error.into());
         }
         match Terminal::new(CrosstermBackend::new(output)) {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => Ok(Self { terminal, input }),
             Err(error) => {
+                let _ = input.restore();
                 let _ = disable_raw_mode();
                 let _ = execute!(stdout(), LeaveAlternateScreen, event::DisableBracketedPaste);
                 Err(error.into())
@@ -1724,6 +1779,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = self.input.restore();
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
@@ -1778,6 +1834,218 @@ mod tests {
             observation: observer.snapshot_at(1, now + Duration::from_secs(31)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn portable_newline_and_submit_keys_use_the_existing_typed_command_paths() {
+        use crate::scheduler::{ExternalTurn, Scheduler};
+        let mut scheduler = Scheduler::default();
+        scheduler
+            .enqueue(vec![RootTaskSpec::input("active root".into())])
+            .unwrap();
+        let attempt = scheduler.dispatch().unwrap().attempt;
+        scheduler
+            .started_root(
+                attempt,
+                ExternalTurn {
+                    thread_id: "root".into(),
+                    turn_id: "one".into(),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            scheduler: scheduler.snapshot(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        local.editor.insert("FIRST中文👋");
+        for event in input::fixture_events("\x0f") {
+            let InputEvent::Key(key) = event else {
+                panic!("expected a key");
+            };
+            assert!(!handle_key(key, &snapshot, &mut local, &tx));
+        }
+        local.editor.insert("SECOND");
+        assert_eq!(local.editor.text, "FIRST中文👋\nSECOND");
+        assert!(rx.try_recv().is_err());
+        for event in input::fixture_events("\x13") {
+            let InputEvent::Key(key) = event else {
+                panic!("expected a key");
+            };
+            assert!(!handle_key(key, &snapshot, &mut local, &tx));
+        }
+        let Command::QueueRootTasks { tasks } = rx.try_recv().unwrap() else {
+            panic!("expected typed queue command");
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].text, "FIRST中文👋\nSECOND");
+        assert_eq!(tasks[0].dependencies, vec![attempt.task]);
+        assert!(local.editor.text.is_empty());
+        assert!(rx.try_recv().is_err());
+        local.editor.insert("TASK_DRAFT");
+        handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        for event in input::fixture_events("\x0f\x13") {
+            let InputEvent::Key(key) = event else {
+                panic!("expected a key");
+            };
+            handle_key(key, &snapshot, &mut local, &tx);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        local.search.close();
+        let request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root","turnId":"one","questions":[{"id":"secret","header":"Secret","question":"Value?","isSecret":true}]})).unwrap();
+        let snapshot = CoreSnapshot {
+            requests: vec![request],
+            ..snapshot
+        };
+        handle_paste("ANSWER中文👋", &snapshot, &mut local);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_paste("SECOND", &snapshot, &mut local);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        let Command::AnswerUserInput { request, answers } = rx.try_recv().unwrap() else {
+            panic!("expected typed answer command");
+        };
+        assert_eq!(request, snapshot.requests[0].reference());
+        assert_eq!(answers["secret"], vec!["ANSWER中文👋\nSECOND"]);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_paste_retains_secret_and_task_drafts_and_never_sends_commands() {
+        let request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root","turnId":"one","questions":[{"id":"secret","header":"Secret","question":"Value?","isSecret":true}]})).unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            root_start_requests: 1,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        local.editor.insert("SAVED_TASK");
+        let secret = "SECRET_PASTE中文👋\r\nSECRET_LINE\x19\x0e\x03\x11";
+        let events = input::fixture_events(&format!("\x1b[200~{secret}\x1b[201~"));
+        assert_eq!(events.len(), 1);
+        for event in events {
+            match event {
+                InputEvent::Paste(text) => handle_paste(&text, &snapshot, &mut local),
+                InputEvent::Key(key) => {
+                    assert!(!handle_key(key, &snapshot, &mut local, &tx));
+                }
+                _ => panic!("unexpected input event"),
+            }
+        }
+        assert_eq!(local.editor.text, "SECRET_PASTE中文👋\nSECRET_LINE");
+        assert_eq!(local.task_draft.as_ref().unwrap().text, "SAVED_TASK");
+        assert!(rx.try_recv().is_err());
+        assert!(local.submitted.is_empty());
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx
+        ));
+        let events =
+            input::fixture_events("\x1b[200~QUERY中文👋\rSECOND\x19\x0e\x03\x11\x1b[24~\x1b[201~");
+        assert_eq!(events.len(), 1);
+        let InputEvent::Paste(text) = &events[0] else {
+            panic!("expected a paste");
+        };
+        handle_paste(text, &snapshot, &mut local);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        // TestBackend retains padding cells for wide glyphs.
+        assert!(rendered.replace(' ', "").contains("QUERY中文👋SECOND"));
+        assert!(!rendered.contains("SECRET_PASTE"));
+        assert!(!rendered.contains("SECRET_LINE"));
+        assert!(!rendered.contains("SAVED_TASK"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(snapshot.root_start_requests, 1);
+        assert_eq!(local.editor.text, "SECRET_PASTE中文👋\nSECRET_LINE");
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx
+        ));
+        assert_eq!(local.editor.text, "SECRET_PASTE中文👋\nSECRET_LINE");
+    }
+
+    #[test]
+    fn rejected_terminal_paste_leaves_the_editor_unchanged_and_shows_a_notice_in_search() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("root".into()),
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        local.editor.insert("SAVED_TASK");
+        let events = input::fixture_events(&format!(
+            "\x1b[200~{}\x11\x19\n\x1b[201~",
+            "a".repeat(input::PASTE_BYTES + 1)
+        ));
+        assert_eq!(events, vec![InputEvent::PasteRejected]);
+        reject_paste(&mut local);
+        assert_eq!(local.editor.text, "SAVED_TASK");
+        assert_eq!(local.notice.as_deref(), Some(PASTE_REJECTED));
+        handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_paste("QUERY", &snapshot, &mut local);
+        reject_paste(&mut local);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("32 KiB"));
+        assert!(rendered.contains("QUERY"));
+        assert_eq!(local.editor.text, "SAVED_TASK");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -32,7 +32,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 
 | Key | Action |
 | --- | --- |
-| Enter / Shift+Enter | Send task or answer / insert newline |
+| Enter / Ctrl+O (Shift+Enter when supported) | Send task or answer / insert newline |
 | Left, Right, Home, End | Move through input |
 | Backspace, Delete, Ctrl+U | Edit or clear input |
 | Ctrl+C | Request interruption; wait for the server's terminal event |
@@ -50,10 +50,12 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F10 | Edit temporary attention thresholds; Up/Down class, Tab field, Enter apply |
 | F11 / PageUp, PageDown | Open activity evidence / scroll its details |
 | F12 | Browse retained sessions and export redacted historical evidence |
-| Ctrl+Enter | Explicitly queue a root task during a running turn |
+| Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
 | Escape | Close help/tasks and clear input |
 
 Chinese, combining characters, and emoji are edited as whole graphemes. Secret answers are masked and kept outside conversation history. A task draft is saved while answering questions. Messages and queues have byte limits; history truncation is visible.
+
+Windows framed paste now preserves multiline Unicode input. Paste is limited to 32 KiB and cannot execute keyboard shortcuts; oversized paste is discarded. See [terminal input validation and host limits](docs/windows-terminal-input.md).
 
 ## Implementation status
 

@@ -175,3 +175,11 @@ Ctrl+F 已接入独立查询编辑区与可取消的后台任务。搜索 Core �
 九项新增回归验证 Unicode、身份与范围、取消/释放、字段/命中上限、未投递查询立即禁用旧结果、秘密草稿、窄屏帮助、定位/resize/翻页及 Core/Gate 无副作用。最终 `python scripts/verify.py --live` 全部通过：169 项默认 Rust 测试、八项真实 Codex 检查及全部原生夹具，fmt/check/clippy/doctest/release 通过。
 
 Windows ConPTY 用假 app-server 确认中文查询与过滤、命中定位、草稿恢复和返回审批；搜索前后 RPC、原始消息/接受证据计数与各活动 progress_seq 不变。明确取消后退出，确认进程清理、journal 关闭、脱敏 Interrupted 回放。多行转义注入本次只显示首行，不能作为原生粘贴验收；完整事件时间线、书签、工具/历史搜索、Windows Terminal/Orca IME 与粘贴、试用任务集及 Alpha/V2 发布验收仍待完成。使用与限制见[实时对话搜索](conversation-search.md)。
+
+## Windows 多行粘贴与兼容提交键
+
+Windows 终端输入改为有界 VT/Win32 记录适配，完整标记的多行中文/emoji 粘贴不再把换行当成 Enter。一次最多 32 KiB，超限整段丢弃并提示；Ctrl+O 换行、Ctrl+S 明确排队或提交当前答案。搜索和秘密/任务草稿保持独立，粘贴内控制字符不触发命令。
+
+本轮 `python scripts/verify.py --live` 全部通过：182 项默认 Rust 测试、八项真实 Codex 检查和全部原生夹具，含 12 项 ConPTY 输入检查；fmt/check/clippy/doctest/release 通过。真实 TUI 夹具另行验证三行秘密答案精确提交一次、粘贴和搜索零额外 RPC、进程清理及脱敏回放。
+
+本机 ConPTY 跨写入拆分粘贴标记会丢失前缀，物理 Shift/Ctrl+Enter 可能变为普通 Enter；这两项宿主能力探针当前失败并保留复现命令。Windows Terminal、Orca 剪贴板及 IME 仍待验收，Alpha/V2 未完成。详见[终端输入验证与限制](windows-terminal-input.md)。

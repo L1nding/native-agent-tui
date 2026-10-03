@@ -56,7 +56,7 @@ never launches app-server. --json-events streams committed redacted state.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
 See docs/scheduler-usage.md and docs/workflow-example.json.
 
-TUI: Enter send, Ctrl+Enter queue, Shift+Enter newline, Ctrl+C interrupt,
+TUI: Enter send, Ctrl+S/Ctrl+Enter queue, Ctrl+O/Shift+Enter newline, Ctrl+C interrupt,
      Ctrl+Q quit, PgUp/PgDn scroll, Ctrl+Y approve, Ctrl+N decline,
      Ctrl+W acknowledge/restore silence reminders for the selected agent,
      F1 help, F2 request details/next, F3 agent, F4 tasks, F5 pause dispatch.
