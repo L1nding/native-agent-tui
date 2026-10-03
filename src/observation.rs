@@ -13,6 +13,7 @@ use crate::interactions::{RequestKind, RequestRef, RequestView};
 use crate::protocol::{RpcId, ToolCategory};
 use crate::scheduler::{TaskId, TaskSnapshot, TaskState};
 use crate::state::{GateSnapshot, SessionPhase};
+use crate::timeline::{Timeline, TimelineEntry, TimelineSnapshot};
 
 const ACTIVITY_LIMIT: usize = 1024;
 const RECENT_EVIDENCE: usize = 8;
@@ -468,6 +469,7 @@ pub struct Observer {
     raw_messages: u64,
     next_evidence: u64,
     active_gate: Option<(String, u64)>,
+    timeline: Timeline,
 }
 
 impl Observer {
@@ -493,6 +495,7 @@ impl Observer {
         wall_ms: Option<u64>,
     ) -> Self {
         Self {
+            timeline: Timeline::new(session.clone()),
             epoch: format!("{session}:clock-1"),
             session_id: session,
             origin: now,
@@ -597,6 +600,25 @@ impl Observer {
         if kind != EvidenceKind::Output {
             activity.transitions = activity.transitions.saturating_add(1);
         }
+        self.timeline.record(TimelineEntry {
+            activity_id: activity_id(key, &activity.identity),
+            identity: activity.identity.clone(),
+            scope: activity.scope,
+            activity_kind: activity.kind,
+            execution_state: activity.execution,
+            interaction_state: activity.interaction,
+            tool_category: activity.tool_category,
+            item_id: evidence
+                .item_id
+                .clone()
+                .or_else(|| activity.item_id.clone()),
+            evidence: evidence.clone(),
+            request: match &key.1 {
+                Slot::Request(reference) => Some(reference.clone()),
+                _ => None,
+            },
+            wait_targets: activity.targets.clone(),
+        });
         activity.evidence.push_back(evidence);
         while activity.evidence.len() > RECENT_EVIDENCE {
             activity.evidence.pop_front();
@@ -1041,6 +1063,7 @@ impl Observer {
             }
             if self.active_gate.is_some() {
                 let previous = self.activities[&root_key].targets.clone();
+                self.activities.get_mut(&root_key).unwrap().targets = gate.targets.clone();
                 for target in &gate.targets {
                     if let Some(old) = previous
                         .iter()
@@ -1078,7 +1101,6 @@ impl Observer {
                         );
                     }
                 }
-                self.activities.get_mut(&root_key).unwrap().targets = gate.targets.clone();
                 if !pending {
                     self.active_gate = None;
                     if gate.root_starts_at_release.is_some()
@@ -1124,6 +1146,7 @@ impl Observer {
                 )?;
                 let activity = self.activities.get_mut(&key).unwrap();
                 activity.request_id = Some(request.id.clone());
+                activity.item_id = request.details.item_id.clone();
                 activity.interaction = Some(InteractionState::Pending);
                 self.evidence(
                     &key,
@@ -1296,6 +1319,10 @@ impl Observer {
             .any(|activity| activity.execution.active() && activity.kind.class().is_some())
     }
 
+    pub fn timeline_snapshot(&self) -> TimelineSnapshot {
+        self.timeline.snapshot()
+    }
+
     pub fn snapshot_at(&self, version: u64, now: Instant) -> ObservationSnapshot {
         let activities = self
             .activities
@@ -1423,13 +1450,7 @@ impl Observer {
         ActivitySnapshot {
             session_id: self.session_id.clone(),
             clock_epoch: self.epoch.clone(),
-            activity_id: format!(
-                "{}:{:?}:{}:{}",
-                key.0.label(),
-                key.1,
-                activity.identity.task_id.map_or(0, |task| task.0),
-                activity.identity.attempt_id.unwrap_or(0)
-            ),
+            activity_id: activity_id(key, &activity.identity),
             identity: activity.identity.clone(),
             scope: activity.scope,
             kind: activity.kind,
@@ -1469,6 +1490,16 @@ impl Observer {
             provider_state: None,
         }
     }
+}
+
+fn activity_id(key: &Key, identity: &ActivityIdentity) -> String {
+    format!(
+        "{}:{:?}:{}:{}",
+        key.0.label(),
+        key.1,
+        identity.task_id.map_or(0, |task| task.0),
+        identity.attempt_id.unwrap_or(0)
+    )
 }
 
 fn execution(state: TaskState, bound: bool) -> ExecutionState {

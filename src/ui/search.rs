@@ -11,31 +11,12 @@ use tokio::sync::watch;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::scope::Scope;
 use super::{wrap, Editor};
 use crate::state::{display_text, ConversationItem, CoreSnapshot};
 
 const QUERY_BYTES: usize = 1024;
 const HIT_LIMIT: usize = 512;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Scope {
-    #[default]
-    Thread,
-    Subtree,
-    Path,
-    All,
-}
-
-impl Scope {
-    fn next(self) -> Self {
-        match self {
-            Self::Thread => Self::Subtree,
-            Self::Subtree => Self::Path,
-            Self::Path => Self::All,
-            Self::All => Self::Thread,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Role {
@@ -66,47 +47,7 @@ struct Filter {
 
 impl Filter {
     fn threads(&self, source: &CoreSnapshot) -> Vec<String> {
-        if self.scope == Scope::All {
-            return Vec::new();
-        }
-        let mut threads = vec![self.thread.clone()];
-        match self.scope {
-            Scope::Subtree => {
-                for _ in 0..source.agents.len() {
-                    let mut changed = false;
-                    for agent in &source.agents {
-                        if agent.info.confirmed
-                            && threads.contains(&agent.info.parent_id)
-                            && !threads.contains(&agent.info.id)
-                        {
-                            threads.push(agent.info.id.clone());
-                            changed = true;
-                        }
-                    }
-                    if !changed {
-                        break;
-                    }
-                }
-            }
-            Scope::Path => {
-                for _ in 0..source.agents.len() {
-                    let current = threads.last().unwrap();
-                    let Some(agent) = source
-                        .agents
-                        .iter()
-                        .find(|a| a.info.confirmed && &a.info.id == current)
-                    else {
-                        break;
-                    };
-                    if threads.contains(&agent.info.parent_id) {
-                        break;
-                    }
-                    threads.push(agent.info.parent_id.clone());
-                }
-            }
-            _ => {}
-        }
-        threads
+        self.scope.threads(&self.thread, source)
     }
 
     fn accepts(&self, message: &ConversationItem, threads: &[String]) -> bool {
@@ -160,6 +101,14 @@ pub(super) struct Focus {
 }
 
 impl Focus {
+    pub fn message(message: &ConversationItem) -> Self {
+        Self {
+            key: MessageKey::of(message),
+            offset: 0,
+            text: message.text.clone(),
+        }
+    }
+
     pub fn matches(&self, message: &ConversationItem) -> bool {
         self.key.matches(message) && self.text == message.text
     }

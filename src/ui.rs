@@ -32,7 +32,9 @@ mod history;
 mod input;
 mod reminders;
 mod requests;
+mod scope;
 mod search;
+mod timeline;
 
 use input::{InputEvent, TerminalInput};
 
@@ -95,6 +97,7 @@ impl Editor {
 struct LocalState {
     viewport: ratatui::layout::Rect,
     search: search::SearchPanel,
+    timeline: timeline::TimelinePanel,
     conversation_focus: Option<search::Focus>,
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
@@ -200,6 +203,7 @@ async fn run_tasks_inner(
                 local.reminders.sync(&snapshot.observation);
                 sync_local_requests(&mut local, &snapshot);
                 local.search.dispatch(snapshot.clone(), &mut search);
+                local.timeline.sync(&snapshot);
                 terminal.terminal.draw(|frame| {
                     if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
@@ -235,6 +239,7 @@ async fn run_tasks_inner(
                                     if history_panel.key(key, history.as_mut().unwrap(), false) { return Ok(()); }
                                 } else if key.code == KeyCode::F(12) {
                                     local.search.close();
+                                    local.timeline.close();
                                     if let Some(history) = &mut history { history_panel.open(history, None); }
                                     else { local.notice = Some("History browsing is unavailable for this client.".into()); }
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
@@ -330,6 +335,10 @@ fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
         local.search.paste(text);
         return;
     }
+    if local.timeline.visible {
+        local.timeline.paste(text);
+        return;
+    }
     if let Some(editor) = &mut local.attention_editor {
         for digit in text.chars().filter(char::is_ascii_digit).take(10) {
             if editor.input().len() < 10 {
@@ -344,6 +353,8 @@ fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
 fn reject_paste(local: &mut LocalState) {
     if local.search.visible {
         local.search.reject_paste();
+    } else if local.timeline.visible {
+        local.timeline.reject_paste();
     } else if let Some(editor) = &mut local.attention_editor {
         editor.notice = Some(PASTE_REJECTED.into());
     } else {
@@ -480,6 +491,56 @@ fn handle_key(
             }
             return false;
         }
+    }
+    if local.timeline.visible {
+        if control && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d')) {
+            return true;
+        }
+        if control && key.code == KeyCode::Char('c') {
+            send(Command::Interrupt, tx, local);
+            return false;
+        }
+        if matches!(
+            key.code,
+            KeyCode::F(2) | KeyCode::F(3) | KeyCode::F(4) | KeyCode::F(10) | KeyCode::F(11)
+        ) {
+            local.timeline.close();
+        } else {
+            match local.timeline.key(key, snapshot) {
+                Some(timeline::Locate::Message(focus)) => {
+                    local.agent_id = if snapshot.thread_id.as_deref() == Some(focus.thread()) {
+                        None
+                    } else {
+                        Some(focus.thread().into())
+                    };
+                    local.conversation_focus = Some(focus);
+                    local.tasks = false;
+                    local.evidence = false;
+                    local.request_panel = false;
+                    local.notice = None;
+                }
+                Some(timeline::Locate::Request(reference)) => {
+                    local.request_selection = Some(reference);
+                    local.request_panel = true;
+                    local.request_scroll = 0;
+                    local.tasks = false;
+                    local.evidence = false;
+                    sync_local_requests(local, snapshot);
+                    local.notice = None;
+                }
+                None => {}
+            }
+            return false;
+        }
+    }
+    if control && key.code == KeyCode::Char('t') && local.attention_editor.is_none() {
+        let thread = local
+            .agent_id
+            .clone()
+            .or_else(|| snapshot.thread_id.clone())
+            .unwrap_or_default();
+        local.timeline.open(thread, snapshot);
+        return false;
     }
     if control && key.code == KeyCode::Char('f') && local.attention_editor.is_none() {
         let thread = local
@@ -1082,6 +1143,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         return;
     }
 
+    if local.timeline.visible {
+        local.timeline.draw(
+            frame,
+            ratatui::layout::Rect {
+                y: chunks[0].y + chunks[0].height,
+                height: area.height.saturating_sub(chunks[0].height),
+                ..area
+            },
+            snapshot,
+        );
+        return;
+    }
+
     let conversation_area = if area.width >= 100 && !snapshot.agents.is_empty() {
         let panels = Layout::default()
             .direction(Direction::Horizontal)
@@ -1244,7 +1318,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Ctrl+F retained conversation search | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Ctrl+T evidence timeline | Ctrl+F retained conversation search | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
         notice.clone()
     } else if let Some(request) = request {
@@ -1366,7 +1440,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         } else if local.evidence {
             "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
         } else {
-            "Enter send | Ctrl+O newline | Ctrl+S queue | Ctrl+F search | Ctrl+Q quit | F1 help"
+            "Enter send | Ctrl+T timeline | Ctrl+F search | Ctrl+Q quit | F1 help"
         }),
         chunks[4],
     );
@@ -1796,6 +1870,10 @@ mod tests {
     use crate::protocol::RpcId;
 
     fn observed_snapshot() -> CoreSnapshot {
+        observed_snapshot_with_requests(&[])
+    }
+
+    fn observed_snapshot_with_requests(requests: &[RequestView]) -> CoreSnapshot {
         use crate::observation::{ObservationFacts, Observer};
         use crate::scheduler::{ExternalTurn, Scheduler};
         let now = tokio::time::Instant::now();
@@ -1823,7 +1901,7 @@ mod tests {
                     root_generation: 1,
                     root_task: scheduler.task(attempt.task),
                     children: vec![],
-                    requests: &[],
+                    requests,
                     gate: None,
                 },
                 now,
@@ -1832,8 +1910,103 @@ mod tests {
         CoreSnapshot {
             phase: crate::state::SessionPhase::Running,
             observation: observer.snapshot_at(1, now + Duration::from_secs(31)),
+            timeline: observer.timeline_snapshot(),
+            requests: requests.to_vec(),
+            thread_id: Some("root-thread".into()),
+            turn_id: Some("turn".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn timeline_browsing_preserves_secret_and_task_drafts_and_never_sends_commands() {
+        let mut request = RequestView::decode(
+            RpcId::Number(7),
+            "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root-thread","turnId":"turn","questions":[{
+                "id":"secret","header":"Secret","question":"Value?","isSecret":true}]}),
+        )
+        .unwrap();
+        request.received_seq = 10;
+        let snapshot = observed_snapshot_with_requests(&[request.clone()]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let mut local = LocalState::default();
+        local.editor.insert("PRIVATE_TASK_DRAFT");
+        sync_local_requests(&mut local, &snapshot);
+        local.editor.insert("PRIVATE_SECRET_DRAFT中文👋");
+        let open = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!handle_key(open, &snapshot, &mut local, &tx));
+        assert!(local.timeline.visible);
+        for (code, modifiers) in [
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            (KeyCode::Char('b'), KeyModifiers::CONTROL),
+            (KeyCode::Char('s'), KeyModifiers::CONTROL),
+            (KeyCode::Char('o'), KeyModifiers::CONTROL),
+            (KeyCode::F(6), KeyModifiers::NONE),
+            (KeyCode::F(7), KeyModifiers::NONE),
+            (KeyCode::F(8), KeyModifiers::NONE),
+            (KeyCode::Char('/'), KeyModifiers::NONE),
+        ] {
+            assert!(!handle_key(
+                KeyEvent::new(code, modifiers),
+                &snapshot,
+                &mut local,
+                &tx
+            ));
+        }
+        handle_paste("bB中文\nmetadata", &snapshot, &mut local);
+        for (width, height) in [
+            (30, 10),
+            (60, 20),
+            (80, 24),
+            (100, 30),
+            (120, 40),
+            (160, 50),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("Timeline"));
+            assert!(text.contains("action:1"));
+            assert!(!text.contains("PRIVATE_SECRET") && !text.contains("PRIVATE_TASK"));
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "PRIVATE_SECRET_DRAFT中文👋");
+        assert_eq!(
+            local.task_draft.as_ref().unwrap().text,
+            "PRIVATE_TASK_DRAFT"
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(open, &snapshot, &mut local, &tx); // Search keeps Ctrl+T as its own turn field.
+        assert!(local.search.visible && !local.timeline.visible);
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "PRIVATE_SECRET_DRAFT中文👋");
     }
 
     #[test]

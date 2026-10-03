@@ -62,6 +62,7 @@ TUI: Enter send, Ctrl+S/Ctrl+Enter queue, Ctrl+O/Shift+Enter newline, Ctrl+C int
      F1 help, F2 request details/next, F3 agent, F4 tasks, F5 pause dispatch.
      In request details: PgUp/PgDn scroll, Ctrl+Home/End jump, Esc close.
      Ctrl+F opens retained conversation search; F1 inside search shows its controls.
+     Ctrl+T opens the live evidence timeline with filters and local bookmarks.
      Ctrl+B cancels the selected approval and interrupts its owning turn when allowed.
      F10 attention thresholds, F11 activity evidence, F12 history/export.
 Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat

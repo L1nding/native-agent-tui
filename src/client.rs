@@ -133,6 +133,7 @@ impl ClientHandle {
             sandbox: config.sandbox.clone(),
             approval_policy: config.approval_policy.clone(),
             observation: observer.snapshot_at(0, Instant::now()),
+            timeline: observer.timeline_snapshot(),
             ..Default::default()
         }
     }
@@ -526,6 +527,7 @@ impl Core {
             .view
             .journal
             .take());
+        self.state.view.timeline = self.observer.timeline_snapshot();
         if let Some(view) = &mut self.state.view.journal {
             view.error = self.journal_error.clone().or(view.error.take());
         }
@@ -2312,6 +2314,24 @@ mod tests {
         assert_eq!(report.final_phase, SessionPhase::Unknown);
         assert!(report.journal_error.is_some());
         assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert!(
+            client
+                .snapshots
+                .borrow()
+                .timeline
+                .entries
+                .iter()
+                .any(|entry| entry.evidence.kind
+                    == crate::observation::EvidenceKind::ExecutionUnknown)
+        );
+        assert_eq!(
+            client.snapshots.borrow().timeline.high_water,
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count
+        );
         assert!(client
             .snapshots
             .borrow()
@@ -3123,6 +3143,144 @@ mod tests {
             .iter()
             .any(|activity| activity.identity.attempt_id == Some(2)
                 && activity.identity.turn_id.as_deref() == Some("retry-turn")));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeline_archives_accepted_evidence_without_tick_configuration_or_secret_content() {
+        use crate::observation::{EvidenceKind, ExecutionState};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let initial = client.snapshots.borrow().timeline.clone();
+        assert_eq!(
+            initial.high_water,
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count
+        );
+        client
+            .commands
+            .send(Command::ConfigureAttention {
+                class: AttentionClass::Model,
+                quiet_ms: 10,
+                attention_ms: 20,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.observation.settings.model.quiet_ms == 10)
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(std::sync::Arc::ptr_eq(
+            &initial.entries,
+            &client.snapshots.borrow().timeline.entries
+        ));
+        observation_event(&mut client, &mut server, json!({"method":"item/agentMessage/delta",
+            "params":{"threadId":"root","turnId":"old-turn","itemId":"stale","delta":"PRIVATE_STALE"}})).await;
+        assert_eq!(
+            client.snapshots.borrow().timeline.high_water,
+            initial.high_water
+        );
+        for _ in 0..20 {
+            observation_event(&mut client, &mut server, json!({"method":"item/agentMessage/delta",
+                "params":{"threadId":"root","turnId":"root-turn","itemId":"message","delta":"PRIVATE_BODY中文👋"}})).await;
+        }
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"item/started",
+            "params":{"threadId":"root","turnId":"root-turn","item":{
+                "id":"tool","type":"commandExecution","command":"PRIVATE_TOOL"}}}),
+        )
+        .await;
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"item/completed",
+            "params":{"threadId":"root","turnId":"root-turn","item":{
+                "id":"tool","type":"commandExecution","status":"completed"}}}),
+        )
+        .await;
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"id":7,"method":"item/commandExecution/requestApproval",
+            "params":{"threadId":"root","turnId":"root-turn","command":"PRIVATE_COMMAND"}}),
+        )
+        .await;
+        let reference = client.snapshots.borrow().requests[0].reference();
+        let archive = client.snapshots.borrow().timeline.clone();
+        assert!(archive
+            .entries
+            .iter()
+            .any(|entry| entry.evidence.kind == EvidenceKind::ToolCompleted
+                && entry.scope == crate::observation::ActivityScope::Tool
+                && entry.item_id.as_deref() == Some("tool")));
+        assert_eq!(
+            archive.high_water,
+            client
+                .snapshots
+                .borrow()
+                .observation
+                .accepted_evidence_count
+        );
+        assert!(archive.entries.len() > 8);
+        assert!(archive
+            .entries
+            .iter()
+            .any(|entry| entry.request.as_ref() == Some(&reference)
+                && entry.evidence.kind == EvidenceKind::RequestCreated));
+        let diagnostic = format!("{archive:?}");
+        let stored =
+            serde_json::to_string(&StoredSnapshot::capture(&client.snapshots.borrow())).unwrap();
+        for private in [
+            "PRIVATE_BODY",
+            "PRIVATE_COMMAND",
+            "PRIVATE_STALE",
+            "PRIVATE_TOOL",
+        ] {
+            assert!(!diagnostic.contains(private));
+            assert!(!stored.contains(private));
+        }
+        assert!(!stored.contains("\"timeline\""));
+        assert!(archive
+            .entries
+            .iter()
+            .zip(archive.entries.iter().skip(1))
+            .all(|(previous, next)| previous.evidence.id < next.evidence.id));
+        assert_eq!(initial.entries.len(), initial.high_water as usize);
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"serverRequest/resolved",
+            "params":{"threadId":"root","requestId":7}}),
+        )
+        .await;
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"turn/completed",
+            "params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}),
+        )
+        .await;
+        let completed = client.snapshots.borrow().timeline.clone();
+        assert!(completed
+            .entries
+            .iter()
+            .any(|entry| entry.evidence.kind == EvidenceKind::TurnCompleted
+                && entry.execution_state == ExecutionState::Completed));
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

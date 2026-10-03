@@ -19,6 +19,7 @@ pub mod rpc;
 pub mod scheduler;
 mod shell_check;
 pub mod state;
+pub mod timeline;
 pub mod transport;
 pub mod ui;
 

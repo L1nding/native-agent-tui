@@ -161,6 +161,7 @@ try:
             (root / "answers.json").write_text(json.dumps({"valid_fixture_answer": answers == {
                 "question": {"answers": ["秘密回答中文👋"]}}}))
             send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": "input-request"}})
+            terminal()
         elif not method and mode == "input_paste" and message.get("id") == "input-request":
             assert not input_paste_answered
             input_paste_answered = True

@@ -434,6 +434,87 @@ fn request_delivery_identity_separates_replacements_and_stale_resolution() {
 }
 
 #[test]
+fn timeline_freezes_gate_target_updates_and_retains_previous_attempt_metadata() {
+    let now = Instant::now();
+    let mut root = root_task();
+    root.state = TaskState::WaitingChildren;
+    let mut children = [child("a")];
+    children[0].turn_id = None;
+    children[0].awaiting_turn = true;
+    let mut gate = GateSnapshot {
+        pending: true,
+        targets: vec![WaitTarget {
+            id: "a".into(),
+            generation: 1,
+            turn_id: None,
+            outcome: None,
+        }],
+        root_starts_at_enter: 1,
+        root_starts_at_release: None,
+    };
+    let mut observer = observer(now);
+    observer
+        .reconcile(facts(&root, &children, &[], Some(&gate)), now)
+        .unwrap();
+    let entered = observer.timeline_snapshot();
+    let waiting = entered
+        .entries
+        .iter()
+        .find(|entry| entry.evidence.kind == EvidenceKind::GateEntered)
+        .unwrap();
+    assert!(waiting.wait_targets[0].turn_id.is_none());
+    children[0].turn_id = Some("a-1".into());
+    children[0].awaiting_turn = false;
+    gate.targets[0].turn_id = Some("a-1".into());
+    observer
+        .reconcile(facts(&root, &children, &[], Some(&gate)), now)
+        .unwrap();
+    let bound = observer.timeline_snapshot();
+    let binding = bound
+        .entries
+        .iter()
+        .find(|entry| entry.evidence.kind == EvidenceKind::ChildTurnBound)
+        .unwrap();
+    assert_eq!(binding.wait_targets[0].turn_id.as_deref(), Some("a-1"));
+    children[0].outcome = Some(ChildOutcome::Completed);
+    gate.targets[0].outcome = Some(ChildOutcome::Completed);
+    observer
+        .reconcile(facts(&root, &children, &[], Some(&gate)), now)
+        .unwrap();
+    let finished = observer.timeline_snapshot();
+    let terminal = finished
+        .entries
+        .iter()
+        .find(|entry| entry.evidence.kind == EvidenceKind::ChildTerminal)
+        .unwrap();
+    assert_eq!(
+        terminal.wait_targets[0].outcome,
+        Some(ChildOutcome::Completed)
+    );
+    assert_eq!(
+        binding.wait_targets[0].outcome, None,
+        "earlier evidence must stay frozen"
+    );
+    root.attempt = 2;
+    root.external.as_mut().unwrap().turn_id = "new-turn".into();
+    root.state = TaskState::Running;
+    observer
+        .reconcile(facts(&root, &children, &[], None), now)
+        .unwrap();
+    let retried = observer.timeline_snapshot();
+    assert!(retried
+        .entries
+        .iter()
+        .any(|entry| entry.identity.attempt_id == Some(1)
+            && entry.identity.turn_id.as_deref() == Some("turn-1")));
+    assert!(retried
+        .entries
+        .iter()
+        .any(|entry| entry.identity.attempt_id == Some(2)
+            && entry.identity.turn_id.as_deref() == Some("new-turn")));
+}
+
+#[test]
 fn terminal_results_stop_aging_and_unfinished_tools_never_become_successful() {
     let now = Instant::now();
     let mut root = root_task();
