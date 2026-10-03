@@ -9,13 +9,15 @@ cargo run --locked -- --workflow docs/workflow-example.json
 cargo run --locked -- --workflow docs/workflow-example.json --headless --sandbox read-only --windows-sandbox unelevated
 # 可选：把原生子代理边界收紧到 3 个直属 child、1 层深度
 cargo run --locked -- --workflow docs/workflow-example.json --max-native-children 3 --max-native-depth 1
+# 可选：限制同时活动的原生 turn
+cargo run --locked -- --workflow docs/workflow-example.json --max-native-turns 2
 ```
 
 第二条命令中的 Windows sandbox 覆盖只适用于 Windows。工作流文件路径相对于启动目录，`--cwd` 指定任务的工作目录。
 
 文件是 UTF-8 JSON，包含 `tasks` 数组。每项必填 `text`，可选 `id`、`dependencies`、`priority`、`policy` 和 `failure`。任务 ID 是非零整数；依赖可以引用数组中稍后出现的任务。Core 原子校验整批任务，未知依赖、重复 ID、环和非法策略均拒绝，不会先执行半个计划。
 
-原生子代理默认最多 8 个直属 child、最多 2 层观察深度；`--max-native-children 1-64` 和 `--max-native-depth 1-8` 可在启动时收紧边界。超限身份不会继续进入执行树，Core 将会话标记为 `Unknown`，因为 app-server 可能已经创建了外部线程；已登记的深层 child 仍可被观察，但不能作为根 Gate 的直属等待目标。
+原生子代理默认最多 8 个直属 child、最多 2 层观察深度和 8 个活动 turn；`--max-native-children 1-64`、`--max-native-depth 1-8`、`--max-native-turns 1-64` 可在启动时收紧边界。超限身份或轮次不会继续进入执行树，Core 将会话标记为 `Unknown`，因为 app-server 可能已经创建了外部线程；已登记的深层 child 仍可被观察，但不能作为根 Gate 的直属等待目标。
 
 ```json
 {
@@ -64,7 +66,7 @@ cargo run --locked -- --workflow docs/workflow-example.json --max-native-childre
 
 最多 8 个待执行根任务、256 条任务记录；每项正文最多 32 KiB UTF-8，文件最多 2 MiB。成功任务释放正文，失败/取消任务保留正文供本次进程内重试。达到历史上限需要新会话。
 
-原生子代理由 app-server 创建，客户端登记实际轮次并支持 `turn/interrupt`。身份已知但还未开始第一轮时，取消意图等到真实 `turn/started` 才发送。原生 child 的暂停、重试、优先级控制被拒绝；后续轮次由根代理的原生工具启动。直属 child 数量和观察深度现在受启动配置硬限制；并发 turn、资源预算、持久调度恢复和多工作流支持仍未实现。
+原生子代理由 app-server 创建，客户端登记实际轮次并支持 `turn/interrupt`。身份已知但还未开始第一轮时，取消意图等到真实 `turn/started` 才发送。原生 child 的暂停、重试、优先级控制被拒绝；后续轮次由根代理的原生工具启动。直属 child 数量、观察深度和活动 turn 数现在受启动配置硬限制；更细的工具/模型资源预算、持久调度恢复和多工作流支持仍未实现。
 
 断连将活动任务标记为 Unknown；不会自动重试。持久 journal、outbox 和重启恢复仍未实现。Headless 工作流仅在所有根任务成功时退出 0；失败、取消、阻塞和未知结果退出非零。
 

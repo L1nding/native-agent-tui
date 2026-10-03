@@ -1,7 +1,9 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::agents::{DEFAULT_MAX_NATIVE_CHILDREN, DEFAULT_MAX_NATIVE_DEPTH};
+use crate::agents::{
+    DEFAULT_MAX_NATIVE_CHILDREN, DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_NATIVE_TURNS,
+};
 use crate::journal::JournalSettings;
 use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
 use thiserror::Error;
@@ -16,6 +18,7 @@ pub struct Config {
     pub windows_sandbox: Option<String>,
     pub max_native_children: usize,
     pub max_native_depth: usize,
+    pub max_native_turns: usize,
     pub attention: AttentionSettings,
     pub journal: JournalSettings,
 }
@@ -35,6 +38,7 @@ impl Default for Config {
             windows_sandbox: None,
             max_native_children: DEFAULT_MAX_NATIVE_CHILDREN,
             max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
+            max_native_turns: DEFAULT_MAX_NATIVE_TURNS,
             attention: AttentionSettings::default(),
             journal: JournalSettings::default(),
         }
@@ -149,6 +153,9 @@ where
             }
             "--max-native-depth" => {
                 config.max_native_depth = bounded_usize(&args, &mut index, option, 1, 8)?;
+            }
+            "--max-native-turns" => {
+                config.max_native_turns = bounded_usize(&args, &mut index, option, 1, 64)?;
             }
             "--json-events" if !json_events => json_events = true,
             "--output" if output.is_none() => {
@@ -530,17 +537,22 @@ mod tests {
             "3",
             "--max-native-depth",
             "1",
+            "--max-native-turns",
+            "2",
         ])
         .unwrap() else {
             panic!()
         };
         assert_eq!(config.max_native_children, 3);
         assert_eq!(config.max_native_depth, 1);
+        assert_eq!(config.max_native_turns, 2);
         for args in [
             vec!["--run", "task", "--max-native-children", "0"],
             vec!["--run", "task", "--max-native-children", "65"],
             vec!["--run", "task", "--max-native-depth", "0"],
             vec!["--run", "task", "--max-native-depth", "9"],
+            vec!["--run", "task", "--max-native-turns", "0"],
+            vec!["--run", "task", "--max-native-turns", "65"],
             vec!["--run", "task", "--max-native-depth", "bad"],
         ] {
             assert!(matches!(

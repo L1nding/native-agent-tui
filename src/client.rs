@@ -169,6 +169,7 @@ impl ClientHandle {
         let agent_limits = AgentLimits {
             max_children: config.max_native_children,
             max_depth: config.max_native_depth,
+            max_active_turns: config.max_native_turns,
         };
         let (commands, command_rx) = mpsc::channel(32);
         let (observer, journal) = match prepared {
@@ -1889,11 +1890,18 @@ impl Core {
                 if let Some(turn) = params.pointer("/turn/id").and_then(Value::as_str) {
                     let event = match method {
                         "turn/started" => {
-                            let event = self.state.agents.started(thread, turn, self.ingress_seq);
-                            if event.is_some() {
-                                self.read_agent_identity(thread);
+                            match self.state.agents.started(thread, turn, self.ingress_seq) {
+                                Ok(event) => {
+                                    if event.is_some() {
+                                        self.read_agent_identity(thread);
+                                    }
+                                    event
+                                }
+                                Err(error) => {
+                                    self.state.error(SessionPhase::Unknown, error.to_string());
+                                    None
+                                }
                             }
-                            event
                         }
                         "turn/completed" => {
                             if !self.state.agents.current_turn(thread, turn) {
@@ -4548,6 +4556,43 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("capacity reached")));
         assert_eq!(snapshot.agents.len(), 1);
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_native_turn_capacity_rejects_a_second_active_turn() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_native_children: 2,
+            max_native_turns: 1,
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        send(
+            &mut server,
+            json!({
+                "method":"thread/started",
+                "params":{"thread":{"id":"b","parentThreadId":"root","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"root","depth":1,"agent_path":"/root/b"}}}}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"b","turn":{"id":"b-1"}}}),
+        )
+        .await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| snapshot.phase == SessionPhase::Unknown)
+            .await
+            .unwrap()
+            .clone();
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("active turn capacity")));
+        assert_eq!(snapshot.agents.len(), 2);
         client.join.await.unwrap();
     }
 

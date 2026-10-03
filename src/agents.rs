@@ -8,11 +8,13 @@ const AGENT_LIMIT: usize = 64;
 const ID_BYTES: usize = 1024;
 pub const DEFAULT_MAX_NATIVE_CHILDREN: usize = 8;
 pub const DEFAULT_MAX_NATIVE_DEPTH: usize = 2;
+pub const DEFAULT_MAX_NATIVE_TURNS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
     pub max_children: usize,
     pub max_depth: usize,
+    pub max_active_turns: usize,
 }
 
 impl Default for AgentLimits {
@@ -20,6 +22,7 @@ impl Default for AgentLimits {
         Self {
             max_children: DEFAULT_MAX_NATIVE_CHILDREN,
             max_depth: DEFAULT_MAX_NATIVE_DEPTH,
+            max_active_turns: DEFAULT_MAX_NATIVE_TURNS,
         }
     }
 }
@@ -52,6 +55,8 @@ pub enum AgentError {
     Capacity(usize),
     #[error("native agent depth exceeds the configured limit ({0})")]
     DepthLimit(usize),
+    #[error("native active turn capacity reached ({0} active turns)")]
+    ActiveTurnLimit(usize),
     #[error("agent parent identity changed")]
     ParentChanged,
     #[error("unknown child target: {0}")]
@@ -86,6 +91,7 @@ impl AgentRegistry {
             limits: AgentLimits {
                 max_children: limits.max_children.max(1),
                 max_depth: limits.max_depth.max(1),
+                max_active_turns: limits.max_active_turns.max(1),
             },
         }
     }
@@ -190,18 +196,32 @@ impl AgentRegistry {
         }
     }
 
-    pub fn started(&mut self, id: &str, turn: &str, seq: u64) -> Option<GateEvent> {
-        let agent = self.agents.get_mut(id)?;
+    pub fn started(
+        &mut self,
+        id: &str,
+        turn: &str,
+        seq: u64,
+    ) -> Result<Option<GateEvent>, AgentError> {
+        let agent = match self.agents.get(id) {
+            Some(agent) => agent,
+            None => return Ok(None),
+        };
         if turn.is_empty()
             || turn.len() > ID_BYTES
             || agent.retired.iter().any(|old| old == turn)
             || agent.turn_id.as_deref() == Some(turn)
         {
-            return None;
+            return Ok(None);
         }
         if agent.awaiting_after.is_some_and(|after| seq <= after) {
-            return None;
+            return Ok(None);
         }
+        let has_active_slot =
+            agent.turn_id.is_some() && agent.outcome.is_none() && agent.awaiting_after.is_none();
+        if !has_active_slot && self.active_turn_count() >= self.limits.max_active_turns {
+            return Err(AgentError::ActiveTurnLimit(self.limits.max_active_turns));
+        }
+        let agent = self.agents.get_mut(id).expect("agent was checked above");
         if let Some(old) = agent.turn_id.replace(turn.into()) {
             agent.retired.push_back(old);
             if agent.retired.len() > 128 {
@@ -212,12 +232,12 @@ impl AgentRegistry {
         agent.started_seq = seq;
         agent.awaiting_after = None;
         agent.outcome = None;
-        Some(GateEvent {
+        Ok(Some(GateEvent {
             target: id.into(),
             generation: agent.generation,
             turn_id: turn.into(),
             outcome: None,
-        })
+        }))
     }
 
     pub fn completed(&mut self, id: &str, turn: &str, outcome: ChildOutcome) -> Option<GateEvent> {
@@ -329,6 +349,15 @@ impl AgentRegistry {
         }
         depth
     }
+
+    fn active_turn_count(&self) -> usize {
+        self.agents
+            .values()
+            .filter(|agent| {
+                agent.turn_id.is_some() && agent.outcome.is_none() && agent.awaiting_after.is_none()
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -381,8 +410,8 @@ mod tests {
         let target = agents.capture("root", &[]).unwrap().remove(0);
         assert_eq!(target.generation, 2);
         assert_eq!(target.turn_id, None);
-        assert!(agents.started("a", "old", 3).is_none());
-        let event = agents.started("a", "new", 4).unwrap();
+        assert!(agents.started("a", "old", 3).unwrap().is_none());
+        let event = agents.started("a", "new", 4).unwrap().unwrap();
         assert_eq!(event.generation, 2);
         assert!(agents
             .completed("a", "old", ChildOutcome::Completed)
@@ -399,6 +428,7 @@ mod tests {
         let mut agents = AgentRegistry::with_limits(AgentLimits {
             max_children: 2,
             max_depth: 2,
+            max_active_turns: 2,
         });
         agents.register(child("a", "root")).unwrap();
         agents.register(child("b", "root")).unwrap();
@@ -423,5 +453,25 @@ mod tests {
             })
             .unwrap();
         assert!(agents.known("a"));
+    }
+
+    #[test]
+    fn active_turn_limit_releases_only_after_a_confirmed_terminal_event() {
+        let mut agents = AgentRegistry::with_limits(AgentLimits {
+            max_children: 2,
+            max_depth: 1,
+            max_active_turns: 1,
+        });
+        agents.register(child("a", "root")).unwrap();
+        agents.register(child("b", "root")).unwrap();
+        agents.started("a", "a-1", 1).unwrap().unwrap();
+        assert!(matches!(
+            agents.started("b", "b-1", 2),
+            Err(AgentError::ActiveTurnLimit(1))
+        ));
+        agents
+            .completed("a", "a-1", ChildOutcome::Completed)
+            .unwrap();
+        agents.started("b", "b-1", 3).unwrap().unwrap();
     }
 }
