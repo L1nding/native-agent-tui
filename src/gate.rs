@@ -88,17 +88,12 @@ impl PendingGate {
             .map(|pending| pending.targets.values().cloned().collect())
             .unwrap_or_default()
     }
-    pub fn result(&self) -> Option<(WaitToken, Vec<WaitTarget>)> {
-        let pending = self.pending.as_ref()?;
-        pending
-            .released()
-            .then(|| (pending.token, pending.targets.values().cloned().collect()))
-    }
-
     pub fn take_result(&mut self) -> Option<(WaitToken, Vec<WaitTarget>)> {
-        let result = self.result()?;
-        self.pending.take();
-        Some(result)
+        if !self.pending.as_ref().is_some_and(PendingWait::released) {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        Some((pending.token, pending.targets.into_values().collect()))
     }
 }
 
@@ -223,7 +218,7 @@ mod tests {
             GateChange::Released
         );
         assert!(gate.take_result().is_some());
-        assert!(gate.result().is_none());
+        assert!(gate.take_result().is_none());
     }
 
     #[test]
