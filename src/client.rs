@@ -22,6 +22,9 @@ use crate::scheduler::{
 use crate::state::{CoreSnapshot, GateSnapshot, SessionPhase, SessionState, MESSAGE_BYTES};
 use crate::transport::{PipeTransport, TransportError};
 
+#[cfg(all(test, windows))]
+mod live_requests;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     SubmitRootInput {
@@ -2758,6 +2761,119 @@ mod tests {
             next(&mut server).await["result"]["answers"]["secret"]["answers"][0],
             "answer"
         );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_cancel_rejects_stale_actions_and_waits_for_server_resolution_and_terminal() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let approval = json!({"id":7,"method":"item/commandExecution/requestApproval","params":{
+            "threadId":"root","turnId":"root-turn","availableDecisions":["accept","cancel"]}});
+        observation_event(&mut client, &mut server, approval.clone()).await;
+        let old = current_request(&client, RpcId::Number(7));
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"serverRequest/resolved","params":{"threadId":"root","requestId":7}}),
+        )
+        .await;
+        observation_event(&mut client, &mut server, approval).await;
+        let current = current_request(&client, RpcId::Number(7));
+        assert_ne!(old.received_seq, current.received_seq);
+        for reference in [
+            old,
+            RequestRef {
+                thread_id: "other".into(),
+                ..current.clone()
+            },
+            RequestRef {
+                turn_id: "old-turn".into(),
+                ..current.clone()
+            },
+        ] {
+            client
+                .commands
+                .send(Command::AnswerApproval {
+                    request: reference,
+                    decision: ApprovalDecision::Cancel,
+                })
+                .await
+                .unwrap();
+        }
+        client
+            .commands
+            .send(Command::AnswerApproval {
+                request: current.clone(),
+                decision: ApprovalDecision::Decline,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice.as_deref() == Some("this decision is not available for the request")
+            })
+            .await
+            .unwrap();
+        assert!(!client.snapshots.borrow().requests[0].responding);
+        let cancel = Command::AnswerApproval {
+            request: current.clone(),
+            decision: ApprovalDecision::Cancel,
+        };
+        client.commands.send(cancel.clone()).await.unwrap();
+        client.commands.send(cancel.clone()).await.unwrap();
+        assert_eq!(
+            next(&mut server).await,
+            json!({"id":7,"result":{"decision":"cancel"}})
+        );
+        client
+            .snapshots
+            .wait_for(|s| s.requests[0].responding)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Running);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"serverRequest/resolved","params":{"threadId":"root","requestId":7}}),
+        )
+        .await;
+        let snapshot = client.snapshots.borrow().clone();
+        assert!(snapshot.requests.is_empty());
+        assert_eq!(snapshot.phase, SessionPhase::Running);
+        assert!(snapshot.observation.activities.iter().any(|a| a.request_id
+            == Some(RpcId::Number(7))
+            && a.interaction_state == Some(crate::observation::InteractionState::Resolved)
+            && a.recent_evidence
+                .iter()
+                .any(|e| e.kind == crate::observation::EvidenceKind::RequestResolved)));
+        client.commands.send(cancel).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.notice.as_deref() == Some("Request already resolved."))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"turn/completed","params":{
+            "threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Interrupted).await;
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

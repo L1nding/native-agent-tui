@@ -32,6 +32,7 @@ pub enum HeadlessAction {
 pub enum ApprovalDecision {
     Accept,
     Decline,
+    Cancel,
 }
 
 impl ApprovalDecision {
@@ -39,6 +40,7 @@ impl ApprovalDecision {
         match self {
             Self::Accept => "accept",
             Self::Decline => "decline",
+            Self::Cancel => "cancel",
         }
     }
 }
@@ -87,6 +89,8 @@ pub struct DetailField {
 pub struct RequestDetails {
     pub item_id: Option<String>,
     pub started_at_ms: Option<i64>,
+    pub is_blocking: Option<bool>,
+    pub auto_resolution_ms: Option<u64>,
     pub fields: Vec<DetailField>,
     pub available_decisions: Option<Vec<String>>,
     pub file_preview: Option<FilePreview>,
@@ -111,6 +115,7 @@ pub struct RequestView {
     pub kind: RequestKind,
     pub allow_accept: bool,
     pub allow_decline: bool,
+    pub allow_cancel: bool,
     pub responding: bool,
     pub received_seq: u64,
     pub details: RequestDetails,
@@ -241,6 +246,7 @@ impl RequestView {
             kind,
             allow_accept: allows("accept"),
             allow_decline: allows("decline"),
+            allow_cancel: allows("cancel"),
             responding: false,
             received_seq: 0, // Core stamps this when accepting a request.
             details,
@@ -254,6 +260,7 @@ impl RequestView {
         if matches!(self.kind, RequestKind::UserInput { .. })
             || (decision == ApprovalDecision::Accept && !self.allow_accept)
             || (decision == ApprovalDecision::Decline && !self.allow_decline)
+            || (decision == ApprovalDecision::Cancel && !self.allow_cancel)
         {
             return Err(InteractionError::DecisionUnavailable);
         }
@@ -317,6 +324,22 @@ impl RequestDetails {
                     .ok_or_else(|| InteractionError::Invalid("invalid startedAtMs".into()))?,
             ),
         };
+        let is_blocking = match params.get("isBlocking") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_bool()
+                    .ok_or_else(|| InteractionError::Invalid("invalid isBlocking".into()))?,
+            ),
+        };
+        let auto_resolution_ms = match params.get("autoResolutionMs") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| InteractionError::Invalid("invalid autoResolutionMs".into()))?,
+            ),
+        };
         let mut fields = Vec::new();
         for (key, label) in [
             ("kind", "Operation"),
@@ -359,6 +382,8 @@ impl RequestDetails {
         Ok(Self {
             item_id: optional_string("itemId")?,
             started_at_ms,
+            is_blocking,
+            auto_resolution_ms,
             fields,
             available_decisions: decisions.map(|values| {
                 values
@@ -433,6 +458,77 @@ mod tests {
             request.approval_result(ApprovalDecision::Decline).unwrap(),
             json!({"decision":"decline"})
         );
+        assert!(request.approval_result(ApprovalDecision::Cancel).is_err());
+    }
+
+    #[test]
+    fn cancel_respects_the_advertised_decisions_and_submission_state() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ] {
+            let mut request = RequestView::decode(
+                RpcId::Number(1),
+                method,
+                &json!({"threadId":"t","turnId":"u","availableDecisions":["accept","cancel"]}),
+            )
+            .unwrap();
+            assert!(request.allow_cancel);
+            assert!(!request.allow_decline);
+            assert_eq!(
+                request.approval_result(ApprovalDecision::Cancel).unwrap(),
+                json!({"decision":"cancel"})
+            );
+            assert!(request.approval_result(ApprovalDecision::Decline).is_err());
+            request.responding = true;
+            assert!(request.approval_result(ApprovalDecision::Cancel).is_err());
+            for decisions in [
+                json!([]),
+                json!(["acceptForSession"]),
+                json!([{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["cmd"]}}]),
+            ] {
+                let request = RequestView::decode(
+                    RpcId::Number(1),
+                    method,
+                    &json!({"threadId":"t","turnId":"u","availableDecisions":decisions}),
+                )
+                .unwrap();
+                assert!(!request.allow_cancel);
+                assert!(request.approval_result(ApprovalDecision::Cancel).is_err());
+            }
+        }
+        let input = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput",
+            &json!({"threadId":"t","turnId":"u","questions":[{"id":"a","header":"H","question":"Q"}]})).unwrap();
+        assert!(input.approval_result(ApprovalDecision::Cancel).is_err());
+    }
+
+    #[test]
+    fn input_hints_are_optional_typed_server_facts() {
+        let params = json!({"threadId":"t","turnId":"u","isBlocking":false,"autoResolutionMs":0,
+            "questions":[{"id":"a","header":"H","question":"Q"}]});
+        let decode = |params: &Value| {
+            RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", params)
+        };
+        let request = decode(&params).unwrap();
+        assert_eq!(request.details.is_blocking, Some(false));
+        assert_eq!(request.details.auto_resolution_ms, Some(0));
+        let mut missing = params.clone();
+        missing.as_object_mut().unwrap().remove("isBlocking");
+        missing["autoResolutionMs"] = Value::Null;
+        let request = decode(&missing).unwrap();
+        assert_eq!(request.details.is_blocking, None);
+        assert_eq!(request.details.auto_resolution_ms, None);
+        for (field, value) in [
+            ("isBlocking", json!("false")),
+            ("isBlocking", json!(0)),
+            ("autoResolutionMs", json!(-1)),
+            ("autoResolutionMs", json!(0.5)),
+            ("autoResolutionMs", json!("100")),
+        ] {
+            let mut invalid = params.clone();
+            invalid[field] = value;
+            assert!(decode(&invalid).is_err());
+        }
     }
 
     #[test]

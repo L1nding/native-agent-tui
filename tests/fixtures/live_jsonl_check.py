@@ -89,6 +89,7 @@ def main():
 
         for mode, expected_code, result in [("success", 0, "completed"), ("approval", 0, "completed"),
                                             ("approval_no_decline", 130, "interrupted"),
+                                            ("approval_cancel", 130, "interrupted"),
                                             ("request_details", 130, "interrupted"),
                                             ("input", 130, "interrupted"), ("input_hang", 4, "unknown"),
                                             ("failure", 1, "failed"), ("workflow", 1, "failed"),
@@ -137,7 +138,7 @@ def main():
                 assert all(a["action"] == "declineApproval" for a in actions if a)
             if mode.startswith("input"):
                 assert any(a and a["action"] == "interruptForInput" and a["request_id"] == "input-request" for a in actions)
-            if mode == "approval_no_decline":
+            if mode in ("approval_no_decline", "approval_cancel"):
                 assert any(a and a["action"] == "interruptForApproval" and a["request_id"] == 7 for a in actions)
             if mode == "request_details":
                 rpc = [json.loads(line) for line in (root / "rpc.jsonl").read_text().splitlines()]

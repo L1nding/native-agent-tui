@@ -479,12 +479,12 @@ fn handle_key(
                 };
                 return false;
             }
-            KeyCode::Char('y') | KeyCode::Char('n') => {
+            KeyCode::Char('y') | KeyCode::Char('n') | KeyCode::Char('b') => {
                 if let Some(request) = selected_request(snapshot, local) {
-                    let decision = if key.code == KeyCode::Char('y') {
-                        ApprovalDecision::Accept
-                    } else {
-                        ApprovalDecision::Decline
+                    let decision = match key.code {
+                        KeyCode::Char('y') => ApprovalDecision::Accept,
+                        KeyCode::Char('n') => ApprovalDecision::Decline,
+                        _ => ApprovalDecision::Cancel,
                     };
                     if request_locked(snapshot, local, request) {
                         local.notice = Some(
@@ -2438,8 +2438,121 @@ mod tests {
     }
 
     #[test]
+    fn cancel_targets_the_selected_owner_once_and_never_substitutes_for_decline() {
+        let request = RequestView::decode(RpcId::Number(7), "item/commandExecution/requestApproval",
+            &serde_json::json!({"threadId":"child","turnId":"child-turn","availableDecisions":["accept","cancel"]})).unwrap();
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        local.editor.insert("TASK_DRAFT中文👋");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        handle_key(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        let ctrl = |code| KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL);
+        handle_key(ctrl('n'), &snapshot, &mut local, &tx);
+        assert!(rx.try_recv().is_err());
+        handle_key(ctrl('b'), &snapshot, &mut local, &tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: snapshot.requests[0].reference(),
+                decision: ApprovalDecision::Cancel
+            }
+        );
+        for code in ['b', 'y', 'n'] {
+            handle_key(ctrl(code), &snapshot, &mut local, &tx);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "TASK_DRAFT中文👋");
+        snapshot.requests[0].received_seq += 1;
+        handle_key(ctrl('b'), &snapshot, &mut local, &tx);
+        assert!(rx.try_recv().is_err());
+        // Explicit selection of a replacement restores only that request's controls.
+        handle_key(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(ctrl('b'), &snapshot, &mut local, &tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: snapshot.requests[0].reference(),
+                decision: ApprovalDecision::Cancel
+            }
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_hints_and_disabled_cancel_do_not_send_commands_or_expose_answers() {
+        let mut snapshot = observed_snapshot();
+        snapshot.requests = vec![RequestView::decode(RpcId::Number(2), "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root-thread","turnId":"turn","isBlocking":false,"autoResolutionMs":42,
+                "questions":[{"id":"secret","header":"Secret","question":"Q","isSecret":true}]})).unwrap()];
+        let observation = snapshot.observation.clone();
+        let mut local = LocalState {
+            request_panel: true,
+            ..Default::default()
+        };
+        sync_local_requests(&mut local, &snapshot);
+        local.editor.insert("PRIVATE_ANSWER中文👋");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "PRIVATE_ANSWER中文👋");
+        local.notice = None;
+        let mut seen = String::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for scroll in 0..70 {
+            local.request_scroll = scroll;
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            seen.extend(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol()),
+            );
+        }
+        assert!(seen.contains("Server blocking hint: false"));
+        assert!(seen.contains("42 ms (informational)"));
+        assert!(!seen.contains("PRIVATE_ANSWER"));
+        assert!(!seen.contains("Ctrl+B"));
+        assert_eq!(snapshot.observation, observation);
+        assert!(rx.try_recv().is_err());
+        snapshot.requests = vec![RequestView::decode(RpcId::Number(3), "item/fileChange/requestApproval",
+            &serde_json::json!({"threadId":"root-thread","turnId":"turn","availableDecisions":["decline"]})).unwrap()];
+        local.request_selection = None;
+        sync_local_requests(&mut local, &snapshot);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn request_context_is_scrollable_at_all_supported_sizes_and_never_exposes_secret_drafts() {
-        let request = RequestView::decode(RpcId::Number(1), "item/commandExecution/requestApproval", &serde_json::json!({"threadId":"root","turnId":"one","itemId":"shell","command":"printf 中文👋\nSECOND_LINE\u{001b}[31m","cwd":"COMMAND_DIRECTORY","startedAtMs":123,"availableDecisions":["accept","decline","acceptForSession"],"additionalPermissions":{"network":{"enabled":true}}})).unwrap();
+        let request = RequestView::decode(RpcId::Number(1), "item/commandExecution/requestApproval", &serde_json::json!({"threadId":"root","turnId":"one","itemId":"shell","command":"printf 中文👋\nSECOND_LINE\u{001b}[31m","cwd":"COMMAND_DIRECTORY","startedAtMs":123,"availableDecisions":["accept","decline","cancel","acceptForSession"],"additionalPermissions":{"network":{"enabled":true}}})).unwrap();
         let mut snapshot = CoreSnapshot {
             phase: SessionPhase::Running,
             thread_id: Some("root".into()),
@@ -2486,6 +2599,7 @@ mod tests {
                 "not applied",
                 "Ctrl+Y",
                 "Ctrl+N",
+                "Ctrl+B",
             ] {
                 assert!(seen.contains(value), "missing {value} at {width}x{height}");
             }

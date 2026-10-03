@@ -4,7 +4,8 @@
 
 - `F2` 打开当前请求详情；面板内再次按 `F2` 切换到下一个请求，包括已提交、等待服务端 resolved 的请求。
 - `PgUp/PgDn` 按行滚动；`Ctrl+Home/End` 跳到首尾。宽窄终端都保留回答和导航行。
-- `Ctrl+Y` 发送 `accept`，`Ctrl+N` 发送 `decline`，仅在该决策允许且请求仍有效时可用。提交后立即禁用该请求的重复回答。
+- `Ctrl+Y` 发送 `accept`，`Ctrl+N` 发送 `decline`，`Ctrl+B` 发送 `cancel`，仅在该决策允许且请求仍有效时可用。提交后立即禁用该请求的重复回答。
+- `decline` 拒绝本次操作并允许代理继续；`cancel` 拒绝本次操作并中断该请求所属轮次。普通真实命令审批常提供 `cancel` 而没有 `decline`。按不允许的快捷键只显示提示；Core 等待服务端终态确认中断。`Ctrl+C` 继续用于明确中断根轮次。
 - 输入请求按问题顺序填写，`Enter` 进入下一题或提交全部答案，`Shift+Enter` 换行。秘密答案在编辑区保持掩码。
 - `Esc` 关闭详情并保留任务和输入草稿。切换输入请求时，草稿绑定各自的请求身份；已解决、过期或被替换的请求不能把旧秘密答案带到新请求。
 - 原选择过期后显示已过期，需要明确按 `F2` 选择当前请求。列表变化不会自动把回答目标换成另一个请求。
@@ -15,9 +16,9 @@
 
 文件审批展示服务端 `fileChange` item 中的路径、变更类型、移动目标和 diff。只关联同一线程、轮次、item 的当前事件；不读取工作区文件推测差异。缓存最多 64 项、256 KiB，每个预览最多 32 KiB；裁剪、字段无效或未保留均明确显示。对应轮次终止后清理缓存。
 
-输入请求展示全部题目、选项说明与当前题目。缺少的 item、时间、目录、差异和风险评估显示 `unavailable`。根请求显示会话的 sandbox 与 approval policy，包括 `never`；子代理没有独立策略事实时显示 unavailable，并另列根策略。
+输入请求展示全部题目、选项说明与当前题目，以及服务端 `isBlocking` 和已废弃的 `autoResolutionMs` 提示。缺少提示显示 unavailable；时间提示仅供查看，不触发倒计时、自动回答或状态改变。缺少的 item、时间、目录、差异和风险评估显示 `unavailable`。根请求显示会话的 sandbox 与 approval policy，包括 `never`；子代理没有独立策略事实时显示 unavailable，并另列根策略。
 
-UI 当前支持 `accept` / `decline`，不会发送 session grant、执行策略或网络策略 amendment 决策。服务端给出的其他选项仍可查看。文件 `grantRoot` 是服务端提案，实际服务端执行语义尚未单独验收。查看或关闭面板不会改变策略、释放 Gate 或启动模型轮次。
+UI 当前支持 `accept` / `decline` / `cancel`，不会发送 session grant、执行策略或网络策略 amendment 决策。服务端给出的其他选项仍可查看；缺少允许列表时显示客户端可选决策，不声称这些选项已获服务端确认。文件 `grantRoot` 是服务端提案，实际服务端执行语义尚未单独验收。查看或关闭面板不会改变策略、释放 Gate 或启动模型轮次。
 
 ## Core 边界与隐私
 
@@ -25,7 +26,7 @@ UI 当前支持 `accept` / `decline`，不会发送 session grant、执行策略
 
 答案总大小限 32 KiB。超限时不发送，保留当前编辑内容供修正。所有详情和输入草稿仅在有界实时内存中；journal、JSONL、历史回放和脱敏导出不保存命令、目录、diff、问题或秘密答案。历史请求继续只读。
 
-## 验证
+## 请求详情初次验证
 
 `python scripts/verify.py` 覆盖 fmt、check、clippy、155 项默认 Rust 测试、doctest、release build 和原生夹具。新增回归验证同轮次 ID 复用、错误线程/轮次、三类过期动作、文件事件归属、缓存裁剪/清理、隐私投影、立即防重复提交、秘密草稿隔离和超限修正。
 
@@ -33,4 +34,12 @@ Ratatui TestBackend 覆盖 30×10、60×20、80×24、100×30、120×40、160×5
 
 最终源码的 `python scripts/verify.py` 全部通过。Windows ConPTY 交互验证了 F2、首尾跳转、命令目录/权限提案、文件 diff、过期选择与同 ID 的新请求；重复拒绝只发一次回答。中文/emoji 秘密答案始终显示掩码，Esc 保留草稿，提交后恢复原任务草稿。夹具确认秘密答案正确，但记录中只保留校验布尔值。随后明确中断和退出，终端恢复，主/辅助及其子进程均退出；只读回放确认 journal 关闭、清理成功及 Interrupted，并排除命令、diff 和答案文本。
 
-该场景共一个根轮次、一个 shell 检查、两个 ID=7 的独立拒绝、一个文件拒绝、一个输入回答和一个明确中断；详情导航没有额外 RPC。本轮采用确定性假 app-server；真实 Codex 审批表单、更多终端/IME、试用任务集、Alpha 与 V2 的完整发布验收仍待完成。
+该场景共一个根轮次、一个 shell 检查、两个 ID=7 的独立拒绝、一个文件拒绝、一个输入回答和一个明确中断；详情导航没有额外 RPC。该次采用确定性假 app-server。
+
+## 真实请求与取消验证
+
+新增五项默认回归覆盖 cancel 决策限制、过期身份、重复提交、终态确认、输入提示类型和隐私；30×10 至 160×50 的详情页可滚动查看三个允许决策。最终 `python scripts/verify.py --live` 通过 160 项默认测试、八项真实 Codex 检查及全部原生夹具，fmt/check/clippy/doctest/release 均通过。
+
+Windows ConPTY 另验证只提供 accept/cancel 的审批：Ctrl+N 未发送回答，连续 Ctrl+B 只发一次 cancel，没有另发根中断 RPC；确认 Interrupted 后 Esc 关闭详情，中文/emoji 任务草稿保留。退出恢复终端，进程身份检查确认拥有进程全部退出；只读回放确认 journal 关闭、清理成功、Interrupted 且无请求或草稿文本。
+
+真实 Codex 0.159.2 的命令、文件和输入往返、沙箱约束、独立夹具与能力限制见[请求兼容验证](request-compatibility.md)。更多终端/IME、子代理真实审批、策略 amendment、试用任务集、Alpha 与 V2 的完整发布验收仍待完成。

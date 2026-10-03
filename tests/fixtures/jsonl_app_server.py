@@ -75,6 +75,9 @@ def approval(request_id):
                       additionalPermissions={"network": {"enabled": True}})
     if mode == "approval_no_decline":
         params["availableDecisions"] = ["accept"]
+    if mode == "approval_cancel":
+        params.update(itemId="cancel-command", cwd="PRIVATE_COMMAND_DIRECTORY",
+                      availableDecisions=["accept", "cancel"])
     send({"id": request_id, "method": "item/commandExecution/requestApproval",
           "params": params})
 
@@ -127,6 +130,10 @@ try:
             send({"id": message["id"], "result": {}})
             if mode != "input_hang":
                 terminal("interrupted")
+        elif not method and mode == "approval_cancel" and message.get("id") == 7:
+            assert message["result"]["decision"] == "cancel"
+            send({"method": "serverRequest/resolved", "params": {"threadId": "root", "requestId": 7}})
+            terminal("interrupted")
         elif not method and mode == "request_details" and message.get("id") == 7:
             assert message["result"]["decision"] in ("accept", "decline")
             detail_stage += 1

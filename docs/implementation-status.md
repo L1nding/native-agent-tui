@@ -159,3 +159,11 @@ Ctrl+W 关闭/恢复所选代理当前的静默提醒；记录仅在 UI 内绑�
 F2 已接入可滚动请求详情，显示命令/目录、允许决策、策略及权限提案、输入问题和选项。文件 diff 只关联同一线程/轮次/item 的服务端事件，缓存与预览有界，缺失或裁剪明确可见；详情不进入 journal、JSONL 或历史。Esc 关闭详情并保留草稿；答案超限可修正，秘密仍保持掩码。目前支持 accept/decline，其他决策表单、风险事实与子代理独立策略保持 unavailable。
 
 最终 `python scripts/verify.py` 通过 155 项默认 Rust 测试和全部原生夹具，fmt/check/clippy/doctest/release 通过。新增原生 JSONL 场景验证同 ID 两次独立审批、文件请求、秘密输入中断及脱敏持久结果。Windows ConPTY 使用假 app-server 验证详情导航、重复提交锁定、过期选择、中文/emoji 秘密回答、Esc 保留和任务草稿恢复；一个根请求、一个 shell 检查、一个明确中断，退出后确认进程清理、journal 关闭和只读 Interrupted 回放。使用、内存边界与验证范围见[请求详情](request-details.md)。真实审批兼容性、更广终端/IME、搜索、试用与 Alpha/V2 发布验收仍待完成。
+
+## S4a 真实请求往返与取消审批
+
+真实 Codex 普通命令审批提供 cancel 而通常没有 decline。新增 Ctrl+B 按服务端允许列表取消所选审批，拒绝操作并中断所属轮次；Ctrl+N 保持 decline。完整请求身份和立即锁定继续约束所有回答，Core 等待服务端 resolved 与终态确认；输入详情新增有类型的 blocking 与废弃时间提示，不触发自动回答或状态改变。窄屏独立显示三个允许决策。
+
+最终 `python scripts/verify.py --live` 全部通过：160 项默认 Rust 测试、八项真实 Codex 检查和全部原生夹具，fmt/check/clippy/doctest/release 通过。三项新增真实请求测试使用 localhost provider 和独立 Codex home，验证取消命令无副作用、文件 decline/accept、接受命令仍受 read-only 约束、中文/emoji 输入与明确 RequestResolved 证据；持久结果和清理均确认。输入工具仅在夹具中显式开启普通模式的可选功能。
+
+Windows ConPTY 另确认不允许的 Ctrl+N 不发送回答、连续 Ctrl+B 只发一次 cancel、零额外根中断、Interrupted 与草稿保留；退出后进程身份检查和脱敏只读回放通过。边界与复现见[请求兼容验证](request-compatibility.md)。搜索、更广终端/IME、子代理真实审批、试用任务集及 Alpha/V2 发布验收仍待完成。

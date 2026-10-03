@@ -25,6 +25,9 @@ pub(super) fn actions(
     if request.allow_decline {
         actions.push("Ctrl+N decline");
     }
+    if request.allow_cancel {
+        actions.push("Ctrl+B stop turn");
+    }
     if actions.is_empty() {
         actions.push("No supported decision; Ctrl+C interrupt root");
     }
@@ -86,6 +89,20 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
     lines.push("Proposals: not applied".into());
     match &request.kind {
         RequestKind::UserInput { questions } => {
+            lines.push(format!(
+                "Server blocking hint: {}",
+                request
+                    .details
+                    .is_blocking
+                    .map_or_else(|| "unavailable".into(), |blocking| blocking.to_string())
+            ));
+            lines.push(format!(
+                "Legacy auto-resolution hint: {}",
+                request.details.auto_resolution_ms.map_or_else(
+                    || "unavailable".into(),
+                    |ms| format!("{ms} ms (informational)")
+                )
+            ));
             for (index, question) in questions.iter().enumerate() {
                 lines.push(format!(
                     "\nQuestion {}/{} · {} · id={}{}{}",
@@ -118,7 +135,7 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
             lines.push(format!(
                 "Server decisions:\n{}",
                 request.details.available_decisions.as_ref().map_or_else(
-                    || "unavailable; supported protocol defaults: accept / decline".into(),
+                    || "unavailable; client choices: accept / decline / cancel".into(),
                     |decisions| if decisions.is_empty() {
                         "none".into()
                     } else {
@@ -126,7 +143,8 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                     }
                 )
             ));
-            lines.push("UI supports single-request accept / decline. Other decisions are unavailable here; session grants and policy amendments require a supported decision form.".into());
+            lines.push("Cancel rejects this approval and interrupts its owning turn. Decline rejects it and lets the agent continue.".into());
+            lines.push("UI supports accept / decline / cancel. Session grants and policy amendments require a supported decision form.".into());
             lines.push("Risk assessment: unavailable (review the request context)".into());
             if matches!(request.kind, RequestKind::CommandApproval) {
                 for label in ["Command", "Command cwd"] {
@@ -187,8 +205,24 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         "No pending requests.".into()
     };
     let lines = wrap(&display_text(&text), area.width.saturating_sub(2) as usize);
+    let actions = request.map_or_else(
+        || "Answers disabled".into(),
+        |request| actions(snapshot, local, request),
+    );
+    let action_text = display_text(local.notice.as_deref().unwrap_or(&actions));
+    let action_lines = if action_text.len() <= area.width as usize {
+        vec![action_text]
+    } else if local.notice.is_none() {
+        action_text
+            .split(" | ")
+            .flat_map(|action| wrap(action, area.width as usize))
+            .collect()
+    } else {
+        wrap(&action_text, area.width as usize)
+    };
+    let action_height = action_lines.len().min(3) as u16;
     let body = Rect {
-        height: panel.height.saturating_sub(1),
+        height: panel.height.saturating_sub(action_height),
         ..panel
     };
     let height = body.height.saturating_sub(2) as usize;
@@ -208,20 +242,16 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         ))),
         body,
     );
-    let actions = request.map_or_else(
-        || "Answers disabled".into(),
-        |request| actions(snapshot, local, request),
-    );
     frame.render_widget(
-        Paragraph::new(display_text(local.notice.as_deref().unwrap_or(&actions))),
+        Paragraph::new(action_lines.into_iter().map(Line::from).collect::<Vec<_>>()),
         Rect {
-            y: panel.y + panel.height.saturating_sub(1),
-            height: 1,
+            y: panel.y + panel.height.saturating_sub(action_height),
+            height: action_height,
             ..area
         },
     );
     frame.render_widget(
-        Paragraph::new("F2 next  PgUp/PgDn scroll  Esc close"),
+        Paragraph::new("F2 next  PgUp/Dn  Esc close"),
         Rect {
             y: area.y + area.height.saturating_sub(1),
             height: 1,
