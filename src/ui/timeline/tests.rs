@@ -70,6 +70,7 @@ fn child(id: &str, parent: &str, confirmed: bool) -> AgentSnapshot {
         turn_id: None,
         outcome: None,
         awaiting_turn: false,
+        usage: Default::default(),
     }
 }
 

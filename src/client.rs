@@ -1845,14 +1845,20 @@ impl Core {
             let Some(thread) = params.get("threadId").and_then(Value::as_str) else {
                 return;
             };
+            let Some(turn) = params.get("turnId").and_then(Value::as_str) else {
+                return;
+            };
             let Some(usage) = decode_usage(&params) else {
                 return;
             };
             let accepted = if self.state.view.thread_id.as_deref() == Some(thread) {
+                if self.state.view.turn_id.as_deref() != Some(turn) {
+                    return;
+                }
                 self.state.view.usage = usage;
                 true
             } else {
-                self.state.agents.update_usage(thread, usage)
+                self.state.agents.update_usage(thread, turn, usage)
             };
             if accepted {
                 if let Some(limit) = self.token_budget_exhausted() {
@@ -5638,7 +5644,7 @@ mod tests {
         assert_eq!(next(&mut server).await["error"]["code"], -32602);
         send(&mut server, json!({"id":"active","method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"current"}})).await;
         send(&mut server, json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":"active"}})).await;
-        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"inputTokens":62,"cachedInputTokens":40,"outputTokens":18,"reasoningOutputTokens":3,"totalTokens":83},"modelContextWindow":128}}})).await;
+        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"current","tokenUsage":{"total":{"inputTokens":62,"cachedInputTokens":40,"outputTokens":18,"reasoningOutputTokens":3,"totalTokens":83},"modelContextWindow":128}}})).await;
         tokio::time::timeout(
             Duration::from_secs(3),
             client
@@ -5660,7 +5666,7 @@ mod tests {
             client.snapshots.borrow().usage.source,
             FactSource::ServerConfirmed
         );
-        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","tokenUsage":{"total":{"totalTokens":999}}}})).await;
+        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"child-current","tokenUsage":{"total":{"totalTokens":999}}}})).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(client.snapshots.borrow().usage.total_tokens, Some(83));
         assert_eq!(client.snapshots.borrow().requests.len(), 1);
@@ -5730,7 +5736,7 @@ mod tests {
         .await;
         send(
             &mut server,
-            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":10}}}}),
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"one","tokenUsage":{"total":{"totalTokens":10}}}}),
         )
         .await;
         let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
@@ -5767,6 +5773,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_root_usage_cannot_lower_current_usage_or_bypass_budget() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_total_tokens: Some(10),
+            ..Default::default()
+        })
+        .await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "first".into(),
+            })
+            .await
+            .unwrap();
+        let first = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":first["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"one"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"one","tokenUsage":{"total":{"totalTokens":9}}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.usage.total_tokens == Some(9))
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one","status":"completed"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Completed).await;
+
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "second".into(),
+            })
+            .await
+            .unwrap();
+        let second = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":second["id"],"result":{"turn":{"id":"two"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"two"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"two","tokenUsage":{"total":{"totalTokens":9}}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.turn_id.as_deref() == Some("two") && snapshot.usage.total_tokens == Some(9)
+            })
+            .await
+            .unwrap();
+        let mut version = client.snapshots.borrow().version;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":1}}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.version > version)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().usage.total_tokens, Some(9));
+        version = client.snapshots.borrow().version;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"one","tokenUsage":{"total":{"totalTokens":1}}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.version > version)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().usage.total_tokens, Some(9));
+
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"two","tokenUsage":{"total":{"totalTokens":10}}}}),
+        )
+        .await;
+        let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(
+            interrupt["params"],
+            json!({"threadId":"root","turnId":"two"})
+        );
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"two","status":"interrupted"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Failed).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_token_budget_sums_confirmed_root_and_child_usage() {
         let (mut client, mut server) = harness_with_config(Config {
             max_total_tokens: Some(10),
@@ -5779,7 +5910,7 @@ mod tests {
             &mut server,
             json!({
                 "method":"thread/tokenUsage/updated",
-                "params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":5}}}
+                "params":{"threadId":"root","turnId":"root-turn","tokenUsage":{"total":{"totalTokens":5}}}
             }),
         )
         .await;
@@ -5787,7 +5918,7 @@ mod tests {
             &mut server,
             json!({
                 "method":"thread/tokenUsage/updated",
-                "params":{"threadId":"child","tokenUsage":{"total":{"totalTokens":5}}}
+                "params":{"threadId":"child","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":5}}}
             }),
         )
         .await;
@@ -5882,7 +6013,7 @@ mod tests {
             json!({"id":first["id"],"result":{"turn":{"id":"one"}}}),
         )
         .await;
-        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":42}}}})).await;
+        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"two","tokenUsage":{"total":{"totalTokens":42}}}})).await;
         tokio::time::timeout(
             Duration::from_secs(3),
             client

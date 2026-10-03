@@ -777,6 +777,7 @@ mod tests {
             turn_id: None,
             outcome: None,
             awaiting_turn: false,
+            usage: Default::default(),
         }
     }
 

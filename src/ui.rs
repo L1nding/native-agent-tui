@@ -1228,6 +1228,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                 "  ".repeat(depth.saturating_sub(1)),
                 agent.generation,
             )));
+            agents.push(Line::from(format!(
+                "    {}{}",
+                "  ".repeat(depth.saturating_sub(1)),
+                agent_usage_brief(agent)
+            )));
             if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
                 agents.push(Line::from(format!(
                     "    {}{:?} / quiet {}",
@@ -1709,6 +1714,13 @@ fn usage_status(snapshot: &CoreSnapshot) -> String {
         usage_value(usage.output_tokens),
         usage_value(usage.reasoning_tokens)
     )
+}
+
+fn agent_usage_brief(agent: &crate::agents::AgentSnapshot) -> String {
+    match (agent.usage.source, agent.usage.total_tokens) {
+        (FactSource::ServerConfirmed, Some(tokens)) => format!("tokens:{tokens}"),
+        _ => "tokens: unavailable".to_owned(),
+    }
 }
 
 fn format_usage_evidence(snapshot: &CoreSnapshot) -> String {
@@ -2829,6 +2841,11 @@ mod tests {
                     turn_id: Some("a-1".into()),
                     outcome: None,
                     awaiting_turn: false,
+                    usage: crate::state::UsageSummary {
+                        total_tokens: Some(123),
+                        source: FactSource::ServerConfirmed,
+                        ..Default::default()
+                    },
                 },
                 AgentSnapshot {
                     info: AgentInfo {
@@ -2844,6 +2861,7 @@ mod tests {
                     turn_id: Some("b-1".into()),
                     outcome: None,
                     awaiting_turn: false,
+                    usage: Default::default(),
                 },
             ],
             gate: Some(GateSnapshot {
@@ -2901,6 +2919,8 @@ mod tests {
             if width >= 100 {
                 assert!(rendered.contains("Agents · F3"));
                 assert!(rendered.contains("+- /root/a/b"), "{rendered}");
+                assert!(rendered.contains("tokens:123"), "{rendered}");
+                assert!(rendered.contains("tokens: unavailable"), "{rendered}");
             }
         }
         local.editor.insert("root task");

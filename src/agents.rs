@@ -46,6 +46,7 @@ pub struct AgentSnapshot {
     pub turn_id: Option<String>,
     pub outcome: Option<ChildOutcome>,
     pub awaiting_turn: bool,
+    pub usage: UsageSummary,
 }
 
 #[derive(Debug, Error)]
@@ -177,7 +178,10 @@ impl AgentRegistry {
         self.agents.contains_key(id)
     }
 
-    pub fn update_usage(&mut self, id: &str, usage: UsageSummary) -> bool {
+    pub fn update_usage(&mut self, id: &str, turn_id: &str, usage: UsageSummary) -> bool {
+        if !self.current_turn(id, turn_id) {
+            return false;
+        }
         let Some(agent) = self.agents.get_mut(id) else {
             return false;
         };
@@ -354,6 +358,7 @@ impl AgentRegistry {
                 turn_id: agent.turn_id.clone(),
                 outcome: agent.outcome.clone(),
                 awaiting_turn: agent.turn_id.is_none() || agent.awaiting_after.is_some(),
+                usage: agent.usage,
             })
             .collect()
     }
@@ -508,12 +513,44 @@ mod tests {
             source: crate::state::FactSource::ServerConfirmed,
             ..UsageSummary::default()
         };
-        assert!(agents.update_usage("a", usage(12)));
-        assert!(agents.update_usage("nested", usage(7)));
-        assert!(!agents.update_usage("missing", usage(100)));
-        assert!(!agents.update_usage("unknown", UsageSummary::default()));
+        agents.started("a", "a-1", 1).unwrap();
+        agents.started("nested", "nested-1", 2).unwrap();
+        assert!(agents.update_usage("a", "a-1", usage(12)));
+        assert!(agents.update_usage("nested", "nested-1", usage(7)));
+        assert!(!agents.update_usage("missing", "missing-1", usage(100)));
+        assert!(!agents.update_usage("unknown", "unknown-1", UsageSummary::default()));
         assert_eq!(agents.confirmed_total_tokens(), 19);
-        assert!(agents.update_usage("a", usage(20)));
+        assert!(agents.update_usage("a", "a-1", usage(20)));
         assert_eq!(agents.confirmed_total_tokens(), 27);
+        let snapshots = agents.snapshots();
+        assert_eq!(snapshots[0].usage.total_tokens, Some(20));
+        assert_eq!(
+            snapshots[0].usage.source,
+            crate::state::FactSource::ServerConfirmed
+        );
+        assert_eq!(snapshots[2].usage.total_tokens, None);
+        assert_eq!(snapshots[2].usage.source, crate::state::FactSource::Unknown);
+    }
+
+    #[test]
+    fn stale_child_usage_cannot_replace_the_current_turn_usage() {
+        let mut agents = AgentRegistry::default();
+        agents.register(child("a", "root")).unwrap();
+        let usage = |total_tokens| UsageSummary {
+            total_tokens: Some(total_tokens),
+            source: crate::state::FactSource::ServerConfirmed,
+            ..UsageSummary::default()
+        };
+        agents.started("a", "old", 1).unwrap();
+        assert!(agents.update_usage("a", "old", usage(9)));
+        agents
+            .completed("a", "old", ChildOutcome::Completed)
+            .unwrap();
+        agents.rearm("a", 2);
+        agents.started("a", "new", 3).unwrap();
+        assert!(!agents.update_usage("a", "old", usage(1)));
+        assert_eq!(agents.confirmed_total_tokens(), 9);
+        assert!(agents.update_usage("a", "new", usage(12)));
+        assert_eq!(agents.confirmed_total_tokens(), 12);
     }
 }

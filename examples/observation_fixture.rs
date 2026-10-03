@@ -53,6 +53,7 @@ async fn main() {
             turn_id: Some(format!("{id}-1")),
             outcome: None,
             awaiting_turn: false,
+            usage: Default::default(),
         })
         .collect();
     let gate = GateSnapshot {
