@@ -1746,14 +1746,15 @@ impl Core {
                 return;
             }
             if let Ok(id) = serde_json::from_value::<RpcId>(params["requestId"].clone()) {
-                if self
+                if let Some(request) = self
                     .state
                     .view
                     .requests
                     .iter()
-                    .any(|request| request.id == id && request.thread_id == thread)
+                    .find(|request| request.id == id && request.thread_id == thread)
                 {
-                    self.observer.request_resolved(thread, &id, Instant::now());
+                    self.observer
+                        .request_resolved(&request.reference(), Instant::now());
                 }
                 self.state
                     .view
@@ -2635,6 +2636,105 @@ mod tests {
             .find(|request| request.id == id)
             .unwrap()
             .reference()
+    }
+
+    #[tokio::test]
+    async fn reused_request_delivery_restores_actionable_observation() {
+        use crate::observation::{ActivityKind, EvidenceKind, InteractionState};
+
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        for id in [json!(7), json!("7")] {
+            let request = json!({"id":id,"method":"item/commandExecution/requestApproval",
+                "params":{"threadId":"root","turnId":"root-turn"}});
+            observation_event(&mut client, &mut server, request.clone()).await;
+            let old_delivery = client.snapshots.borrow().requests[0].reference();
+            let first = client.snapshots.borrow().observation.clone();
+            let old = first
+                .activities
+                .iter()
+                .find(|activity| activity.attention.requires_action)
+                .unwrap();
+            let old_id = old.activity_id.clone();
+            observation_event(
+                &mut client,
+                &mut server,
+                json!({"method":"serverRequest/resolved","params":{
+                    "threadId":"root","requestId":id}}),
+            )
+            .await;
+            let resolved = client.snapshots.borrow().observation.clone();
+            assert!(!resolved
+                .activities
+                .iter()
+                .any(|a| a.attention.requires_action));
+
+            observation_event(&mut client, &mut server, request.clone()).await;
+            let new_delivery = client.snapshots.borrow().requests[0].reference();
+            assert_ne!(old_delivery.received_seq, new_delivery.received_seq);
+            assert!(!client.snapshots.borrow().requests[0].responding);
+            let recreated = client.snapshots.borrow().observation.clone();
+            let pending: Vec<_> = recreated
+                .activities
+                .iter()
+                .filter(|activity| activity.attention.requires_action)
+                .collect();
+            assert_eq!(
+                pending.len(),
+                1,
+                "a new delivery must restore requires_action"
+            );
+            assert_ne!(pending[0].activity_id, old_id);
+            assert_eq!(pending[0].kind, ActivityKind::WaitingApproval);
+            assert_eq!(
+                pending[0].interaction_state,
+                Some(InteractionState::Pending)
+            );
+            assert_eq!(
+                pending[0].last_evidence.as_ref().unwrap().kind,
+                EvidenceKind::RequestCreated
+            );
+            assert_eq!(
+                recreated
+                    .activities
+                    .iter()
+                    .flat_map(|activity| &activity.recent_evidence)
+                    .filter(|evidence| evidence.id > resolved.accepted_evidence_count
+                        && evidence.kind == EvidenceKind::RequestCreated)
+                    .count(),
+                2
+            );
+            assert!(recreated
+                .activities
+                .iter()
+                .any(|activity| activity.activity_id == old_id
+                    && activity.interaction_state == Some(InteractionState::Resolved)));
+            // A duplicate wire request remains the same accepted delivery.
+            observation_event(&mut client, &mut server, request).await;
+            assert_eq!(
+                client
+                    .snapshots
+                    .borrow()
+                    .observation
+                    .accepted_evidence_count,
+                recreated.accepted_evidence_count
+            );
+            observation_event(
+                &mut client,
+                &mut server,
+                json!({"method":"serverRequest/resolved","params":{
+                    "threadId":"root","requestId":id}}),
+            )
+            .await;
+        }
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

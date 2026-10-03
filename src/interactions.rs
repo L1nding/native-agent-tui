@@ -70,7 +70,7 @@ pub enum RequestKind {
 }
 
 /// Identifies one accepted delivery, including reuse of an RPC ID in the same turn.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestRef {
     pub id: RpcId,
     pub thread_id: String,

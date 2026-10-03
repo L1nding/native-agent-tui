@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::agents::AgentSnapshot;
 use crate::gate::{ChildOutcome, WaitTarget};
-use crate::interactions::{RequestKind, RequestView};
+use crate::interactions::{RequestKind, RequestRef, RequestView};
 use crate::protocol::{RpcId, ToolCategory};
 use crate::scheduler::{TaskId, TaskSnapshot, TaskState};
 use crate::state::{GateSnapshot, SessionPhase};
@@ -428,7 +428,7 @@ impl AgentKey {
 enum Slot {
     Main,
     Tool(String),
-    Request(String),
+    Request(RequestRef),
 }
 type Key = (AgentKey, Slot);
 
@@ -843,10 +843,9 @@ impl Observer {
         );
         Ok(())
     }
-    pub fn request_resolved(&mut self, thread: &str, id: &RpcId, now: Instant) {
+    pub fn request_resolved(&mut self, request: &RequestRef, now: Instant) {
         let key = self.activities.iter().find_map(|(key, activity)| {
-            (activity.identity.thread_id.as_deref() == Some(thread)
-                && activity.request_id.as_ref() == Some(id)
+            (matches!(&key.1, Slot::Request(reference) if reference == request)
                 && activity.execution.active())
             .then(|| key.clone())
         });
@@ -1105,10 +1104,7 @@ impl Observer {
             let Some(agent) = self.agent_for_turn(&request.thread_id, &request.turn_id) else {
                 continue;
             };
-            let key = (
-                agent.clone(),
-                Slot::Request(serde_json::to_string(&request.id).expect("RPC ids serialize")),
-            );
+            let key = (agent.clone(), Slot::Request(request.reference()));
             present.insert(key.clone());
             if !self.activities.contains_key(&key) {
                 let kind = if matches!(request.kind, RequestKind::UserInput { .. }) {

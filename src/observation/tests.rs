@@ -321,8 +321,8 @@ fn approval_remains_actionable_despite_output_and_resolves_exactly_once() {
         observer.snapshot_at(3, time).accepted_evidence_count,
         answered.accepted_evidence_count
     );
-    observer.request_resolved("parent", &RpcId::String("approval".into()), time);
-    observer.request_resolved("parent", &RpcId::String("approval".into()), time);
+    observer.request_resolved(&requests[0].reference(), time);
+    observer.request_resolved(&requests[0].reference(), time);
     observer
         .reconcile(facts(&root, &[], &requests[1..], None), time)
         .unwrap();
@@ -343,6 +343,93 @@ fn approval_remains_actionable_despite_output_and_resolves_exactly_once() {
     assert_eq!(
         serde_json::from_str::<ObservationSnapshot>(&encoded).unwrap(),
         snapshot
+    );
+}
+
+#[test]
+fn request_delivery_identity_separates_replacements_and_stale_resolution() {
+    let now = Instant::now();
+    let root = root_task();
+    let mut observer = observer(now);
+    let mut request = RequestView::decode(
+        RpcId::Number(7),
+        "item/commandExecution/requestApproval",
+        &json!({"threadId":"parent","turnId":"turn-1"}),
+    )
+    .unwrap();
+    request.received_seq = 1;
+    observer
+        .reconcile(facts(&root, &[], std::slice::from_ref(&request), None), now)
+        .unwrap();
+    let stale = request.reference();
+    // Replacement without a resolution notification expires the old delivery.
+    request.received_seq = 2;
+    let time = now + Duration::from_secs(1);
+    observer
+        .reconcile(
+            facts(&root, &[], std::slice::from_ref(&request), None),
+            time,
+        )
+        .unwrap();
+    let replaced = observer.snapshot_at(1, time);
+    assert_eq!(
+        replaced
+            .activities
+            .iter()
+            .filter(|a| a.attention.requires_action)
+            .count(),
+        1
+    );
+    assert_eq!(
+        replaced
+            .activities
+            .iter()
+            .filter(|a| a.interaction_state == Some(InteractionState::Expired))
+            .count(),
+        1
+    );
+    observer.request_resolved(&stale, time);
+    observer.request_resolved(
+        &RequestRef {
+            thread_id: "other".into(),
+            ..request.reference()
+        },
+        time,
+    );
+    observer.request_resolved(
+        &RequestRef {
+            turn_id: "old-turn".into(),
+            ..request.reference()
+        },
+        time,
+    );
+    assert_eq!(
+        observer.snapshot_at(2, time).accepted_evidence_count,
+        replaced.accepted_evidence_count
+    );
+    assert!(observer
+        .snapshot_at(2, time)
+        .activities
+        .iter()
+        .any(|a| a.attention.requires_action));
+    observer.request_resolved(&request.reference(), time);
+    let resolved = observer.snapshot_at(3, time);
+    assert!(!resolved
+        .activities
+        .iter()
+        .any(|a| a.attention.requires_action));
+    assert_eq!(
+        resolved
+            .activities
+            .iter()
+            .filter(|a| a.interaction_state == Some(InteractionState::Resolved))
+            .count(),
+        1
+    );
+    observer.request_resolved(&request.reference(), time);
+    assert_eq!(
+        observer.snapshot_at(4, time).accepted_evidence_count,
+        resolved.accepted_evidence_count
     );
 }
 

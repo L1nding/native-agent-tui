@@ -233,7 +233,7 @@ pub fn dynamic_tool_result(success: bool, data: Value) -> Value {
     serde_json::json!({"success":success,"contentItems":[{"type":"inputText","text":data.to_string()}]})
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RpcId {
     Number(i64),

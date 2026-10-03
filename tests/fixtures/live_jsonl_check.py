@@ -141,6 +141,18 @@ def main():
             if mode in ("approval_no_decline", "approval_cancel"):
                 assert any(a and a["action"] == "interruptForApproval" and a["request_id"] == 7 for a in actions)
             if mode == "request_details":
+                # One wire ID represents two accepted deliveries in this turn.
+                # Both must remain distinct in live and durable observation.
+                for stream in (live, history):
+                    deliveries = {}
+                    for record in stream:
+                        for activity in record["payload"].get("observation", {}).get("activities", []):
+                            if activity.get("request_id") == 7:
+                                deliveries[activity["activity_id"]] = activity
+                    assert len(deliveries) == 2, "reused approval ID lost an observation activity"
+                    assert all(a["interaction_state"] == "resolved" for a in deliveries.values())
+                    assert all(any(e["kind"] == "requestCreated" for e in a["recent_evidence"])
+                               for a in deliveries.values())
                 rpc = [json.loads(line) for line in (root / "rpc.jsonl").read_text().splitlines()]
                 assert sum(r["id"] == 7 and r["decision"] == "decline" for r in rpc) == 2
                 assert any(a and a["action"] == "declineApproval" and a["request_id"] == "file-detail" for a in actions)
