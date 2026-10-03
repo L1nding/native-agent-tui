@@ -185,14 +185,29 @@ async fn execute() -> Result<(), (u8, String)> {
                 if replay.info.needs_recovery {
                     println!("Observation review required. Replay cannot answer old requests or resume execution.");
                 }
+                let compactions = state
+                    .observation
+                    .activities
+                    .iter()
+                    .filter(|activity| {
+                        activity.tool_category
+                            == Some(native_agent_tui::protocol::ToolCategory::Compaction)
+                    })
+                    .count();
+                println!(
+                    "Compactions retained: {} | lifetime total unavailable | before/after usage, reason and summary unavailable",
+                    compactions
+                );
                 for activity in &state.observation.activities {
                     println!(
-                        "{} {:?} {:?} | progress {} | historical quiet {:?}ms",
+                        "{} {:?} {:?} {:?} | progress {} | historical quiet {:?}ms | last source {:?}",
                         display_text_for_cli(&activity.identity.agent_id),
                         activity.scope,
                         activity.execution_state,
+                        activity.tool_category,
                         activity.progress_seq,
-                        activity.silence_ms
+                        activity.silence_ms,
+                        activity.last_evidence.as_ref().map(|evidence| evidence.source)
                     );
                 }
             }

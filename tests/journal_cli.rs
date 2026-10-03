@@ -5,10 +5,63 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use native_agent_tui::journal::{Journal, JournalSettings, StoredSnapshot};
-use native_agent_tui::observation::Observer;
+use native_agent_tui::observation::{ChildFact, ObservationFacts, Observer};
+use native_agent_tui::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
+use native_agent_tui::scheduler::{ExternalTurn, RootTaskSpec, Scheduler};
 use native_agent_tui::state::{CoreSnapshot, SessionPhase};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn observed_compaction_snapshot(now: tokio::time::Instant) -> CoreSnapshot {
+    let mut scheduler = Scheduler::default();
+    scheduler
+        .enqueue(vec![RootTaskSpec::input("PRIVATE_PROMPT".into())])
+        .unwrap();
+    let attempt = scheduler.dispatch().unwrap().attempt;
+    scheduler
+        .started_root(
+            attempt,
+            ExternalTurn {
+                thread_id: "root-thread".into(),
+                turn_id: "compaction-turn".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+    let mut observer = Observer::new_at("cli-session".into(), Default::default(), now, Some(1000));
+    observer
+        .reconcile(
+            ObservationFacts {
+                phase: SessionPhase::Running,
+                root_thread: Some("root-thread"),
+                root_generation: 1,
+                root_task: scheduler.task(attempt.task),
+                children: Vec::<ChildFact<'_>>::new(),
+                requests: &[],
+                gate: None,
+            },
+            now,
+        )
+        .unwrap();
+    observer
+        .tool(
+            &ObservedTool {
+                thread_id: "root-thread".into(),
+                turn_id: "compaction-turn".into(),
+                item_id: "compaction-item".into(),
+                outcome: Some(ObservedToolOutcome::Completed),
+                category: ToolCategory::Compaction,
+            },
+            now,
+        )
+        .unwrap();
+    CoreSnapshot {
+        phase: SessionPhase::Running,
+        scheduler: scheduler.snapshot(),
+        observation: observer.snapshot_at(0, now),
+        ..Default::default()
+    }
+}
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -146,12 +199,7 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
     let fixture = Fixture::new();
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let now = tokio::time::Instant::now();
-    let observer = Observer::new_at("cli-session".into(), Default::default(), now, Some(1000));
-    let core = CoreSnapshot {
-        phase: SessionPhase::Running,
-        observation: observer.snapshot_at(0, now),
-        ..Default::default()
-    };
+    let core = observed_compaction_snapshot(now);
     let journal = Journal::open(&fixture.settings(), cwd, StoredSnapshot::capture(&core)).unwrap();
     let active_before = fixture.contents();
     let active = fixture.run(&["--replay", "cli-session", "--json-events"]);
@@ -168,6 +216,18 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
         serde_json::Value::Null
     );
     assert_eq!(lines.last().unwrap()["payload"]["needs_recovery"], true);
+    let activity = lines
+        .iter()
+        .filter_map(|record| record["payload"]["observation"]["activities"].as_array())
+        .flatten()
+        .find(|activity| activity["tool_category"] == "compaction")
+        .unwrap();
+    assert_eq!(activity["execution_state"], "completed");
+    assert_eq!(activity["identity"]["turn_id"], "compaction-turn");
+    assert_eq!(activity["item_id"], "compaction-item");
+    assert!(!serde_json::to_string(&lines)
+        .unwrap()
+        .contains("PRIVATE_PROMPT"));
     let mut terminal = StoredSnapshot::capture(&core);
     terminal.observation.snapshot_version = 1;
     terminal.close(SessionPhase::Unknown, true);
@@ -186,7 +246,12 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
     assert_eq!(lines[2]["kind"], "replay_end");
     assert_eq!(lines[2]["payload"]["execution_result"], "unknown");
     assert_eq!(lines[2]["payload"]["live_attached"], false);
-    assert!(fixture.run(&["--replay", "cli-session"]).status.success());
+    let text_replay = fixture.run(&["--replay", "cli-session"]);
+    assert!(text_replay.status.success());
+    let text_replay = String::from_utf8(text_replay.stdout).unwrap();
+    assert!(text_replay.contains("Compactions retained: 1"));
+    assert!(text_replay.contains("lifetime total unavailable"));
+    assert!(text_replay.contains("Some(Compaction)"));
     let listing = fixture.run(&["--sessions"]);
     assert!(listing.status.success());
     assert!(String::from_utf8(listing.stdout)

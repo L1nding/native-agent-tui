@@ -3666,6 +3666,171 @@ mod tests {
         client.join.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn compaction_observation_is_inert_for_root_and_child_gate_execution() {
+        use crate::observation::{ActivityScope, EvidenceKind, EvidenceSource, ExecutionState};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        wait_call(&mut server, "compaction-wait", vec!["a"]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        for (thread, turn, id) in [
+            ("root", "root-turn", "root-compaction"),
+            ("a", "a-1", "child-compaction"),
+        ] {
+            observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,"item":{"id":id,"type":"contextCompaction"}}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{"threadId":thread,"turnId":turn,"item":{"id":id,"type":"contextCompaction"}}})).await;
+        }
+        let before_duplicate = client
+            .snapshots
+            .borrow()
+            .observation
+            .accepted_evidence_count;
+        for (thread, turn, id) in [
+            ("root", "root-turn", "root-compaction"),
+            ("a", "a-1", "child-compaction"),
+        ] {
+            observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,"item":{"id":id,"type":"contextCompaction"}}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{"threadId":thread,"turnId":turn,"item":{"id":id,"type":"contextCompaction"}}})).await;
+        }
+        let snapshot = client.snapshots.borrow().clone();
+        assert_eq!(snapshot.phase, SessionPhase::GatePending);
+        assert!(snapshot.gate.as_ref().unwrap().pending);
+        assert_eq!(snapshot.root_start_requests, 1);
+        assert_eq!(
+            snapshot.observation.accepted_evidence_count,
+            before_duplicate
+        );
+        for (thread, turn, id) in [
+            ("root", "old-root-turn", "stale-root-compaction"),
+            ("a", "old-child-turn", "stale-child-compaction"),
+            ("foreign", "root-turn", "foreign-compaction"),
+        ] {
+            observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{"threadId":thread,"turnId":turn,"item":{"id":id,"type":"contextCompaction"}}})).await;
+        }
+        let snapshot = client.snapshots.borrow().clone();
+        assert_eq!(
+            snapshot.observation.accepted_evidence_count,
+            before_duplicate
+        );
+        assert!(snapshot.observation.activities.iter().all(|activity| {
+            !matches!(
+                activity.item_id.as_deref(),
+                Some("stale-root-compaction")
+                    | Some("stale-child-compaction")
+                    | Some("foreign-compaction")
+            )
+        }));
+        assert_eq!(snapshot.root_start_requests, 1);
+        for (id, owner) in [("root-compaction", "root"), ("child-compaction", "a")] {
+            let activity = snapshot
+                .observation
+                .activities
+                .iter()
+                .find(|activity| activity.item_id.as_deref() == Some(id))
+                .unwrap();
+            assert_eq!(activity.identity.agent_id, owner);
+            assert_eq!(activity.scope, ActivityScope::Tool);
+            assert_eq!(
+                activity.tool_category,
+                Some(protocol::ToolCategory::Compaction)
+            );
+            assert_eq!(activity.execution_state, ExecutionState::Completed);
+            assert_eq!(
+                activity.last_evidence.as_ref().unwrap().source,
+                EvidenceSource::AppServer
+            );
+            assert!(activity
+                .recent_evidence
+                .iter()
+                .any(|evidence| evidence.kind == EvidenceKind::ToolCompleted));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err(),
+            "compaction evidence cannot release Gate or send another root request"
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unfinished_compaction_is_unknown_when_its_root_or_child_turn_ends() {
+        use crate::observation::{EvidenceSource, ExecutionState};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        for (thread, turn, id) in [
+            ("root", "root-turn", "root-open-compaction"),
+            ("a", "a-1", "child-open-compaction"),
+        ] {
+            observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,"item":{"id":id,"type":"contextCompaction"}}})).await;
+        }
+        observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"a-1","status":"completed"}}})).await;
+        let child = client
+            .snapshots
+            .borrow()
+            .observation
+            .activities
+            .iter()
+            .find(|activity| activity.item_id.as_deref() == Some("child-open-compaction"))
+            .unwrap()
+            .clone();
+        assert_eq!(child.execution_state, ExecutionState::Unknown);
+        assert_eq!(
+            child.last_evidence.as_ref().unwrap().source,
+            EvidenceSource::Core
+        );
+
+        observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        let root = client
+            .snapshots
+            .borrow()
+            .observation
+            .activities
+            .iter()
+            .find(|activity| activity.item_id.as_deref() == Some("root-open-compaction"))
+            .unwrap()
+            .clone();
+        assert_eq!(root.execution_state, ExecutionState::Unknown);
+        assert_eq!(
+            root.last_evidence.as_ref().unwrap().source,
+            EvidenceSource::Core
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unfinished_compaction_is_unknown_on_transport_disconnect() {
+        use crate::observation::{EvidenceSource, ExecutionState};
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"open-compaction","type":"contextCompaction"}}})).await;
+        drop(server);
+        phase(&mut client, SessionPhase::Disconnected).await;
+        let activity = client
+            .snapshots
+            .borrow()
+            .observation
+            .activities
+            .iter()
+            .find(|activity| activity.item_id.as_deref() == Some("open-compaction"))
+            .unwrap()
+            .clone();
+        assert_eq!(activity.execution_state, ExecutionState::Unknown);
+        assert_eq!(
+            activity.last_evidence.as_ref().unwrap().source,
+            EvidenceSource::Core
+        );
+        assert_eq!(
+            activity.last_evidence.as_ref().unwrap().kind,
+            crate::observation::EvidenceKind::ExecutionUnknown
+        );
+        client.join.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn attention_changes_and_child_output_cannot_release_a_paused_gate_or_hide_approval() {
         use crate::observation::{ActivityScope, AttentionLevel, ConfigSource};

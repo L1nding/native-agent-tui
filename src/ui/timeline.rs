@@ -693,6 +693,11 @@ fn metadata(entry: &TimelineEntry) -> Vec<String> {
             request.id, request.thread_id, request.turn_id, request.received_seq
         ));
     }
+    if entry.tool_category == Some(crate::protocol::ToolCategory::Compaction) {
+        rows.push(
+            "Compaction before/after usage, reason and summary: unavailable from schema".into(),
+        );
+    }
     for target in &entry.wait_targets {
         rows.push(format!(
             "Wait target: {} / turn {} / generation {} / {:?}",

@@ -123,7 +123,59 @@ fn historical_details_render_persisted_usage_and_budget_without_private_content(
         stop_triggered: false,
     });
     state.observation.session_id = "history-session".into();
-    state.observation.activities.clear();
+    let evidence = crate::observation::Evidence {
+        id: 1,
+        kind: crate::observation::EvidenceKind::ToolCompleted,
+        source: crate::observation::EvidenceSource::AppServer,
+        recorded_at_ms: Some(1000),
+        item_id: Some("compact-item".into()),
+        request_id: None,
+        output_bytes: 0,
+    };
+    state.observation.accepted_evidence_count = 1;
+    state.observation.activities = vec![crate::observation::ActivitySnapshot {
+        session_id: "history-session".into(),
+        clock_epoch: "history-session:clock-1".into(),
+        activity_id: "compaction".into(),
+        identity: crate::observation::ActivityIdentity {
+            agent_id: "root".into(),
+            task_id: None,
+            attempt_id: Some(1),
+            thread_id: Some("root-thread".into()),
+            turn_id: Some("root-turn".into()),
+            generation: Some(1),
+        },
+        scope: crate::observation::ActivityScope::Tool,
+        kind: crate::observation::ActivityKind::Completed,
+        execution_state: crate::observation::ExecutionState::Completed,
+        item_id: Some("compact-item".into()),
+        request_id: None,
+        interaction_state: None,
+        tool_category: Some(crate::protocol::ToolCategory::Compaction),
+        started_at_ms: Some(900),
+        last_evidence_at_ms: Some(1000),
+        elapsed_ms: Some(100),
+        silence_ms: None,
+        freshness: crate::observation::Freshness::Final,
+        last_evidence: Some(evidence.clone()),
+        recent_evidence: vec![evidence],
+        progress_seq: 1,
+        output_bytes: 0,
+        transition_count: 1,
+        child_terminal_count: 0,
+        wait_reason: None,
+        resume_condition: None,
+        wait_targets: vec![],
+        attention: crate::observation::Attention {
+            level: crate::observation::AttentionLevel::Ended,
+            reason: crate::observation::AttentionReason::ExecutionEnded,
+            requires_action: false,
+            quiet_after_ms: None,
+            attention_after_ms: None,
+            config_source: None,
+        },
+        provider_state: None,
+    }];
     panel.view.as_mut().unwrap().selected.payload = Payload::Snapshot(Box::new(state));
 
     let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
@@ -139,6 +191,12 @@ fn historical_details_render_persisted_usage_and_budget_without_private_content(
     assert!(screen.contains("total 20"), "{screen}");
     assert!(screen.contains("Recorded token budget"), "{screen}");
     assert!(screen.contains("20 / 30"), "{screen}");
+    assert!(screen.contains("Compactions retained: 1"), "{screen}");
+    assert!(screen.contains("source Some(AppServer)"), "{screen}");
+    assert!(
+        screen.contains("before/after usage, reason and summary unavailable"),
+        "{screen}"
+    );
     assert!(!screen.contains("PRIVATE"), "{screen}");
 }
 

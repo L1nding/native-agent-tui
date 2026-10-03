@@ -1,7 +1,10 @@
 use super::*;
 use crate::history::search::{Category, Query};
 use crate::journal::{tests::Fixture, Journal, StoredSnapshot};
-use crate::observation::{Freshness, ObservationFacts, Observer};
+use crate::observation::{
+    Evidence, EvidenceKind, EvidenceSource, Freshness, ObservationFacts, Observer,
+};
+use crate::protocol::ToolCategory;
 use crate::scheduler::{ExternalTurn, RootTaskSpec, Scheduler};
 use crate::state::{CoreSnapshot, SessionPhase};
 
@@ -65,6 +68,66 @@ fn state(version: u64) -> StoredSnapshot {
         turn_id: "C:\\Users\\PRIVATE_PATH".into(),
     });
     StoredSnapshot::capture(&core)
+}
+
+fn with_compaction(mut stored: StoredSnapshot) -> StoredSnapshot {
+    let mut activity = stored.observation.activities[0].clone();
+    let id = stored.observation.accepted_evidence_count.saturating_add(1);
+    let evidence = Evidence {
+        id,
+        kind: EvidenceKind::ToolCompleted,
+        source: EvidenceSource::AppServer,
+        recorded_at_ms: Some(2000),
+        item_id: Some("compact-item".into()),
+        request_id: None,
+        output_bytes: 0,
+    };
+    activity.activity_id = "compaction-fixture".into();
+    activity.scope = crate::observation::ActivityScope::Tool;
+    activity.kind = crate::observation::ActivityKind::Completed;
+    activity.execution_state = crate::observation::ExecutionState::Completed;
+    activity.item_id = Some("compact-item".into());
+    activity.tool_category = Some(ToolCategory::Compaction);
+    activity.last_evidence = Some(evidence.clone());
+    activity.recent_evidence = vec![evidence];
+    activity.progress_seq = 1;
+    activity.transition_count = 1;
+    stored.observation.accepted_evidence_count = id;
+    stored.observation.activities.push(activity);
+    stored
+}
+
+fn with_unknown_compaction(mut stored: StoredSnapshot) -> StoredSnapshot {
+    stored = with_compaction(stored);
+    let activity = stored.observation.activities.last_mut().unwrap();
+    let started_id = stored.observation.accepted_evidence_count.saturating_add(1);
+    let terminal_id = started_id.saturating_add(1);
+    let started = Evidence {
+        id: started_id,
+        kind: EvidenceKind::ToolStarted,
+        source: EvidenceSource::AppServer,
+        recorded_at_ms: Some(1500),
+        item_id: Some("compact-item".into()),
+        request_id: None,
+        output_bytes: 0,
+    };
+    let unknown = Evidence {
+        id: terminal_id,
+        kind: EvidenceKind::ExecutionUnknown,
+        source: EvidenceSource::Core,
+        recorded_at_ms: Some(2000),
+        item_id: Some("compact-item".into()),
+        request_id: None,
+        output_bytes: 0,
+    };
+    activity.kind = crate::observation::ActivityKind::Unknown;
+    activity.execution_state = crate::observation::ExecutionState::Unknown;
+    activity.last_evidence = Some(unknown.clone());
+    activity.recent_evidence = vec![started, unknown];
+    activity.progress_seq = 2;
+    activity.transition_count = 2;
+    stored.observation.accepted_evidence_count = terminal_id;
+    stored
 }
 
 #[tokio::test]
@@ -291,6 +354,93 @@ async fn history_search_returns_locatable_redacted_metadata() {
         panic!()
     };
     assert_eq!(view.selected.event_seq, hit.event_seq);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_compaction_category_finds_only_locatable_confirmed_event_metadata() {
+    let fixture = Fixture::new();
+    let settings = fixture.settings();
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let journal = Journal::open(&settings, &cwd, with_compaction(state(1))).unwrap();
+    let mut terminal = with_compaction(state(2));
+    terminal.close(SessionPhase::Unknown, true);
+    journal.finish(terminal).await.unwrap();
+
+    let mut service = HistoryHandle::start(settings, cwd).unwrap();
+    let search_id = service
+        .search
+        .submit(
+            "PRIVATE-SESSION".into(),
+            Query {
+                text: "Compaction".into(),
+                category: Category::Compaction,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let results = service.search.response(search_id).await.unwrap();
+    assert_eq!(results.total, 1);
+    let hit = &results.hits[0];
+    assert_eq!(hit.tool_category, Some(ToolCategory::Compaction));
+    assert!(hit.metadata().contains("Compaction"));
+    assert!(!hit.metadata().contains("PRIVATE") && !hit.metadata().contains("Bearer"));
+
+    let request_id = service
+        .request(HistoryRequest::Open {
+            session: hit.session_id.clone(),
+            sequence: Some(hit.event_seq),
+        })
+        .unwrap();
+    let HistoryResult::Loaded(view) = service.response(request_id).await.unwrap() else {
+        panic!()
+    };
+    assert!(hit.matches(&view));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_compaction_category_finds_locatable_unknown_core_evidence() {
+    let fixture = Fixture::new();
+    let settings = fixture.settings();
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let journal = Journal::open(&settings, &cwd, with_unknown_compaction(state(1))).unwrap();
+    let mut terminal = with_unknown_compaction(state(2));
+    terminal.close(SessionPhase::Unknown, true);
+    journal.finish(terminal).await.unwrap();
+
+    let mut service = HistoryHandle::start(settings, cwd).unwrap();
+    let search_id = service
+        .search
+        .submit(
+            "PRIVATE-SESSION".into(),
+            Query {
+                text: "ExecutionUnknown".into(),
+                category: Category::Compaction,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let results = service.search.response(search_id).await.unwrap();
+    assert_eq!(results.total, 1);
+    let hit = &results.hits[0];
+    assert_eq!(hit.tool_category, Some(ToolCategory::Compaction));
+    assert_eq!(hit.evidence.kind, EvidenceKind::ExecutionUnknown);
+    assert_eq!(hit.evidence.source, EvidenceSource::Core);
+    let metadata = hit.metadata();
+    assert!(metadata.contains("ExecutionUnknown") && metadata.contains("Core"));
+    assert!(!metadata.contains("PRIVATE") && !metadata.contains("Bearer"));
+
+    let request_id = service
+        .request(HistoryRequest::Open {
+            session: hit.session_id.clone(),
+            sequence: Some(hit.event_seq),
+        })
+        .unwrap();
+    let HistoryResult::Loaded(view) = service.response(request_id).await.unwrap() else {
+        panic!()
+    };
+    assert!(hit.matches(&view));
     service.shutdown().await.unwrap();
 }
 

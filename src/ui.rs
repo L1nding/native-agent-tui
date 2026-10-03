@@ -1599,6 +1599,18 @@ fn draw_evidence(
             journal.session_id, journal.committed_seq, journal.submitted_seq
         ));
     }
+    let compactions = snapshot
+        .observation
+        .activities
+        .iter()
+        .filter(|activity| {
+            activity.identity.agent_id == agent_id
+                && activity.tool_category == Some(crate::protocol::ToolCategory::Compaction)
+        })
+        .count();
+    rows.push(format!(
+        "Compactions retained: {compactions} | lifetime total unavailable"
+    ));
     for activity in snapshot
         .observation
         .activities
@@ -1611,6 +1623,13 @@ fn draw_evidence(
             activity.item_id.as_deref().unwrap_or("turn"),
             activity.attention.level
         ));
+        if activity.tool_category == Some(crate::protocol::ToolCategory::Compaction) {
+            rows.push(format!(
+                "Compaction {:?} | source {:?} | before/after usage, reason and summary unavailable",
+                activity.execution_state,
+                activity.last_evidence.as_ref().map(|evidence| evidence.source)
+            ));
+        }
         rows.push(activity_brief(activity));
         if local.reminders.is_acknowledged(activity) {
             rows.push("Silence reminder: off locally until new evidence; Ctrl+W restore".into());
@@ -2526,6 +2545,60 @@ mod tests {
         interrupted.observation.activities[0].execution_state = ExecutionState::Interrupted;
         interrupted.observation.activities[0].kind = crate::observation::ActivityKind::Completed;
         assert!(activity_brief(&interrupted.observation.activities[0]).starts_with("Interrupted"));
+    }
+
+    #[test]
+    fn evidence_panel_labels_retained_compaction_facts_and_schema_gaps() {
+        use crate::observation::{ActivityScope, EvidenceKind, EvidenceSource};
+        use crate::protocol::ToolCategory;
+
+        let mut snapshot = observed_snapshot();
+        let mut compaction = snapshot.observation.activities[0].clone();
+        compaction.scope = ActivityScope::Tool;
+        compaction.tool_category = Some(ToolCategory::Compaction);
+        compaction.item_id = Some("compact-item".into());
+        let mut evidence = compaction.last_evidence.clone().unwrap();
+        evidence.kind = EvidenceKind::ToolCompleted;
+        evidence.source = EvidenceSource::AppServer;
+        evidence.item_id = compaction.item_id.clone();
+        compaction.last_evidence = Some(evidence.clone());
+        compaction.recent_evidence = vec![evidence];
+        compaction.execution_state = ExecutionState::Completed;
+        snapshot.observation.activities.push(compaction);
+
+        let mut local = LocalState {
+            evidence: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Compactions retained: 1"), "{screen}");
+        assert!(screen.contains("Compaction Completed"), "{screen}");
+        assert!(screen.contains("AppServer"), "{screen}");
+        assert!(screen.contains("before/after usage"), "{screen}");
+
+        local.evidence = true;
+        local.evidence_scroll = 6;
+        let mut narrow = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        narrow.draw(|frame| draw(frame, &snapshot, &local)).unwrap();
+        let narrow_screen = narrow
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(narrow_screen.contains("Compaction"), "{narrow_screen}");
+        assert!(narrow_screen.contains("AppServer"), "{narrow_screen}");
     }
 
     #[test]

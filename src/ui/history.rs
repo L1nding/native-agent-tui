@@ -607,6 +607,17 @@ impl HistoryPanel {
                 if view.info.needs_recovery {
                     rows.push("Unconfirmed external outcomes remain unknown. Inspect evidence before a new task; prior side effects may already have occurred.".into());
                 }
+                let retained_compactions = state
+                    .observation
+                    .activities
+                    .iter()
+                    .filter(|activity| {
+                        activity.tool_category == Some(crate::protocol::ToolCategory::Compaction)
+                    })
+                    .count();
+                rows.push(format!(
+                    "Compactions retained: {retained_compactions} | lifetime total unavailable"
+                ));
                 for task in &state.tasks {
                     rows.push(format!(
                         "Task {} / attempt {} | {:?} | recorded {:?} | dependencies {:?}",
@@ -615,6 +626,14 @@ impl HistoryPanel {
                 }
                 for activity in &state.observation.activities {
                     rows.push(format!("{} | {:?} / {:?} | {:?} | historical quiet {} | progress {} | freshness {:?}", activity.identity.agent_id, activity.scope, activity.kind, activity.execution_state, age(activity.silence_ms), activity.progress_seq, activity.freshness));
+                    if activity.tool_category == Some(crate::protocol::ToolCategory::Compaction) {
+                        rows.push(format!(
+                            "  Compaction {:?} | source {:?} | item {:?} | before/after usage, reason and summary unavailable",
+                            activity.execution_state,
+                            activity.last_evidence.as_ref().map(|evidence| evidence.source),
+                            activity.item_id
+                        ));
+                    }
                     rows.push(format!(
                         "  thread {:?} turn {:?} generation {:?} item {:?} request {:?}",
                         activity.identity.thread_id,

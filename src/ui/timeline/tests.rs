@@ -181,6 +181,24 @@ fn selection_and_bookmarks_never_open_evicted_or_reused_request_deliveries() {
 }
 
 #[test]
+fn compaction_timeline_metadata_preserves_evidence_source_and_schema_limits() {
+    use crate::protocol::ToolCategory;
+
+    let mut entry = (*event(1, "root", "turn", "compact-item")).clone();
+    entry.scope = ActivityScope::Tool;
+    entry.activity_kind = ActivityKind::Completed;
+    entry.execution_state = ExecutionState::Unknown;
+    entry.tool_category = Some(ToolCategory::Compaction);
+    entry.evidence.kind = EvidenceKind::ExecutionUnknown;
+    entry.evidence.source = EvidenceSource::Core;
+    let rows = metadata(&entry).join("\n");
+    assert!(rows.contains("tool: Some(Compaction)"), "{rows}");
+    assert!(rows.contains("source: Core"), "{rows}");
+    assert!(rows.contains("before/after usage, reason and summary: unavailable from schema"));
+    assert!(!rows.contains("server observed"));
+}
+
+#[test]
 fn current_request_links_are_exact_and_pending_filter_tracks_the_live_projection() {
     let mut request = RequestView::decode(
         RpcId::String("7".into()),

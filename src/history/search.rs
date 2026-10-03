@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use super::{HistoricalView, HistoryError};
 use crate::journal::{JournalError, JournalSettings, Payload, Replay, SessionInfo};
 use crate::observation::{ActivityIdentity, ActivityScope, Evidence, EvidenceKind};
+use crate::protocol::ToolCategory;
 
 pub const FIELD_BYTES: usize = 1024;
 pub const HIT_LIMIT: usize = 128;
@@ -21,6 +22,7 @@ pub enum Category {
     Lifecycle,
     Output,
     Tool,
+    Compaction,
     Request,
     Waiting,
 }
@@ -32,6 +34,7 @@ impl Category {
             Self::Lifecycle => "lifecycle",
             Self::Output => "output",
             Self::Tool => "tool",
+            Self::Compaction => "compaction",
             Self::Request => "request",
             Self::Waiting => "waiting",
         }
@@ -42,13 +45,18 @@ impl Category {
             Self::All => Self::Lifecycle,
             Self::Lifecycle => Self::Output,
             Self::Output => Self::Tool,
-            Self::Tool => Self::Request,
+            Self::Tool => Self::Compaction,
+            Self::Compaction => Self::Request,
             Self::Request => Self::Waiting,
             Self::Waiting => Self::All,
         }
     }
-    fn accepts(self, kind: EvidenceKind) -> bool {
+    fn accepts(self, kind: EvidenceKind, tool_category: Option<ToolCategory>) -> bool {
         use EvidenceKind::*;
+        if self == Self::Compaction {
+            return matches!(kind, ToolStarted | ToolCompleted | ExecutionUnknown)
+                && tool_category == Some(ToolCategory::Compaction);
+        }
         let category = match kind {
             Output | MessageFinalized => Self::Output,
             ToolStarted | ToolCompleted => Self::Tool,
@@ -89,17 +97,19 @@ pub struct Hit {
     pub activity_id: String,
     pub identity: ActivityIdentity,
     pub scope: ActivityScope,
+    pub tool_category: Option<ToolCategory>,
     pub evidence: Evidence,
 }
 
 impl Hit {
     pub fn metadata(&self) -> String {
         format!(
-            "#{} {:?} {:?} | {:?} | agent <redacted> | thread {} | turn {} | item {} | request {} | task {} attempt {:?} generation {:?} | recorded ms {:?} | bytes {}",
+            "#{} {:?} {:?} | {:?} | tool {:?} | agent <redacted> | thread {} | turn {} | item {} | request {} | task {} attempt {:?} generation {:?} | recorded ms {:?} | bytes {}",
             self.evidence.id,
             self.evidence.kind,
             self.evidence.source,
             self.scope,
+            self.tool_category,
             presence(self.identity.thread_id.as_deref()),
             presence(self.identity.turn_id.as_deref()),
             presence(self.evidence.item_id.as_deref()),
@@ -114,11 +124,12 @@ impl Hit {
 
     fn searchable_metadata(&self) -> String {
         format!(
-            "#{} {:?} {:?} | {:?} | agent {} | thread {} | turn {} | item {:?} | request {:?} | task {:?} attempt {:?} generation {:?} | recorded ms {:?} | bytes {}",
+            "#{} {:?} {:?} | {:?} | tool {:?} | agent {} | thread {} | turn {} | item {:?} | request {:?} | task {:?} attempt {:?} generation {:?} | recorded ms {:?} | bytes {}",
             self.evidence.id,
             self.evidence.kind,
             self.evidence.source,
             self.scope,
+            self.tool_category,
             self.identity.agent_id,
             self.identity.thread_id.as_deref().unwrap_or("unavailable"),
             self.identity.turn_id.as_deref().unwrap_or("unavailable"),
@@ -154,6 +165,7 @@ impl Hit {
                     activity.activity_id == self.activity_id
                         && activity.identity == self.identity
                         && activity.scope == self.scope
+                        && activity.tool_category == self.tool_category
                         && activity.recent_evidence.contains(&self.evidence)
                 })
             })
@@ -225,7 +237,10 @@ pub(crate) fn scan(
                     .saturating_sub(fresh.len() as u64),
             );
             for (activity, evidence) in fresh {
-                if !results.query.category.accepts(evidence.kind)
+                if !results
+                    .query
+                    .category
+                    .accepts(evidence.kind, activity.tool_category)
                     || !results.query.thread.is_empty()
                         && activity.identity.thread_id.as_ref() != Some(&results.query.thread)
                     || !results.query.turn.is_empty()
@@ -239,6 +254,7 @@ pub(crate) fn scan(
                     activity_id: activity.activity_id.clone(),
                     identity: activity.identity.clone(),
                     scope: activity.scope,
+                    tool_category: activity.tool_category,
                     evidence: evidence.clone(),
                 };
                 if !results.query.text.is_empty()

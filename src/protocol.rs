@@ -77,14 +77,40 @@ pub fn decode_observed_tool(
         } else {
             Some(match item["status"].as_str() {
                 Some("completed")
-                    if item["exitCode"].as_i64().is_none_or(|code| code == 0)
+                    if category != ToolCategory::Compaction
+                        && item["exitCode"].as_i64().is_none_or(|code| code == 0)
                         && item["success"].as_bool() != Some(false)
                         && item["error"].is_null() =>
                 {
                     ObservedToolOutcome::Completed
                 }
+                Some("completed")
+                    if category == ToolCategory::Compaction
+                        && item
+                            .get("exitCode")
+                            .is_none_or(|code| code.is_null() || code.as_i64() == Some(0))
+                        && item.get("success").is_none_or(|success| {
+                            success.is_null() || success.as_bool() == Some(true)
+                        })
+                        && item.get("error").is_none_or(Value::is_null) =>
+                {
+                    ObservedToolOutcome::Completed
+                }
                 Some("completed" | "failed" | "declined") => ObservedToolOutcome::Failed,
                 Some("interrupted" | "cancelled") => ObservedToolOutcome::Interrupted,
+                None if category == ToolCategory::Compaction
+                    && item.get("status").is_none()
+                    && item
+                        .get("exitCode")
+                        .is_none_or(|code| code.is_null() || code.as_i64() == Some(0))
+                    && item.get("success").is_none_or(|success| {
+                        success.is_null() || success.as_bool() == Some(true)
+                    })
+                    && item.get("error").is_none_or(Value::is_null) =>
+                {
+                    // 0.159.2 的 contextCompactionThreadItem 只有 id/type；其完成事件由 item/completed 确认。
+                    ObservedToolOutcome::Completed
+                }
                 _ => ObservedToolOutcome::Unknown,
             })
         };
@@ -462,6 +488,51 @@ mod tests {
         .unwrap();
         assert_eq!(output.bytes, 3);
         assert_eq!(output.kind, ObservedOutputKind::Reasoning);
+    }
+
+    #[test]
+    fn schema_statusless_compaction_is_confirmed_only_by_item_completed() {
+        use super::{decode_observed_tool, ObservedToolOutcome, ToolCategory};
+        let params = serde_json::json!({
+            "threadId":"t", "turnId":"u",
+            "item":{"id":"compact-1", "type":"contextCompaction"}
+        });
+        let started = decode_observed_tool("item/started", &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.category, ToolCategory::Compaction);
+        assert_eq!(started.outcome, None);
+        let completed = decode_observed_tool("item/completed", &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.outcome, Some(ObservedToolOutcome::Completed));
+
+        for contradiction in [
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","status":"running"}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","error":{"message":"failed"}}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","success":false}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","exitCode":1}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","exitCode":"1"}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","success":"false"}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","error":"failed"}),
+            serde_json::json!({"id":"compact-1","type":"contextCompaction","status":null}),
+        ] {
+            let notice = decode_observed_tool(
+                "item/completed",
+                &serde_json::json!({"threadId":"t","turnId":"u","item":contradiction}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_ne!(notice.outcome, Some(ObservedToolOutcome::Completed));
+        }
+
+        let ordinary = decode_observed_tool(
+            "item/completed",
+            &serde_json::json!({"threadId":"t","turnId":"u","item":{"id":"tool","type":"commandExecution"}}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ordinary.outcome, Some(ObservedToolOutcome::Unknown));
     }
 
     #[test]
