@@ -306,6 +306,32 @@ impl Core {
         );
     }
 
+    fn token_budget_exhausted(&self) -> Option<u64> {
+        let limit = self.config.max_total_tokens?;
+        self.state
+            .view
+            .usage
+            .total_tokens
+            .filter(|total| *total >= limit)
+            .map(|_| limit)
+    }
+
+    fn interrupt_for_token_budget(&mut self, limit: u64) {
+        if self.interrupt_requested {
+            return;
+        }
+        if let Some(attempt) = self.scheduler.active_root() {
+            let _ = self
+                .scheduler
+                .command(SchedulerCommand::Cancel(attempt.task));
+        }
+        self.interrupt_requested = true;
+        self.state.view.notice = Some(format!(
+            "Token budget {limit} reached; interrupt requested; waiting for the server's terminal event."
+        ));
+        self.issue_interrupt();
+    }
+
     async fn run(mut self) -> ExitReport {
         if let Err(error) = self.send_rpc(RpcKind::Initialize) {
             self.state.error(SessionPhase::Failed, error.to_string());
@@ -885,6 +911,22 @@ impl Core {
             || !self.state.view.phase.can_submit()
             || self.state.view.thread_id.is_none()
         {
+            return;
+        }
+        if let Some(limit) = self.token_budget_exhausted() {
+            if self.interrupt_requested
+                || matches!(
+                    self.state.view.phase,
+                    SessionPhase::StartingTurn | SessionPhase::Running | SessionPhase::GatePending
+                )
+            {
+                return;
+            }
+            self.scheduler.disconnected();
+            self.state.error(
+                SessionPhase::Failed,
+                format!("Token budget {limit} reached; start a new session."),
+            );
             return;
         }
         if let Some(dispatch) = self.scheduler.dispatch() {
@@ -2068,6 +2110,16 @@ impl Core {
                 }
                 if let Some(usage) = decode_usage(&params) {
                     self.state.view.usage = usage;
+                    if let Some(limit) = self.token_budget_exhausted() {
+                        if matches!(
+                            self.state.view.phase,
+                            SessionPhase::StartingTurn
+                                | SessionPhase::Running
+                                | SessionPhase::GatePending
+                        ) {
+                            self.interrupt_for_token_budget(limit);
+                        }
+                    }
                 }
             }
             "error" => {
@@ -5634,6 +5686,71 @@ mod tests {
         assert_eq!(usage.context_window, None);
         assert_eq!(usage.source, FactSource::ServerConfirmed);
         assert!(decode_usage(&json!({"tokenUsage": {}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn token_budget_interrupts_the_active_root_and_blocks_later_dispatch() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_total_tokens: Some(10),
+            ..Default::default()
+        })
+        .await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "budgeted work".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"one"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":10}}}}),
+        )
+        .await;
+        let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert!(client
+            .snapshots
+            .borrow()
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Token budget 10 reached")));
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one","status":"interrupted"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Failed).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "must not dispatch".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

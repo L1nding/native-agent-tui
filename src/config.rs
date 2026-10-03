@@ -19,6 +19,7 @@ pub struct Config {
     pub max_native_children: usize,
     pub max_native_depth: usize,
     pub max_native_turns: usize,
+    pub max_total_tokens: Option<u64>,
     pub attention: AttentionSettings,
     pub journal: JournalSettings,
 }
@@ -39,6 +40,7 @@ impl Default for Config {
             max_native_children: DEFAULT_MAX_NATIVE_CHILDREN,
             max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
             max_native_turns: DEFAULT_MAX_NATIVE_TURNS,
+            max_total_tokens: None,
             attention: AttentionSettings::default(),
             journal: JournalSettings::default(),
         }
@@ -156,6 +158,20 @@ where
             }
             "--max-native-turns" => {
                 config.max_native_turns = bounded_usize(&args, &mut index, option, 1, 64)?;
+            }
+            "--max-total-tokens" if config.max_total_tokens.is_none() => {
+                let raw = value(&args, &mut index, option)?;
+                let parsed = raw.parse::<u64>().map_err(|_| CliError::InvalidValue {
+                    option: option.clone(),
+                    value: "expected a positive integer".into(),
+                })?;
+                if parsed == 0 {
+                    return Err(CliError::InvalidValue {
+                        option: option.clone(),
+                        value: "expected a positive integer".into(),
+                    });
+                }
+                config.max_total_tokens = Some(parsed);
             }
             "--json-events" if !json_events => json_events = true,
             "--output" if output.is_none() => {
@@ -539,6 +555,8 @@ mod tests {
             "1",
             "--max-native-turns",
             "2",
+            "--max-total-tokens",
+            "1000",
         ])
         .unwrap() else {
             panic!()
@@ -546,6 +564,7 @@ mod tests {
         assert_eq!(config.max_native_children, 3);
         assert_eq!(config.max_native_depth, 1);
         assert_eq!(config.max_native_turns, 2);
+        assert_eq!(config.max_total_tokens, Some(1000));
         for args in [
             vec!["--run", "task", "--max-native-children", "0"],
             vec!["--run", "task", "--max-native-children", "65"],
@@ -554,6 +573,8 @@ mod tests {
             vec!["--run", "task", "--max-native-turns", "0"],
             vec!["--run", "task", "--max-native-turns", "65"],
             vec!["--run", "task", "--max-native-depth", "bad"],
+            vec!["--run", "task", "--max-total-tokens", "0"],
+            vec!["--run", "task", "--max-total-tokens", "bad"],
         ] {
             assert!(matches!(
                 parse_args(args),
