@@ -31,6 +31,7 @@ use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 mod history;
 mod reminders;
 mod requests;
+mod search;
 
 #[derive(Debug, Error)]
 pub enum UiError {
@@ -87,6 +88,9 @@ impl Editor {
 
 #[derive(Default)]
 struct LocalState {
+    viewport: ratatui::layout::Rect,
+    search: search::SearchPanel,
+    conversation_focus: Option<search::Focus>,
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
@@ -171,6 +175,8 @@ async fn run_tasks_inner(
 ) -> Result<(), UiError> {
     let mut history_panel = history::HistoryPanel::default();
     let mut history_open = history.is_some();
+    let mut search = search::SearchHandle::spawn();
+    let mut search_open = true;
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
         let mut local = LocalState::default();
@@ -183,9 +189,12 @@ async fn run_tasks_inner(
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         loop {
             if dirty {
+                let size = terminal.terminal.size()?;
+                local.viewport = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 let snapshot = client.snapshots.borrow().clone();
                 local.reminders.sync(&snapshot.observation);
                 sync_local_requests(&mut local, &snapshot);
+                local.search.dispatch(snapshot.clone(), &mut search);
                 terminal.terminal.draw(|frame| {
                     if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
@@ -193,6 +202,12 @@ async fn run_tasks_inner(
                 dirty = false;
             }
             tokio::select! {
+                change = search.changed(), if search_open => {
+                    search_open = change.is_ok();
+                    if search_open { local.search.updated(&search); }
+                    else { local.search.unavailable(); }
+                    dirty = true;
+                }
                 change = async {
                     match &mut history { Some(history) => history.status.changed().await, None => std::future::pending().await }
                 }, if history_open => {
@@ -213,6 +228,7 @@ async fn run_tasks_inner(
                                 if history_panel.visible {
                                     if history_panel.key(key, history.as_mut().unwrap(), false) { return Ok(()); }
                                 } else if key.code == KeyCode::F(12) {
+                                    local.search.close();
                                     if let Some(history) = &mut history { history_panel.open(history, None); }
                                     else { local.notice = Some("History browsing is unavailable for this client.".into()); }
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
@@ -222,6 +238,7 @@ async fn run_tasks_inner(
                                 if history_panel.visible { history_panel.paste(&text); dirty = true; continue; }
                                 let snapshot = client.snapshots.borrow().clone();
                                 sync_local_requests(&mut local, &snapshot);
+                                if local.search.visible { local.search.paste(&text); dirty = true; continue; }
                                 if let Some(editor) = &mut local.attention_editor {
                                     for digit in text.chars().filter(char::is_ascii_digit).take(10) {
                                         if editor.input().len() < 10 { editor.input().push(digit); }
@@ -237,6 +254,7 @@ async fn run_tasks_inner(
             }
         }
     }.await;
+    search.shutdown().await;
     let _ = client.commands.send(Command::Quit).await;
     let report = client
         .join
@@ -397,6 +415,77 @@ fn handle_key(
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if local.search.visible {
+        if control && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d')) {
+            return true;
+        }
+        if control && key.code == KeyCode::Char('c') {
+            send(Command::Interrupt, tx, local);
+            return false;
+        }
+        if matches!(
+            key.code,
+            KeyCode::F(2) | KeyCode::F(3) | KeyCode::F(4) | KeyCode::F(10) | KeyCode::F(11)
+        ) {
+            local.search.close();
+        } else {
+            if let Some(focus) = local.search.key(key, snapshot) {
+                local.agent_id = if snapshot.thread_id.as_deref() == Some(focus.thread()) {
+                    None
+                } else {
+                    Some(focus.thread().into())
+                };
+                local.conversation_focus = Some(focus);
+                local.tasks = false;
+                local.evidence = false;
+                local.request_panel = false;
+                local.notice = None;
+            }
+            return false;
+        }
+    }
+    if control && key.code == KeyCode::Char('f') && local.attention_editor.is_none() {
+        let thread = local
+            .agent_id
+            .clone()
+            .or_else(|| snapshot.thread_id.clone())
+            .unwrap_or_default();
+        local.search.open(thread);
+        return false;
+    }
+    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+        || control && matches!(key.code, KeyCode::Home | KeyCode::End)
+    {
+        if let Some(focus) = &local.conversation_focus {
+            let chunks = main_layout(local.viewport, snapshot, local);
+            let mut area = chunks[1];
+            if local.viewport.width >= 100 && !snapshot.agents.is_empty() {
+                area = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(32), Constraint::Min(1)])
+                    .split(area)[1];
+            }
+            let (width, height) = conversation_content_size(area);
+            let mut rows = 0;
+            let mut target = None;
+            for message in snapshot
+                .messages
+                .iter()
+                .filter(|m| m.thread_id == focus.thread())
+            {
+                rows += 1;
+                if focus.matches(message) {
+                    target = Some(rows + focus.row(width));
+                }
+                rows += wrap(&message.text, width).len() + 1;
+            }
+            let max_scroll = rows.saturating_sub(1).saturating_sub(height);
+            if let Some(row) = target {
+                local.scroll_from_bottom =
+                    max_scroll.saturating_sub(row.saturating_sub(height / 3).min(max_scroll));
+            }
+        }
+    }
     if let Some(editor) = &mut local.attention_editor {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('d') if control => return true,
@@ -631,6 +720,7 @@ fn handle_key(
             sync_local_requests(local, snapshot);
         }
         KeyCode::F(3) => {
+            local.conversation_focus = None;
             let next = local
                 .agent_id
                 .as_ref()
@@ -654,10 +744,22 @@ fn handle_key(
             local.evidence = false;
             local.editor.clear();
         }
-        KeyCode::PageUp => local.scroll_from_bottom = local.scroll_from_bottom.saturating_add(8),
-        KeyCode::PageDown => local.scroll_from_bottom = local.scroll_from_bottom.saturating_sub(8),
-        KeyCode::Home if control => local.scroll_from_bottom = usize::MAX,
-        KeyCode::End if control => local.scroll_from_bottom = 0,
+        KeyCode::PageUp => {
+            local.conversation_focus = None;
+            local.scroll_from_bottom = local.scroll_from_bottom.saturating_add(8);
+        }
+        KeyCode::PageDown => {
+            local.conversation_focus = None;
+            local.scroll_from_bottom = local.scroll_from_bottom.saturating_sub(8);
+        }
+        KeyCode::Home if control => {
+            local.conversation_focus = None;
+            local.scroll_from_bottom = usize::MAX;
+        }
+        KeyCode::End if control => {
+            local.conversation_focus = None;
+            local.scroll_from_bottom = 0;
+        }
         KeyCode::Left => local.editor.left(),
         KeyCode::Right => local.editor.right(),
         KeyCode::Home => local.editor.cursor = 0,
@@ -781,6 +883,47 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     output
 }
 
+fn main_layout(
+    area: ratatui::layout::Rect,
+    snapshot: &CoreSnapshot,
+    local: &LocalState,
+) -> std::rc::Rc<[ratatui::layout::Rect]> {
+    let request = selected_request(snapshot, local).is_some();
+    let waiting = snapshot.gate.as_ref().is_some_and(|gate| gate.pending);
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(if area.height > 16 {
+                if snapshot.observation.activities.is_empty() {
+                    4
+                } else {
+                    6
+                }
+            } else {
+                3
+            }),
+            Constraint::Min(1),
+            Constraint::Length(
+                if area.height > 16 && (request || snapshot.last_error.is_some() || waiting) {
+                    6
+                } else {
+                    2
+                },
+            ),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area)
+}
+
+fn conversation_content_size(area: ratatui::layout::Rect) -> (usize, usize) {
+    let border = if area.height < 3 { 0 } else { 2 };
+    (
+        area.width.saturating_sub(border) as usize,
+        area.height.saturating_sub(border) as usize,
+    )
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
     let area = frame.area();
     if area.width < 24 || area.height < 8 {
@@ -803,32 +946,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .map(|agent| agent.info.id.as_str())
         .or(snapshot.thread_id.as_deref())
         .unwrap_or("");
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(if area.height > 16 {
-                if snapshot.observation.activities.is_empty() {
-                    4
-                } else {
-                    6
-                }
-            } else {
-                3
-            }),
-            Constraint::Min(1),
-            Constraint::Length(
-                if area.height > 16
-                    && (request.is_some() || snapshot.last_error.is_some() || waiting.is_some())
-                {
-                    6
-                } else {
-                    2
-                },
-            ),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let chunks = main_layout(area, snapshot, local);
     let actions = snapshot
         .observation
         .activities
@@ -906,6 +1024,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         chunks[0],
     );
 
+    if local.search.visible {
+        local.search.draw(
+            frame,
+            ratatui::layout::Rect {
+                y: chunks[0].y + chunks[0].height,
+                height: area.height.saturating_sub(chunks[0].height),
+                ..area
+            },
+            snapshot,
+        );
+        return;
+    }
+
     let conversation_area = if area.width >= 100 && !snapshot.agents.is_empty() {
         let panels = Layout::default()
             .direction(Direction::Horizontal)
@@ -965,8 +1096,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     } else {
         chunks[1]
     };
-    let width = conversation_area.width.saturating_sub(2) as usize;
+    let (width, height) = conversation_content_size(conversation_area);
     let mut transcript = Vec::new();
+    let mut focused_row = None;
     for message in snapshot
         .messages
         .iter()
@@ -981,6 +1113,13 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                 ""
             }
         ));
+        if let Some(focus) = local
+            .conversation_focus
+            .as_ref()
+            .filter(|focus| focus.matches(message))
+        {
+            focused_row = Some(transcript.len() + focus.row(width));
+        }
         transcript.extend(wrap(&message.text, width));
         transcript.push(String::new());
     }
@@ -997,10 +1136,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     if transcript.last().is_some_and(|line| line.is_empty()) {
         transcript.pop();
     }
-    let height = conversation_area.height.saturating_sub(2) as usize;
     let max_scroll = transcript.len().saturating_sub(height);
     let scroll = local.scroll_from_bottom.min(max_scroll);
-    let start = max_scroll.saturating_sub(scroll);
+    let start = focused_row.map_or_else(
+        || max_scroll.saturating_sub(scroll),
+        |row| row.saturating_sub(height / 3).min(max_scroll),
+    );
     let name = selected_agent
         .map(|agent| {
             agent
@@ -1012,21 +1153,37 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         })
         .unwrap_or("root");
     let title = display_text(&format!(
-        " {name} · F3 switch{} ",
+        " {name} · F3 switch{}{} ",
         if snapshot.history_truncated {
             " [older content truncated]"
+        } else {
+            ""
+        },
+        if local.conversation_focus.is_some() && focused_row.is_none() {
+            " [search content changed/evicted]"
         } else {
             ""
         }
     ));
     let visible: Vec<_> = transcript
         .into_iter()
+        .enumerate()
         .skip(start)
         .take(height)
-        .map(Line::from)
+        .map(|(row, text)| {
+            if Some(row) == focused_row {
+                Line::from(text).style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
+            } else {
+                Line::from(text)
+            }
+        })
         .collect();
     frame.render_widget(
-        Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(visible).block(if conversation_area.height < 3 {
+            Block::default()
+        } else {
+            Block::default().borders(Borders::ALL).title(title)
+        }),
         conversation_area,
     );
     if local.tasks {
@@ -1042,7 +1199,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Ctrl+F retained conversation search | Enter root task | Ctrl+Enter queue | Shift+Enter newline | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
         notice.clone()
     } else if let Some(request) = request {
@@ -1164,7 +1321,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         } else if local.evidence {
             "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
         } else {
-            "Enter send | Ctrl+C interrupt | Ctrl+Q quit | F3 agent | F4 tasks | F11 evidence | Ctrl+W wait/restore | F12 history"
+            "Ctrl+F search | Enter send | Ctrl+C interrupt | Ctrl+Q quit | F3 agent | F4 tasks | F11 evidence | Ctrl+W wait/restore | F12 history"
         }),
         chunks[4],
     );

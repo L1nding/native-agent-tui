@@ -37,8 +37,9 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | Backspace, Delete, Ctrl+U | Edit or clear input |
 | Ctrl+C | Request interruption; wait for the server's terminal event |
 | Ctrl+Q / Ctrl+D | Quit and clean up owned processes |
+| Ctrl+F | Search retained conversation text; Enter searches/opens, Esc closes |
 | PageUp / PageDown, Ctrl+Home / Ctrl+End | Scroll conversation |
-| Ctrl+Y / Ctrl+N | Approve once / decline the selected request |
+| Ctrl+Y / Ctrl+N / Ctrl+B | Accept / decline / cancel the selected approval when allowed |
 | F1 / F2 | Show help / select next pending request |
 | F3 | Cycle root and child conversations; input still submits a root task |
 | F4 / Up, Down | Open tasks / select a task |
@@ -116,3 +117,9 @@ cargo nextest run --locked --run-ignored only live_app_server_gate --no-capture
 ```
 
 Set `NATIVE_AGENT_TUI_PYTHON` to the actual Python executable if `python` resolves to a Windows Store alias. The fixture changes `use_responses_lite` only in its isolated catalog so its ordinary SSE responses match the selected wire format.
+
+## Conversation search
+
+Ctrl+F opens a separate search editor without changing task or secret-answer drafts. Enter searches retained live conversation text; Up/Down or n/N select matches, Enter locates the selected message, and Esc closes the search. Tab changes thread/subtree/path/all-agent scope; Ctrl+T edits an exact turn filter, F6 changes role, and F7 changes message state. F1 shows all search controls.
+
+Results use a fixed snapshot. Press r to refresh; changed or evicted content cannot be opened from an old result. Search is literal, case-sensitive, and supports Chinese and emoji. It excludes answer drafts and historical journal text. See [search scope, limits and validation](docs/conversation-search.md).

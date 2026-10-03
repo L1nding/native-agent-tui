@@ -167,3 +167,11 @@ F2 已接入可滚动请求详情，显示命令/目录、允许决策、策略�
 最终 `python scripts/verify.py --live` 全部通过：160 项默认 Rust 测试、八项真实 Codex 检查和全部原生夹具，fmt/check/clippy/doctest/release 通过。三项新增真实请求测试使用 localhost provider 和独立 Codex home，验证取消命令无副作用、文件 decline/accept、接受命令仍受 read-only 约束、中文/emoji 输入与明确 RequestResolved 证据；持久结果和清理均确认。输入工具仅在夹具中显式开启普通模式的可选功能。
 
 Windows ConPTY 另确认不允许的 Ctrl+N 不发送回答、连续 Ctrl+B 只发一次 cancel、零额外根中断、Interrupted 与草稿保留；退出后进程身份检查和脱敏只读回放通过。边界与复现见[请求兼容验证](request-compatibility.md)。搜索、更广终端/IME、子代理真实审批、试用任务集及 Alpha/V2 发布验收仍待完成。
+
+## S8a 实时对话搜索
+
+Ctrl+F 已接入独立查询编辑区与可取消的后台任务。搜索 Core 有界对话快照，支持中文/emoji、线程/子树/关联路径/全部代理范围和 turn/角色/消息状态过滤。结果固定来源，按线程/轮次/item/角色与 UTF-8 位置定位；刷新、淘汰或文本变化明确禁用旧命中。查询字段最多 1024 字节，保留最多 512 个命中并显示准确总数。原输入和秘密草稿保留，搜索无 Core 执行命令，查询与结果不进入 journal/JSONL。
+
+九项新增回归验证 Unicode、身份与范围、取消/释放、字段/命中上限、未投递查询立即禁用旧结果、秘密草稿、窄屏帮助、定位/resize/翻页及 Core/Gate 无副作用。最终 `python scripts/verify.py --live` 全部通过：169 项默认 Rust 测试、八项真实 Codex 检查及全部原生夹具，fmt/check/clippy/doctest/release 通过。
+
+Windows ConPTY 用假 app-server 确认中文查询与过滤、命中定位、草稿恢复和返回审批；搜索前后 RPC、原始消息/接受证据计数与各活动 progress_seq 不变。明确取消后退出，确认进程清理、journal 关闭、脱敏 Interrupted 回放。多行转义注入本次只显示首行，不能作为原生粘贴验收；完整事件时间线、书签、工具/历史搜索、Windows Terminal/Orca IME 与粘贴、试用任务集及 Alpha/V2 发布验收仍待完成。使用与限制见[实时对话搜索](conversation-search.md)。

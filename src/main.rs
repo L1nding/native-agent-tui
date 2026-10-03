@@ -61,6 +61,7 @@ TUI: Enter send, Ctrl+Enter queue, Shift+Enter newline, Ctrl+C interrupt,
      Ctrl+W acknowledge/restore silence reminders for the selected agent,
      F1 help, F2 request details/next, F3 agent, F4 tasks, F5 pause dispatch.
      In request details: PgUp/PgDn scroll, Ctrl+Home/End jump, Esc close.
+     Ctrl+F opens retained conversation search; F1 inside search shows its controls.
      Ctrl+B cancels the selected approval and interrupts its owning turn when allowed.
      F10 attention thresholds, F11 activity evidence, F12 history/export.
 Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat
