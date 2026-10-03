@@ -528,6 +528,9 @@ impl Core {
             .journal
             .take());
         self.state.view.timeline = self.observer.timeline_snapshot();
+        let transport = self.pipe.stats();
+        self.state.view.diagnostics.transport_bytes_in = transport.bytes_in;
+        self.state.view.diagnostics.transport_bytes_out = transport.bytes_out;
         if let Some(view) = &mut self.state.view.journal {
             view.error = self.journal_error.clone().or(view.error.take());
         }
@@ -1057,6 +1060,10 @@ impl Core {
     }
 
     fn envelope(&mut self, envelope: Envelope) {
+        self.state
+            .view
+            .diagnostics
+            .record_incoming(envelope.method.as_deref(), envelope.id.is_some());
         self.observer.raw_message();
         self.ingress_seq += 1;
         match (envelope.method.as_deref(), envelope.id.clone()) {
@@ -3216,6 +3223,11 @@ mod tests {
         .await;
         let reference = client.snapshots.borrow().requests[0].reference();
         let archive = client.snapshots.borrow().timeline.clone();
+        let metrics = client.snapshots.borrow().diagnostics.clone();
+        assert!(metrics.transport_bytes_in > 0);
+        assert!(metrics.transport_bytes_out > 0);
+        assert!(metrics.telemetry_events >= 20);
+        assert!(metrics.control_events >= 4);
         assert!(archive
             .entries
             .iter()

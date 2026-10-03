@@ -1574,6 +1574,14 @@ fn draw_evidence(
     agent_id: &str,
 ) {
     let mut rows = Vec::new();
+    let diagnostics = &snapshot.diagnostics;
+    rows.push(format!(
+        "Transport bytes in/out {} / {} | control events {} | telemetry events {}",
+        diagnostics.transport_bytes_in,
+        diagnostics.transport_bytes_out,
+        diagnostics.control_events,
+        diagnostics.telemetry_events
+    ));
     if let Some(journal) = &snapshot.journal {
         rows.push(format!(
             "Session {} / committed {} / submitted {}",
@@ -2343,7 +2351,11 @@ mod tests {
 
     #[test]
     fn evidence_and_threshold_views_render_at_supported_sizes_without_leaking_drafts() {
-        let snapshot = observed_snapshot();
+        let mut snapshot = observed_snapshot();
+        snapshot.diagnostics.transport_bytes_in = 123;
+        snapshot.diagnostics.transport_bytes_out = 456;
+        snapshot.diagnostics.control_events = 7;
+        snapshot.diagnostics.telemetry_events = 8;
         for (width, height) in [(40, 12), (80, 24), (160, 45)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut local = LocalState::default();
@@ -2372,6 +2384,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(rendered.contains("Evidence"), "{rendered}");
+            assert!(rendered.contains("Transport bytes"), "{rendered}");
             local.attention_editor = Some(AttentionEditor::new(&snapshot, 0));
             terminal
                 .draw(|frame| draw(frame, &snapshot, &local))

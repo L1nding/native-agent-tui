@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -25,6 +26,18 @@ struct Queued<T> {
     _budget: OwnedSemaphorePermit,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+#[derive(Default)]
+struct TransportCounters {
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
 /// Owns reader/writer tasks; only the Core consumes incoming envelopes.
 /// Byte permits bound queued memory even when individual frames are large.
 pub struct PipeTransport {
@@ -33,6 +46,7 @@ pub struct PipeTransport {
     writer: JoinHandle<()>,
     reader: JoinHandle<()>,
     write_budget: Arc<Semaphore>,
+    counters: Arc<TransportCounters>,
 }
 
 impl PipeTransport {
@@ -53,6 +67,9 @@ impl PipeTransport {
         let (outgoing, mut writes) = mpsc::channel::<Queued<String>>(32);
         let write_budget = Arc::new(Semaphore::new(QUEUE_BYTES));
         let read_budget = Arc::new(Semaphore::new(QUEUE_BYTES));
+        let counters = Arc::new(TransportCounters::default());
+        let reader_counters = counters.clone();
+        let writer_counters = counters.clone();
         let writer_error = incoming_tx.clone();
         let writer = tokio::spawn(async move {
             while let Some(frame) = writes.recv().await {
@@ -62,6 +79,9 @@ impl PipeTransport {
                         .await;
                     return;
                 }
+                writer_counters
+                    .bytes_out
+                    .fetch_add(frame.value.len() as u64, Ordering::Relaxed);
                 if let Err(error) = writer.flush().await {
                     let _ = writer_error
                         .send(Err(TransportError::Failed(error.to_string())))
@@ -77,6 +97,9 @@ impl PipeTransport {
                 let result = read_frame(&mut reader, limit).await;
                 match result {
                     Ok(line) => {
+                        reader_counters
+                            .bytes_in
+                            .fetch_add(line.len() as u64, Ordering::Relaxed);
                         let permits = line.len().max(1) as u32;
                         let budget = match read_budget.clone().try_acquire_many_owned(permits) {
                             Ok(budget) => budget,
@@ -119,6 +142,14 @@ impl PipeTransport {
             writer,
             reader,
             write_budget,
+            counters,
+        }
+    }
+
+    pub fn stats(&self) -> TransportStats {
+        TransportStats {
+            bytes_in: self.counters.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.counters.bytes_out.load(Ordering::Relaxed),
         }
     }
 
@@ -263,6 +294,7 @@ mod tests {
         let mut reader = BufReader::new(&mut server);
         let line = read_frame(&mut reader, MAX_LINE_BYTES).await.unwrap();
         assert_eq!(line, r#"{"method":"initialized"}"#);
+        assert!(transport.stats().bytes_out > 0);
     }
 
     #[tokio::test]
