@@ -160,14 +160,6 @@ impl AttentionEditor {
     }
 }
 
-pub async fn run(client: ClientHandle, goal: Option<String>) -> Result<(), UiError> {
-    run_tasks(client, goal.into_iter().map(RootTaskSpec::input).collect()).await
-}
-
-pub async fn run_tasks(client: ClientHandle, tasks: Vec<RootTaskSpec>) -> Result<(), UiError> {
-    run_tasks_inner(client, tasks, None).await
-}
-
 pub async fn run_tasks_with_history(
     client: ClientHandle,
     tasks: Vec<RootTaskSpec>,
