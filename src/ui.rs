@@ -1592,6 +1592,7 @@ fn draw_evidence(
         diagnostics.telemetry_events
     ));
     rows.push(format_usage_evidence(snapshot));
+    rows.push(format_token_budget_evidence(snapshot));
     if let Some(journal) = &snapshot.journal {
         rows.push(format!(
             "Session {} / committed {} / submitted {}",
@@ -1695,11 +1696,7 @@ fn draw_evidence(
 
 fn usage_status(snapshot: &CoreSnapshot) -> String {
     let usage = snapshot.usage;
-    let total = usage.total_tokens;
-    let base = total.map_or_else(
-        || "tokens: unavailable".to_owned(),
-        |tokens| format!("tokens:{tokens}"),
-    );
+    let base = token_budget_brief(snapshot);
     if usage.input_tokens.is_none()
         && usage.cached_input_tokens.is_none()
         && usage.output_tokens.is_none()
@@ -1713,6 +1710,33 @@ fn usage_status(snapshot: &CoreSnapshot) -> String {
         usage_value(usage.cached_input_tokens),
         usage_value(usage.output_tokens),
         usage_value(usage.reasoning_tokens)
+    )
+}
+
+fn token_budget_brief(snapshot: &CoreSnapshot) -> String {
+    let total = snapshot.token_budget.confirmed_total_tokens.map_or_else(
+        || "unavailable".to_owned(),
+        |total| {
+            if snapshot.token_budget.confirmed_complete {
+                total.to_string()
+            } else {
+                format!("partial {total}")
+            }
+        },
+    );
+    format!(
+        "tokens:{}/{}",
+        total,
+        usage_value(snapshot.token_budget.limit)
+    )
+}
+
+fn format_token_budget_evidence(snapshot: &CoreSnapshot) -> String {
+    let budget = snapshot.token_budget;
+    format!(
+        "Session token budget: {} | stop triggered: {}",
+        token_budget_brief(snapshot),
+        if budget.stop_triggered { "yes" } else { "no" }
     )
 }
 
@@ -2440,6 +2464,9 @@ mod tests {
     fn evidence_and_threshold_views_render_at_supported_sizes_without_leaking_drafts() {
         let mut snapshot = observed_snapshot();
         snapshot.usage.total_tokens = Some(4);
+        snapshot.token_budget.confirmed_total_tokens = Some(4);
+        snapshot.token_budget.confirmed_complete = true;
+        snapshot.token_budget.limit = Some(10);
         snapshot.diagnostics.transport_bytes_in = 123;
         snapshot.diagnostics.transport_bytes_out = 456;
         snapshot.diagnostics.control_events = 7;
@@ -2460,6 +2487,9 @@ mod tests {
                 .collect();
             assert!(rendered.contains("quiet 31s"), "{rendered}");
             assert!(rendered.contains("attention:1"), "{rendered}");
+            if width >= 100 {
+                assert!(rendered.contains("tokens:4/10"), "{rendered}");
+            }
             local.evidence = true;
             terminal
                 .draw(|frame| draw(frame, &snapshot, &local))
@@ -2474,7 +2504,8 @@ mod tests {
             assert!(rendered.contains("Evidence"), "{rendered}");
             assert!(rendered.contains("Transport bytes"), "{rendered}");
             if height > 16 {
-                assert!(rendered.contains("tokens:4"), "{rendered}");
+                assert!(rendered.contains("tokens:4/10"), "{rendered}");
+                assert!(rendered.contains("Session token budget"), "{rendered}");
             }
             local.attention_editor = Some(AttentionEditor::new(&snapshot, 0));
             terminal
@@ -2495,6 +2526,31 @@ mod tests {
         interrupted.observation.activities[0].execution_state = ExecutionState::Interrupted;
         interrupted.observation.activities[0].kind = crate::observation::ActivityKind::Completed;
         assert!(activity_brief(&interrupted.observation.activities[0]).starts_with("Interrupted"));
+    }
+
+    #[test]
+    fn token_budget_view_keeps_missing_usage_and_limit_unavailable() {
+        let mut snapshot = CoreSnapshot::default();
+        assert_eq!(
+            token_budget_brief(&snapshot),
+            "tokens:unavailable/unavailable"
+        );
+
+        snapshot.token_budget.limit = Some(10);
+        assert_eq!(token_budget_brief(&snapshot), "tokens:unavailable/10");
+
+        snapshot.token_budget.confirmed_total_tokens = Some(4);
+        assert_eq!(token_budget_brief(&snapshot), "tokens:partial 4/10");
+        snapshot.token_budget.confirmed_complete = true;
+        assert_eq!(token_budget_brief(&snapshot), "tokens:4/10");
+        snapshot.token_budget.stop_triggered = true;
+        assert_eq!(
+            format_token_budget_evidence(&snapshot),
+            "Session token budget: tokens:4/10 | stop triggered: yes"
+        );
+
+        snapshot.token_budget.limit = None;
+        assert_eq!(token_budget_brief(&snapshot), "tokens:4/unavailable");
     }
 
     #[test]

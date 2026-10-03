@@ -91,6 +91,15 @@ pub struct UsageSummary {
     pub source: FactSource,
 }
 
+/// 会话级预算投影；数字只来自服务端确认的 usage。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenBudgetSnapshot {
+    pub confirmed_total_tokens: Option<u64>,
+    pub confirmed_complete: bool,
+    pub limit: Option<u64>,
+    pub stop_triggered: bool,
+}
+
 impl UsageSummary {
     pub fn has_value(self) -> bool {
         self.input_tokens.is_some()
@@ -129,6 +138,7 @@ pub struct CoreSnapshot {
     pub last_error: Option<String>,
     pub tool_activity: Option<String>,
     pub usage: UsageSummary,
+    pub token_budget: TokenBudgetSnapshot,
     pub history_truncated: bool,
 }
 
@@ -168,6 +178,7 @@ impl Default for CoreSnapshot {
             last_error: None,
             tool_activity: None,
             usage: UsageSummary::default(),
+            token_budget: TokenBudgetSnapshot::default(),
             history_truncated: false,
         }
     }

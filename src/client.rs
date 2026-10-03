@@ -20,7 +20,8 @@ use crate::scheduler::{
     TaskKind, TaskSnapshot,
 };
 use crate::state::{
-    CoreSnapshot, FactSource, GateSnapshot, SessionPhase, SessionState, UsageSummary, MESSAGE_BYTES,
+    CoreSnapshot, FactSource, GateSnapshot, SessionPhase, SessionState, TokenBudgetSnapshot,
+    UsageSummary, MESSAGE_BYTES,
 };
 use crate::transport::{PipeTransport, TransportError};
 
@@ -134,6 +135,10 @@ impl ClientHandle {
             cwd: config.cwd.display().to_string(),
             sandbox: config.sandbox.clone(),
             approval_policy: config.approval_policy.clone(),
+            token_budget: TokenBudgetSnapshot {
+                limit: config.max_total_tokens,
+                ..Default::default()
+            },
             observation: observer.snapshot_at(0, Instant::now()),
             timeline: observer.timeline_snapshot(),
             ..Default::default()
@@ -301,6 +306,44 @@ struct PendingTool {
 }
 
 impl Core {
+    fn confirmed_session_usage(&self) -> (Option<u64>, bool) {
+        let root = (self.state.view.usage.source == FactSource::ServerConfirmed)
+            .then_some(self.state.view.usage.total_tokens)
+            .flatten();
+        let child_usages = self.state.agents.snapshots();
+        let children_complete = child_usages.iter().all(|agent| {
+            agent.usage.source == FactSource::ServerConfirmed && agent.usage.total_tokens.is_some()
+        });
+        let child_total = child_usages
+            .iter()
+            .filter(|agent| agent.usage.source == FactSource::ServerConfirmed)
+            .filter_map(|agent| agent.usage.total_tokens)
+            .fold(0, u64::saturating_add);
+        let has_any_confirmed_total = root.is_some()
+            || child_usages.iter().any(|agent| {
+                agent.usage.source == FactSource::ServerConfirmed
+                    && agent.usage.total_tokens.is_some()
+            });
+        let complete = root.is_some() && children_complete;
+        if !has_any_confirmed_total {
+            return (None, false);
+        }
+        (
+            Some(root.unwrap_or_default().saturating_add(child_total)),
+            complete,
+        )
+    }
+
+    fn update_token_budget_snapshot(&mut self) {
+        let (confirmed_total_tokens, confirmed_complete) = self.confirmed_session_usage();
+        self.state.view.token_budget = TokenBudgetSnapshot {
+            confirmed_total_tokens,
+            confirmed_complete,
+            limit: self.config.max_total_tokens,
+            stop_triggered: self.token_budget_stop_started,
+        };
+    }
+
     fn shell_timeout(&mut self) {
         self.state.error(
             SessionPhase::Unknown,
@@ -551,6 +594,7 @@ impl Core {
         self.scheduler.interactions(&self.state.view.requests);
         self.state.view.scheduler = self.scheduler.snapshot();
         self.state.view.queued_inputs = self.state.view.scheduler.queued_roots;
+        self.update_token_budget_snapshot();
         self.reconcile_observation();
         self.state.view.observation = self
             .observer
@@ -1855,10 +1899,24 @@ impl Core {
                 if self.state.view.turn_id.as_deref() != Some(turn) {
                     return;
                 }
-                self.state.view.usage = usage;
+                self.state.view.usage = preserve_cumulative_total(self.state.view.usage, usage);
                 true
             } else {
-                self.state.agents.update_usage(thread, turn, usage)
+                if !self.state.agents.current_turn(thread, turn) {
+                    return;
+                }
+                let previous = self
+                    .state
+                    .agents
+                    .snapshots()
+                    .into_iter()
+                    .find(|agent| agent.info.id == thread)
+                    .map_or_else(UsageSummary::default, |agent| agent.usage);
+                self.state.agents.update_usage(
+                    thread,
+                    turn,
+                    preserve_cumulative_total(previous, usage),
+                )
             };
             if accepted {
                 if let Some(limit) = self.token_budget_exhausted() {
@@ -2218,6 +2276,19 @@ fn decode_usage(params: &Value) -> Option<UsageSummary> {
         source: FactSource::ServerConfirmed,
     };
     summary.has_value().then_some(summary)
+}
+
+fn preserve_cumulative_total(previous: UsageSummary, mut current: UsageSummary) -> UsageSummary {
+    if previous.source == FactSource::ServerConfirmed
+        && current.source == FactSource::ServerConfirmed
+    {
+        current.total_tokens = match (previous.total_tokens, current.total_tokens) {
+            (Some(previous), Some(current)) => Some(previous.max(current)),
+            (Some(previous), None) => Some(previous),
+            (None, current) => current,
+        };
+    }
+    current
 }
 
 #[cfg(test)]
@@ -5707,6 +5778,36 @@ mod tests {
         assert!(decode_usage(&json!({"tokenUsage": {}})).is_none());
     }
 
+    #[test]
+    fn usage_decoder_reads_thread_cumulative_total_from_schema_total_object() {
+        let usage = decode_usage(&json!({
+            "tokenUsage": {"total": {"totalTokens": 42}}
+        }))
+        .unwrap();
+        assert_eq!(usage.total_tokens, Some(42));
+    }
+
+    #[test]
+    fn cumulative_usage_keeps_the_larger_thread_total_across_turn_updates() {
+        let confirmed = |total_tokens| UsageSummary {
+            total_tokens,
+            source: FactSource::ServerConfirmed,
+            ..Default::default()
+        };
+        assert_eq!(
+            preserve_cumulative_total(confirmed(Some(9)), confirmed(Some(1))).total_tokens,
+            Some(9)
+        );
+        assert_eq!(
+            preserve_cumulative_total(confirmed(Some(9)), confirmed(None)).total_tokens,
+            Some(9)
+        );
+        assert_eq!(
+            preserve_cumulative_total(confirmed(Some(9)), confirmed(Some(12))).total_tokens,
+            Some(12)
+        );
+    }
+
     #[tokio::test]
     async fn token_budget_interrupts_the_active_root_and_blocks_later_dispatch() {
         let (mut client, mut server) = harness_with_config(Config {
@@ -5716,6 +5817,15 @@ mod tests {
         .await;
         ready(&mut server).await;
         phase(&mut client, SessionPhase::Ready).await;
+        assert_eq!(client.snapshots.borrow().token_budget.limit, Some(10));
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .token_budget
+                .confirmed_total_tokens,
+            None
+        );
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -5739,6 +5849,16 @@ mod tests {
             json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"one","tokenUsage":{"total":{"totalTokens":10}}}}),
         )
         .await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.token_budget.confirmed_total_tokens == Some(10)
+                    && snapshot.token_budget.stop_triggered
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
             .await
             .unwrap();
@@ -5810,6 +5930,15 @@ mod tests {
             .wait_for(|snapshot| snapshot.usage.total_tokens == Some(9))
             .await
             .unwrap();
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .token_budget
+                .confirmed_total_tokens,
+            Some(9)
+        );
+        assert!(client.snapshots.borrow().token_budget.confirmed_complete);
         send(
             &mut server,
             json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one","status":"completed"}}}),
@@ -5849,6 +5978,27 @@ mod tests {
             .await
             .unwrap();
         let mut version = client.snapshots.borrow().version;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"two","tokenUsage":{"total":{"totalTokens":1}}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.version > version)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().usage.total_tokens, Some(9));
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .token_budget
+                .confirmed_total_tokens,
+            Some(9)
+        );
+        assert!(client.snapshots.borrow().token_budget.confirmed_complete);
+        version = client.snapshots.borrow().version;
         send(
             &mut server,
             json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":1}}}}),
@@ -5914,6 +6064,16 @@ mod tests {
             }),
         )
         .await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.token_budget.confirmed_total_tokens == Some(5)
+                    && !snapshot.token_budget.confirmed_complete
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         send(
             &mut server,
             json!({
@@ -5922,6 +6082,18 @@ mod tests {
             }),
         )
         .await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.token_budget.confirmed_total_tokens == Some(10)
+                    && snapshot.token_budget.confirmed_complete
+                    && snapshot.token_budget.limit == Some(10)
+                    && snapshot.token_budget.stop_triggered
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let mut interrupted_threads = BTreeSet::new();
         for _ in 0..2 {
