@@ -604,6 +604,12 @@ impl HistoryPanel {
                         budget.stop_triggered,
                     ));
                 }
+                if let Some(skills) = state.skills {
+                    rows.push(format!("Recorded skills inventory: {}", skills.brief()));
+                    rows.push("Directory metadata only; loaded/invoked/completed/failed status is unknown.".into());
+                } else {
+                    rows.push("Recorded skills inventory: not queried or unavailable in this older journal.".into());
+                }
                 if view.info.needs_recovery {
                     rows.push("Unconfirmed external outcomes remain unknown. Inspect evidence before a new task; prior side effects may already have occurred.".into());
                 }

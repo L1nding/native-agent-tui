@@ -182,6 +182,12 @@ async fn execute() -> Result<(), (u8, String)> {
                     state.phase,
                     state.cleanup_confirmed
                 );
+                if let Some(skills) = state.skills {
+                    println!("Skills inventory: {}", skills.brief());
+                    println!("Directory metadata only; loaded/invoked/completed/failed status is unknown.");
+                } else {
+                    println!("Skills inventory: not queried or unavailable in this older journal.");
+                }
                 if replay.info.needs_recovery {
                     println!("Observation review required. Replay cannot answer old requests or resume execution.");
                 }

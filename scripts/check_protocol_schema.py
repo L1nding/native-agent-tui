@@ -19,7 +19,14 @@ def main():
     parser.add_argument('--schema-dir', type=Path, help='Output of the pinned CLI generate-json-schema --experimental')
     args = parser.parse_args()
     manifest = json.loads((FIXTURES / 'schema-manifest.json').read_text(encoding='utf-8'))
-    for name in ['v1/InitializeResponse.json', 'v2/CommandExecResponse.json']:
+    retained = [
+        'v1/InitializeResponse.json',
+        'v2/CommandExecResponse.json',
+        'v2/SkillsListParams.json',
+        'v2/SkillsListResponse.json',
+        'v2/SkillsChangedNotification.json',
+    ]
+    for name in retained:
         schema = json.loads((FIXTURES / Path(name).name).read_text(encoding='utf-8'))
         if fingerprint(schema) != manifest['schemas'][name]['sha256']:
             raise ValueError(f'Retained source schema changed: {name}')
@@ -36,7 +43,7 @@ def main():
             schema = json.loads((args.schema_dir / name).read_text(encoding='utf-8'))
             if fingerprint(schema) != expected['sha256'] or schema.get('required', []) != expected['required']:
                 raise ValueError(f'Exported schema changed; manual compatibility review required: {name}')
-        print('Pinned protocol schemas: eight exported fingerprints match the reviewed baseline')
+        print(f'Pinned protocol schemas: {len(manifest["schemas"])} exported fingerprints match the reviewed baseline')
     else:
         print('Pinned protocol fixtures: retained schemas and initialize/startup fixture match (no external CLI queried)')
 

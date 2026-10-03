@@ -139,6 +139,7 @@ pub struct CoreSnapshot {
     pub tool_activity: Option<String>,
     pub usage: UsageSummary,
     pub token_budget: TokenBudgetSnapshot,
+    pub skills: crate::skills::SkillsSnapshot,
     pub history_truncated: bool,
 }
 
@@ -179,6 +180,7 @@ impl Default for CoreSnapshot {
             tool_activity: None,
             usage: UsageSummary::default(),
             token_budget: TokenBudgetSnapshot::default(),
+            skills: crate::skills::SkillsSnapshot::default(),
             history_truncated: false,
         }
     }

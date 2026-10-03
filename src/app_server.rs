@@ -393,6 +393,14 @@ pub(crate) fn preflight(id: RpcId, config: &Config) -> Envelope {
     )
 }
 
+pub(crate) fn skills_list(id: RpcId, cwd: &std::path::Path, force_reload: bool) -> Envelope {
+    Envelope::request(
+        id,
+        "skills/list",
+        Some(json!({"cwds":[cwd.to_string_lossy()],"forceReload":force_reload})),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +569,20 @@ mod tests {
             assert!(params.get("outputBytesCap").is_none());
             assert_eq!(request.method.as_deref(), Some("command/exec"));
         }
+    }
+
+    #[test]
+    fn skills_list_carries_explicit_reload_intent_and_single_cwd() {
+        let cwd = std::path::Path::new("C:/workspace");
+        let initial = skills_list(RpcId::Number(1), cwd, false);
+        assert_eq!(initial.method.as_deref(), Some("skills/list"));
+        assert_eq!(
+            initial.params.as_ref().unwrap()["cwds"],
+            json!([cwd.to_string_lossy()])
+        );
+        assert_eq!(initial.params.as_ref().unwrap()["forceReload"], false);
+        let explicit = skills_list(RpcId::Number(2), cwd, true);
+        assert_eq!(explicit.params.as_ref().unwrap()["forceReload"], true);
     }
 
     #[cfg(windows)]

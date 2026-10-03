@@ -58,6 +58,7 @@ pub enum Command {
     HeadlessRequest {
         request: RequestRef,
     },
+    RefreshSkills,
     OutputUnavailable,
     UnconfirmedHeadlessInteraction,
     Quit,
@@ -223,6 +224,9 @@ impl ClientHandle {
                 identity_pending: BTreeSet::new(),
                 identity_requested: BTreeSet::new(),
                 check_only,
+                skills_generation: 0,
+                skills_refresh_queued: false,
+                skills_refresh_force_reload: false,
             }
             .run(),
         );
@@ -243,6 +247,7 @@ enum RpcKind {
     StartTurn { generation: u64 },
     Interrupt { generation: u64 },
     ChildInterrupt { attempt: TaskAttempt },
+    SkillsList { generation: u64, force_reload: bool },
 }
 
 impl RpcKind {
@@ -258,6 +263,7 @@ struct PendingRpc {
     kind: RpcKind,
     deadline: Instant,
     identity_thread: Option<String>,
+    skills_cwd: Option<String>,
 }
 
 struct Core {
@@ -295,6 +301,9 @@ struct Core {
     identity_pending: BTreeSet<String>,
     identity_requested: BTreeSet<String>,
     check_only: bool,
+    skills_generation: u64,
+    skills_refresh_queued: bool,
+    skills_refresh_force_reload: bool,
 }
 
 struct PendingTool {
@@ -474,6 +483,9 @@ impl Core {
                                 self.state.view.phase = SessionPhase::Ready;
                                 self.state.view.notice = None;
                                 self.preflight_passed = true;
+                                self.skills_generation = self.skills_generation.wrapping_add(1);
+                                self.skills_refresh_queued = true;
+                                self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
                             }
                             Outcome::TimedOut => self.shell_timeout(),
                             Outcome::Cancelled => self.state.error(SessionPhase::Failed, "Shell preflight cancelled; no model turn was started"),
@@ -491,17 +503,25 @@ impl Core {
                     let expired = self.pending.iter().find(|(_, rpc)| rpc.deadline <= Instant::now()).map(|(id, rpc)| (id.clone(), rpc.kind));
                     if let Some((id, kind)) = expired {
                         self.pending.remove(&id);
-                        let message = if matches!(kind, RpcKind::Preflight) {
+                        if let RpcKind::SkillsList { generation, .. } = kind {
+                            // 旧代次超时只丢弃结果；保留排队刷新并在本轮循环末重发。
+                            if generation == self.skills_generation {
+                                self.skills_failed(crate::skills::SkillAvailability::TimedOut);
+                            }
+                        } else {
+                            let message = if matches!(kind, RpcKind::Preflight) {
                             let advice = if cfg!(windows) { " Check Codex Windows sandbox setup, or explicitly select --windows-sandbox unelevated." } else { " Check the configured shell and sandbox." };
                             format!("Shell preflight timed out; no model turn was started.{advice} Automatic retry is disabled.")
                         } else {
                             format!("app-server {kind:?} response timed out; automatic retry is disabled")
                         };
-                        self.state.error(SessionPhase::Unknown, message);
+                            self.state.error(SessionPhase::Unknown, message);
+                        }
                     }
                 }
             }
             self.flush_child_interrupt();
+            self.flush_skills_refresh();
             self.dispatch_root();
             if matches!(
                 self.state.view.phase,
@@ -669,6 +689,68 @@ impl Core {
         }
     }
 
+    fn skills_idle_for_refresh(&self) -> bool {
+        let phase_allows_query = matches!(
+            self.state.view.phase,
+            SessionPhase::Ready | SessionPhase::Completed | SessionPhase::Interrupted
+        );
+        let scheduler = self.scheduler.snapshot();
+        !self.check_only
+            && self.preflight_passed
+            && phase_allows_query
+            && self.wait.is_none()
+            && self
+                .state
+                .view
+                .gate
+                .as_ref()
+                .is_none_or(|gate| !gate.pending)
+            && self.state.view.requests.is_empty()
+            && !scheduler.stopping
+            && !scheduler.tasks.iter().any(|task| task.state.active())
+    }
+
+    fn flush_skills_refresh(&mut self) {
+        if !self.skills_refresh_queued
+            || !self.skills_idle_for_refresh()
+            || self
+                .pending
+                .values()
+                .any(|rpc| matches!(rpc.kind, RpcKind::SkillsList { .. }))
+        {
+            return;
+        }
+        let kind = RpcKind::SkillsList {
+            generation: self.skills_generation,
+            force_reload: self.skills_refresh_force_reload,
+        };
+        if let Err(error) = self.send_rpc(kind) {
+            self.skills_failed(crate::skills::SkillAvailability::TransportUnavailable);
+            self.state
+                .error(SessionPhase::Disconnected, error.to_string());
+        } else {
+            self.skills_refresh_queued = false;
+            self.skills_refresh_force_reload = false;
+        }
+    }
+
+    fn skills_failed(&mut self, reason: crate::skills::SkillAvailability) {
+        self.state.view.skills.availability = reason;
+        self.state.view.skills.freshness = if self.skills_refresh_queued {
+            crate::skills::SkillFreshness::Queued
+        } else {
+            crate::skills::SkillFreshness::Stale
+        };
+    }
+
+    fn skills_rpc_is_current(&self, pending: &PendingRpc) -> bool {
+        let RpcKind::SkillsList { generation, .. } = pending.kind else {
+            return false;
+        };
+        pending.skills_cwd.as_deref() == Some(self.config.cwd.display().to_string().as_str())
+            && generation == self.skills_generation
+    }
+
     fn send_rpc(&mut self, kind: RpcKind) -> Result<(), TransportError> {
         if matches!(kind, RpcKind::Preflight) {
             if let Some(source) = self.shell_source.take() {
@@ -688,6 +770,9 @@ impl Core {
             RpcKind::Initialize => app_server::initialize(id.clone()),
             RpcKind::ThreadStart => app_server::thread_start(id.clone(), &self.config),
             RpcKind::Preflight => app_server::preflight(id.clone(), &self.config),
+            RpcKind::SkillsList { force_reload, .. } => {
+                app_server::skills_list(id.clone(), &self.config.cwd, force_reload)
+            }
             RpcKind::Interrupt { .. } => app_server::interrupt(
                 id.clone(),
                 self.state.view.thread_id.as_deref().unwrap_or(""),
@@ -711,6 +796,8 @@ impl Core {
                 kind,
                 deadline: Instant::now() + Duration::from_secs(30),
                 identity_thread: None,
+                skills_cwd: matches!(kind, RpcKind::SkillsList { .. })
+                    .then(|| self.config.cwd.display().to_string()),
             },
         );
         Ok(())
@@ -819,6 +906,13 @@ impl Core {
                 self.queue_tasks(vec![spec]);
             }
             Command::QueueRootTasks { tasks } => self.queue_tasks(tasks),
+            Command::RefreshSkills => {
+                self.skills_generation = self.skills_generation.wrapping_add(1);
+                self.state.view.skills.freshness = crate::skills::SkillFreshness::Stale;
+                self.skills_refresh_queued = true;
+                self.skills_refresh_force_reload = true;
+                self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+            }
             Command::Schedule(command) => self.schedule(command),
             Command::ScheduleTask { attempt, command } => {
                 let target = match command {
@@ -1047,6 +1141,7 @@ impl Core {
                         },
                         deadline: Instant::now() + Duration::from_secs(30),
                         identity_thread: None,
+                        skills_cwd: None,
                     },
                 );
             }
@@ -1110,6 +1205,7 @@ impl Core {
                         },
                         deadline: Instant::now() + Duration::from_secs(30),
                         identity_thread: None,
+                        skills_cwd: None,
                     },
                 );
             }
@@ -1273,7 +1369,7 @@ impl Core {
                     // Acknowledgement never completes a child or releases its Gate.
                     return;
                 }
-                if let Some(error) = envelope.error {
+                if let Some(error) = &envelope.error {
                     let message = error
                         .get("message")
                         .and_then(Value::as_str)
@@ -1287,6 +1383,24 @@ impl Core {
                             self.scheduler.interrupt_rejected(attempt);
                         }
                         self.state.view.notice = Some(format!("Interrupt was not accepted: {message}. Waiting for turn status; Ctrl+C can request another interrupt."));
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::SkillsList { .. }) {
+                        if !self.skills_rpc_is_current(&pending) {
+                            return;
+                        }
+                        let reason = if envelope
+                            .error
+                            .as_ref()
+                            .and_then(|error| error.get("code"))
+                            .and_then(Value::as_i64)
+                            == Some(-32601)
+                        {
+                            crate::skills::SkillAvailability::Unsupported
+                        } else {
+                            crate::skills::SkillAvailability::RpcError
+                        };
+                        self.skills_failed(reason);
                         return;
                     }
                     let phase = if matches!(pending.kind, RpcKind::AgentRead)
@@ -1320,6 +1434,24 @@ impl Core {
                         ),
                     }
                 } else {
+                    if matches!(pending.kind, RpcKind::SkillsList { .. }) {
+                        let Some(cwd) = pending.skills_cwd.as_deref() else {
+                            return;
+                        };
+                        if !self.skills_rpc_is_current(&pending) {
+                            return;
+                        }
+                        self.skills_refresh_queued = false;
+                        if let Some(skills) = crate::skills::parse_result(
+                            &envelope.result.unwrap_or(Value::Null),
+                            cwd,
+                        ) {
+                            self.state.view.skills = skills;
+                        } else {
+                            self.skills_failed(crate::skills::SkillAvailability::Malformed);
+                        }
+                        return;
+                    }
                     self.response(pending.kind, envelope.result.unwrap_or(Value::Null));
                 }
             }
@@ -1388,6 +1520,11 @@ impl Core {
                 self.state.view.phase = SessionPhase::Ready;
                 self.state.view.notice = None;
                 self.preflight_passed = true;
+                if !self.check_only {
+                    self.skills_generation = self.skills_generation.wrapping_add(1);
+                    self.skills_refresh_queued = true;
+                    self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+                }
                 None
             }
             RpcKind::StartTurn { .. } => {
@@ -1404,6 +1541,7 @@ impl Core {
             RpcKind::Interrupt { .. } => None, // An RPC acknowledgement is not a terminal turn event.
             RpcKind::AgentRead => None, // The response is handled with its captured thread identity.
             RpcKind::ChildInterrupt { .. } => None,
+            RpcKind::SkillsList { .. } => None,
         };
         if let Some(kind) = action {
             if let Err(error) = self.send_rpc(kind) {
@@ -1793,6 +1931,7 @@ impl Core {
                 kind: RpcKind::AgentRead,
                 deadline: Instant::now() + Duration::from_secs(30),
                 identity_thread: Some(id.into()),
+                skills_cwd: None,
             },
         );
     }
@@ -1842,6 +1981,21 @@ impl Core {
     }
 
     fn notification(&mut self, method: &str, params: Value) {
+        if method == "skills/changed" {
+            self.skills_generation = self.skills_generation.wrapping_add(1);
+            self.skills_refresh_queued = true;
+            self.skills_refresh_force_reload |= self.pending.values().any(|rpc| {
+                matches!(
+                    rpc.kind,
+                    RpcKind::SkillsList {
+                        force_reload: true,
+                        ..
+                    }
+                )
+            });
+            self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+            return;
+        }
         if method == "thread/started" {
             match protocol::decode_agent_info(&params) {
                 Ok(Some(info))
@@ -4392,6 +4546,9 @@ mod tests {
         assert_eq!(client.snapshots.borrow().root_start_requests, 0);
         send(&mut server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
         phase(&mut client, SessionPhase::Ready).await;
+        let skills = next(&mut server).await;
+        assert_eq!(skills["method"], "skills/list");
+        send(&mut server, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(50), next(&mut server))
                 .await
@@ -5198,6 +5355,134 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires the installed authenticated Codex app-server"]
+    async fn live_app_server_skills_list_finds_fixture_without_a_model_turn() {
+        struct Fixture {
+            root: std::path::PathBuf,
+            previous_home: Option<std::ffi::OsString>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(home) = self.previous_home.take() {
+                    std::env::set_var("CODEX_HOME", home);
+                } else {
+                    std::env::remove_var("CODEX_HOME");
+                }
+                let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .canonicalize()
+                    .unwrap();
+                if let Ok(root) = self.root.canonicalize() {
+                    if root.starts_with(&target)
+                        && root
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("skills-fixture-")
+                    {
+                        let _ = std::fs::remove_dir_all(root);
+                    }
+                }
+            }
+        }
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let root = loop {
+            let candidate = target.join(format!(
+                "skills-fixture-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create skills smoke fixture: {error}"),
+            }
+        };
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        let skill = workspace
+            .join(".agents")
+            .join("skills")
+            .join("fixture-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: fixture-skill\ndescription: isolated skills list smoke fixture\n---\n# Fixture skill\n",
+        )
+        .unwrap();
+        let fixture = Fixture {
+            root,
+            previous_home: std::env::var_os("CODEX_HOME"),
+        };
+        std::env::set_var("CODEX_HOME", home);
+        let journal = JournalFixture::new();
+        let config = Config {
+            cwd: workspace,
+            journal: journal.settings(),
+            sandbox: "read-only".into(),
+            windows_sandbox: Some("unelevated".into()),
+            ..Default::default()
+        };
+        let mut client = ClientHandle::spawn(config).await.unwrap();
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(45),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.phase == SessionPhase::Ready
+                    && snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            }),
+        )
+        .await
+        .expect("live skills/list did not return within 45 seconds")
+        .unwrap()
+        .clone();
+        assert!(matches!(
+            snapshot.skills.availability,
+            crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
+        ));
+        assert!(snapshot
+            .skills
+            .entries
+            .iter()
+            .any(|entry| entry.name == "fixture-skill"));
+        assert_eq!(snapshot.root_turn_count, 0);
+        assert_eq!(snapshot.root_start_requests, 0);
+        let second_skill = fixture
+            .root
+            .join("workspace/.agents/skills/explicit-refresh");
+        std::fs::create_dir_all(&second_skill).unwrap();
+        std::fs::write(
+            second_skill.join("SKILL.md"),
+            "---\nname: explicit-refresh\ndescription: explicit reload fixture\n---\n# Explicit refresh\n",
+        )
+        .unwrap();
+        client.commands.send(Command::RefreshSkills).await.unwrap();
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+                    && snapshot
+                        .skills
+                        .entries
+                        .iter()
+                        .any(|entry| entry.name == "explicit-refresh")
+            }),
+        )
+        .await
+        .expect("explicit forceReload did not find the newly added fixture skill")
+        .unwrap()
+        .clone();
+        assert_eq!(refreshed.root_turn_count, 0);
+        assert_eq!(refreshed.root_start_requests, 0);
+        client.commands.send(Command::Quit).await.unwrap();
+        let report = client.join.await.unwrap();
+        assert!(report.cleanup_error.is_none());
+        drop(fixture);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires the installed authenticated Codex app-server"]
     async fn live_windows_core_reaches_ready_without_a_model_turn() {
         let fixture = JournalFixture::new();
         let config = Config {
@@ -5379,6 +5664,9 @@ mod tests {
         assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
         assert_eq!(client.snapshots.borrow().root_start_requests, 0);
         send(&mut peer, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        let skills = next(&mut main).await;
+        assert_eq!(skills["method"], "skills/list");
+        send(&mut main, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
         let turn = next(&mut main).await;
         assert_eq!(turn["method"], "turn/start");
         assert_eq!(turn["params"]["threadId"], "root");
@@ -5555,7 +5843,10 @@ mod tests {
     }
     async fn next(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
         let mut line = String::new();
-        server.read_line(&mut line).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server.read_line(&mut line))
+            .await
+            .expect("scripted app-server request timed out")
+            .unwrap();
         serde_json::from_str(&line).unwrap()
     }
     async fn send(server: &mut BufReader<tokio::io::DuplexStream>, data: Value) {
@@ -5568,6 +5859,400 @@ mod tests {
     async fn ready(server: &mut BufReader<tokio::io::DuplexStream>) {
         let preflight = initialized(server).await;
         send(server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok","stderr":""}})).await;
+        let skills = next(server).await;
+        assert_eq!(skills["method"], "skills/list");
+        send(server, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
+    }
+
+    #[tokio::test]
+    async fn changed_inventory_refresh_coalesces_and_ignores_stale_results() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.availability == crate::skills::SkillAvailability::Available
+                    && snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        let stale_request = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(stale_request["method"], "skills/list");
+        assert_eq!(stale_request["params"]["forceReload"], false);
+        client.commands.send(Command::RefreshSkills).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Queued
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        send(
+            &mut server,
+            json!({"id":stale_request["id"],"result":{"data":[{"cwd":stale_request["params"]["cwds"][0],"errors":[],"skills":[{"name":"stale","description":"PRIVATE_DESCRIPTION","enabled":true,"path":"/workspace/stale/SKILL.md","scope":"repo"}]}]}}),
+        )
+        .await;
+        let current_request = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(current_request["method"], "skills/list");
+        assert_eq!(current_request["params"]["forceReload"], true);
+        send(
+            &mut server,
+            json!({"id":current_request["id"],"result":{"data":[{"cwd":current_request["params"]["cwds"][0],"errors":[],"skills":[{"name":"current","description":"PRIVATE_DESCRIPTION","enabled":true,"path":"/workspace/current/SKILL.md","scope":"repo","interface":{"defaultPrompt":"PRIVATE_PROMPT"}}]}]}}),
+        )
+        .await;
+        let current = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+                    && snapshot
+                        .skills
+                        .entries
+                        .iter()
+                        .any(|entry| entry.name == "current")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(current.skills.entries.len(), 1);
+        assert_eq!(current.phase, SessionPhase::Ready);
+        assert_eq!(current.root_turn_count, 0);
+        assert_eq!(current.root_start_requests, 0);
+        drop(current);
+        client.commands.send(Command::Quit).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.join)
+            .await
+            .expect("Core did not stop after Quit")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_skills_rpc_error_keeps_confirmed_inventory_while_refresh_is_queued() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            }),
+        )
+        .await
+        .expect("initial inventory response was not applied")
+        .unwrap();
+
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        let stale_request = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .expect("changed notification did not request an inventory refresh");
+        let version_before_refresh = client.snapshots.borrow().version;
+        client.commands.send(Command::RefreshSkills).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.version > version_before_refresh
+                    && snapshot.skills.freshness == crate::skills::SkillFreshness::Queued
+            }),
+        )
+        .await
+        .expect("explicit refresh command was not applied")
+        .unwrap();
+        send(
+            &mut server,
+            json!({"id":stale_request["id"],"error":{"code":-32601,"message":"PRIVATE_STALE_ERROR"}}),
+        )
+        .await;
+
+        let current_request = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .expect("stale RPC error blocked the current inventory refresh");
+        assert_eq!(current_request["method"], "skills/list");
+        assert_eq!(current_request["params"]["forceReload"], true);
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(
+                snapshot.skills.availability,
+                crate::skills::SkillAvailability::Available
+            );
+            assert_eq!(
+                snapshot.skills.freshness,
+                crate::skills::SkillFreshness::Queued
+            );
+        }
+        send(
+            &mut server,
+            json!({"id":current_request["id"],"result":{"data":[{"cwd":current_request["params"]["cwds"][0],"errors":[],"skills":[{"name":"current-after-stale-error","enabled":true,"path":"/workspace/current/SKILL.md","scope":"repo"}]}]}}),
+        )
+        .await;
+        let snapshot = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+                    && snapshot
+                        .skills
+                        .entries
+                        .iter()
+                        .any(|entry| entry.name == "current-after-stale-error")
+            }),
+        )
+        .await
+        .expect("current inventory result was not applied")
+        .unwrap();
+        {
+            assert_eq!(
+                snapshot.skills.availability,
+                crate::skills::SkillAvailability::Available
+            );
+            assert_eq!(snapshot.phase, SessionPhase::Ready);
+        }
+        drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.join)
+            .await
+            .expect("Quit did not stop Core after stale RPC error")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skills_refresh_waits_for_gate_and_coalesces_until_root_and_child_are_idle() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        wait_call(&mut server, "skills-gate-wait", vec!["a"]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+
+        let before = client.snapshots.borrow().clone();
+        let gate_before = before.gate.clone().unwrap();
+        let root_turn_before = before
+            .observation
+            .activities
+            .iter()
+            .find(|activity| {
+                activity.identity.agent_id == "root"
+                    && activity.scope == crate::observation::ActivityScope::Turn
+            })
+            .unwrap()
+            .clone();
+        let waiting_before = before
+            .observation
+            .activities
+            .iter()
+            .find(|activity| {
+                activity.identity.agent_id == "root"
+                    && activity.kind == crate::observation::ActivityKind::WaitingChildren
+            })
+            .unwrap()
+            .clone();
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.observation.raw_message_count > before.observation.raw_message_count
+            })
+            .await
+            .unwrap();
+        client.commands.send(Command::RefreshSkills).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.version > before.version
+                    && snapshot.skills.freshness == crate::skills::SkillFreshness::Queued
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err(),
+            "skills refresh must not emit RPCs while the Gate is pending"
+        );
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.phase, SessionPhase::GatePending);
+            assert_eq!(snapshot.root_start_requests, before.root_start_requests);
+            assert_eq!(snapshot.gate.as_ref().unwrap(), &gate_before);
+            assert_eq!(
+                snapshot.observation.accepted_evidence_count,
+                before.observation.accepted_evidence_count
+            );
+            let root_turn = snapshot
+                .observation
+                .activities
+                .iter()
+                .find(|activity| {
+                    activity.identity.agent_id == "root"
+                        && activity.scope == crate::observation::ActivityScope::Turn
+                })
+                .unwrap();
+            let waiting = snapshot
+                .observation
+                .activities
+                .iter()
+                .find(|activity| {
+                    activity.identity.agent_id == "root"
+                        && activity.kind == crate::observation::ActivityKind::WaitingChildren
+                })
+                .unwrap();
+            assert_eq!(root_turn.progress_seq, root_turn_before.progress_seq);
+            assert_eq!(root_turn.last_evidence, root_turn_before.last_evidence);
+            assert_eq!(root_turn.attention, root_turn_before.attention);
+            assert_eq!(waiting.progress_seq, waiting_before.progress_seq);
+            assert_eq!(waiting.last_evidence, waiting_before.last_evidence);
+            assert_eq!(waiting.attention, waiting_before.attention);
+        }
+
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"a-1","status":"completed"}}}),
+        ).await;
+        let gate_release = next(&mut server).await;
+        assert_eq!(gate_release["id"], "skills-gate-wait");
+        phase(&mut client, SessionPhase::Running).await;
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}),
+        ).await;
+        phase(&mut client, SessionPhase::Completed).await;
+
+        let refresh = next(&mut server).await;
+        assert_eq!(refresh["method"], "skills/list");
+        assert_eq!(refresh["params"]["forceReload"], true);
+        send(
+            &mut server,
+            json!({"id":refresh["id"],"result":{"data":[{"cwd":refresh["params"]["cwds"][0],"errors":[],"skills":[]}]}}),
+        ).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Completed);
+        assert_eq!(
+            client.snapshots.borrow().root_start_requests,
+            before.root_start_requests
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err(),
+            "changed and explicit refresh must coalesce to one request"
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unanswered_initial_skills_query_does_not_block_root_start_or_quit() {
+        let (mut client, mut server) = harness().await;
+        let preflight = initialized(&mut server).await;
+        send(&mut server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        let skills = next(&mut server).await;
+        assert_eq!(skills["method"], "skills/list");
+
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "task while inventory is pending".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        assert_eq!(start["method"], "turn/start");
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"task-turn"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        client.commands.send(Command::Quit).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.join)
+            .await
+            .expect("Quit must stop Core with an unanswered optional skills query")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_skills_rpc_timeout_dispatches_queued_refresh_without_other_events() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            })
+            .await
+            .unwrap();
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        let old_request = next(&mut server).await;
+        client.commands.send(Command::RefreshSkills).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.skills.freshness == crate::skills::SkillFreshness::Queued)
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let refresh = next(&mut server).await;
+        assert_eq!(refresh["method"], "skills/list");
+        assert_ne!(refresh["id"], old_request["id"]);
+        let snapshot = client.snapshots.borrow();
+        assert_eq!(snapshot.phase, SessionPhase::Ready);
+        assert_eq!(snapshot.root_turn_count, 0);
+        assert_eq!(snapshot.root_start_requests, 0);
+        drop(snapshot);
+
+        send(&mut server, json!({"id":refresh["id"],"result":{"data":[{"cwd":refresh["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_skills_list_keeps_execution_ready() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            })
+            .await
+            .unwrap();
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"error":{"code":-32601,"message":"PRIVATE_SERVER_ERROR"}}),
+        )
+        .await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.skills.availability == crate::skills::SkillAvailability::Unsupported
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.phase, SessionPhase::Ready);
+        assert!(snapshot.last_error.is_none());
+        assert_eq!(snapshot.root_start_requests, 0);
+        drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
     async fn initialized(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
         let init = next(server).await;

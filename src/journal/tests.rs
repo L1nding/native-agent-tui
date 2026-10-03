@@ -505,6 +505,7 @@ fn schema_one_history_stays_readable_and_is_not_mixed_with_schema_two_records() 
     let payload = legacy_value["payload"].as_object_mut().unwrap();
     payload.remove("usage");
     payload.remove("token_budget");
+    payload.remove("skills");
     let bytes = [serde_json::to_vec(&legacy_value).unwrap(), vec![b'\n']].concat();
     store.log.set_len(0).unwrap();
     store.log.seek(SeekFrom::Start(0)).unwrap();
@@ -516,6 +517,7 @@ fn schema_one_history_stays_readable_and_is_not_mixed_with_schema_two_records() 
     atomic_metadata(&store.root.join(format!("{}.cursor", store.stem)), &info).unwrap();
     let legacy = replay(&fixture, "legacy", 0).unwrap();
     assert!(legacy.latest_state().last_headless_action.is_none());
+    assert!(legacy.latest_state().skills.is_none());
     assert!(jsonl(legacy)
         .iter()
         .all(|record| record.schema_version == 1));
@@ -548,6 +550,20 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
     };
     core.model = Some("PRIVATE_MODEL".into());
     core.last_error = Some("PRIVATE_SECRET".into());
+    core.skills = crate::skills::SkillsSnapshot {
+        availability: crate::skills::SkillAvailability::Available,
+        freshness: crate::skills::SkillFreshness::Current,
+        skill_count: 1,
+        enabled_count: 1,
+        scan_error_count: 0,
+        truncated: false,
+        entries: vec![crate::skills::SkillEntry {
+            name: "PRIVATE_SKILL_NAME".into(),
+            path: "PRIVATE_SKILL_PATH".into(),
+            scope: "repo".into(),
+            enabled: true,
+        }],
+    };
     core.messages.push(crate::state::ConversationItem {
         id: "message".into(),
         thread_id: "root-thread".into(),
@@ -582,6 +598,8 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
     );
     let serialized = serde_json::to_string(&captured).unwrap();
     assert!(!serialized.contains("PRIVATE_"));
+    assert!(captured.skills.is_some());
+    assert!(!serialized.contains("skills/list"));
 
     let _store = store(&fixture, captured);
     let replay = replay(&fixture, "usage-budget", 0).unwrap();

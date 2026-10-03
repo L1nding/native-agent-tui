@@ -1,0 +1,30 @@
+{
+  "data": [
+    {
+      "cwd": "/workspace",
+      "errors": [],
+      "skills": [
+        {
+          "name": "first",
+          "description": "private description",
+          "enabled": true,
+          "path": "/workspace/first/SKILL.md",
+          "scope": "repo"
+        }
+      ]
+    },
+    {
+      "cwd": "/workspace",
+      "errors": [],
+      "skills": [
+        {
+          "name": "duplicate",
+          "description": "private description",
+          "enabled": true,
+          "path": "/workspace/duplicate/SKILL.md",
+          "scope": "repo"
+        }
+      ]
+    }
+  ]
+}

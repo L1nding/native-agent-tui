@@ -38,6 +38,20 @@
         "stdout"
       ]
     },
+    "v2/SkillsListParams.json": {
+      "sha256": "6545e3092aa7c67aab3dd2e5c602cf1a532e024530568bb3aeab96903dfb0178",
+      "required": []
+    },
+    "v2/SkillsListResponse.json": {
+      "sha256": "fe9e51e090b9c6a2ee751055d980b11a5305c7baadc0ddff6294dbd3cc372831",
+      "required": [
+        "data"
+      ]
+    },
+    "v2/SkillsChangedNotification.json": {
+      "sha256": "bf0948d41467efb01ed4c08aa948031a60cdff97addc39ae558a111ef1958e3a",
+      "required": []
+    },
     "v2/TurnCompletedNotification.json": {
       "sha256": "78e6f8b0eff801649f93623eed4ec5551caa7d05dda740d36515d0d34cd82c70",
       "required": [

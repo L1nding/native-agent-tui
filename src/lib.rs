@@ -17,6 +17,7 @@ mod owned_process;
 pub mod protocol;
 pub mod scheduler;
 mod shell_check;
+pub mod skills;
 pub mod state;
 pub mod timeline;
 pub mod transport;

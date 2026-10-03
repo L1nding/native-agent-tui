@@ -104,6 +104,8 @@ struct LocalState {
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
     evidence_scroll: usize,
+    skills: bool,
+    skills_scroll: usize,
     editor: Editor,
     task_draft: Option<Editor>,
     scroll_from_bottom: usize,
@@ -486,6 +488,56 @@ fn handle_key(
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if local.skills {
+        match key.code {
+            KeyCode::Char('q') if control => return true,
+            KeyCode::Char('k') if control => local.skills = false,
+            KeyCode::Esc => local.skills = false,
+            KeyCode::Char('c') if control => {
+                send(Command::Interrupt, tx, local);
+                local.skills = false;
+            }
+            KeyCode::F(2) => {
+                local.skills = false;
+                let current = selected_request(snapshot, local)
+                    .filter(|request| !request.responding)
+                    .or_else(|| snapshot.requests.iter().find(|request| !request.responding));
+                if let Some(request) = current {
+                    local.request_selection = Some(request.reference());
+                    local.request_panel = true;
+                    local.request_scroll = 0;
+                    local.tasks = false;
+                    local.evidence = false;
+                    sync_local_requests(local, snapshot);
+                    local.notice = None;
+                } else {
+                    local.request_panel = false;
+                    local.notice = Some("No pending requests.".into());
+                }
+            }
+            KeyCode::Enter => {
+                send(Command::RefreshSkills, tx, local);
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                let step = skills_panel_entries_capacity(local.viewport).max(1);
+                local.skills_scroll = local.skills_scroll.saturating_sub(step);
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                let visible = skills_panel_entries_capacity(local.viewport);
+                local.skills_scroll = local
+                    .skills_scroll
+                    .saturating_add(visible.max(1))
+                    .min(snapshot.skills.entries.len().saturating_sub(visible));
+            }
+            KeyCode::Home => local.skills_scroll = 0,
+            KeyCode::End => {
+                let visible = skills_panel_entries_capacity(local.viewport);
+                local.skills_scroll = snapshot.skills.entries.len().saturating_sub(visible);
+            }
+            _ => {}
+        }
+        return false;
+    }
     if local.search.visible {
         if control && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d')) {
             return true;
@@ -731,6 +783,10 @@ fn handle_key(
         }
     }
     match key.code {
+        KeyCode::Char('k') if control => {
+            local.skills = !local.skills;
+            local.skills_scroll = 0;
+        }
         KeyCode::PageUp if local.request_panel => {
             local.request_scroll = local.request_scroll.saturating_sub(1)
         }
@@ -1181,6 +1237,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         return;
     }
 
+    if local.skills {
+        draw_skills(frame, area, snapshot, local);
+        return;
+    }
+
     let conversation_area = if area.width >= 100 && !snapshot.agents.is_empty() {
         let panels = Layout::default()
             .direction(Direction::Horizontal)
@@ -1357,7 +1418,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Ctrl+T evidence timeline | Ctrl+F retained conversation search | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
         notice.clone()
     } else if let Some(request) = request {
@@ -1489,6 +1550,144 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     if local.request_panel && local.attention_editor.is_none() {
         requests::draw(frame, snapshot, local);
     }
+}
+
+const SKILLS_PANEL_FULL_HEADER_LINES: u16 = 6;
+const SKILLS_PANEL_COMPACT_HEADER_LINES: u16 = 4;
+
+fn skills_panel_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let width = area.width.saturating_sub(4).clamp(1, 100);
+    let height = area.height.saturating_sub(2).max(1);
+    ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn skills_panel_entries_capacity(area: ratatui::layout::Rect) -> usize {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .inner(skills_panel_rect(area));
+    let header = if inner.height < 10 {
+        SKILLS_PANEL_COMPACT_HEADER_LINES
+    } else {
+        SKILLS_PANEL_FULL_HEADER_LINES
+    };
+    inner.height.saturating_sub(header) as usize
+}
+
+fn draw_skills(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    snapshot: &CoreSnapshot,
+    local: &LocalState,
+) {
+    let rect = skills_panel_rect(area);
+    let inner = Block::default().borders(Borders::ALL).inner(rect);
+    let compact = inner.height < 10;
+    frame.render_widget(Clear, rect);
+    let skills = &snapshot.skills;
+    let directory = Line::from(format!("Directory: {}", display_text(&snapshot.cwd)));
+    let status = Line::from(
+        if matches!(
+            skills.availability,
+            crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
+        ) {
+            format!(
+                "Status: {:?} / {:?} | {} skills observed, {} enabled | scan errors: {}{}",
+                skills.availability,
+                skills.freshness,
+                skills.skill_count,
+                skills.enabled_count,
+                skills.scan_error_count,
+                if skills.truncated { " | truncated" } else { "" },
+            )
+        } else {
+            format!(
+                "Status: {:?} / {:?} | skill counts unavailable",
+                skills.availability, skills.freshness
+            )
+        },
+    );
+    let session = Line::from(format!(
+        "Session: {:?} · pending requests: {}",
+        snapshot.phase,
+        snapshot.requests.len()
+    ));
+    let source = if matches!(
+        skills.availability,
+        crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
+    ) {
+        Line::from("Source: server-confirmed skills/list directory scan")
+    } else {
+        Line::from(format!(
+            "Inventory source unavailable: {:?}",
+            skills.availability
+        ))
+    };
+    let mut lines = if compact {
+        let compact_status = Line::from(format!(
+            "{:?} / {:?}",
+            skills.availability, skills.freshness
+        ));
+        let compact_source = if matches!(
+            skills.availability,
+            crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
+        ) {
+            Line::from("Source: AppServer")
+        } else {
+            Line::from(format!("Unavailable: {:?}", skills.availability))
+        };
+        vec![
+            directory,
+            compact_status,
+            compact_source,
+            Line::from(format!(
+                "{:?} req {} · Enter/F2",
+                snapshot.phase,
+                snapshot.requests.len()
+            )),
+        ]
+    } else {
+        vec![
+            directory,
+            status,
+            session,
+            source,
+            Line::from("Listed entries do not confirm loaded, invoked, completed, or failed."),
+            Line::from("Enter refresh · Esc/Ctrl+K close · ↑/↓ scroll · F2 requests"),
+        ]
+    };
+    let visible = inner.height.saturating_sub(lines.len() as u16) as usize;
+    let start = local
+        .skills_scroll
+        .min(skills.entries.len().saturating_sub(visible));
+    lines.extend(
+        skills
+            .entries
+            .iter()
+            .skip(start)
+            .take(visible)
+            .map(|entry| {
+                Line::from(display_text(&format!(
+                    "{} [{}] {} · {}",
+                    if entry.enabled { "on" } else { "off" },
+                    entry.scope,
+                    entry.name,
+                    entry.path,
+                )))
+            }),
+    );
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Skills inventory · Ctrl+K "),
+        ),
+        rect,
+    );
 }
 
 fn age(ms: Option<u64>) -> String {
@@ -2039,6 +2238,201 @@ mod tests {
 
     fn observed_snapshot() -> CoreSnapshot {
         observed_snapshot_with_requests(&[])
+    }
+
+    #[test]
+    fn opening_skills_panel_is_local_and_enter_requests_a_refresh() {
+        let snapshot = observed_snapshot();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.skills);
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(rx.try_recv().unwrap(), Command::RefreshSkills);
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.skills);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn skills_panel_f2_opens_selected_request_without_losing_its_reference_or_draft() {
+        let request = RequestView::decode(
+            RpcId::Number(93),
+            "item/commandExecution/requestApproval",
+            &serde_json::json!({"threadId":"root-thread","turnId":"turn","command":"safe"}),
+        )
+        .unwrap();
+        let reference = request.reference();
+        let snapshot = observed_snapshot_with_requests(&[request]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState {
+            skills: true,
+            request_selection: Some(reference.clone()),
+            ..Default::default()
+        };
+        local.editor.insert("TASK_DRAFT");
+        handle_key(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.skills);
+        assert!(local.request_panel);
+        assert_eq!(
+            selected_request(&snapshot, &local).unwrap().reference(),
+            reference
+        );
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert!(rx.try_recv().is_err());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: reference,
+                decision: ApprovalDecision::Accept,
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_skills_panel_renders_and_scrolls_a_long_list() {
+        use ratatui::backend::TestBackend;
+
+        let mut snapshot = observed_snapshot();
+        snapshot.skills.availability = crate::skills::SkillAvailability::Available;
+        snapshot.skills.freshness = crate::skills::SkillFreshness::Current;
+        snapshot.skills.skill_count = 20;
+        snapshot.skills.enabled_count = 20;
+        snapshot.skills.entries = (0..20)
+            .map(|index| crate::skills::SkillEntry {
+                name: format!("skill-{index}"),
+                path: format!("/workspace/skill-{index}/SKILL.md"),
+                scope: "repo".into(),
+                enabled: true,
+            })
+            .collect();
+        let mut local = LocalState {
+            skills: true,
+            viewport: ratatui::layout::Rect::new(0, 0, 30, 10),
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let initial: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(initial.contains("Skills inventory"));
+        assert!(initial.contains("Source: AppServer"));
+        assert!(initial.contains("skill-0"));
+        assert!(initial.contains("skill-1"));
+
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let scrolled: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(scrolled.contains("skill-2"));
+        assert!(!scrolled.contains("skill-0"));
+
+        snapshot.skills.availability = crate::skills::SkillAvailability::Unsupported;
+        snapshot.skills.freshness = crate::skills::SkillFreshness::Stale;
+        for (width, height) in [(30, 10), (40, 12)] {
+            local.viewport = ratatui::layout::Rect::new(0, 0, width, height);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let unavailable: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                unavailable.contains("Unsupported / Stale"),
+                "status clipped at {width}x{height}"
+            );
+            assert!(
+                unavailable.contains("Unavailable: Unsupported"),
+                "unavailable source clipped at {width}x{height}"
+            );
+            assert!(
+                unavailable.contains("Running req 0"),
+                "phase/request count clipped at {width}x{height}"
+            );
+        }
+        snapshot.skills.availability = crate::skills::SkillAvailability::Available;
+        snapshot.skills.freshness = crate::skills::SkillFreshness::Current;
+
+        for (width, height) in [(40, 12), (80, 24)] {
+            local.viewport = ratatui::layout::Rect::new(0, 0, width, height);
+            local.skills_scroll = 0;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            local.skills_scroll = snapshot
+                .skills
+                .entries
+                .len()
+                .saturating_sub(skills_panel_entries_capacity(local.viewport));
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let tail: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                tail.contains("skill-19"),
+                "last entry clipped at {width}x{height}"
+            );
+        }
     }
 
     fn observed_snapshot_with_requests(requests: &[RequestView]) -> CoreSnapshot {

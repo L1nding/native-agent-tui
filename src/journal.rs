@@ -159,6 +159,9 @@ pub struct StoredSnapshot {
     pub usage: Option<StoredUsageSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<StoredTokenBudgetSnapshot>,
+    /// 只持久化技能扫描摘要，不保存名称、路径或服务端错误文本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<crate::skills::StoredSkillsSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +244,8 @@ impl StoredSnapshot {
                         stop_triggered: budget.stop_triggered,
                     })
             },
+            skills: (core.skills.freshness != crate::skills::SkillFreshness::Unknown)
+                .then_some(crate::skills::StoredSkillsSummary::from(&core.skills)),
             issue: match (&core.last_headless_action, core.phase) {
                 (Some(crate::interactions::HeadlessAction::StopForOutput), _) => {
                     Some(PersistenceIssue::OutputUnavailable)
