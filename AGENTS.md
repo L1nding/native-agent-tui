@@ -31,7 +31,7 @@ Test through public seams such as `ClientHandle`, `TransportAdapter`, and schedu
 
 ## Commit & Pull Request Guidelines
 
-There is no Git history yet, so no repository-specific commit convention has been established. Use concise imperative subjects such as `Add protocol envelope types`; keep each commit focused. Pull requests should explain the behavior or design change, link relevant issues or documents, list validation commands, and include terminal screenshots or recordings for visible TUI changes.
+使用中文 Conventional Commit，格式为 `<类型>: <中文描述>`，例如 `feat: 接入标准输入输出应用服务器适配器`；每个提交保持单一目的。拉取请求应说明行为或设计变化，关联相关 issue 或文档，列出验证命令；涉及 TUI 视觉变化时，附上终端截图或录屏。
 
 ## Architecture and Safety Notes
 
