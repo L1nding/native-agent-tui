@@ -163,6 +163,7 @@ impl Hit {
 #[derive(Debug)]
 pub struct Results {
     pub info: SessionInfo,
+    pub sessions: Vec<SessionInfo>,
     pub query: Query,
     pub hits: Vec<Hit>,
     pub total: u64,
@@ -179,6 +180,7 @@ pub(crate) fn scan(
     query.validate()?;
     let mut results = Results {
         info: replay.info.clone(),
+        sessions: vec![replay.info.clone()],
         query,
         hits: Vec::new(),
         total: 0,
@@ -259,6 +261,37 @@ pub(crate) fn scan(
     Ok(results)
 }
 
+fn merge(results: impl IntoIterator<Item = Results>) -> Option<Results> {
+    let mut results = results.into_iter();
+    let first = results.next()?;
+    let mut merged = Results {
+        info: first.info.clone(),
+        sessions: Vec::new(),
+        query: first.query.clone(),
+        hits: Vec::new(),
+        total: 0,
+        omitted_evidence: 0,
+        retained_bytes: 0,
+        uncommitted_tail: false,
+    };
+    for result in std::iter::once(first).chain(results) {
+        merged.sessions.extend(result.sessions);
+        merged.total = merged.total.saturating_add(result.total);
+        merged.omitted_evidence = merged
+            .omitted_evidence
+            .saturating_add(result.omitted_evidence);
+        merged.uncommitted_tail |= result.uncommitted_tail;
+        for hit in result.hits {
+            let bytes = hit.bytes();
+            if merged.hits.len() < HIT_LIMIT && merged.retained_bytes + bytes <= HIT_BYTES {
+                merged.retained_bytes += bytes;
+                merged.hits.push(hit);
+            }
+        }
+    }
+    Some(merged)
+}
+
 fn presence(value: Option<&str>) -> &'static str {
     if value.is_some() {
         "present"
@@ -269,7 +302,7 @@ fn presence(value: Option<&str>) -> &'static str {
 
 struct Job {
     id: u64,
-    session: String,
+    sessions: Vec<String>,
     query: Query,
 }
 
@@ -320,14 +353,13 @@ impl SearchHandle {
                     }
                     slot.take().unwrap()
                 };
-                let cancelled = || {
+                let mut cancelled = || {
                     owner.stopping.load(Ordering::Acquire)
                         || owner.epoch.load(Ordering::Acquire) != job.id
                 };
-                let result = Replay::open_cancellable(&settings, &cwd, &job.session, 0, cancelled)
-                    .map_err(HistoryError::from)
-                    .and_then(|mut replay| scan(&mut replay, job.query, cancelled))
-                    .map(Arc::new);
+                let result =
+                    search_sessions(&settings, &cwd, &job.sessions, job.query, &mut cancelled)
+                        .map(Arc::new);
                 if !cancelled() {
                     updates.send_replace(Some(Arc::new(Status { id: job.id, result })));
                 }
@@ -341,8 +373,16 @@ impl SearchHandle {
     }
 
     pub fn submit(&mut self, session: String, query: Query) -> Result<u64, HistoryError> {
+        self.submit_sessions(vec![session], query)
+    }
+
+    pub fn submit_sessions(
+        &mut self,
+        sessions: Vec<String>,
+        query: Query,
+    ) -> Result<u64, HistoryError> {
         query.validate()?;
-        if session.len() > 160 {
+        if sessions.is_empty() || sessions.iter().any(|session| session.len() > 160) {
             return Err(HistoryError::Journal(JournalError::Identity));
         }
         if self.mailbox.stopping.load(Ordering::Acquire) || self.status.has_changed().is_err() {
@@ -355,7 +395,11 @@ impl SearchHandle {
             .fetch_add(1, Ordering::AcqRel)
             .checked_add(1)
             .ok_or(HistoryError::Closed)?;
-        *slot = Some(Job { id, session, query });
+        *slot = Some(Job {
+            id,
+            sessions,
+            query,
+        });
         self.mailbox.wake.notify_one();
         Ok(id)
     }
@@ -407,6 +451,25 @@ impl SearchHandle {
         .await
         .unwrap_or(Err(HistoryError::Closed))
     }
+}
+
+fn search_sessions(
+    settings: &JournalSettings,
+    cwd: &std::path::Path,
+    sessions: &[String],
+    query: Query,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Results, HistoryError> {
+    let mut scans = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        if cancelled() {
+            return Err(HistoryError::Cancelled);
+        }
+        let mut replay = Replay::open_cancellable(settings, cwd, session, 0, &mut cancelled)
+            .map_err(HistoryError::from)?;
+        scans.push(scan(&mut replay, query.clone(), &mut cancelled)?);
+    }
+    merge(scans).ok_or(HistoryError::Journal(JournalError::Identity))
 }
 
 impl Drop for SearchHandle {

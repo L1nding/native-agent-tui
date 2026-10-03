@@ -152,6 +152,40 @@ async fn history_search_editor_moves_and_deletes_unicode_graphemes() {
 }
 
 #[tokio::test]
+async fn history_search_can_start_from_the_session_list_without_quitting() {
+    let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();
+    let mut panel = HistoryPanel {
+        visible: true,
+        sessions: vec![SessionInfo {
+            schema_version: 2,
+            workspace_id: "workspace".into(),
+            session_id: "retained-session".into(),
+            committed_seq: 1,
+            committed_bytes: 1,
+            snapshot_version: 0,
+            recorded_at: None,
+            session_closed: true,
+            needs_recovery: false,
+            execution_result: Some(SessionPhase::Unknown),
+        }],
+        ..Default::default()
+    };
+    assert!(!panel.key(
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        &mut service,
+        true,
+    ));
+    assert!(panel.search_editing);
+    assert!(!panel.key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut service,
+        true,
+    ));
+    assert!(!panel.search_editing);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn export_preview_can_be_scrolled_while_the_destination_remains_editable() {
     let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();
     let mut panel = panel();

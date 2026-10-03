@@ -25,7 +25,7 @@ cargo run --locked -- --history SESSION_ID --cwd PATH --journal-dir PATH
 
 每次打开或刷新只捕获当时已提交的前缀，`live_attached=false`。顶部的最终结果与所选历史事件的 recorded phase 分别展示；此前 Running 不代表任务现在仍在运行。缺少关闭记录、Unknown 或未确认清理明确显示需要检查，未提交尾部另行标记。
 
-历史详情中的搜索只读取当前会话的固定已提交前缀。查询匹配活动、线程、turn、工具、请求和等待证据的元数据；结果只显示脱敏摘要，按 Enter 可定位到记录事件序号。超过命中或元数据预算的结果会显示省略数量；未提交尾部、提示、答案、秘密、命令、路径和原始工具输出不进入搜索结果。完整说明见[历史证据搜索](history-evidence-search.md)。
+历史搜索可以在会话列表或已打开的详情中启动。列表模式扫描当前保留的所有 session，详情模式只扫描当前 session；每个 session 都固定在搜索开始时的已提交前缀。查询匹配活动、线程、turn、工具、请求和等待证据的元数据；结果只显示脱敏摘要，按 Enter 可定位到对应 session 的记录事件序号。超过命中或元数据预算的结果会显示省略数量；未提交尾部、提示、答案、秘密、命令、路径和原始工具输出不进入搜索结果。完整说明见[历史证据搜索](history-evidence-search.md)。
 
 elapsed、quiet、attention 和 progress 保留历史数值。原来为 Current 的 freshness 改为 Unknown；不按当前进程时钟继续计时。历史请求无法回答，原任务正文、秘密答案和完整对话没有保留，不能恢复它们。
 

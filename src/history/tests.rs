@@ -318,6 +318,48 @@ async fn cancelled_history_search_does_not_publish_the_old_result() {
     service.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn history_search_can_scan_multiple_retained_sessions_and_preserve_the_hit_session() {
+    let fixture = Fixture::new();
+    let settings = fixture.settings();
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let first = Journal::open(&settings, &cwd, state(1)).unwrap();
+    let mut second_state = state(1);
+    second_state.observation.session_id = "SECOND-SESSION".into();
+    let second = Journal::open(&settings, &cwd, second_state).unwrap();
+    let mut first_terminal = state(2);
+    first_terminal.close(SessionPhase::Unknown, true);
+    first.finish(first_terminal).await.unwrap();
+    let mut second_terminal = state(2);
+    second_terminal.observation.session_id = "SECOND-SESSION".into();
+    second_terminal.close(SessionPhase::Unknown, true);
+    second.finish(second_terminal).await.unwrap();
+
+    let mut service = HistoryHandle::start(settings, cwd).unwrap();
+    let search_id = service
+        .search
+        .submit_sessions(
+            vec!["PRIVATE-SESSION".into(), "SECOND-SESSION".into()],
+            Query {
+                text: "Bearer".into(),
+                category: Category::All,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let results = service.search.response(search_id).await.unwrap();
+    assert_eq!(results.sessions.len(), 2);
+    assert!(results
+        .hits
+        .iter()
+        .any(|hit| hit.session_id == "PRIVATE-SESSION"));
+    assert!(results
+        .hits
+        .iter()
+        .any(|hit| hit.session_id == "SECOND-SESSION"));
+    service.shutdown().await.unwrap();
+}
+
 #[test]
 fn export_cannot_publish_cached_completion_after_the_source_prefix_is_truncated() {
     let fixture = Fixture::new();

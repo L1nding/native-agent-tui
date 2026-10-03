@@ -160,16 +160,24 @@ impl HistoryPanel {
     }
 
     fn submit_search(&mut self, service: &mut HistoryHandle) {
-        let Some(view) = &self.view else {
-            self.notice = Some("Open a retained session before searching.".into());
-            return;
+        let sessions = if let Some(view) = &self.view {
+            vec![view.info.session_id.clone()]
+        } else {
+            self.sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>()
         };
+        if sessions.is_empty() {
+            self.notice = Some("No retained sessions are available to search.".into());
+            return;
+        }
         let query = Query {
             text: self.search_query.clone(),
             category: self.search_category,
             ..Default::default()
         };
-        match service.search.submit(view.info.session_id.clone(), query) {
+        match service.search.submit_sessions(sessions, query) {
             Ok(id) => {
                 self.search_pending = Some(id);
                 self.search_results = None;
@@ -253,7 +261,11 @@ impl HistoryPanel {
             return false;
         }
         if key.code == KeyCode::Esc {
-            if self.form.is_some() || self.preview.is_some() {
+            if self.search_editing {
+                self.search_editing = false;
+                service.search.cancel();
+                self.search_pending = None;
+            } else if self.form.is_some() || self.preview.is_some() {
                 self.form = None;
                 self.preview = None;
             } else if self.view.is_some() {
@@ -279,10 +291,9 @@ impl HistoryPanel {
             return false;
         }
 
-        if self.view.is_some()
-            && (self.search_editing
-                || key.code == KeyCode::Char('/')
-                || (control && key.code == KeyCode::Char('f')))
+        if self.search_editing
+            || key.code == KeyCode::Char('/')
+            || (control && key.code == KeyCode::Char('f'))
         {
             self.search_editing = true;
             if key.code == KeyCode::Char('/') || key.code == KeyCode::Char('f') {
@@ -316,30 +327,30 @@ impl HistoryPanel {
             return false;
         }
 
-        if self.view.is_some() {
+        if key.code == KeyCode::F(1) {
+            self.notice = Some(
+                "/ or Ctrl+F search metadata | F6 category | Up/Down hit | Enter locate | Esc closes".into(),
+            );
+            return false;
+        }
+        if key.code == KeyCode::F(6) {
+            self.search_category = self.search_category.next();
+            self.submit_search(service);
+            return false;
+        }
+        if let Some(results) = &self.search_results {
             match key.code {
-                KeyCode::F(1) => {
-                    self.notice = Some("/ or Ctrl+F search metadata | F6 category | Up/Down hit | Enter locate | Esc closes".into());
-                }
-                KeyCode::F(6) => {
-                    self.search_category = self.search_category.next();
-                    self.submit_search(service);
-                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.search_selected = self.search_selected.saturating_sub(1);
+                    return false;
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
-                    if let Some(results) = &self.search_results {
-                        self.search_selected =
-                            (self.search_selected + 1).min(results.hits.len().saturating_sub(1));
-                    }
+                    self.search_selected =
+                        (self.search_selected + 1).min(results.hits.len().saturating_sub(1));
+                    return false;
                 }
-                KeyCode::Enter if self.search_results.is_some() => {
-                    if let Some(hit) = self
-                        .search_results
-                        .as_ref()
-                        .and_then(|results| results.hits.get(self.search_selected))
-                    {
+                KeyCode::Enter => {
+                    if let Some(hit) = results.hits.get(self.search_selected) {
                         self.submit(
                             service,
                             HistoryRequest::Open {
@@ -614,6 +625,47 @@ impl HistoryPanel {
         } else if self.sessions.is_empty() {
             rows.push("No retained sessions in this workspace. r refresh | Esc return".into());
         } else {
+            if self.search_editing || self.search_pending.is_some() || self.search_results.is_some()
+            {
+                rows.push(format!(
+                    "Search metadata: {:?} | category {} | {}",
+                    self.search_query,
+                    self.search_category.label(),
+                    if self.search_editing {
+                        "editing; Enter runs search"
+                    } else {
+                        "/ or Ctrl+F edit; F6 changes category"
+                    }
+                ));
+                if let Some(results) = &self.search_results {
+                    let retained = results.hits.len() as u64;
+                    rows.push(format!(
+                        "Search scope: {} retained sessions | committed prefixes fixed | hits {}/{} | omitted {} | deduplicated evidence omitted {}",
+                        results.sessions.len(),
+                        retained,
+                        results.total,
+                        results.total.saturating_sub(retained),
+                        results.omitted_evidence
+                    ));
+                    if let Some(hit) = results.hits.get(self.search_selected) {
+                        rows.push(format!(
+                            "Selected hit {}/{}: session {} | event {} | {}",
+                            self.search_selected + 1,
+                            results.hits.len(),
+                            hit.session_id,
+                            hit.event_seq,
+                            hit.metadata()
+                        ));
+                    } else if results.total == 0 {
+                        rows.push("No retained metadata matched this query. Prompts, answers, secrets, commands and raw output are never searched.".into());
+                    }
+                } else if self.search_pending.is_some() {
+                    rows.push(
+                        "Searching retained metadata across sessions; uncommitted tails excluded."
+                            .into(),
+                    );
+                }
+            }
             rows.push(
                 "Select a retained session. Enter opens its latest committed evidence.".into(),
             );
