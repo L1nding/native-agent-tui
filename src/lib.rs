@@ -15,7 +15,6 @@ pub mod json_events;
 pub mod observation;
 mod owned_process;
 pub mod protocol;
-pub mod rpc;
 pub mod scheduler;
 mod shell_check;
 pub mod state;
