@@ -103,6 +103,45 @@ fn history_and_export_preview_render_unknown_results_in_compact_and_wide_termina
     }
 }
 
+#[test]
+fn historical_details_render_persisted_usage_and_budget_without_private_content() {
+    let mut panel = panel();
+    let mut state = StoredSnapshot::capture(&CoreSnapshot::default());
+    state.usage = Some(crate::journal::StoredUsageSummary {
+        input_tokens: Some(12),
+        cached_input_tokens: Some(3),
+        output_tokens: Some(8),
+        reasoning_tokens: Some(2),
+        total_tokens: Some(20),
+        context_window: Some(1024),
+        source: crate::journal::StoredUsageSource::ServerConfirmed,
+    });
+    state.token_budget = Some(crate::journal::StoredTokenBudgetSnapshot {
+        confirmed_total_tokens: Some(20),
+        confirmed_complete: true,
+        limit: Some(30),
+        stop_triggered: false,
+    });
+    state.observation.session_id = "history-session".into();
+    state.observation.activities.clear();
+    panel.view.as_mut().unwrap().selected.payload = Payload::Snapshot(Box::new(state));
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+    terminal.draw(|frame| panel.draw(frame, None)).unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("Recorded usage"), "{screen}");
+    assert!(screen.contains("total 20"), "{screen}");
+    assert!(screen.contains("Recorded token budget"), "{screen}");
+    assert!(screen.contains("20 / 30"), "{screen}");
+    assert!(!screen.contains("PRIVATE"), "{screen}");
+}
+
 #[tokio::test]
 async fn history_search_editor_accepts_paste_and_renders_its_fixed_scope() {
     let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();

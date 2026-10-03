@@ -583,6 +583,27 @@ impl HistoryPanel {
                     "Selected recorded phase: {:?} | cleanup confirmed: {:?} | issue: {:?}",
                     state.phase, state.cleanup_confirmed, state.issue
                 ));
+                if let Some(usage) = state.usage {
+                    rows.push(format!(
+                        "Recorded usage: source {:?} | total {} | input {} | cached {} | output {} | reasoning {} | context {}",
+                        usage.source,
+                        history_value(usage.total_tokens),
+                        history_value(usage.input_tokens),
+                        history_value(usage.cached_input_tokens),
+                        history_value(usage.output_tokens),
+                        history_value(usage.reasoning_tokens),
+                        history_value(usage.context_window),
+                    ));
+                }
+                if let Some(budget) = state.token_budget {
+                    rows.push(format!(
+                        "Recorded token budget: {} / {} | complete: {} | stop triggered: {}",
+                        history_value(budget.confirmed_total_tokens),
+                        history_value(budget.limit),
+                        budget.confirmed_complete,
+                        budget.stop_triggered,
+                    ));
+                }
                 if view.info.needs_recovery {
                     rows.push("Unconfirmed external outcomes remain unknown. Inspect evidence before a new task; prior side effects may already have occurred.".into());
                 }
@@ -768,6 +789,10 @@ impl HistoryPanel {
         }
         frame.render_widget(Paragraph::new("Enter open | Left/Right event | g sequence | e export | r refresh | PgUp/PgDn | Esc back | Ctrl+Q quit"), chunks[3]);
     }
+}
+
+fn history_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".into(), |value| value.to_string())
 }
 
 #[cfg(test)]
