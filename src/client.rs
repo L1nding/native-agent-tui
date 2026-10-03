@@ -4050,6 +4050,7 @@ mod tests {
             sandbox: "read-only".into(),
             ..Default::default()
         };
+        let retained_config = config.clone();
         let mut client = ClientHandle::spawn(config).await.unwrap();
         let outcome = tokio::time::timeout(
             Duration::from_secs(35),
@@ -4066,18 +4067,46 @@ mod tests {
         .await
         .map(|result| result.unwrap().clone());
         let _ = client.commands.send(Command::Quit).await;
-        client.join.await.unwrap();
+        let report = client.join.await.unwrap();
         let snapshot = outcome.unwrap_or_else(|_| {
             let latest = client.snapshots.borrow();
             panic!("live startup did not reach a result within 35 seconds; phase={:?}, notice={:?}, error={:?}", latest.phase, latest.notice, latest.last_error)
         });
+        let session = client
+            .snapshots
+            .borrow()
+            .journal
+            .as_ref()
+            .expect("startup must retain its journal")
+            .session_id
+            .clone();
+        let replay =
+            Replay::open(&retained_config.journal, &retained_config.cwd, &session, 0).unwrap();
+        let final_state = replay.latest_state();
+        eprintln!(
+            "[startup-check] {}",
+            json!({
+                "phase": format!("{:?}", snapshot.phase),
+                "ready": snapshot.phase == SessionPhase::Ready,
+                "root_turn_count": snapshot.root_turn_count,
+                "root_start_requests": final_state.root_start_requests,
+                "cleanup_confirmed": report.cleanup_error.is_none() && final_state.cleanup_confirmed == Some(true),
+                "journal_confirmed": report.journal_error.is_none() && final_state.session_closed,
+                "shell_preflight_timeout": snapshot.last_error.as_deref().is_some_and(|error| error.contains("Shell preflight timed out")),
+            })
+        );
+        assert_eq!(final_state.root_start_requests, 0);
+        assert_eq!(snapshot.root_turn_count, 0);
+        assert!(report.cleanup_error.is_none());
+        assert!(report.journal_error.is_none());
+        assert_eq!(final_state.cleanup_confirmed, Some(true));
+        assert!(final_state.session_closed);
         assert_eq!(
             snapshot.phase,
             SessionPhase::Ready,
             "{:?}",
             snapshot.last_error
         );
-        assert_eq!(snapshot.root_turn_count, 0);
     }
 
     async fn harness() -> (ClientHandle, BufReader<tokio::io::DuplexStream>) {

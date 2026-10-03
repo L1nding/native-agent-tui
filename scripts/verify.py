@@ -48,6 +48,7 @@ def main():
         parser.error("release binaries are missing; run without --fixtures-only to build them")
     fixtures = REPO / "tests/fixtures"
     run([sys.executable, str(REPO / "scripts/check_protocol_schema.py")])
+    run([sys.executable, str(fixtures / "startup_verifier_check.py")])
     run([sys.executable, str(fixtures / "compatibility_cli_check.py"), "--binary", str(binary)])
     for script in ["history_cli_check.py", "journal_replay_check.py"]:
         run([sys.executable, str(fixtures / script), "--fixture", str(fixture), "--binary", str(binary)])

@@ -95,3 +95,7 @@ number 后，指纹检查返回 1，确认差异会阻止兼容放行。
 和响应形状；usage 等可选事实缺失时保留 unavailable。完整 typed event
 迁移、更广协议快照和 Alpha 启动可靠性门禁仍需继续完成。最终基线和
 真实验证结果见[实施状态](implementation-status.md)。
+
+重复启动检查及 Windows 管道继承的诊断证据见
+[启动可靠性诊断](startup-reliability.md)。检查失败会立即停止剩余独立
+启动，不重试模型任务；诊断干预后的成功不能作为无干预启动验收。
