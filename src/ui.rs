@@ -17,6 +17,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::agents::AgentSnapshot;
 use crate::client::{ClientHandle, Command};
 use crate::history::HistoryHandle;
 use crate::interactions::{ApprovalDecision, RequestKind, RequestRef, RequestView};
@@ -1205,23 +1206,32 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
                 .as_deref()
                 .or(agent.info.nickname.as_deref())
                 .unwrap_or(&agent.info.id);
+            let depth = agent_depth(&agent.info.id, &snapshot.agents);
+            let tree_prefix = if depth == 1 {
+                String::new()
+            } else {
+                format!("{}+- ", "  ".repeat(depth - 2))
+            };
             agents.push(Line::from(display_text(&format!(
-                "{} {name}",
+                "{} {}{name}",
                 if Some(agent.info.id.as_str())
                     == selected_agent.map(|agent| agent.info.id.as_str())
                 {
                     ">"
                 } else {
                     " "
-                }
+                },
+                tree_prefix,
             ))));
             agents.push(Line::from(format!(
-                "    {status} / gen {}",
-                agent.generation
+                "    {}{status} / gen {}",
+                "  ".repeat(depth.saturating_sub(1)),
+                agent.generation,
             )));
             if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
                 agents.push(Line::from(format!(
-                    "    {:?} / quiet {}",
+                    "    {}{:?} / quiet {}",
+                    "  ".repeat(depth.saturating_sub(1)),
                     activity.attention.level,
                     age(activity.silence_ms)
                 )));
@@ -1855,6 +1865,26 @@ fn draw_tasks(
         ),
         area,
     );
+}
+
+fn agent_depth(id: &str, agents: &[AgentSnapshot]) -> usize {
+    let mut depth: usize = 1;
+    let mut parent = agents
+        .iter()
+        .find(|agent| agent.info.id == id)
+        .map(|agent| agent.info.parent_id.as_str());
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = parent {
+        if !seen.insert(parent_id) {
+            break;
+        }
+        let Some(parent_agent) = agents.iter().find(|agent| agent.info.id == parent_id) else {
+            break;
+        };
+        depth = depth.saturating_add(1);
+        parent = Some(parent_agent.info.parent_id.as_str());
+    }
+    depth.min(8)
 }
 
 fn gate_status(snapshot: &CoreSnapshot, gate: &crate::state::GateSnapshot) -> String {
@@ -2784,21 +2814,38 @@ mod tests {
             thread_id: Some("root".into()),
             root_start_requests: 1,
             queued_inputs: 2,
-            agents: vec![AgentSnapshot {
-                info: AgentInfo {
-                    id: "a".into(),
-                    parent_id: "root".into(),
-                    path: Some("/root/a".into()),
-                    nickname: None,
-                    role: None,
-                    model: None,
-                    confirmed: true,
+            agents: vec![
+                AgentSnapshot {
+                    info: AgentInfo {
+                        id: "a".into(),
+                        parent_id: "root".into(),
+                        path: Some("/root/a".into()),
+                        nickname: None,
+                        role: None,
+                        model: None,
+                        confirmed: true,
+                    },
+                    generation: 1,
+                    turn_id: Some("a-1".into()),
+                    outcome: None,
+                    awaiting_turn: false,
                 },
-                generation: 1,
-                turn_id: Some("a-1".into()),
-                outcome: None,
-                awaiting_turn: false,
-            }],
+                AgentSnapshot {
+                    info: AgentInfo {
+                        id: "b".into(),
+                        parent_id: "a".into(),
+                        path: Some("/root/a/b".into()),
+                        nickname: None,
+                        role: None,
+                        model: None,
+                        confirmed: true,
+                    },
+                    generation: 2,
+                    turn_id: Some("b-1".into()),
+                    outcome: None,
+                    awaiting_turn: false,
+                },
+            ],
             gate: Some(GateSnapshot {
                 targets: vec![WaitTarget {
                     id: "a".into(),
@@ -2853,6 +2900,7 @@ mod tests {
             }
             if width >= 100 {
                 assert!(rendered.contains("Agents · F3"));
+                assert!(rendered.contains("+- /root/a/b"), "{rendered}");
             }
         }
         local.editor.insert("root task");
@@ -2878,6 +2926,12 @@ mod tests {
         );
         assert_eq!(local.editor.text, "retained draft");
         assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
         handle_key(
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
             &snapshot,
