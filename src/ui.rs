@@ -1106,8 +1106,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     } else {
         String::new()
     };
+    let usage = snapshot.total_tokens.map_or_else(
+        || "tokens: unavailable".into(),
+        |tokens| format!("tokens:{tokens}"),
+    );
     let status = format!(
-        "{:?} | action:{} attention:{}{} | turns: {} | children: {} | queued: {}{}",
+        "{:?} | action:{} attention:{}{} | turns: {} | children: {} | queued: {} | {}{}",
         snapshot.phase,
         actions,
         attention,
@@ -1115,6 +1119,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         snapshot.root_turn_count,
         snapshot.agents.len(),
         snapshot.queued_inputs,
+        usage,
         if snapshot.scheduler.stopping {
             " | stopping"
         } else if snapshot.scheduler.paused {
@@ -2352,6 +2357,7 @@ mod tests {
     #[test]
     fn evidence_and_threshold_views_render_at_supported_sizes_without_leaking_drafts() {
         let mut snapshot = observed_snapshot();
+        snapshot.total_tokens = Some(4);
         snapshot.diagnostics.transport_bytes_in = 123;
         snapshot.diagnostics.transport_bytes_out = 456;
         snapshot.diagnostics.control_events = 7;
@@ -2385,6 +2391,9 @@ mod tests {
                 .collect();
             assert!(rendered.contains("Evidence"), "{rendered}");
             assert!(rendered.contains("Transport bytes"), "{rendered}");
+            if height > 16 {
+                assert!(rendered.contains("tokens:4"), "{rendered}");
+            }
             local.attention_editor = Some(AttentionEditor::new(&snapshot, 0));
             terminal
                 .draw(|frame| draw(frame, &snapshot, &local))
