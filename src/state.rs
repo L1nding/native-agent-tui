@@ -128,7 +128,6 @@ pub struct CoreSnapshot {
     pub notice: Option<String>,
     pub last_error: Option<String>,
     pub tool_activity: Option<String>,
-    pub total_tokens: Option<u64>,
     pub usage: UsageSummary,
     pub history_truncated: bool,
 }
@@ -168,7 +167,6 @@ impl Default for CoreSnapshot {
             notice: None,
             last_error: None,
             tool_activity: None,
-            total_tokens: None,
             usage: UsageSummary::default(),
             history_truncated: false,
         }

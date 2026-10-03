@@ -2067,7 +2067,6 @@ impl Core {
                     return;
                 }
                 if let Some(usage) = decode_usage(&params) {
-                    self.state.view.total_tokens = usage.total_tokens;
                     self.state.view.usage = usage;
                 }
             }
@@ -5577,7 +5576,9 @@ mod tests {
         send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"inputTokens":62,"cachedInputTokens":40,"outputTokens":18,"reasoningOutputTokens":3,"totalTokens":83},"modelContextWindow":128}}})).await;
         tokio::time::timeout(
             Duration::from_secs(3),
-            client.snapshots.wait_for(|s| s.total_tokens == Some(83)),
+            client
+                .snapshots
+                .wait_for(|s| s.usage.total_tokens == Some(83)),
         )
         .await
         .unwrap()
@@ -5681,7 +5682,9 @@ mod tests {
         send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":42}}}})).await;
         tokio::time::timeout(
             Duration::from_secs(3),
-            client.snapshots.wait_for(|s| s.total_tokens == Some(42)),
+            client
+                .snapshots
+                .wait_for(|s| s.usage.total_tokens == Some(42)),
         )
         .await
         .unwrap()

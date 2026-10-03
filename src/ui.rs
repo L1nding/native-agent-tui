@@ -1688,7 +1688,7 @@ fn draw_evidence(
 
 fn usage_status(snapshot: &CoreSnapshot) -> String {
     let usage = snapshot.usage;
-    let total = usage.total_tokens.or(snapshot.total_tokens);
+    let total = usage.total_tokens;
     let base = total.map_or_else(
         || "tokens: unavailable".to_owned(),
         |tokens| format!("tokens:{tokens}"),
@@ -1711,7 +1711,7 @@ fn usage_status(snapshot: &CoreSnapshot) -> String {
 
 fn format_usage_evidence(snapshot: &CoreSnapshot) -> String {
     let usage = snapshot.usage;
-    let total = usage.total_tokens.or(snapshot.total_tokens);
+    let total = usage.total_tokens;
     format!(
         "Usage source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {}",
         source_label(usage.source),
@@ -2405,7 +2405,7 @@ mod tests {
     #[test]
     fn evidence_and_threshold_views_render_at_supported_sizes_without_leaking_drafts() {
         let mut snapshot = observed_snapshot();
-        snapshot.total_tokens = Some(4);
+        snapshot.usage.total_tokens = Some(4);
         snapshot.diagnostics.transport_bytes_in = 123;
         snapshot.diagnostics.transport_bytes_out = 456;
         snapshot.diagnostics.control_events = 7;
