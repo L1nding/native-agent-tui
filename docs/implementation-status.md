@@ -135,3 +135,11 @@ app-server 和目录查询共用私有 `owned_process` 接口。Windows 通过 `
 新增八份导出 schema 指纹、两个保留源 schema、脱敏初始化与合成启动回放夹具。默认 CI 检查本地夹具及九个原生 CLI 场景；可选真实 schema 测试在独立目录重新导出并比较，字段类型漂移注入会返回失败。范围与升级步骤见[Codex 兼容门禁](codex-compatibility.md)。完整 typed event 与更多协议快照尚未全部实现。
 
 最终 `python scripts/verify.py` 通过 134 项默认测试、九个兼容场景、11 个 Windows 进程所有权场景和原有原生 fixture；fmt/check/clippy/doctest/release 通过。Cargo 原生测试路径同样通过 134 项。最新完整 `--live` 的五项真实检查四项通过，Ready 因约 31 秒的 shell 预检超时进入 Unknown，零模型轮次，整次命令失败。最终源码的 schema 专项复验通过，不能据此替代 Ready 或完整真实验证。启动可靠性及 Alpha/V2 仍未完成。
+
+## Windows 隔离启动预检
+
+正常 Windows 启动在主线程版本校验后创建辅助 app-server，只做有界版本查询、初始化和 shell 检查；辅助端不创建线程或模型轮次。主进程的 MCP 保留，两端共享 catalog 生命周期、使用独立 RPC ID。成功且辅助进程树清理确认后才进入 Ready；超时、无效响应和清理不确定性保留 Unknown，取消会 join 所持有的检查，不自动重试。
+
+独立源码/target 的 20 组对照为原路径 18/20、隔离路径 20/20。初次生产接入十次启动通过；补齐响应不确定性后，最终源码另跑五次，全部确认 Ready、零根请求/轮次、进程清理及 journal 关闭。最终 `python scripts/verify.py --live` 全部通过：143 项默认 Rust 测试、五项真实 Codex 测试、十二个兼容场景、八项启动 runner 测试、三项进程身份检查、11 个 Windows 所有权场景及原有原生夹具；fmt/check/clippy/doctest/release 通过。清理 fixture 核对 PID 与创建时间并有界确认退出，覆盖主/辅助父子进程。
+
+详细边界、历史失败和验证限制见[启动可靠性](startup-reliability.md)与[Codex 兼容门禁](codex-compatibility.md)。结果限于本机锁定版本；搜索、提醒关闭、完整请求详情、交互和试用验收，以及 Alpha/V2 仍待完成。

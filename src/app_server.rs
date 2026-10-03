@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -34,7 +35,7 @@ pub(crate) struct AppServer {
     pub pipe: Option<PipeTransport>,
     child: Child,
     stderr: JoinHandle<()>,
-    _catalog: Option<DirectCatalog>,
+    _catalog: Option<Arc<DirectCatalog>>,
 }
 
 impl AppServer {
@@ -48,7 +49,11 @@ impl AppServer {
         )
         .await?;
         compatibility::verify_version(&version)?;
-        let catalog = DirectCatalog::prepare(config).await?;
+        let catalog = Arc::new(DirectCatalog::prepare(config).await?);
+        Self::with_catalog(config, catalog)
+    }
+
+    fn with_catalog(config: &Config, catalog: Arc<DirectCatalog>) -> Result<Self, AppServerError> {
         let mut command = Command::new(&config.executable);
         command.args(["-c", &catalog.config_override()]);
         #[cfg(windows)]
@@ -61,6 +66,12 @@ impl AppServer {
         let mut server = Self::spawn_command(command)?;
         server._catalog = Some(catalog);
         Ok(server)
+    }
+
+    pub(crate) fn shell_peer(&self) -> Option<ShellPeer> {
+        self._catalog.as_ref().map(|catalog| ShellPeer {
+            catalog: Arc::clone(catalog),
+        })
     }
 
     pub(crate) fn spawn_command(command: Command) -> Result<Self, AppServerError> {
@@ -108,6 +119,37 @@ impl AppServer {
         self.stderr.abort();
         let _ = (&mut self.stderr).await;
         Ok(())
+    }
+}
+
+/// Retains the reviewed catalog until both app-server processes have closed.
+pub(crate) struct ShellPeer {
+    catalog: Arc<DirectCatalog>,
+}
+
+impl ShellPeer {
+    pub(crate) async fn launch(
+        self,
+        config: &Config,
+        cancelled: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<AppServer>, AppServerError> {
+        if *cancelled.borrow() {
+            return Ok(None);
+        }
+        // Finish and confirm query cleanup even when cancellation arrives mid-query.
+        let version = query_output(
+            config,
+            &["--version"],
+            4096,
+            Duration::from_secs(5),
+            "version",
+        )
+        .await?;
+        compatibility::verify_version(&version)?;
+        if *cancelled.borrow() {
+            return Ok(None);
+        }
+        AppServer::with_catalog(config, self.catalog).map(Some)
     }
 }
 

@@ -5,16 +5,21 @@ from pathlib import Path
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+from windows_process_identity import record as record_processes
+
 root = Path(os.environ["NATIVE_JSONL_FIXTURE_ROOT"])
 mode = os.environ.get("NATIVE_JSONL_FIXTURE_MODE", "success")
 stage = "version" if "--version" in sys.argv else "catalog" if "debug" in sys.argv and "models" in sys.argv else "app-server"
 with (root / "startup.jsonl").open("a") as record:
     record.write(json.dumps({"stage": stage}) + "\n")
+stages = [json.loads(line)['stage'] for line in (root / 'startup.jsonl').read_text().splitlines()]
+is_peer = stage == 'app-server' and stages.count('app-server') > 1
 if stage == "version":
     if mode == "version_hang":
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                                  creationflags=subprocess.CREATE_NO_WINDOW) if os.name == "nt" else None
-        (root / "pids.json").write_text(json.dumps([os.getpid(), child.pid] if child else [os.getpid()]))
+        record_processes(root, [os.getpid(), child.pid] if child else [os.getpid()])
         print("codex-cli 0.159.2", flush=True)
         try:
             import time
@@ -25,7 +30,9 @@ if stage == "version":
                 child.wait()
     if mode == "version_empty":
         sys.exit(0)
-    if mode == "version_bad":
+    if mode == "peer_version_bad" and stages.count('version') > 1:
+        print("PRIVATE_PEER_BANNER")
+    elif mode == "version_bad":
         print("codex-cli 0.159.20")
     elif mode == "version_private":
         print("PRIVATE_BANNER 0.159.2")
@@ -41,7 +48,7 @@ if "debug" in sys.argv and "models" in sys.argv:
 
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-(root / "pids.json").write_text(json.dumps([os.getpid(), child.pid]))
+record_processes(root, [os.getpid(), child.pid])
 turn_count = 0
 turn_id = "turn"
 
@@ -74,13 +81,13 @@ try:
         if method == "initialize":
             response = json.loads((Path(__file__).parent / "codex-0.159.2/initialize.json").read_text())
             response["id"] = message["id"]
-            if mode == "initialize_bad":
+            if mode == "initialize_bad" or is_peer and mode == "peer_initialize_bad":
                 response["result"] = {"userAgent": "PRIVATE_METADATA"}
             send(response)
         elif method == "thread/start":
             send({"id": message["id"], "result": {"thread": {"id": "root", "cliVersion": "PRIVATE_VERSION" if mode == "thread_version_bad" else "0.159.2"}, "model": "fixture-model"}})
         elif method == "command/exec":
-            send({"id": message["id"], "result": {"exitCode": 0, "stdout": "native-agent-tui-shell-ok"}})
+            send({"id": message["id"], "result": {"exitCode": 1 if mode == "peer_shell_bad" and is_peer else 0, "stdout": "native-agent-tui-shell-ok"}})
         elif method == "turn/start":
             turn_count += 1
             turn_id = f"turn-{turn_count}"

@@ -2,7 +2,6 @@
 import argparse
 import copy
 from contextlib import ExitStack
-import ctypes
 import json
 import os
 from pathlib import Path
@@ -10,6 +9,9 @@ import subprocess
 import sys
 import tempfile
 import time
+
+sys.dont_write_bytecode = True
+from windows_process_identity import check_clean
 
 
 def records(output):
@@ -32,22 +34,6 @@ def main():
         if expected != 2:
             return json.loads(result.stdout)
         assert not result.stdout and b"Traceback" not in result.stderr
-
-    def check_clean(root):
-        if os.name != "nt" or not (root / "pids.json").exists():
-            return
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
-        kernel.OpenProcess.restype = ctypes.c_void_p
-        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        for pid in json.loads((root / "pids.json").read_text()):
-            handle = kernel.OpenProcess(0x00100000, False, pid)
-            if handle:
-                try:
-                    assert kernel.WaitForSingleObject(handle, 0) == 0, ("owned process still alive", pid)
-                finally:
-                    kernel.CloseHandle(handle)
 
     with tempfile.TemporaryDirectory(prefix="live-jsonl-", dir=repo / "target") as temp, ExitStack() as owners:
         temp = Path(temp)

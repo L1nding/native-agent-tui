@@ -9,6 +9,9 @@ import sys
 import tempfile
 import time
 
+sys.dont_write_bytecode = True
+from windows_process_identity import check_clean
+
 
 def values(path):
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
@@ -37,7 +40,8 @@ def main():
         if os.name != 'nt':
             fake.chmod(0o700)
         for mode in ['version_bad', 'version_empty', 'version_private', 'version_large', 'version_failure',
-                     'version_hang', 'initialize_bad', 'thread_version_bad', 'success']:
+                     'version_hang', 'initialize_bad', 'thread_version_bad',
+                     *(['peer_version_bad', 'peer_initialize_bad', 'peer_shell_bad'] if os.name == 'nt' else []), 'success']:
             root = base / mode
             root.mkdir()
             command = [str(binary), '--cwd', str(repo), '--codex', str(fake), '--journal-dir', str(root / 'journal'),
@@ -66,11 +70,18 @@ def main():
                     assert process.returncode == 3 and methods == ['initialize'], (mode, process.returncode, methods)
                 elif mode == 'thread_version_bad':
                     assert process.returncode == 3 and methods == ['initialize', 'initialized', 'thread/start'], (mode, process.returncode, methods)
+                elif mode.startswith('peer_'):
+                    assert process.returncode == 3 and 'turn/start' not in methods
+                    assert methods[:3] == ['initialize', 'initialized', 'thread/start']
+                    expected = ['initialize'] if mode == 'peer_initialize_bad' else ['initialize', 'initialized', 'command/exec'] if mode == 'peer_shell_bad' else []
+                    assert methods[3:] == expected, (mode, methods)
                 else:
                     assert process.returncode == 0 and methods.count('turn/start') == 1
                 if not mode.startswith('version_'):
-                    assert stage == ['version', 'catalog', 'app-server'], stage
+                    extra = ['version'] + ([] if mode == 'peer_version_bad' else ['app-server']) if os.name == 'nt' and mode in ['success', 'peer_version_bad', 'peer_initialize_bad', 'peer_shell_bad'] else []
+                    assert stage == ['version', 'catalog', 'app-server'] + extra, stage
                 assert all(kernel.WaitForSingleObject(handle, 3000) == 0 for handle in handles)
+                check_clean(root)
                 cursor = next((root / 'journal').glob('*.cursor'))
                 session = json.loads(cursor.read_text())['session_id']
                 before = (root / 'startup.jsonl').read_bytes()

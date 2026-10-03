@@ -143,6 +143,25 @@ impl ClientHandle {
         check_only: bool,
         prepared: Option<(Observer, Journal)>,
     ) -> Self {
+        let shell_source = if cfg!(windows) && !check_only {
+            server
+                .as_ref()
+                .and_then(AppServer::shell_peer)
+                .map(crate::shell_check::Source::Peer)
+        } else {
+            None
+        };
+        Self::start_with_shell_source(pipe, config, server, check_only, prepared, shell_source)
+    }
+
+    fn start_with_shell_source(
+        pipe: PipeTransport,
+        config: Config,
+        server: Option<AppServer>,
+        check_only: bool,
+        prepared: Option<(Observer, Journal)>,
+        shell_source: Option<crate::shell_check::Source>,
+    ) -> Self {
         let (commands, command_rx) = mpsc::channel(32);
         let (observer, journal) = match prepared {
             Some((observer, journal)) => (observer, Some(journal)),
@@ -174,6 +193,9 @@ impl ClientHandle {
                 interrupt_requested: false,
                 interrupt_sent: false,
                 preflight_passed: false,
+                shell_source,
+                shell_check: None,
+                peer_cleanup_uncertain: false,
                 generation: 0,
                 retired_turns: VecDeque::new(),
                 gate: PendingGate::default(),
@@ -241,6 +263,9 @@ struct Core {
     interrupt_requested: bool,
     interrupt_sent: bool,
     preflight_passed: bool,
+    shell_source: Option<crate::shell_check::Source>,
+    shell_check: Option<crate::shell_check::ShellCheck>,
+    peer_cleanup_uncertain: bool,
     generation: u64,
     retired_turns: VecDeque<String>,
     gate: PendingGate,
@@ -263,6 +288,13 @@ struct PendingTool {
 }
 
 impl Core {
+    fn shell_timeout(&mut self) {
+        self.state.error(
+            SessionPhase::Unknown,
+            "Shell preflight timed out; no model turn was started. Automatic retry is disabled.",
+        );
+    }
+
     async fn run(mut self) -> ExitReport {
         if let Err(error) = self.send_rpc(RpcKind::Initialize) {
             self.state.error(SessionPhase::Failed, error.to_string());
@@ -333,7 +365,35 @@ impl Core {
                         }
                     }
                 }
-                _ = clock.tick(), if !self.pending.is_empty() || !self.child_interrupts.is_empty() => {
+                report = async { self.shell_check.as_mut().expect("active check").wait().await }, if self.shell_check.is_some() => {
+                    let expired = self.shell_check.as_ref().is_some_and(|check| check.deadline <= Instant::now());
+                    self.shell_check.take();
+                    self.peer_cleanup_uncertain |= !report.cleanup_confirmed;
+                    if !report.cleanup_confirmed {
+                        self.state.error(SessionPhase::Unknown, "Isolated shell preflight process cleanup could not be confirmed");
+                    } else if expired {
+                        self.shell_timeout();
+                    } else {
+                        use crate::shell_check::Outcome;
+                        match report.outcome {
+                            Outcome::Passed => {
+                                self.state.view.phase = SessionPhase::Ready;
+                                self.state.view.notice = None;
+                                self.preflight_passed = true;
+                            }
+                            Outcome::TimedOut => self.shell_timeout(),
+                            Outcome::Cancelled => self.state.error(SessionPhase::Failed, "Shell preflight cancelled; no model turn was started"),
+                            Outcome::TransportUnavailable | Outcome::ProtocolRejected => self.state.error(SessionPhase::Unknown, "Isolated shell preflight has no verified response; its external outcome is unknown. No model turn was started"),
+                            Outcome::BackendRejected => self.state.error(SessionPhase::Failed, "Isolated shell preflight backend version or launch was rejected; no model turn was started"),
+                            Outcome::InitializeRejected => self.state.error(SessionPhase::Failed, "Isolated shell preflight initialize response failed verification; no model turn was started"),
+                            Outcome::ShellRejected => self.state.error(SessionPhase::Failed, "Isolated shell preflight returned an unsuccessful check; no model turn was started"),
+                        }
+                    }
+                }
+                _ = clock.tick(), if !self.pending.is_empty() || !self.child_interrupts.is_empty() || self.shell_check.is_some() => {
+                    if self.shell_check.as_ref().is_some_and(|check| check.deadline <= Instant::now()) {
+                        self.shell_timeout();
+                    }
                     let expired = self.pending.iter().find(|(_, rpc)| rpc.deadline <= Instant::now()).map(|(id, rpc)| (id.clone(), rpc.kind));
                     if let Some((id, kind)) = expired {
                         self.pending.remove(&id);
@@ -377,12 +437,22 @@ impl Core {
             self.state.view.phase = SessionPhase::Stopping;
             self.publish();
         }
+        if let Some(check) = &self.shell_check {
+            check.cancel();
+        }
         self.pipe.close_writer().await;
-        let cleanup_error = if let Some(server) = &mut self.server {
+        let mut cleanup_error = if let Some(server) = &mut self.server {
             server.shutdown().await.err().map(|error| error.to_string())
         } else {
             None
         };
+        if let Some(mut check) = self.shell_check.take() {
+            self.peer_cleanup_uncertain |= !check.wait().await.cleanup_confirmed;
+        }
+        if self.peer_cleanup_uncertain {
+            cleanup_error =
+                Some("Isolated shell preflight process cleanup could not be confirmed".into());
+        }
         if !matches!(
             outcome,
             SessionPhase::Failed | SessionPhase::Unknown | SessionPhase::Disconnected
@@ -501,6 +571,18 @@ impl Core {
     }
 
     fn send_rpc(&mut self, kind: RpcKind) -> Result<(), TransportError> {
+        if matches!(kind, RpcKind::Preflight) {
+            if let Some(source) = self.shell_source.take() {
+                self.state.view.phase = SessionPhase::CheckingShell;
+                self.state.view.notice =
+                    Some("Checking the sandbox shell; no model turn has started.".into());
+                self.shell_check = Some(crate::shell_check::ShellCheck::start(
+                    source,
+                    self.config.clone(),
+                ));
+                return Ok(());
+            }
+        }
         let id = RpcId::Number(self.next_id);
         self.next_id += 1;
         let envelope = match kind {
@@ -4122,6 +4204,280 @@ mod tests {
             ),
             BufReader::new(server),
         )
+    }
+
+    async fn isolated_harness(
+        thread_version: &str,
+    ) -> (
+        ClientHandle,
+        BufReader<tokio::io::DuplexStream>,
+        BufReader<tokio::io::DuplexStream>,
+    ) {
+        isolated_harness_with_cleanup(thread_version, None).await
+    }
+
+    async fn isolated_harness_with_cleanup(
+        thread_version: &str,
+        cleanup: Option<tokio::sync::oneshot::Receiver<bool>>,
+    ) -> (
+        ClientHandle,
+        BufReader<tokio::io::DuplexStream>,
+        BufReader<tokio::io::DuplexStream>,
+    ) {
+        let (main_client, main_server) = tokio::io::duplex(65536);
+        let (main_read, main_write) = tokio::io::split(main_client);
+        let (peer_client, peer_server) = tokio::io::duplex(65536);
+        let (peer_read, peer_write) = tokio::io::split(peer_client);
+        let peer = PipeTransport::new(peer_read, peer_write);
+        let source = match cleanup {
+            Some(confirmation) => crate::shell_check::Source::ScriptedCleanup(peer, confirmation),
+            None => crate::shell_check::Source::Pipe(peer),
+        };
+        let mut client = ClientHandle::start_with_shell_source(
+            PipeTransport::new(main_read, main_write),
+            Config::default(),
+            None,
+            false,
+            None,
+            Some(source),
+        );
+        let mut main = BufReader::new(main_server);
+        let mut initialize: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.159.2/initialize.json"
+        ))
+        .unwrap();
+        initialize["id"] = next(&mut main).await["id"].clone();
+        send(&mut main, initialize).await;
+        assert_eq!(next(&mut main).await["method"], "initialized");
+        let start = next(&mut main).await;
+        assert_eq!(start["method"], "thread/start");
+        send(
+            &mut main,
+            json!({"id":start["id"],"result":{"thread":{"id":"root","cliVersion":thread_version}}}),
+        )
+        .await;
+        phase(
+            &mut client,
+            if thread_version == "0.159.2" {
+                SessionPhase::CheckingShell
+            } else {
+                SessionPhase::Failed
+            },
+        )
+        .await;
+        (client, main, BufReader::new(peer_server))
+    }
+
+    async fn initialize_peer(peer: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+        let request = next(peer).await;
+        assert_eq!(request["method"], "initialize");
+        let mut response: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.159.2/initialize.json"
+        ))
+        .unwrap();
+        response["id"] = request["id"].clone();
+        send(peer, response).await;
+        assert_eq!(next(peer).await["method"], "initialized");
+        let preflight = next(peer).await;
+        assert_eq!(preflight["method"], "command/exec");
+        preflight
+    }
+
+    #[tokio::test]
+    async fn isolated_preflight_keeps_main_rpc_ids_separate_and_blocks_queued_tasks_until_cleanup()
+    {
+        let (client, mut main, mut peer) = isolated_harness("0.159.2").await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "after check".into(),
+            })
+            .await
+            .unwrap();
+        let preflight = initialize_peer(&mut peer).await;
+        // Main connection cannot satisfy the auxiliary request, even with matching numeric IDs.
+        send(&mut main, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), next(&mut main))
+                .await
+                .is_err()
+        );
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        send(&mut peer, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        let turn = next(&mut main).await;
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(turn["params"]["threadId"], "root");
+        let mut line = String::new();
+        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
+        client.commands.send(Command::Quit).await.unwrap();
+        assert!(client.join.await.unwrap().cleanup_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn incompatible_main_thread_cannot_launch_isolated_preflight() {
+        let (client, _main, mut peer) = isolated_harness("PRIVATE_VERSION").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), next(&mut peer))
+                .await
+                .is_err()
+        );
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_isolated_initialize_cannot_execute_shell_or_dispatch_model() {
+        let (mut client, _main, mut peer) = isolated_harness("0.159.2").await;
+        let initialize = next(&mut peer).await;
+        send(
+            &mut peer,
+            json!({"id":initialize["id"],"result":{"userAgent":"PRIVATE_METADATA"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Failed).await;
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        assert!(!client
+            .snapshots
+            .borrow()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("PRIVATE_"));
+        let mut line = String::new();
+        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn isolated_preflight_timeout_remains_unknown_and_cannot_retry_queued_task() {
+        let (mut client, mut main, mut peer) = isolated_harness("0.159.2").await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "must remain queued".into(),
+            })
+            .await
+            .unwrap();
+        initialize_peer(&mut peer).await;
+        tokio::time::advance(crate::shell_check::DEADLINE + Duration::from_secs(1)).await;
+        phase(&mut client, SessionPhase::Unknown).await;
+        let report = client.join.await.unwrap();
+        assert!(report.cleanup_error.is_none());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        let mut line = String::new();
+        assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
+        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn isolated_preflight_uncertain_responses_cannot_dispatch_or_reveal_private_text() {
+        for response in [
+            json!({"id":999,"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}}),
+            json!({"id":2,"error":{"code":-1,"message":"PRIVATE_ERROR"}}),
+            json!({"id":2,"result":{"exitCode":0}}),
+            json!({"id":2,"result":{"exitCode":"PRIVATE_CODE","stdout":"native-agent-tui-shell-ok"}}),
+            json!({"id":"PRIVATE_REQUEST","method":"PRIVATE_INTERACTION","params":{}}),
+        ] {
+            let (mut client, mut main, mut peer) = isolated_harness("0.159.2").await;
+            client
+                .commands
+                .send(Command::SubmitRootInput {
+                    text: "PRIVATE_TASK".into(),
+                })
+                .await
+                .unwrap();
+            initialize_peer(&mut peer).await;
+            send(&mut peer, response).await;
+            phase(&mut client, SessionPhase::Unknown).await;
+            assert!(client.join.await.unwrap().cleanup_error.is_none());
+            assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+            assert!(!client
+                .snapshots
+                .borrow()
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("PRIVATE_"));
+            let mut line = String::new();
+            assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_preflight_eof_preserves_unknown_shell_outcome() {
+        let (mut client, mut main, mut peer) = isolated_harness("0.159.2").await;
+        initialize_peer(&mut peer).await;
+        drop(peer);
+        phase(&mut client, SessionPhase::Unknown).await;
+        assert!(client.join.await.unwrap().cleanup_error.is_none());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        let mut line = String::new();
+        assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn isolated_preflight_success_cannot_release_tasks_after_cleanup_crosses_deadline() {
+        let (confirmation, cleanup) = tokio::sync::oneshot::channel();
+        let (mut client, mut main, mut peer) =
+            isolated_harness_with_cleanup("0.159.2", Some(cleanup)).await;
+        let request = initialize_peer(&mut peer).await;
+        send(&mut peer, json!({"id":request["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        // EOF confirms the worker has consumed success and entered its cleanup stage.
+        let mut line = String::new();
+        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
+        tokio::time::advance(crate::shell_check::DEADLINE + Duration::from_secs(1)).await;
+        confirmation.send(true).unwrap();
+        phase(&mut client, SessionPhase::Unknown).await;
+        let report = client.join.await.unwrap();
+        assert!(report.cleanup_error.is_none());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn quitting_during_isolated_preflight_joins_its_cancelled_owner() {
+        let (client, _main, mut peer) = isolated_harness("0.159.2").await;
+        initialize_peer(&mut peer).await;
+        client.commands.send(Command::Quit).await.unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(2), client.join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.cleanup_error.is_none());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+        let mut line = String::new();
+        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn isolated_preflight_cannot_become_ready_before_cleanup_or_after_uncertain_cleanup() {
+        let (confirmation, cleanup) = tokio::sync::oneshot::channel();
+        let (mut client, mut main, mut peer) =
+            isolated_harness_with_cleanup("0.159.2", Some(cleanup)).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "must remain blocked".into(),
+            })
+            .await
+            .unwrap();
+        let request = initialize_peer(&mut peer).await;
+        send(&mut peer,json!({"id":request["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), next(&mut main))
+                .await
+                .is_err()
+        );
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
+        confirmation.send(false).unwrap();
+        phase(&mut client, SessionPhase::Unknown).await;
+        let report = client.join.await.unwrap();
+        assert!(report.cleanup_error.is_some());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
     }
     async fn next(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
         let mut line = String::new();

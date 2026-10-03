@@ -17,6 +17,7 @@ mod owned_process;
 pub mod protocol;
 pub mod rpc;
 pub mod scheduler;
+mod shell_check;
 pub mod state;
 pub mod transport;
 pub mod ui;
