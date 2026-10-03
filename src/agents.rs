@@ -99,10 +99,6 @@ impl AgentRegistry {
         }
     }
 
-    pub fn limits(&self) -> AgentLimits {
-        self.limits
-    }
-
     pub fn register(&mut self, info: AgentInfo) -> Result<(), AgentError> {
         if [&info.id, &info.parent_id]
             .iter()
