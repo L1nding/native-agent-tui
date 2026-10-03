@@ -1,4 +1,5 @@
 use super::*;
+use crate::history::search::{Category, Query};
 use crate::journal::{tests::Fixture, Journal, StoredSnapshot};
 use crate::observation::{Freshness, ObservationFacts, Observer};
 use crate::scheduler::{ExternalTurn, RootTaskSpec, Scheduler};
@@ -244,6 +245,76 @@ async fn history_service_reads_frozen_evidence_and_requires_an_explicit_export_p
         service.response(id).await,
         Err(HistoryError::PreviewRequired)
     ));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_search_returns_locatable_redacted_metadata() {
+    let fixture = Fixture::new();
+    let settings = fixture.settings();
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let journal = Journal::open(&settings, &cwd, state(1)).unwrap();
+    let mut terminal = state(2);
+    terminal.close(SessionPhase::Unknown, true);
+    journal.finish(terminal).await.unwrap();
+
+    let mut service = HistoryHandle::start(settings, cwd).unwrap();
+    let search_id = service
+        .search
+        .submit(
+            "PRIVATE-SESSION".into(),
+            Query {
+                text: "Bearer".into(),
+                category: Category::All,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let results = service.search.response(search_id).await.unwrap();
+    assert!(results.total > 0);
+    assert!(results.hits.iter().all(|hit| {
+        let metadata = hit.metadata();
+        !metadata.contains("Bearer")
+            && !metadata.contains("PRIVATE")
+            && !metadata.contains("C:\\Users")
+            && !metadata.contains("Cookie=")
+    }));
+
+    let hit = results.hits.first().unwrap();
+    let request_id = service
+        .request(HistoryRequest::Open {
+            session: hit.session_id.clone(),
+            sequence: Some(hit.event_seq),
+        })
+        .unwrap();
+    let HistoryResult::Loaded(view) = service.response(request_id).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(view.selected.event_seq, hit.event_seq);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_history_search_does_not_publish_the_old_result() {
+    let fixture = Fixture::new();
+    let settings = fixture.settings();
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let journal = Journal::open(&settings, &cwd, state(1)).unwrap();
+    let mut terminal = state(2);
+    terminal.close(SessionPhase::Unknown, true);
+    journal.finish(terminal).await.unwrap();
+
+    let mut service = HistoryHandle::start(settings, cwd).unwrap();
+    let search_id = service
+        .search
+        .submit("PRIVATE-SESSION".into(), Query::default())
+        .unwrap();
+    service.search.cancel();
+    assert!(matches!(
+        service.search.response(search_id).await,
+        Err(HistoryError::Cancelled)
+    ));
+    assert!(service.search.status.borrow().is_none());
     service.shutdown().await.unwrap();
 }
 

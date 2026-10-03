@@ -7,6 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{age, wrap, Editor};
+use crate::history::search::{Category, Query, Results, FIELD_BYTES};
 use crate::history::{ExportPreview, HistoricalView, HistoryHandle, HistoryRequest, HistoryResult};
 use crate::journal::SessionInfo;
 use crate::state::{display_text, CoreSnapshot, SessionPhase};
@@ -22,6 +23,12 @@ pub(super) struct HistoryPanel {
     form: Option<Form>,
     pub notice: Option<String>,
     scroll: usize,
+    search_pending: Option<u64>,
+    search_query: String,
+    search_editing: bool,
+    search_category: Category,
+    search_selected: usize,
+    search_results: Option<std::sync::Arc<Results>>,
 }
 
 enum Form {
@@ -37,6 +44,9 @@ impl HistoryPanel {
             return;
         }
         self.form = None;
+        self.search_pending = None;
+        self.search_results = None;
+        service.search.cancel();
         self.preview = None;
         self.view = None;
         self.scroll = 0;
@@ -66,7 +76,7 @@ impl HistoryPanel {
         }
     }
 
-    pub fn updated(&mut self, service: &HistoryHandle) {
+    pub fn updated(&mut self, service: &mut HistoryHandle) {
         let update = service.status.borrow();
         if self.pending != Some(update.request_id) {
             return;
@@ -98,6 +108,9 @@ impl HistoryPanel {
                 self.preview = None;
                 self.form = None;
                 self.scroll = 0;
+                self.search_results = None;
+                self.search_pending = None;
+                service.search.cancel();
             }
             Ok(HistoryResult::Preview(preview)) => {
                 self.preview = Some(preview.clone());
@@ -119,7 +132,65 @@ impl HistoryPanel {
         }
     }
 
+    pub fn search_updated(&mut self, service: &HistoryHandle) -> bool {
+        let status = service.search.status.borrow();
+        if self.search_pending != Some(status.as_ref().map_or(0, |status| status.id)) {
+            return false;
+        }
+        let Some(status) = status.as_ref() else {
+            return false;
+        };
+        self.search_pending = None;
+        match &status.result {
+            Ok(results) => {
+                self.search_results = Some(results.clone());
+                self.search_selected = self
+                    .search_selected
+                    .min(results.hits.len().saturating_sub(1));
+                self.notice = None;
+            }
+            Err(error) => {
+                self.search_results = None;
+                self.notice = Some(error.to_string());
+            }
+        }
+        true
+    }
+
+    fn submit_search(&mut self, service: &mut HistoryHandle) {
+        let Some(view) = &self.view else {
+            self.notice = Some("Open a retained session before searching.".into());
+            return;
+        };
+        let query = Query {
+            text: self.search_query.clone(),
+            category: self.search_category,
+            ..Default::default()
+        };
+        match service.search.submit(view.info.session_id.clone(), query) {
+            Ok(id) => {
+                self.search_pending = Some(id);
+                self.search_results = None;
+                self.search_selected = 0;
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
     pub fn paste(&mut self, text: &str) {
+        if self.search_editing {
+            for character in text.chars().filter(|character| !character.is_control()) {
+                if self.search_query.len() + character.len_utf8() > FIELD_BYTES {
+                    self.notice = Some(format!(
+                        "Historical search field limited to {FIELD_BYTES} UTF-8 bytes."
+                    ));
+                    break;
+                }
+                self.search_query.push(character);
+            }
+            return;
+        }
         match &mut self.form {
             Some(Form::Destination(editor)) => editor.insert(&text.replace(['\n', '\r'], "")),
             Some(Form::Sequence(editor) | Form::Range(editor)) => {
@@ -147,6 +218,9 @@ impl HistoryPanel {
                 self.form = None;
                 self.preview = None;
             } else if self.view.is_some() {
+                service.search.cancel();
+                self.search_pending = None;
+                self.search_results = None;
                 self.view = None;
                 self.submit(service, HistoryRequest::List);
             } else if offline {
@@ -157,11 +231,90 @@ impl HistoryPanel {
             return false;
         }
         if key.code == KeyCode::F(12) && !offline {
+            service.search.cancel();
+            self.search_pending = None;
             self.visible = false;
             return false;
         }
         if self.pending.is_some() {
             return false;
+        }
+
+        if self.view.is_some()
+            && (self.search_editing
+                || key.code == KeyCode::Char('/')
+                || (control && key.code == KeyCode::Char('f')))
+        {
+            self.search_editing = true;
+            if key.code == KeyCode::Char('/') || key.code == KeyCode::Char('f') {
+                return false;
+            }
+        }
+        if self.search_editing {
+            match key.code {
+                KeyCode::Enter => {
+                    self.search_editing = false;
+                    self.submit_search(service);
+                }
+                KeyCode::Esc => self.search_editing = false,
+                KeyCode::Char('u') if control => self.search_query.clear(),
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                }
+                KeyCode::Char(character)
+                    if !control && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if self.search_query.len() + character.len_utf8() <= FIELD_BYTES {
+                        self.search_query.push(character);
+                    } else {
+                        self.notice = Some(format!(
+                            "Historical search field limited to {FIELD_BYTES} UTF-8 bytes."
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        if self.view.is_some() {
+            match key.code {
+                KeyCode::F(1) => {
+                    self.notice = Some("/ or Ctrl+F search metadata | F6 category | Up/Down hit | Enter locate | Esc closes".into());
+                }
+                KeyCode::F(6) => {
+                    self.search_category = self.search_category.next();
+                    self.submit_search(service);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.search_selected = self.search_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+                    if let Some(results) = &self.search_results {
+                        self.search_selected =
+                            (self.search_selected + 1).min(results.hits.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Enter if self.search_results.is_some() => {
+                    if let Some(hit) = self
+                        .search_results
+                        .as_ref()
+                        .and_then(|results| results.hits.get(self.search_selected))
+                    {
+                        self.submit(
+                            service,
+                            HistoryRequest::Open {
+                                session: hit.session_id.clone(),
+                                sequence: Some(hit.event_seq),
+                            },
+                        );
+                    } else {
+                        self.notice = Some("No retained evidence hit is selected.".into());
+                    }
+                    return false;
+                }
+                _ => {}
+            }
         }
         if let Some(form) = &mut self.form {
             let destination_form = matches!(form, Form::Destination(_));
@@ -338,6 +491,43 @@ impl HistoryPanel {
                 view.info.schema_version
             ));
             rows.push(format!("Latest recorded result: {result:?} | closed: {} | needs review: {} | uncommitted tail: {}", view.info.session_closed, view.info.needs_recovery, view.uncommitted_tail));
+            rows.push(format!(
+                "Search metadata: {:?} | category {} | {}",
+                self.search_query,
+                self.search_category.label(),
+                if self.search_editing {
+                    "editing; Enter runs search"
+                } else {
+                    "/ or Ctrl+F edit; F6 changes category"
+                }
+            ));
+            if let Some(results) = &self.search_results {
+                let retained = results.hits.len() as u64;
+                let omitted = results.total.saturating_sub(retained);
+                rows.push(format!(
+                    "Search scope: committed journal prefix through event {} | uncommitted tail excluded | hits {}/{} | omitted {} | deduplicated evidence omitted {}",
+                    results.info.committed_seq,
+                    retained,
+                    results.total,
+                    omitted,
+                    results.omitted_evidence
+                ));
+                if let Some(hit) = results.hits.get(self.search_selected) {
+                    rows.push(format!(
+                        "Selected hit {}/{}: event {} | {}",
+                        self.search_selected + 1,
+                        results.hits.len(),
+                        hit.event_seq,
+                        hit.metadata()
+                    ));
+                } else if results.total == 0 {
+                    rows.push("No retained metadata matched this query. Prompts, answers, secrets, commands and raw output are never searched.".into());
+                }
+            } else if self.search_pending.is_some() {
+                rows.push("Searching retained metadata… uncommitted tail excluded; prompts, answers, secrets, commands and raw output are never searched.".into());
+            } else {
+                rows.push("Search scope: fixed committed journal prefix; prompts, answers, secrets, commands and raw output are never searched.".into());
+            }
             if let Ok(state) = view.selected.state() {
                 rows.push(format!(
                     "Selected recorded phase: {:?} | cleanup confirmed: {:?} | issue: {:?}",

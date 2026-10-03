@@ -19,6 +19,8 @@ const ID_BYTES: usize = 2 * 1024 * 1024;
 const PREVIEW_BYTES: usize = 8192;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 
+pub mod search;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum HistoryError {
     #[error(transparent)]
@@ -87,6 +89,7 @@ pub struct HistoryStatus {
 }
 
 pub struct HistoryHandle {
+    pub search: search::SearchHandle,
     sender: Option<mpsc::SyncSender<(u64, HistoryRequest)>>,
     pub status: watch::Receiver<HistoryStatus>,
     cancel: Arc<AtomicBool>,
@@ -96,6 +99,7 @@ pub struct HistoryHandle {
 
 impl HistoryHandle {
     pub fn start(settings: JournalSettings, cwd: PathBuf) -> Result<Self, HistoryError> {
+        let search = search::SearchHandle::start(settings.clone(), cwd.clone())?;
         let (sender, requests) = mpsc::sync_channel::<(u64, HistoryRequest)>(1);
         let (updates, status) = watch::channel(HistoryStatus {
             request_id: 0,
@@ -161,6 +165,7 @@ impl HistoryHandle {
             })
             .map_err(|_| HistoryError::Closed)?;
         Ok(Self {
+            search,
             sender: Some(sender),
             status,
             cancel,
@@ -213,7 +218,8 @@ impl HistoryHandle {
     pub async fn shutdown(&mut self) -> Result<(), HistoryError> {
         self.cancel.store(true, Ordering::Release);
         self.sender.take();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let search_result = self.search.shutdown().await;
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
             while self
                 .worker
                 .as_ref()
@@ -227,7 +233,8 @@ impl HistoryHandle {
             Ok(())
         })
         .await
-        .unwrap_or(Err(HistoryError::Closed))
+        .unwrap_or(Err(HistoryError::Closed));
+        result.and(search_result)
     }
 }
 

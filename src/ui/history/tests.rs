@@ -104,6 +104,27 @@ fn history_and_export_preview_render_unknown_results_in_compact_and_wide_termina
 }
 
 #[tokio::test]
+async fn history_search_editor_accepts_paste_and_renders_its_fixed_scope() {
+    let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();
+    let mut panel = panel();
+    panel.search_editing = true;
+    panel.paste("thread-中文\n");
+    assert_eq!(panel.search_query, "thread-中文");
+    let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
+    terminal.draw(|frame| panel.draw(frame, None)).unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("Search metadata"));
+    assert!(screen.contains("fixed committed journal prefix"));
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn export_preview_can_be_scrolled_while_the_destination_remains_editable() {
     let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();
     let mut panel = panel();

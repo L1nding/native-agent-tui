@@ -218,10 +218,26 @@ async fn run_tasks_inner(
                     dirty = true;
                 }
                 change = async {
-                    match &mut history { Some(history) => history.status.changed().await, None => std::future::pending().await }
+                    match &mut history {
+                        Some(history) => {
+                            tokio::select! {
+                                result = history.status.changed() => (false, result),
+                                result = history.search.status.changed() => (true, result),
+                            }
+                        }
+                        None => std::future::pending().await,
+                    }
                 }, if history_open => {
-                    if change.is_ok() { history_panel.updated(history.as_ref().unwrap()); }
-                    else { history_open = false; history_panel.notice = Some("History reader closed; return to live execution.".into()); }
+                    if let (is_search, Ok(())) = change {
+                        if is_search {
+                            history_panel.search_updated(history.as_ref().unwrap());
+                        } else {
+                            history_panel.updated(history.as_mut().unwrap());
+                        }
+                    } else {
+                        history_open = false;
+                        history_panel.notice = Some("History reader closed; return to live execution.".into());
+                    }
                     dirty = true;
                 }
                 change = client.snapshots.changed(), if snapshots_open => {
@@ -297,11 +313,24 @@ pub async fn run_history(
         let mut reader_open = true;
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         loop {
-            if dirty { terminal.terminal.draw(|frame| panel.draw(frame, None))?; dirty = false; }
+            if dirty {
+                terminal.terminal.draw(|frame| panel.draw(frame, None))?;
+                dirty = false;
+            }
             tokio::select! {
-                changed = service.status.changed(), if reader_open => {
-                    if changed.is_ok() { panel.updated(&service); }
-                    else { reader_open = false; panel.notice = Some("History reader closed. Ctrl+Q exits.".into()); }
+                changed = async {
+                    tokio::select! {
+                        result = service.status.changed() => (false, result),
+                        result = service.search.status.changed() => (true, result),
+                    }
+                }, if reader_open => {
+                    if let (is_search, Ok(())) = changed {
+                        if is_search { panel.search_updated(&service); }
+                        else { panel.updated(&mut service); }
+                    } else {
+                        reader_open = false;
+                        panel.notice = Some("History reader closed. Ctrl+Q exits.".into());
+                    }
                     dirty = true;
                 }
                 _ = tick.tick() => {
@@ -324,7 +353,8 @@ pub async fn run_history(
                 }
             }
         }
-    }.await;
+    }
+    .await;
     let stopped = service.shutdown().await.map_err(UiError::from);
     result.and(stopped)
 }

@@ -95,6 +95,8 @@ pub enum JournalError {
     Cursor { requested: u64, high: u64 },
     #[error("could not write replay output")]
     Output,
+    #[error("journal read was cancelled")]
+    Cancelled,
 }
 impl From<io::Error> for JournalError {
     fn from(_: io::Error) -> Self {
@@ -907,6 +909,19 @@ impl Replay {
         session_id: &str,
         since: u64,
     ) -> Result<Self, JournalError> {
+        Self::open_cancellable(settings, cwd, session_id, since, || false)
+    }
+
+    pub(crate) fn open_cancellable(
+        settings: &JournalSettings,
+        cwd: &Path,
+        session_id: &str,
+        since: u64,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, JournalError> {
+        if cancelled() {
+            return Err(JournalError::Cancelled);
+        }
         validate_session(session_id)?;
         let root = settings.directory()?;
         let stem = format!("{}_{}", workspace_id(cwd)?, session_id);
@@ -938,7 +953,13 @@ impl Replay {
         let mut previous_version = 0u64;
         let mut baseline = None;
         let mut latest = None;
-        while let Some(record) = read_record(&mut reader)? {
+        loop {
+            if cancelled() {
+                return Err(JournalError::Cancelled);
+            }
+            let Some(record) = read_record(&mut reader)? else {
+                break;
+            };
             validate_record(&record, &info, sequence)?;
             if sequence > 0 && record.snapshot_version < previous_version {
                 return Err(JournalError::Corrupt);
@@ -974,8 +995,19 @@ impl Replay {
 
     pub(crate) fn visit_records(
         &mut self,
-        mut visit: impl FnMut(Record) -> Result<(), JournalError>,
+        visit: impl FnMut(Record) -> Result<(), JournalError>,
     ) -> Result<(), JournalError> {
+        self.visit_records_cancellable(visit, || false)
+    }
+
+    pub(crate) fn visit_records_cancellable(
+        &mut self,
+        mut visit: impl FnMut(Record) -> Result<(), JournalError>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<(), JournalError> {
+        if cancelled() {
+            return Err(JournalError::Cancelled);
+        }
         self.reader.get_mut().get_mut().seek(SeekFrom::Start(0))?;
         self.reader = BufReader::new(
             self.reader
@@ -990,7 +1022,13 @@ impl Replay {
         visit(baseline)?;
         let mut sequence = 0;
         let mut previous_version = 0;
-        while let Some(mut record) = read_record(&mut self.reader)? {
+        loop {
+            if cancelled() {
+                return Err(JournalError::Cancelled);
+            }
+            let Some(mut record) = read_record(&mut self.reader)? else {
+                break;
+            };
             validate_record(&record, &self.info, sequence)?;
             if record.snapshot_version < previous_version
                 || record.event_seq == self.since && record != self.baseline
@@ -1013,6 +1051,9 @@ impl Replay {
                 .ok_or(JournalError::Corrupt)?
         {
             return Err(JournalError::Corrupt);
+        }
+        if cancelled() {
+            return Err(JournalError::Cancelled);
         }
         let mut latest = self.latest.clone();
         latest.kind = RecordKind::Snapshot;
