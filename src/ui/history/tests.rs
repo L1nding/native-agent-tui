@@ -125,6 +125,33 @@ async fn history_search_editor_accepts_paste_and_renders_its_fixed_scope() {
 }
 
 #[tokio::test]
+async fn history_search_editor_moves_and_deletes_unicode_graphemes() {
+    let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();
+    let mut panel = panel();
+    panel.search_editing = true;
+    panel.paste("甲🙂乙");
+    assert_eq!(panel.search_query, "甲🙂乙");
+    panel.key(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        &mut service,
+        false,
+    );
+    panel.key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        &mut service,
+        false,
+    );
+    assert_eq!(panel.search_query, "甲乙");
+    panel.key(
+        KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE),
+        &mut service,
+        false,
+    );
+    assert_eq!(panel.search_query, "甲界乙");
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn export_preview_can_be_scrolled_while_the_destination_remains_editable() {
     let mut service = HistoryHandle::start(Default::default(), PathBuf::from(".")).unwrap();
     let mut panel = panel();

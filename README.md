@@ -89,6 +89,8 @@ cargo run --locked -- --export SESSION_ID --since 0 --output diagnostic.jsonl
 
 Exports preserve recorded states and relationships, replace string identities with stable aliases, and exclude prompts, answers, and full text. Historical ages stay frozen; uncertain outcomes require review before starting a new task. See [history and export](docs/history-export.md) and [validation](docs/history-validation.md).
 
+After opening a retained session, press `/` or `Ctrl+F` to search its committed evidence metadata. `F6` changes the lifecycle/output/tool/request/waiting category; Up/Down selects a hit and Enter opens its recorded event. Search results are bounded and redacted, and never include prompts, answers, secrets, commands, paths, or raw tool output. See [historical evidence search](docs/history-evidence-search.md).
+
 ## Live JSONL
 
 `--run TASK --json-events` and `--workflow FILE --headless --json-events` stream committed redacted state on stdout. A separate writer catches up from the journal; blocked output cannot hold Core. Broken pipes and sustained stalls stop the owner with a nonzero exit code. Final snapshots keep execution results and cleanup confirmation separate.

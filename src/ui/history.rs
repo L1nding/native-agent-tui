@@ -25,6 +25,7 @@ pub(super) struct HistoryPanel {
     scroll: usize,
     search_pending: Option<u64>,
     search_query: String,
+    search_cursor: usize,
     search_editing: bool,
     search_category: Category,
     search_selected: usize,
@@ -46,6 +47,7 @@ impl HistoryPanel {
         self.form = None;
         self.search_pending = None;
         self.search_results = None;
+        self.search_cursor = self.search_query.len();
         service.search.cancel();
         self.preview = None;
         self.view = None;
@@ -178,16 +180,53 @@ impl HistoryPanel {
         }
     }
 
+    fn search_insert(&mut self, character: char) {
+        if self.search_query.len() + character.len_utf8() > FIELD_BYTES {
+            self.notice = Some(format!(
+                "Historical search field limited to {FIELD_BYTES} UTF-8 bytes."
+            ));
+            return;
+        }
+        self.search_query.insert(self.search_cursor, character);
+        self.search_cursor += character.len_utf8();
+    }
+
+    fn search_left(&mut self) {
+        self.search_cursor = self.search_query[..self.search_cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(index, _)| index);
+    }
+
+    fn search_right(&mut self) {
+        if let Some(grapheme) = self.search_query[self.search_cursor..]
+            .graphemes(true)
+            .next()
+        {
+            self.search_cursor += grapheme.len();
+        }
+    }
+
+    fn search_backspace(&mut self) {
+        let end = self.search_cursor;
+        self.search_left();
+        self.search_query.drain(self.search_cursor..end);
+    }
+
+    fn search_delete(&mut self) {
+        if let Some(grapheme) = self.search_query[self.search_cursor..]
+            .graphemes(true)
+            .next()
+        {
+            let end = self.search_cursor + grapheme.len();
+            self.search_query.drain(self.search_cursor..end);
+        }
+    }
+
     pub fn paste(&mut self, text: &str) {
         if self.search_editing {
             for character in text.chars().filter(|character| !character.is_control()) {
-                if self.search_query.len() + character.len_utf8() > FIELD_BYTES {
-                    self.notice = Some(format!(
-                        "Historical search field limited to {FIELD_BYTES} UTF-8 bytes."
-                    ));
-                    break;
-                }
-                self.search_query.push(character);
+                self.search_insert(character);
             }
             return;
         }
@@ -257,20 +296,20 @@ impl HistoryPanel {
                     self.submit_search(service);
                 }
                 KeyCode::Esc => self.search_editing = false,
-                KeyCode::Char('u') if control => self.search_query.clear(),
-                KeyCode::Backspace => {
-                    self.search_query.pop();
+                KeyCode::Char('u') if control => {
+                    self.search_query.clear();
+                    self.search_cursor = 0;
                 }
+                KeyCode::Left => self.search_left(),
+                KeyCode::Right => self.search_right(),
+                KeyCode::Home => self.search_cursor = 0,
+                KeyCode::End => self.search_cursor = self.search_query.len(),
+                KeyCode::Backspace => self.search_backspace(),
+                KeyCode::Delete => self.search_delete(),
                 KeyCode::Char(character)
                     if !control && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    if self.search_query.len() + character.len_utf8() <= FIELD_BYTES {
-                        self.search_query.push(character);
-                    } else {
-                        self.notice = Some(format!(
-                            "Historical search field limited to {FIELD_BYTES} UTF-8 bytes."
-                        ));
-                    }
+                    self.search_insert(character);
                 }
                 _ => {}
             }
@@ -636,6 +675,14 @@ impl HistoryPanel {
         };
         let mut prompt = "Return to live execution or use --run with a fresh task. Prior side effects may have occurred.".to_owned();
         let mut input_cursor = None;
+        if self.search_editing {
+            let left = self.search_query[..self.search_cursor].to_owned();
+            input_cursor = Some(left.width());
+            prompt = format!(
+                "Search metadata: {left}{} | Enter runs, Esc cancels",
+                &self.search_query[self.search_cursor..]
+            );
+        }
         if let Some(editor) = editor {
             let mut left = editor.text[..editor.cursor].to_owned();
             let width = chunks[2].width.saturating_sub(2) as usize;
