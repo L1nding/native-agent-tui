@@ -154,6 +154,38 @@ pub struct StoredSnapshot {
     pub issue: Option<PersistenceIssue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_headless_action: Option<crate::interactions::HeadlessAction>,
+    /// 只保存服务端确认的 token 计数，不保存对话或工具内容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<StoredUsageSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<StoredTokenBudgetSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredUsageSummary {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub source: StoredUsageSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StoredUsageSource {
+    ServerConfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoredTokenBudgetSnapshot {
+    pub confirmed_total_tokens: Option<u64>,
+    pub confirmed_complete: bool,
+    pub limit: Option<u64>,
+    pub stop_triggered: bool,
 }
 
 impl StoredSnapshot {
@@ -185,6 +217,30 @@ impl StoredSnapshot {
             cleanup_confirmed: None,
             session_closed: false,
             last_headless_action: core.last_headless_action.clone(),
+            usage: (core.usage.source == crate::state::FactSource::ServerConfirmed).then_some(
+                StoredUsageSummary {
+                    input_tokens: core.usage.input_tokens,
+                    cached_input_tokens: core.usage.cached_input_tokens,
+                    output_tokens: core.usage.output_tokens,
+                    reasoning_tokens: core.usage.reasoning_tokens,
+                    total_tokens: core.usage.total_tokens,
+                    context_window: core.usage.context_window,
+                    source: StoredUsageSource::ServerConfirmed,
+                },
+            ),
+            token_budget: {
+                let budget = core.token_budget;
+                (budget.confirmed_total_tokens.is_some()
+                    || budget.confirmed_complete
+                    || budget.limit.is_some()
+                    || budget.stop_triggered)
+                    .then_some(StoredTokenBudgetSnapshot {
+                        confirmed_total_tokens: budget.confirmed_total_tokens,
+                        confirmed_complete: budget.confirmed_complete,
+                        limit: budget.limit,
+                        stop_triggered: budget.stop_triggered,
+                    })
+            },
             issue: match (&core.last_headless_action, core.phase) {
                 (Some(crate::interactions::HeadlessAction::StopForOutput), _) => {
                     Some(PersistenceIssue::OutputUnavailable)

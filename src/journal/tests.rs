@@ -48,7 +48,7 @@ impl Drop for Fixture {
     }
 }
 
-fn snapshot(session: &str) -> StoredSnapshot {
+fn core_snapshot(session: &str) -> CoreSnapshot {
     let now = tokio::time::Instant::now();
     let mut scheduler = Scheduler::default();
     scheduler
@@ -80,13 +80,16 @@ fn snapshot(session: &str) -> StoredSnapshot {
             now,
         )
         .unwrap();
-    let core = CoreSnapshot {
+    CoreSnapshot {
         phase: SessionPhase::Running,
         scheduler: scheduler.snapshot(),
         observation: observer.snapshot_at(0, now),
         ..Default::default()
-    };
-    StoredSnapshot::capture(&core)
+    }
+}
+
+fn snapshot(session: &str) -> StoredSnapshot {
+    StoredSnapshot::capture(&core_snapshot(session))
 }
 
 fn completed(session: &str) -> StoredSnapshot {
@@ -498,7 +501,11 @@ fn schema_one_history_stays_readable_and_is_not_mixed_with_schema_two_records() 
     let mut store = store(&fixture, snapshot("legacy"));
     let mut record = Record::snapshot(0, snapshot("legacy"));
     record.schema_version = 1;
-    let bytes = record.encode().unwrap();
+    let mut legacy_value = serde_json::to_value(&record).unwrap();
+    let payload = legacy_value["payload"].as_object_mut().unwrap();
+    payload.remove("usage");
+    payload.remove("token_budget");
+    let bytes = [serde_json::to_vec(&legacy_value).unwrap(), vec![b'\n']].concat();
     store.log.set_len(0).unwrap();
     store.log.seek(SeekFrom::Start(0)).unwrap();
     store.log.write_all(&bytes).unwrap();
@@ -518,4 +525,95 @@ fn schema_one_history_stays_readable_and_is_not_mixed_with_schema_two_records() 
         replay(&fixture, "legacy", 0),
         Err(JournalError::Corrupt)
     ));
+}
+
+#[test]
+fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_private_content() {
+    let fixture = Fixture::new();
+    let mut core = core_snapshot("usage-budget");
+    core.usage = crate::state::UsageSummary {
+        input_tokens: Some(120),
+        cached_input_tokens: Some(30),
+        output_tokens: Some(45),
+        reasoning_tokens: Some(12),
+        total_tokens: Some(165),
+        context_window: Some(32_000),
+        source: crate::state::FactSource::ServerConfirmed,
+    };
+    core.token_budget = crate::state::TokenBudgetSnapshot {
+        confirmed_total_tokens: Some(165),
+        confirmed_complete: true,
+        limit: Some(200),
+        stop_triggered: false,
+    };
+    core.model = Some("PRIVATE_MODEL".into());
+    core.last_error = Some("PRIVATE_SECRET".into());
+    core.messages.push(crate::state::ConversationItem {
+        id: "message".into(),
+        thread_id: "root-thread".into(),
+        turn_id: "turn".into(),
+        role: "Agent".into(),
+        text: "PRIVATE_PROMPT_AND_OUTPUT".into(),
+        complete: true,
+        truncated: false,
+    });
+
+    let captured = StoredSnapshot::capture(&core);
+    assert_eq!(
+        captured.usage,
+        Some(StoredUsageSummary {
+            input_tokens: Some(120),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(45),
+            reasoning_tokens: Some(12),
+            total_tokens: Some(165),
+            context_window: Some(32_000),
+            source: StoredUsageSource::ServerConfirmed,
+        })
+    );
+    assert_eq!(
+        captured.token_budget,
+        Some(StoredTokenBudgetSnapshot {
+            confirmed_total_tokens: Some(165),
+            confirmed_complete: true,
+            limit: Some(200),
+            stop_triggered: false,
+        })
+    );
+    let serialized = serde_json::to_string(&captured).unwrap();
+    assert!(!serialized.contains("PRIVATE_"));
+
+    let _store = store(&fixture, captured);
+    let replay = replay(&fixture, "usage-budget", 0).unwrap();
+    assert_eq!(replay.info.committed_seq, 0);
+    assert_eq!(replay.latest_state().root_start_requests, 0);
+    assert_eq!(
+        replay.latest_state().usage,
+        Some(StoredUsageSummary {
+            input_tokens: Some(120),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(45),
+            reasoning_tokens: Some(12),
+            total_tokens: Some(165),
+            context_window: Some(32_000),
+            source: StoredUsageSource::ServerConfirmed,
+        })
+    );
+    let mut bytes = Vec::new();
+    replay.write_jsonl(&mut bytes).unwrap();
+    let output = String::from_utf8(bytes).unwrap();
+    assert!(output.contains("\"totalTokens\":165"));
+    assert!(output.contains("\"confirmedTotalTokens\":165"));
+    assert!(!output.contains("PRIVATE_"));
+}
+
+#[test]
+fn unconfirmed_usage_is_not_persisted() {
+    let mut core = core_snapshot("estimated-usage");
+    core.usage = crate::state::UsageSummary {
+        total_tokens: Some(100),
+        source: crate::state::FactSource::LocalEstimate,
+        ..Default::default()
+    };
+    assert!(StoredSnapshot::capture(&core).usage.is_none());
 }
