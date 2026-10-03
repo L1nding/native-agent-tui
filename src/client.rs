@@ -19,7 +19,9 @@ use crate::scheduler::{
     ExternalTurn, InterruptEffect, RootTaskSpec, Scheduler, SchedulerCommand, TaskAttempt,
     TaskKind, TaskSnapshot,
 };
-use crate::state::{CoreSnapshot, GateSnapshot, SessionPhase, SessionState, MESSAGE_BYTES};
+use crate::state::{
+    CoreSnapshot, FactSource, GateSnapshot, SessionPhase, SessionState, UsageSummary, MESSAGE_BYTES,
+};
 use crate::transport::{PipeTransport, TransportError};
 
 #[cfg(all(test, windows))]
@@ -2045,9 +2047,17 @@ impl Core {
                 }
             }
             "thread/tokenUsage/updated" => {
-                self.state.view.total_tokens = params
-                    .pointer("/tokenUsage/total/totalTokens")
-                    .and_then(Value::as_u64);
+                if params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|thread| self.state.view.thread_id.as_deref() != Some(thread))
+                {
+                    return;
+                }
+                if let Some(usage) = decode_usage(&params) {
+                    self.state.view.total_tokens = usage.total_tokens;
+                    self.state.view.usage = usage;
+                }
             }
             "error" => {
                 self.state.view.notice = params
@@ -2058,6 +2068,74 @@ impl Core {
             _ => {}
         }
     }
+}
+
+fn decode_usage(params: &Value) -> Option<UsageSummary> {
+    let usage = params.get("tokenUsage").unwrap_or(params);
+    let number = |paths: &[&str]| {
+        paths.iter().find_map(|path| {
+            usage
+                .pointer(path)
+                .and_then(Value::as_u64)
+                .or_else(|| params.pointer(path).and_then(Value::as_u64))
+        })
+    };
+    let input_tokens = number(&[
+        "/total/inputTokens",
+        "/total/input_tokens",
+        "/inputTokens",
+        "/input_tokens",
+    ]);
+    let cached_input_tokens = number(&[
+        "/total/cachedInputTokens",
+        "/total/cached_input_tokens",
+        "/total/inputTokensDetails/cachedTokens",
+        "/total/input_tokens_details/cached_tokens",
+        "/cachedInputTokens",
+        "/cached_input_tokens",
+        "/inputTokensDetails/cachedTokens",
+        "/input_tokens_details/cached_tokens",
+    ]);
+    let output_tokens = number(&[
+        "/total/outputTokens",
+        "/total/output_tokens",
+        "/outputTokens",
+        "/output_tokens",
+    ]);
+    let reasoning_tokens = number(&[
+        "/total/reasoningOutputTokens",
+        "/total/reasoning_output_tokens",
+        "/total/outputTokensDetails/reasoningTokens",
+        "/total/output_tokens_details/reasoning_tokens",
+        "/reasoningOutputTokens",
+        "/reasoning_output_tokens",
+        "/outputTokensDetails/reasoningTokens",
+        "/output_tokens_details/reasoning_tokens",
+    ]);
+    let total_tokens = number(&[
+        "/total/totalTokens",
+        "/total/total_tokens",
+        "/totalTokens",
+        "/total_tokens",
+    ]);
+    let context_window = number(&[
+        "/modelContextWindow",
+        "/model_context_window",
+        "/contextWindow",
+        "/context_window",
+        "/total/modelContextWindow",
+        "/total/model_context_window",
+    ]);
+    let summary = UsageSummary {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+        context_window,
+        source: FactSource::ServerConfirmed,
+    };
+    summary.has_value().then_some(summary)
 }
 
 #[cfg(test)]
@@ -5416,14 +5494,29 @@ mod tests {
         assert_eq!(next(&mut server).await["error"]["code"], -32602);
         send(&mut server, json!({"id":"active","method":"item/commandExecution/requestApproval","params":{"threadId":"root","turnId":"current"}})).await;
         send(&mut server, json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":"active"}})).await;
-        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"totalTokens":1}}}})).await;
+        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","tokenUsage":{"total":{"inputTokens":62,"cachedInputTokens":40,"outputTokens":18,"reasoningOutputTokens":3,"totalTokens":83},"modelContextWindow":128}}})).await;
         tokio::time::timeout(
             Duration::from_secs(3),
-            client.snapshots.wait_for(|s| s.total_tokens == Some(1)),
+            client.snapshots.wait_for(|s| s.total_tokens == Some(83)),
         )
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(client.snapshots.borrow().usage.input_tokens, Some(62));
+        assert_eq!(
+            client.snapshots.borrow().usage.cached_input_tokens,
+            Some(40)
+        );
+        assert_eq!(client.snapshots.borrow().usage.output_tokens, Some(18));
+        assert_eq!(client.snapshots.borrow().usage.reasoning_tokens, Some(3));
+        assert_eq!(client.snapshots.borrow().usage.context_window, Some(128));
+        assert_eq!(
+            client.snapshots.borrow().usage.source,
+            FactSource::ServerConfirmed
+        );
+        send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","tokenUsage":{"total":{"totalTokens":999}}}})).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(client.snapshots.borrow().usage.total_tokens, Some(83));
         assert_eq!(client.snapshots.borrow().requests.len(), 1);
         client
             .commands
@@ -5436,6 +5529,30 @@ mod tests {
         assert_eq!(next(&mut server).await["result"]["decision"], "decline");
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
+    }
+
+    #[test]
+    fn usage_decoder_accepts_server_shapes_without_inventing_missing_context() {
+        let usage = decode_usage(&json!({
+            "tokenUsage": {
+                "total": {
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cached_tokens": 4},
+                    "output_tokens": 6,
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                    "total_tokens": 16
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.cached_input_tokens, Some(4));
+        assert_eq!(usage.output_tokens, Some(6));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.total_tokens, Some(16));
+        assert_eq!(usage.context_window, None);
+        assert_eq!(usage.source, FactSource::ServerConfirmed);
+        assert!(decode_usage(&json!({"tokenUsage": {}})).is_none());
     }
 
     #[tokio::test]

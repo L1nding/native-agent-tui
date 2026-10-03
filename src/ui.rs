@@ -26,7 +26,7 @@ use crate::observation::{
 use crate::scheduler::{
     RootTaskSpec, SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, ROOT_QUEUE_LIMIT,
 };
-use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
+use crate::state::{display_text, CoreSnapshot, FactSource, MESSAGE_BYTES};
 
 mod history;
 mod input;
@@ -1106,10 +1106,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     } else {
         String::new()
     };
-    let usage = snapshot.total_tokens.map_or_else(
-        || "tokens: unavailable".into(),
-        |tokens| format!("tokens:{tokens}"),
-    );
+    let usage = usage_status(snapshot);
     let status = format!(
         "{:?} | action:{} attention:{}{} | turns: {} | children: {} | queued: {} | {}{}",
         snapshot.phase,
@@ -1587,6 +1584,7 @@ fn draw_evidence(
         diagnostics.control_events,
         diagnostics.telemetry_events
     ));
+    rows.push(format_usage_evidence(snapshot));
     if let Some(journal) = &snapshot.journal {
         rows.push(format!(
             "Session {} / committed {} / submitted {}",
@@ -1686,6 +1684,56 @@ fn draw_evidence(
         ),
         area,
     );
+}
+
+fn usage_status(snapshot: &CoreSnapshot) -> String {
+    let usage = snapshot.usage;
+    let total = usage.total_tokens.or(snapshot.total_tokens);
+    let base = total.map_or_else(
+        || "tokens: unavailable".to_owned(),
+        |tokens| format!("tokens:{tokens}"),
+    );
+    if usage.input_tokens.is_none()
+        && usage.cached_input_tokens.is_none()
+        && usage.output_tokens.is_none()
+        && usage.reasoning_tokens.is_none()
+    {
+        return base;
+    }
+    format!(
+        "{base} in:{} cached:{} out:{} reasoning:{}",
+        usage_value(usage.input_tokens),
+        usage_value(usage.cached_input_tokens),
+        usage_value(usage.output_tokens),
+        usage_value(usage.reasoning_tokens)
+    )
+}
+
+fn format_usage_evidence(snapshot: &CoreSnapshot) -> String {
+    let usage = snapshot.usage;
+    let total = usage.total_tokens.or(snapshot.total_tokens);
+    format!(
+        "Usage source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {}",
+        source_label(usage.source),
+        usage_value(total),
+        usage_value(usage.input_tokens),
+        usage_value(usage.cached_input_tokens),
+        usage_value(usage.output_tokens),
+        usage_value(usage.reasoning_tokens),
+        usage_value(usage.context_window),
+    )
+}
+
+fn usage_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+}
+
+fn source_label(source: FactSource) -> &'static str {
+    match source {
+        FactSource::ServerConfirmed => "server confirmed",
+        FactSource::LocalEstimate => "local estimate",
+        FactSource::Unknown => "unknown",
+    }
 }
 
 fn draw_attention_editor(

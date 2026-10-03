@@ -72,6 +72,36 @@ pub struct ConversationItem {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FactSource {
+    ServerConfirmed,
+    LocalEstimate,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UsageSummary {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub source: FactSource,
+}
+
+impl UsageSummary {
+    pub fn has_value(self) -> bool {
+        self.input_tokens.is_some()
+            || self.cached_input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.reasoning_tokens.is_some()
+            || self.total_tokens.is_some()
+            || self.context_window.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreSnapshot {
     pub version: u64,
@@ -99,6 +129,7 @@ pub struct CoreSnapshot {
     pub last_error: Option<String>,
     pub tool_activity: Option<String>,
     pub total_tokens: Option<u64>,
+    pub usage: UsageSummary,
     pub history_truncated: bool,
 }
 
@@ -138,6 +169,7 @@ impl Default for CoreSnapshot {
             last_error: None,
             tool_activity: None,
             total_tokens: None,
+            usage: UsageSummary::default(),
             history_truncated: false,
         }
     }
