@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::gate::GateEvent;
 use crate::observation::{AttentionLevel, Freshness, ObservationFacts, Observer};
 use crate::scheduler::{RootTaskSpec, Scheduler};
 
@@ -655,4 +656,70 @@ fn unconfirmed_usage_is_not_persisted() {
         ..Default::default()
     };
     assert!(StoredSnapshot::capture(&core).usage.is_none());
+}
+
+#[test]
+fn native_child_reservation_round_trips_through_journal() {
+    let fixture = Fixture::new();
+    let now = tokio::time::Instant::now();
+    let mut scheduler = Scheduler::default();
+    let child = scheduler
+        .register_child("native-child", None, "child")
+        .unwrap();
+    scheduler
+        .child_event(&GateEvent {
+            target: "native-child".into(),
+            generation: 3,
+            turn_id: "turn-3".into(),
+            outcome: None,
+        })
+        .unwrap();
+    let observer = Observer::new_at("native-reservation".into(), Default::default(), now, None);
+    let core = CoreSnapshot {
+        phase: SessionPhase::Running,
+        scheduler: scheduler.snapshot(),
+        observation: observer.snapshot_at(0, now),
+        ..Default::default()
+    };
+    let captured = StoredSnapshot::capture(&core);
+    assert_eq!(captured.native_slots_reserved, 1);
+    assert!(
+        captured
+            .tasks
+            .iter()
+            .find(|task| task.id == child)
+            .unwrap()
+            .native_slot_reserved
+    );
+
+    let decoded: StoredSnapshot =
+        serde_json::from_str(&serde_json::to_string(&captured).unwrap()).unwrap();
+    assert_eq!(decoded.native_slots_reserved, 1);
+    assert!(
+        decoded
+            .tasks
+            .iter()
+            .find(|task| task.id == child)
+            .unwrap()
+            .native_slot_reserved
+    );
+
+    let mut legacy = decoded.clone();
+    legacy.native_slots_complete = false;
+    legacy.native_slots_reserved = 0;
+    legacy
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == child)
+        .unwrap()
+        .native_slot_reserved = false;
+    let legacy_scheduler = legacy.scheduler_snapshot();
+    assert_eq!(legacy_scheduler.native_slots_reserved, 1);
+    assert!(Scheduler::restore(&legacy_scheduler).is_ok());
+
+    let _store = store(&fixture, captured);
+    let replayed = replay(&fixture, "native-reservation", 0).unwrap();
+    let latest = replayed.latest_state();
+    assert_eq!(latest.native_slots_reserved, 1);
+    assert!(Scheduler::restore(&latest.scheduler_snapshot()).is_ok());
 }

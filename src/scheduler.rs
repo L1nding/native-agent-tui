@@ -165,6 +165,8 @@ pub struct TaskSnapshot {
     pub pending_requests: usize,
     pub wait_targets: Vec<TaskAttempt>,
     pub root_slot_reserved: bool,
+    /// 当前 NativeChild attempt 已收到 authoritative started，仍占用活动槽位。
+    pub native_slot_reserved: bool,
     pub cancellation_epoch: u64,
 }
 
@@ -178,6 +180,8 @@ pub struct SchedulerSnapshot {
     pub disconnected: bool,
     pub queued_roots: usize,
     pub root_slots_reserved: usize,
+    /// 当前 NativeChild attempt 的活动槽位 reservation 数量。
+    pub native_slots_reserved: usize,
     /// Native turns are observed; this count is not a client-enforced capacity.
     pub native_turns_observed: usize,
 }
@@ -320,6 +324,24 @@ impl Scheduler {
             {
                 return Err(SchedulerError::InvalidSnapshot(
                     "only active root tasks can reserve root slots",
+                ));
+            }
+            if view.native_slot_reserved
+                && (view.kind != TaskKind::NativeChild
+                    || !view.state.active()
+                    || view.external.is_none())
+            {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "native slot reservations require an active started child",
+                ));
+            }
+            if view.kind == TaskKind::NativeChild
+                && view.state.active()
+                && view.external.is_some()
+                && !view.native_slot_reserved
+            {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "active started child must reserve a native slot",
                 ));
             }
             if view.priority.abs_diff(0) > 1000 {
@@ -589,6 +611,15 @@ impl Scheduler {
                 "native turn count does not match task state",
             ));
         }
+        let native_slots_reserved = tasks
+            .values()
+            .filter(|task| task.view.native_slot_reserved)
+            .count();
+        if native_slots_reserved != snapshot.native_slots_reserved {
+            return Err(SchedulerError::InvalidSnapshot(
+                "native slot count does not match task state",
+            ));
+        }
         let queued_roots = tasks
             .values()
             .filter(|task| task.view.kind == TaskKind::RootTurn && task.view.state.unstarted())
@@ -764,6 +795,7 @@ impl Scheduler {
                         pending_requests: 0,
                         wait_targets: Vec::new(),
                         root_slot_reserved: false,
+                        native_slot_reserved: false,
                         cancellation_epoch: 0,
                     },
                     text: Some(spec.text),
@@ -873,6 +905,7 @@ impl Scheduler {
             ChildOutcome::Interrupted => TaskState::Cancelled,
         };
         task.view.root_slot_reserved = false;
+        task.view.native_slot_reserved = false;
         task.view.pending_requests = 0;
         task.waiting_children = false;
         if outcome == ChildOutcome::Completed {
@@ -940,6 +973,7 @@ impl Scheduler {
                     pending_requests: 0,
                     wait_targets: Vec::new(),
                     root_slot_reserved: false,
+                    native_slot_reserved: false,
                     cancellation_epoch: 0,
                 },
                 text: None,
@@ -978,6 +1012,7 @@ impl Scheduler {
                 TaskState::Running
             };
             task.view.pending_requests = 0;
+            task.view.native_slot_reserved = true;
             self.refresh(
                 self.dependents
                     .get(&id)
@@ -1250,6 +1285,7 @@ impl Scheduler {
         {
             task.view.state = TaskState::Unknown;
             task.view.root_slot_reserved = false;
+            task.view.native_slot_reserved = false;
             changed.push(task.view.id);
         }
         let affected = changed
@@ -1272,6 +1308,11 @@ impl Scheduler {
                 .tasks
                 .values()
                 .filter(|task| task.view.root_slot_reserved)
+                .count(),
+            native_slots_reserved: self
+                .tasks
+                .values()
+                .filter(|task| task.view.native_slot_reserved)
                 .count(),
             native_turns_observed: self
                 .tasks
@@ -1819,6 +1860,108 @@ mod tests {
             .blocked_reason = Some(BlockedReason::DependencyFailed(TaskId(1)));
         assert!(matches!(
             Scheduler::restore(&child_reason),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn native_child_turn_reserves_and_releases_one_slot_per_attempt() {
+        let mut scheduler = Scheduler::default();
+        let child = scheduler.register_child("child", None, "child").unwrap();
+        assert!(!scheduler.task(child).unwrap().native_slot_reserved);
+
+        scheduler
+            .child_event(&GateEvent {
+                target: "child".into(),
+                generation: 1,
+                turn_id: "turn-1".into(),
+                outcome: None,
+            })
+            .unwrap();
+        assert!(scheduler.task(child).unwrap().native_slot_reserved);
+        assert_eq!(scheduler.snapshot().native_slots_reserved, 1);
+
+        scheduler
+            .child_event(&GateEvent {
+                target: "child".into(),
+                generation: 1,
+                turn_id: "turn-1".into(),
+                outcome: Some(ChildOutcome::Completed),
+            })
+            .unwrap();
+        assert!(!scheduler.task(child).unwrap().native_slot_reserved);
+        assert_eq!(scheduler.snapshot().native_slots_reserved, 0);
+
+        // 重复终态和旧 attempt 事件都不能再次释放或改变 reservation 计数。
+        scheduler
+            .child_event(&GateEvent {
+                target: "child".into(),
+                generation: 1,
+                turn_id: "turn-1".into(),
+                outcome: Some(ChildOutcome::Failed),
+            })
+            .unwrap();
+        scheduler
+            .child_event(&GateEvent {
+                target: "child".into(),
+                generation: 0,
+                turn_id: "old".into(),
+                outcome: Some(ChildOutcome::Failed),
+            })
+            .unwrap();
+        assert_eq!(scheduler.snapshot().native_slots_reserved, 0);
+    }
+
+    #[test]
+    fn native_child_disconnect_releases_reservation() {
+        let mut scheduler = Scheduler::default();
+        let child = scheduler.register_child("child", None, "child").unwrap();
+        scheduler
+            .child_event(&GateEvent {
+                target: "child".into(),
+                generation: 1,
+                turn_id: "turn-1".into(),
+                outcome: None,
+            })
+            .unwrap();
+        assert_eq!(scheduler.snapshot().native_slots_reserved, 1);
+        scheduler.disconnected();
+        assert_eq!(scheduler.snapshot().native_slots_reserved, 0);
+        assert!(!scheduler.task(child).unwrap().native_slot_reserved);
+    }
+
+    #[test]
+    fn restore_validates_native_child_reservation_and_count() {
+        let mut scheduler = Scheduler::default();
+        let child = scheduler.register_child("child", None, "child").unwrap();
+        scheduler
+            .child_event(&GateEvent {
+                target: "child".into(),
+                generation: 7,
+                turn_id: "turn-7".into(),
+                outcome: None,
+            })
+            .unwrap();
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.native_slots_reserved, 1);
+        assert!(Scheduler::restore(&snapshot).is_ok());
+
+        let mut missing_reservation = snapshot.clone();
+        missing_reservation
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == child)
+            .unwrap()
+            .native_slot_reserved = false;
+        assert!(matches!(
+            Scheduler::restore(&missing_reservation),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut wrong_count = snapshot;
+        wrong_count.native_slots_reserved = 0;
+        assert!(matches!(
+            Scheduler::restore(&wrong_count),
             Err(SchedulerError::InvalidSnapshot(_))
         ));
     }

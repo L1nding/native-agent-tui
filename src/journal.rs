@@ -155,6 +155,8 @@ pub struct StoredTask {
     #[serde(default)]
     pub root_slot_reserved: bool,
     #[serde(default)]
+    pub native_slot_reserved: bool,
+    #[serde(default)]
     pub cancellation_epoch: u64,
 }
 
@@ -182,6 +184,11 @@ pub struct StoredSnapshot {
     pub active_root: Option<TaskAttempt>,
     #[serde(default)]
     pub root_slots_reserved: usize,
+    #[serde(default)]
+    pub native_slots_reserved: usize,
+    /// 新快照明确记录 reservation 一致性；缺失时按旧快照只读推导。
+    #[serde(default)]
+    pub native_slots_complete: bool,
     #[serde(default)]
     pub native_turns_observed: usize,
     #[serde(default)]
@@ -249,6 +256,8 @@ impl StoredSnapshot {
             ready_roots: core.scheduler.ready_roots.clone(),
             active_root: core.scheduler.active_root,
             root_slots_reserved: core.scheduler.root_slots_reserved,
+            native_slots_reserved: core.scheduler.native_slots_reserved,
+            native_slots_complete: true,
             native_turns_observed: core.scheduler.native_turns_observed,
             scheduler_disconnected: core.scheduler.disconnected,
             tasks: core
@@ -272,6 +281,7 @@ impl StoredSnapshot {
                     blocked_reason: task.blocked_reason.clone(),
                     wait_targets: task.wait_targets.clone(),
                     root_slot_reserved: task.root_slot_reserved,
+                    native_slot_reserved: task.native_slot_reserved,
                     cancellation_epoch: task.cancellation_epoch,
                 })
                 .collect(),
@@ -403,6 +413,10 @@ impl StoredSnapshot {
     /// Converts the persisted, redacted scheduler projection into the
     /// scheduler's read-only restore seam. Task bodies remain unavailable.
     pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        let legacy_native_slots = !self.native_slots_complete
+            && self.tasks.iter().any(|task| {
+                task.kind == TaskKind::NativeChild && task.state.active() && task.external.is_some()
+            });
         let tasks: Vec<_> = self
             .tasks
             .iter()
@@ -424,6 +438,11 @@ impl StoredSnapshot {
                 pending_requests: task.pending_requests,
                 wait_targets: task.wait_targets.clone(),
                 root_slot_reserved: task.root_slot_reserved,
+                native_slot_reserved: task.native_slot_reserved
+                    || (legacy_native_slots
+                        && task.kind == TaskKind::NativeChild
+                        && task.state.active()
+                        && task.external.is_some()),
                 cancellation_epoch: task.cancellation_epoch,
             })
             .collect();
@@ -443,6 +462,19 @@ impl StoredSnapshot {
                 task.kind == TaskKind::NativeChild && task.external.is_some() && task.state.active()
             })
             .count();
+        // 旧快照没有 reservation 字段；已启动的 active child 仍应只读恢复。
+        let native_slots_reserved = if legacy_native_slots {
+            tasks
+                .iter()
+                .filter(|task| {
+                    task.kind == TaskKind::NativeChild
+                        && task.state.active()
+                        && task.external.is_some()
+                })
+                .count()
+        } else {
+            self.native_slots_reserved
+        };
         SchedulerSnapshot {
             tasks,
             ready_roots,
@@ -469,6 +501,7 @@ impl StoredSnapshot {
             } else {
                 self.root_slots_reserved
             },
+            native_slots_reserved,
             native_turns_observed: if self.native_turns_observed == 0 {
                 computed_native_turns
             } else {

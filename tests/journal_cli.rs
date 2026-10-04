@@ -106,6 +106,7 @@ fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnaps
             blocked_reason: None,
             wait_targets: Vec::new(),
             root_slot_reserved: state.active(),
+            native_slot_reserved: false,
             cancellation_epoch: 0,
         })
         .collect();
