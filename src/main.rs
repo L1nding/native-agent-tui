@@ -202,7 +202,10 @@ async fn execute() -> Result<(), (u8, String)> {
                     "requires_input"
                 }
                 Ok(_) => "available",
-                Err(_) => "invalid",
+                Err(error) => {
+                    println!("scheduler_restore_error={error}");
+                    "invalid"
+                }
             };
             println!("scheduler_restore={scheduler_restore}");
             let outbox_path = config

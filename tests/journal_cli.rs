@@ -459,3 +459,26 @@ async fn recovery_cli_reports_torn_tail_without_reading_or_executing_it() {
     assert!(text.contains("scheduler_restore=requires_input"), "{text}");
     assert_eq!(fixture.contents(), before);
 }
+
+#[tokio::test]
+async fn recovery_cli_explains_invalid_scheduler_structure_without_executing() {
+    let fixture = Fixture::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut invalid = snapshot_with_task_states("recovery-invalid", &[TaskState::Queued]);
+    invalid.tasks[0].dependencies = vec![TaskId(99)];
+    let journal = Journal::open(&fixture.settings(), cwd, invalid.clone()).unwrap();
+    invalid.observation.snapshot_version = 1;
+    journal.finish(invalid).await.unwrap();
+    let before = fixture.contents();
+
+    let output = fixture.run(&["--recovery", "recovery-invalid"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("scheduler_restore=invalid"), "{text}");
+    assert!(
+        text.contains("scheduler_restore_error=unknown dependency or task"),
+        "{text}"
+    );
+    assert!(!text.contains("PRIVATE_PROMPT"));
+    assert_eq!(fixture.contents(), before);
+}
