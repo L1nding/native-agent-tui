@@ -1,7 +1,10 @@
 use super::*;
 use crate::agents::{AgentInfo, AgentSnapshot};
 use crate::interactions::RequestView;
-use crate::observation::{ActivityIdentity, ActivityKind, ActivityScope, Evidence, EvidenceSource};
+use crate::observation::{
+    ActivityIdentity, ActivityKind, ActivityScope, CompactionFact, CompactionFactStatus, Evidence,
+    EvidenceSource,
+};
 use crate::protocol::RpcId;
 use crate::state::ConversationItem;
 use crate::timeline::TimelineSnapshot;
@@ -192,11 +195,107 @@ fn compaction_timeline_metadata_preserves_evidence_source_and_schema_limits() {
     entry.tool_category = Some(ToolCategory::Compaction);
     entry.evidence.kind = EvidenceKind::ExecutionUnknown;
     entry.evidence.source = EvidenceSource::Core;
+    entry.compaction = Some(Box::new(CompactionFact {
+        thread_id: "root".into(),
+        turn_id: "turn".into(),
+        item_id: "compact-item".into(),
+        status: CompactionFactStatus::Unknown,
+        started_at_ms: Some(10),
+        completed_at_ms: None,
+        input_tokens: Some(120),
+        cached_input_tokens: None,
+        output_tokens: Some(20),
+        total_tokens: Some(140),
+        context_window: Some(200),
+    }));
     let rows = metadata(&entry).join("\n");
     assert!(rows.contains("tool: Some(Compaction)"), "{rows}");
     assert!(rows.contains("source: Core"), "{rows}");
-    assert!(rows.contains("before/after usage, reason and summary: unavailable from schema"));
+    assert!(rows.contains("Compaction status: Unknown"), "{rows}");
+    assert!(rows.contains("input 120"), "{rows}");
+    assert!(rows.contains("cached input unavailable"), "{rows}");
+    assert!(rows.contains("output 20"), "{rows}");
+    assert!(rows.contains("total 140"), "{rows}");
+    assert!(rows.contains("context window 200"), "{rows}");
     assert!(!rows.contains("server observed"));
+
+    let mut fact_without_category = entry.clone();
+    fact_without_category.tool_category = None;
+    let rows = metadata(&fact_without_category).join("\n");
+    assert!(rows.contains("Compaction status: Unknown"), "{rows}");
+}
+
+#[test]
+fn compaction_timeline_metadata_without_fact_marks_all_values_unavailable() {
+    use crate::protocol::ToolCategory;
+
+    let mut entry = (*event(1, "root", "turn", "compact-item")).clone();
+    entry.tool_category = Some(ToolCategory::Compaction);
+    let rows = metadata(&entry).join("\n");
+    assert!(rows.contains("Compaction status: unavailable"), "{rows}");
+    assert!(rows.contains("input unavailable"), "{rows}");
+    assert!(rows.contains("cached input unavailable"), "{rows}");
+    assert!(rows.contains("output unavailable"), "{rows}");
+    assert!(rows.contains("total unavailable"), "{rows}");
+    assert!(rows.contains("context window unavailable"), "{rows}");
+}
+
+#[test]
+fn compaction_timeline_details_render_at_narrow_and_wide_sizes() {
+    use crate::protocol::ToolCategory;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut value = (*event(1, "root", "turn", "compact-item")).clone();
+    value.tool_category = Some(ToolCategory::Compaction);
+    value.compaction = Some(Box::new(CompactionFact {
+        thread_id: "root".into(),
+        turn_id: "turn".into(),
+        item_id: "compact-item".into(),
+        status: CompactionFactStatus::Completed,
+        started_at_ms: None,
+        completed_at_ms: Some(20),
+        input_tokens: Some(120),
+        cached_input_tokens: Some(30),
+        output_tokens: Some(20),
+        total_tokens: Some(140),
+        context_window: Some(200),
+    }));
+    let current = source(vec![Arc::new(value)]);
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+    for (width, height) in [(40, 16), (80, 24), (160, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| panel.draw(frame, frame.area(), &current))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("Evidence timeline"),
+            "{width}x{height}: {text}"
+        );
+        if width >= 80 {
+            assert!(
+                text.contains("Compaction status: Completed"),
+                "{width}x{height}: {text}"
+            );
+            assert!(text.contains("input 120"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("context window 200"),
+                "{width}x{height}: {text}"
+            );
+            assert!(
+                !text.contains("Raw tool output, reasoning/usage/compaction: unavailable here"),
+                "{width}x{height}: {text}"
+            );
+        }
+    }
 }
 
 #[test]

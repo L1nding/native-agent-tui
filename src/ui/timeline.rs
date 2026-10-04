@@ -553,7 +553,7 @@ impl TimelinePanel {
             }
             details.extend(metadata(entry));
             details.push("Enter: locate retained message / current request delivery".into());
-            details.push("Raw tool output, reasoning/usage/compaction: unavailable here".into());
+            details.push("Raw tool output and reasoning: unavailable here".into());
         } else if self.selected.is_some() {
             details.push(
                 "Selected evidence evicted or filtered. Up/Down selects an available event.".into(),
@@ -693,10 +693,10 @@ fn metadata(entry: &TimelineEntry) -> Vec<String> {
             request.id, request.thread_id, request.turn_id, request.received_seq
         ));
     }
-    if entry.tool_category == Some(crate::protocol::ToolCategory::Compaction) {
-        rows.push(
-            "Compaction before/after usage, reason and summary: unavailable from schema".into(),
-        );
+    if entry.tool_category == Some(crate::protocol::ToolCategory::Compaction)
+        || entry.compaction.is_some()
+    {
+        rows.extend(super::compaction_fact_rows(entry.compaction.as_deref()));
     }
     for target in &entry.wait_targets {
         rows.push(format!(

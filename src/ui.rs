@@ -22,7 +22,8 @@ use crate::client::{ClientHandle, Command};
 use crate::history::HistoryHandle;
 use crate::interactions::{ApprovalDecision, RequestKind, RequestRef, RequestView};
 use crate::observation::{
-    ActivityScope, ActivitySnapshot, AttentionClass, AttentionLevel, ExecutionState,
+    ActivityScope, ActivitySnapshot, AttentionClass, AttentionLevel, CompactionFact,
+    CompactionFactStatus, ExecutionState,
 };
 use crate::scheduler::{
     RootTaskSpec, SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, ROOT_QUEUE_LIMIT,
@@ -1824,10 +1825,15 @@ fn draw_evidence(
         ));
         if activity.tool_category == Some(crate::protocol::ToolCategory::Compaction) {
             rows.push(format!(
-                "Compaction {:?} | source {:?} | before/after usage, reason and summary unavailable",
-                activity.execution_state,
-                activity.last_evidence.as_ref().map(|evidence| evidence.source)
+                "Compaction source {:?}",
+                activity
+                    .last_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.source)
             ));
+            rows.extend(compaction_fact_rows(compaction_fact_for_activity(
+                snapshot, activity,
+            )));
         }
         rows.push(activity_brief(activity));
         if local.reminders.is_acknowledged(activity) {
@@ -1910,6 +1916,37 @@ fn draw_evidence(
         ),
         area,
     );
+}
+
+fn compaction_fact_for_activity<'a>(
+    snapshot: &'a CoreSnapshot,
+    activity: &ActivitySnapshot,
+) -> Option<&'a CompactionFact> {
+    let thread_id = activity.identity.thread_id.as_ref()?;
+    let turn_id = activity.identity.turn_id.as_ref()?;
+    let item_id = activity.item_id.as_ref()?;
+    snapshot.observation.compactions.iter().find(|fact| {
+        fact.thread_id == *thread_id && fact.turn_id == *turn_id && fact.item_id == *item_id
+    })
+}
+
+pub(super) fn compaction_fact_rows(fact: Option<&CompactionFact>) -> Vec<String> {
+    let status = fact.map_or("unavailable", |fact| match fact.status {
+        CompactionFactStatus::Started => "Started",
+        CompactionFactStatus::Completed => "Completed",
+        CompactionFactStatus::Unknown => "Unknown",
+    });
+    vec![
+        format!("Compaction status: {status}"),
+        format!(
+            "Compaction usage: input {} | cached input {} | output {} | total {} | context window {}",
+            usage_value(fact.and_then(|fact| fact.input_tokens)),
+            usage_value(fact.and_then(|fact| fact.cached_input_tokens)),
+            usage_value(fact.and_then(|fact| fact.output_tokens)),
+            usage_value(fact.and_then(|fact| fact.total_tokens)),
+            usage_value(fact.and_then(|fact| fact.context_window)),
+        ),
+    ]
 }
 
 fn usage_status(snapshot: &CoreSnapshot) -> String {
@@ -3009,7 +3046,9 @@ mod tests {
 
     #[test]
     fn evidence_panel_labels_retained_compaction_facts_and_schema_gaps() {
-        use crate::observation::{ActivityScope, EvidenceKind, EvidenceSource};
+        use crate::observation::{
+            ActivityScope, CompactionFact, CompactionFactStatus, EvidenceKind, EvidenceSource,
+        };
         use crate::protocol::ToolCategory;
 
         let mut snapshot = observed_snapshot();
@@ -3025,6 +3064,19 @@ mod tests {
         compaction.recent_evidence = vec![evidence];
         compaction.execution_state = ExecutionState::Completed;
         snapshot.observation.activities.push(compaction);
+        snapshot.observation.compactions.push(CompactionFact {
+            thread_id: "root-thread".into(),
+            turn_id: "turn".into(),
+            item_id: "compact-item".into(),
+            status: CompactionFactStatus::Completed,
+            started_at_ms: Some(10),
+            completed_at_ms: Some(20),
+            input_tokens: Some(120),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(20),
+            total_tokens: Some(140),
+            context_window: Some(200),
+        });
 
         let mut local = LocalState {
             evidence: true,
@@ -3042,9 +3094,11 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("Compactions retained: 1"), "{screen}");
-        assert!(screen.contains("Compaction Completed"), "{screen}");
+        assert!(screen.contains("Compaction status: Completed"), "{screen}");
         assert!(screen.contains("AppServer"), "{screen}");
-        assert!(screen.contains("before/after usage"), "{screen}");
+        assert!(screen.contains("input 120"), "{screen}");
+        assert!(screen.contains("cached input 30"), "{screen}");
+        assert!(screen.contains("context window 200"), "{screen}");
 
         local.evidence = true;
         local.evidence_scroll = 6;
@@ -3059,6 +3113,35 @@ mod tests {
             .collect::<String>();
         assert!(narrow_screen.contains("Compaction"), "{narrow_screen}");
         assert!(narrow_screen.contains("AppServer"), "{narrow_screen}");
+    }
+
+    #[test]
+    fn compaction_fact_rows_show_unknown_and_missing_values_without_private_content() {
+        use crate::observation::{CompactionFact, CompactionFactStatus};
+
+        let fact = CompactionFact {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            status: CompactionFactStatus::Unknown,
+            started_at_ms: None,
+            completed_at_ms: None,
+            input_tokens: Some(8),
+            cached_input_tokens: None,
+            output_tokens: None,
+            total_tokens: Some(9),
+            context_window: None,
+        };
+        let rows = compaction_fact_rows(Some(&fact)).join("\n");
+        assert!(rows.contains("Compaction status: Unknown"));
+        assert!(rows.contains("input 8"));
+        assert!(rows.contains("cached input unavailable"));
+        assert!(rows.contains("output unavailable"));
+        assert!(rows.contains("total 9"));
+        assert!(rows.contains("context window unavailable"));
+        let missing = compaction_fact_rows(None).join("\n");
+        assert!(missing.contains("Compaction status: unavailable"));
+        assert!(missing.matches("unavailable").count() >= 6);
     }
 
     #[test]
