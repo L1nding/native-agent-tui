@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use native_agent_tui::client::Command;
 use native_agent_tui::config::{self, CliCommand, Config};
+use native_agent_tui::history::search::Query;
 use native_agent_tui::history::{HistoryHandle, HistoryRequest, HistoryResult};
 use native_agent_tui::journal::{self, JournalError, Replay};
 use native_agent_tui::scheduler::{RootTaskSpec, WorkflowPlan, WORKFLOW_BYTES};
@@ -29,6 +30,7 @@ Usage:
   native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
   native-agent-tui --check-shell [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
+  native-agent-tui --search QUERY [--cwd PATH] [--journal-dir PATH]
   native-agent-tui --replay SESSION_ID [--since SEQ] [--json-events] [OPTIONS]
   native-agent-tui --history [SESSION_ID] [OPTIONS]
   native-agent-tui --export SESSION_ID [--since SEQ] [--output NEW_FILE] [OPTIONS]
@@ -57,6 +59,7 @@ Sessions persist redacted snapshots by default. Replay is read-only and
 never launches app-server. --json-events streams committed redacted state.
 --history opens offline read-only observation. --export previews the range;
 --output writes that captured range with stable identity aliases to a new file.
+--search scans retained redacted evidence across sessions without launching Codex.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
 See docs/scheduler-usage.md and docs/workflow-example.json.
 
@@ -157,6 +160,54 @@ async fn execute() -> Result<(), (u8, String)> {
                     }
                 );
             }
+        }
+        CliCommand::Search { query, config } => {
+            let mut history = HistoryHandle::start(config.journal, config.cwd)
+                .map_err(|error| (2, error.to_string()))?;
+            let result = async {
+                let list = history.request(HistoryRequest::List)?;
+                let sessions = match history.response(list).await? {
+                    HistoryResult::Sessions(sessions) => sessions,
+                    _ => return Err(native_agent_tui::history::HistoryError::Closed),
+                };
+                if sessions.is_empty() {
+                    println!("No retained sessions in this workspace.");
+                    return Ok::<(), native_agent_tui::history::HistoryError>(());
+                }
+                let session_ids = sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect();
+                let search = history.search.submit_sessions(
+                    session_ids,
+                    Query {
+                        text: query,
+                        ..Query::default()
+                    },
+                )?;
+                let results = history.search.response(search).await?;
+                println!(
+                    "Search results: {} hits across {} sessions; {} hits not retained and {} duplicate evidence omitted.",
+                    results.total,
+                    results.sessions.len(),
+                    results.total.saturating_sub(results.hits.len() as u64),
+                    results.omitted_evidence,
+                );
+                for hit in &results.hits {
+                    let session = results
+                        .sessions
+                        .iter()
+                        .position(|info| info.session_id == hit.session_id)
+                        .map_or(0, |index| index + 1);
+                    println!("session#{session} event {} | {}", hit.event_seq, hit.metadata());
+                }
+                Ok(())
+            }
+            .await;
+            let stopped = history.shutdown().await;
+            result
+                .and(stopped)
+                .map_err(|error| (2, error.to_string()))?;
         }
         CliCommand::Replay {
             session,

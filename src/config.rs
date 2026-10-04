@@ -53,6 +53,10 @@ pub enum CliCommand {
     Version,
     CheckShell(Config),
     Sessions(Config),
+    Search {
+        query: String,
+        config: Config,
+    },
     History {
         session: Option<String>,
         config: Config,
@@ -131,7 +135,7 @@ where
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
             "--run" | "--tui" | "--check-shell" | "--workflow" | "--sessions" | "--replay"
-            | "--history" | "--export" => {
+            | "--history" | "--export" | "--search" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
@@ -139,6 +143,7 @@ where
                     || option == "--replay"
                     || option == "--workflow"
                     || option == "--export"
+                    || option == "--search"
                     || (matches!(option.as_str(), "--tui" | "--history")
                         && args.get(index).is_some_and(|next| !next.starts_with('-')))
                 {
@@ -269,6 +274,10 @@ where
     }
     Ok(match mode {
         Some("--sessions") => CliCommand::Sessions(config),
+        Some("--search") => CliCommand::Search {
+            query: goal.unwrap(),
+            config,
+        },
         Some("--history") => CliCommand::History {
             session: goal,
             config,
@@ -373,6 +382,10 @@ mod tests {
             vec!["--run", "task", "--output", "out"],
             vec!["--output", "out"],
             vec!["--export", "s", "--output", "one", "--output", "two"],
+            vec!["--search"],
+            vec!["--search", "waiting", "--run", "task"],
+            vec!["--search", "waiting", "--since", "1"],
+            vec!["--search", "waiting", "--json-events"],
         ] {
             assert!(parse_args(args).is_err());
         }
@@ -408,6 +421,10 @@ mod tests {
         assert!(matches!(
             parse_args(["--sessions"]).unwrap(),
             CliCommand::Sessions(_)
+        ));
+        assert!(matches!(
+            parse_args(["--search", "waiting"]).unwrap(),
+            CliCommand::Search { query, .. } if query == "waiting"
         ));
         assert!(matches!(
             parse_args(["--replay", "s"]).unwrap(),
