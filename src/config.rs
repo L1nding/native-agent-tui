@@ -21,6 +21,7 @@ pub struct Config {
     pub max_native_depth: usize,
     pub max_native_turns: usize,
     pub max_total_tokens: Option<u64>,
+    pub max_agent_tokens: Option<u64>,
     pub attention: AttentionSettings,
     pub journal: JournalSettings,
 }
@@ -42,6 +43,7 @@ impl Default for Config {
             max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
             max_native_turns: DEFAULT_MAX_NATIVE_TURNS,
             max_total_tokens: None,
+            max_agent_tokens: None,
             attention: AttentionSettings::default(),
             journal: JournalSettings::default(),
         }
@@ -174,18 +176,10 @@ where
                 config.max_native_turns = bounded_usize(&args, &mut index, option, 1, 64)?;
             }
             "--max-total-tokens" if config.max_total_tokens.is_none() => {
-                let raw = value(&args, &mut index, option)?;
-                let parsed = raw.parse::<u64>().map_err(|_| CliError::InvalidValue {
-                    option: option.clone(),
-                    value: "expected a positive integer".into(),
-                })?;
-                if parsed == 0 {
-                    return Err(CliError::InvalidValue {
-                        option: option.clone(),
-                        value: "expected a positive integer".into(),
-                    });
-                }
-                config.max_total_tokens = Some(parsed);
+                config.max_total_tokens = Some(positive_u64(&args, &mut index, option)?);
+            }
+            "--max-agent-tokens" if config.max_agent_tokens.is_none() => {
+                config.max_agent_tokens = Some(positive_u64(&args, &mut index, option)?);
             }
             "--json-events" if !json_events => json_events = true,
             "--search-category" if search_category.is_none() => {
@@ -369,6 +363,21 @@ fn bounded_usize(
         return Err(CliError::InvalidValue {
             option: option.into(),
             value: format!("expected an integer from {min} to {max}"),
+        });
+    }
+    Ok(parsed)
+}
+
+fn positive_u64(args: &[String], index: &mut usize, option: &str) -> Result<u64, CliError> {
+    let raw = value(args, index, option)?;
+    let parsed = raw.parse::<u64>().map_err(|_| CliError::InvalidValue {
+        option: option.into(),
+        value: "expected a positive integer".into(),
+    })?;
+    if parsed == 0 {
+        return Err(CliError::InvalidValue {
+            option: option.into(),
+            value: "expected a positive integer".into(),
         });
     }
     Ok(parsed)
@@ -644,6 +653,7 @@ mod tests {
         assert_eq!(config.max_native_depth, 1);
         assert_eq!(config.max_native_turns, 2);
         assert_eq!(config.max_total_tokens, Some(1000));
+        assert_eq!(config.max_agent_tokens, None);
         for args in [
             vec!["--run", "task", "--max-native-children", "0"],
             vec!["--run", "task", "--max-native-children", "65"],
@@ -654,9 +664,27 @@ mod tests {
             vec!["--run", "task", "--max-native-depth", "bad"],
             vec!["--run", "task", "--max-total-tokens", "0"],
             vec!["--run", "task", "--max-total-tokens", "bad"],
+            vec!["--run", "task", "--max-agent-tokens", "0"],
+            vec!["--run", "task", "--max-agent-tokens", "bad"],
         ] {
             assert!(matches!(
                 parse_args(args),
+                Err(CliError::InvalidValue { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_positive_per_agent_token_budget() {
+        let CliCommand::Run { config, .. } =
+            parse_args(["--run", "task", "--max-agent-tokens", "42"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(config.max_agent_tokens, Some(42));
+        for value in ["0", "-1", "bad", "18446744073709551616"] {
+            assert!(matches!(
+                parse_args(["--run", "task", "--max-agent-tokens", value]),
                 Err(CliError::InvalidValue { .. })
             ));
         }

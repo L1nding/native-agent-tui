@@ -46,6 +46,7 @@ Options:
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)
   --max-native-turns N     Maximum active native turns (1-64; default: 8)
   --max-total-tokens N     Session token budget; interrupt at the confirmed total
+  --max-agent-tokens N     Per-agent turn token budget; interrupt at the confirmed total
   --attention-config FILE  JSON threshold pairs (milliseconds)
   --attention-model QUIET_MS,ATTENTION_MS  Override model silence thresholds
   --attention-tool QUIET_MS,ATTENTION_MS   Override tool silence thresholds

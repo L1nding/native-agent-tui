@@ -208,6 +208,7 @@ impl ClientHandle {
                 interrupt_requested: false,
                 interrupt_sent: false,
                 token_budget_stop_started: false,
+                agent_budget_interrupts: BTreeMap::new(),
                 preflight_passed: false,
                 shell_source,
                 shell_check: None,
@@ -285,6 +286,8 @@ struct Core {
     interrupt_requested: bool,
     interrupt_sent: bool,
     token_budget_stop_started: bool,
+    /// 已触发的 agent/turn 预算键；同一代只允许一次中断。
+    agent_budget_interrupts: BTreeMap<String, (String, u64)>,
     preflight_passed: bool,
     shell_source: Option<crate::shell_check::Source>,
     shell_check: Option<crate::shell_check::ShellCheck>,
@@ -368,6 +371,87 @@ impl Core {
             0
         };
         (root.saturating_add(self.state.agents.confirmed_total_tokens()) >= limit).then_some(limit)
+    }
+
+    fn current_agent_budget(&self, thread: &str, turn: &str) -> Option<(u64, u64)> {
+        let limit = self.config.max_agent_tokens?;
+        if self.state.view.thread_id.as_deref() == Some(thread) {
+            if self.state.view.turn_id.as_deref() != Some(turn)
+                || !matches!(
+                    self.state.view.phase,
+                    SessionPhase::StartingTurn | SessionPhase::Running | SessionPhase::GatePending
+                )
+            {
+                return None;
+            }
+            let total = (self.state.view.usage.source == FactSource::ServerConfirmed)
+                .then_some(self.state.view.usage.total_tokens)
+                .flatten()?;
+            return (total >= limit).then_some((limit, self.generation));
+        }
+        if !self.state.agents.active_turn(thread, turn) {
+            return None;
+        }
+        let agent = self
+            .state
+            .agents
+            .snapshots()
+            .into_iter()
+            .find(|agent| agent.info.id == thread && agent.turn_id.as_deref() == Some(turn))?;
+        let total = (agent.usage.source == FactSource::ServerConfirmed)
+            .then_some(agent.usage.total_tokens)
+            .flatten()?;
+        (total >= limit).then_some((limit, agent.generation))
+    }
+
+    fn interrupt_for_agent_budget(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        limit: u64,
+        generation: u64,
+    ) {
+        if self
+            .agent_budget_interrupts
+            .get(thread)
+            .is_some_and(|(old_turn, old_generation)| {
+                old_turn == turn && *old_generation == generation
+            })
+        {
+            return;
+        }
+        self.agent_budget_interrupts
+            .insert(thread.to_owned(), (turn.to_owned(), generation));
+        self.state.view.notice = Some(format!(
+            "Agent token budget reached: limit={limit} thread={thread} turn={turn}; interrupt requested; waiting for the server's terminal event."
+        ));
+        if self.state.view.thread_id.as_deref() == Some(thread) {
+            if let Some(attempt) = self.scheduler.active_root() {
+                let _ = self
+                    .scheduler
+                    .command(SchedulerCommand::Cancel(attempt.task));
+            }
+            self.interrupt_requested = true;
+            self.issue_interrupt();
+            return;
+        }
+        let Some(task) = self.scheduler.child_task(thread).cloned() else {
+            return;
+        };
+        if !task.state.active()
+            || task.external.as_ref().is_none_or(|external| {
+                external.thread_id != thread
+                    || external.turn_id != turn
+                    || external.generation != generation
+            })
+        {
+            return;
+        }
+        if let Ok(effects) = self.scheduler.command(SchedulerCommand::Cancel(task.id)) {
+            for effect in effects {
+                self.queue_child_interrupt(effect);
+            }
+        }
     }
 
     fn interrupt_for_token_budget(&mut self, limit: u64) {
@@ -2075,6 +2159,9 @@ impl Core {
             if accepted {
                 if let Some(limit) = self.token_budget_exhausted() {
                     self.interrupt_for_token_budget(limit);
+                }
+                if let Some((limit, generation)) = self.current_agent_budget(thread, turn) {
+                    self.interrupt_for_agent_budget(thread, turn, limit, generation);
                 }
             }
             return;
@@ -6983,6 +7070,114 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_agent_budget_interrupts_root_once_and_ignores_late_old_turn_usage() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_agent_tokens: Some(10),
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"root-turn","tokenUsage":{"total":{"totalTokens":10}}}}),
+        )
+        .await;
+        let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert!(client
+            .snapshots
+            .borrow()
+            .notice
+            .as_deref()
+            .is_some_and(|notice| {
+                notice.contains("Agent token budget reached")
+                    && notice.contains("thread=root")
+                    && notice.contains("turn=root-turn")
+            }));
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"root-turn","tokenUsage":{"total":{"totalTokens":10}}}}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Interrupted).await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"old-turn","tokenUsage":{"total":{"totalTokens":100}}}}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_agent_budget_interrupts_child_once_and_rejects_old_turn_usage() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_agent_tokens: Some(10),
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "child", "child-turn").await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":10}}}}),
+        )
+        .await;
+        let interrupt = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(interrupt["params"]["threadId"], "child");
+        assert_eq!(interrupt["params"]["turnId"], "child-turn");
+        send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":10}}}}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"interrupted"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"old-child-turn","tokenUsage":{"total":{"totalTokens":100}}}}),
+        )
+        .await;
         assert!(
             tokio::time::timeout(Duration::from_millis(100), next(&mut server))
                 .await
