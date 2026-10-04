@@ -56,6 +56,10 @@ pub enum CliCommand {
     Version,
     CheckShell(Config),
     Sessions(Config),
+    Recovery {
+        session: String,
+        config: Config,
+    },
     Search {
         query: String,
         category: Category,
@@ -146,7 +150,7 @@ where
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
             "--run" | "--tui" | "--check-shell" | "--workflow" | "--sessions" | "--replay"
-            | "--history" | "--export" | "--search" => {
+            | "--history" | "--export" | "--search" | "--recovery" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
@@ -155,6 +159,7 @@ where
                     || option == "--workflow"
                     || option == "--export"
                     || option == "--search"
+                    || option == "--recovery"
                     || (matches!(option.as_str(), "--tui" | "--history")
                         && args.get(index).is_some_and(|next| !next.starts_with('-')))
                 {
@@ -299,6 +304,10 @@ where
     }
     Ok(match mode {
         Some("--sessions") => CliCommand::Sessions(config),
+        Some("--recovery") => CliCommand::Recovery {
+            session: goal.unwrap(),
+            config,
+        },
         Some("--search") => CliCommand::Search {
             query: goal.unwrap(),
             category: search_category.unwrap_or_default(),
@@ -511,6 +520,11 @@ mod tests {
                 since: u64::MAX,
                 ..
             }
+        ));
+        assert!(matches!(
+            parse_args(["--recovery", "s", "--journal-dir", "history"]),
+            Ok(CliCommand::Recovery { session, config })
+                if session == "s" && config.journal.root == Some(PathBuf::from("history"))
         ));
     }
 

@@ -30,6 +30,7 @@ Usage:
   native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
   native-agent-tui --check-shell [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
+  native-agent-tui --recovery SESSION_ID [OPTIONS]
   native-agent-tui --search QUERY [--search-category CATEGORY] [--search-thread ID] [--search-turn ID] [OPTIONS]
   native-agent-tui --replay SESSION_ID [--since SEQ] [--json-events] [OPTIONS]
   native-agent-tui --history [SESSION_ID] [OPTIONS]
@@ -60,6 +61,7 @@ Sessions persist redacted snapshots by default. Replay is read-only and
 never launches app-server. --json-events streams committed redacted state.
 --history opens offline read-only observation. --export previews the range;
 --output writes that captured range with stable identity aliases to a new file.
+--recovery summarizes committed recovery facts without launching Codex or writing journal.
 --search scans retained redacted evidence across sessions without launching Codex.
   Search filters: all, lifecycle, output, tool, compaction, request, waiting.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
@@ -160,6 +162,48 @@ async fn execute() -> Result<(), (u8, String)> {
                     } else {
                         "closed"
                     }
+                );
+            }
+        }
+        CliCommand::Recovery { session, config } => {
+            let replay =
+                Replay::open(&config.journal, &config.cwd, &session, 0).map_err(replay_error)?;
+            let summary = replay.recovery_summary();
+            println!(
+                "Recovery summary for session {} through event {}",
+                summary.session_id, summary.committed_seq
+            );
+            println!(
+                "needs_recovery={} requires_input={} can_resume={} uncommitted_tail={}",
+                summary.needs_recovery,
+                summary.requires_input,
+                summary.can_resume,
+                summary.uncommitted_tail
+            );
+            println!(
+                "session_closed={} execution_result={:?}",
+                summary.session_closed,
+                summary.execution_result.unwrap_or(SessionPhase::Unknown)
+            );
+            let mut counts = [0usize; 5];
+            for task in &summary.tasks {
+                let index = match task.class {
+                    native_agent_tui::journal::RecoveryTaskClass::Active => 0,
+                    native_agent_tui::journal::RecoveryTaskClass::Unknown => 1,
+                    native_agent_tui::journal::RecoveryTaskClass::Queued => 2,
+                    native_agent_tui::journal::RecoveryTaskClass::Blocked => 3,
+                    native_agent_tui::journal::RecoveryTaskClass::Terminal => 4,
+                };
+                counts[index] += 1;
+            }
+            println!(
+                "tasks: active={} unknown={} queued={} blocked={} terminal={}",
+                counts[0], counts[1], counts[2], counts[3], counts[4]
+            );
+            for task in summary.tasks {
+                println!(
+                    "task#{} {:?} {:?} | {:?}",
+                    task.id.0, task.kind, task.state, task.class
                 );
             }
         }

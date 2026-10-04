@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use native_agent_tui::journal::{Journal, JournalSettings, StoredSnapshot};
+use native_agent_tui::journal::{Journal, JournalSettings, StoredSnapshot, StoredTask};
 use native_agent_tui::observation::{ChildFact, ObservationFacts, Observer};
 use native_agent_tui::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
-use native_agent_tui::scheduler::{ExternalTurn, RootTaskSpec, Scheduler};
+use native_agent_tui::scheduler::{
+    ExternalTurn, RootTaskSpec, Scheduler, TaskId, TaskKind, TaskState,
+};
 use native_agent_tui::state::{CoreSnapshot, SessionPhase};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -61,6 +64,34 @@ fn observed_compaction_snapshot(now: tokio::time::Instant, session: &str) -> Cor
         observation: observer.snapshot_at(0, now),
         ..Default::default()
     }
+}
+
+fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnapshot {
+    let now = tokio::time::Instant::now();
+    let observer = Observer::new_at(session.into(), Default::default(), now, Some(1000));
+    let core = CoreSnapshot {
+        phase: SessionPhase::Running,
+        observation: observer.snapshot_at(0, now),
+        ..Default::default()
+    };
+    let mut snapshot = StoredSnapshot::capture(&core);
+    snapshot.tasks = states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| StoredTask {
+            id: TaskId((index + 1) as u64),
+            kind: TaskKind::RootTurn,
+            state: *state,
+            attempt: 0,
+            parent: None,
+            dependencies: Vec::new(),
+            external: None,
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+        })
+        .collect();
+    snapshot
 }
 
 struct Fixture(PathBuf);
@@ -306,4 +337,87 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
         "Replay and session listing must leave history untouched"
     );
     drop(second_journal);
+}
+
+#[tokio::test]
+async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() {
+    let fixture = Fixture::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut active = snapshot_with_task_states(
+        "recovery-active",
+        &[
+            TaskState::Running,
+            TaskState::Unknown,
+            TaskState::Queued,
+            TaskState::Blocked,
+            TaskState::Succeeded,
+        ],
+    );
+    let journal = Journal::open(&fixture.settings(), cwd, active.clone()).unwrap();
+    active.observation.snapshot_version = 1;
+    journal.finish(active).await.unwrap();
+    let before = fixture.contents();
+
+    let output = fixture.run(&["--recovery", "recovery-active"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("needs_recovery=true"), "{text}");
+    assert!(text.contains("requires_input=true"), "{text}");
+    assert!(text.contains("can_resume=false"), "{text}");
+    assert!(
+        text.contains("tasks: active=1 unknown=1 queued=1 blocked=1 terminal=1"),
+        "{text}"
+    );
+    assert!(!text.contains("PRIVATE_PROMPT"));
+    assert_eq!(fixture.contents(), before);
+}
+
+#[tokio::test]
+async fn recovery_cli_marks_closed_terminal_session_safe_without_input() {
+    let fixture = Fixture::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut complete = snapshot_with_task_states("recovery-complete", &[TaskState::Succeeded]);
+    complete.phase = SessionPhase::Completed;
+    complete.close(SessionPhase::Completed, true);
+    let journal = Journal::open(&fixture.settings(), cwd, complete.clone()).unwrap();
+    complete.observation.snapshot_version = 1;
+    journal.finish(complete).await.unwrap();
+    let before = fixture.contents();
+
+    let output = fixture.run(&["--recovery", "recovery-complete"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("needs_recovery=false"), "{text}");
+    assert!(text.contains("requires_input=false"), "{text}");
+    assert!(text.contains("can_resume=false"), "{text}");
+    assert!(text.contains("tasks: active=0 unknown=0 queued=0 blocked=0 terminal=1"));
+    assert_eq!(fixture.contents(), before);
+}
+
+#[tokio::test]
+async fn recovery_cli_reports_torn_tail_without_reading_or_executing_it() {
+    let fixture = Fixture::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut active = snapshot_with_task_states("recovery-tail", &[TaskState::Running]);
+    let journal = Journal::open(&fixture.settings(), cwd, active.clone()).unwrap();
+    active.observation.snapshot_version = 1;
+    journal.finish(active).await.unwrap();
+    let log = fs::read_dir(&fixture.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"))
+        .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(log).unwrap();
+    file.write_all(br#"{"schema_version":2,"kind":"state""#)
+        .unwrap();
+    drop(file);
+    let before = fixture.contents();
+
+    let output = fixture.run(&["--recovery", "recovery-tail"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("uncommitted_tail=true"), "{text}");
+    assert!(text.contains("needs_recovery=true"), "{text}");
+    assert_eq!(fixture.contents(), before);
 }

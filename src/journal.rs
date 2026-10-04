@@ -303,7 +303,8 @@ impl StoredSnapshot {
         }
     }
 
-    fn needs_recovery(&self) -> bool {
+    /// 判断快照是否仍可能包含未确认的执行结果。
+    pub fn needs_recovery(&self) -> bool {
         !self.session_closed
             || self.cleanup_confirmed != Some(true)
             || matches!(
@@ -333,6 +334,97 @@ impl StoredSnapshot {
                         | ExecutionState::Unknown
                 )
             })
+    }
+
+    /// 构造脱敏的只读恢复摘要。
+    ///
+    /// StoredSnapshot 不含任务正文；存在非终态任务时，重新规划前必须取得用户输入。
+    /// 历史回放不会恢复副作用，can_resume 固定为 false。
+    pub fn recovery_summary(
+        &self,
+        session_id: impl Into<String>,
+        committed_seq: u64,
+    ) -> RecoverySummary {
+        RecoverySummary::from_snapshot(session_id.into(), committed_seq, self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryTaskClass {
+    Active,
+    Unknown,
+    Queued,
+    Blocked,
+    Terminal,
+}
+
+impl RecoveryTaskClass {
+    fn classify(state: TaskState) -> Self {
+        match state {
+            TaskState::Starting
+            | TaskState::Running
+            | TaskState::WaitingChildren
+            | TaskState::WaitingApproval
+            | TaskState::Cancelling => Self::Active,
+            TaskState::Unknown => Self::Unknown,
+            TaskState::Queued | TaskState::Ready | TaskState::Paused => Self::Queued,
+            TaskState::Blocked => Self::Blocked,
+            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => Self::Terminal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryTaskSummary {
+    pub id: TaskId,
+    pub kind: TaskKind,
+    pub state: TaskState,
+    pub class: RecoveryTaskClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverySummary {
+    pub session_id: String,
+    pub committed_seq: u64,
+    pub uncommitted_tail: bool,
+    pub session_closed: bool,
+    pub execution_result: Option<SessionPhase>,
+    pub needs_recovery: bool,
+    pub requires_input: bool,
+    pub can_resume: bool,
+    pub tasks: Vec<RecoveryTaskSummary>,
+}
+
+impl RecoverySummary {
+    fn from_snapshot(session_id: String, committed_seq: u64, snapshot: &StoredSnapshot) -> Self {
+        let tasks = snapshot
+            .tasks
+            .iter()
+            .map(|task| RecoveryTaskSummary {
+                id: task.id,
+                kind: task.kind,
+                state: task.state,
+                class: RecoveryTaskClass::classify(task.state),
+            })
+            .collect::<Vec<_>>();
+        let requires_input = snapshot.needs_recovery()
+            && tasks
+                .iter()
+                .any(|task| task.class != RecoveryTaskClass::Terminal);
+        Self {
+            session_id,
+            committed_seq,
+            uncommitted_tail: false,
+            session_closed: snapshot.session_closed,
+            execution_result: snapshot.execution_result,
+            needs_recovery: snapshot.needs_recovery(),
+            requires_input,
+            can_resume: false,
+            tasks,
+        }
     }
 }
 
@@ -1154,6 +1246,15 @@ impl Replay {
 
     pub fn latest_state(&self) -> &StoredSnapshot {
         self.latest.state().expect("validated replay")
+    }
+
+    /// 返回已提交最新快照的脱敏恢复结论。
+    pub fn recovery_summary(&self) -> RecoverySummary {
+        let mut summary = self
+            .latest_state()
+            .recovery_summary(self.info.session_id.clone(), self.info.committed_seq);
+        summary.uncommitted_tail = self.uncommitted_tail;
+        summary
     }
 }
 
