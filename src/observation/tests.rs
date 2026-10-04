@@ -1,6 +1,6 @@
 use super::*;
 use crate::agents::AgentInfo;
-use crate::protocol::{ObservedTool, ObservedToolOutcome};
+use crate::protocol::{ObservedCompaction, ObservedTool, ObservedToolOutcome};
 use crate::scheduler::{ExternalTurn, RootTaskSpec, Scheduler};
 use serde_json::json;
 use std::time::Duration;
@@ -91,7 +91,200 @@ fn tool(id: &str, outcome: Option<ObservedToolOutcome>) -> ObservedTool {
         item_id: id.into(),
         outcome,
         category: ToolCategory::Shell,
+        compaction: None,
     }
+}
+
+#[test]
+fn compaction_fact_tracks_lifecycle_unknown_and_legacy_decode() {
+    let now = Instant::now();
+    let root = root_task();
+    let mut observer = observer(now);
+    observer
+        .reconcile(facts(&root, &[], &[], None), now)
+        .unwrap();
+    let usage = ObservedCompaction {
+        input_tokens: Some(12),
+        cached_input_tokens: Some(3),
+        output_tokens: Some(4),
+        total_tokens: Some(16),
+        context_window: Some(128),
+    };
+    observer
+        .tool(
+            &ObservedTool {
+                thread_id: "parent".into(),
+                turn_id: "turn-1".into(),
+                item_id: "compact".into(),
+                outcome: None,
+                category: ToolCategory::Compaction,
+                compaction: Some(usage),
+            },
+            now,
+        )
+        .unwrap();
+    let started = observer.snapshot_at(1, now);
+    assert_eq!(started.compactions.len(), 1);
+    assert_eq!(started.compactions[0].status, CompactionFactStatus::Started);
+    assert_eq!(started.compactions[0].total_tokens, Some(16));
+    let started_timeline = observer.timeline_snapshot();
+    let started_entry = started_timeline
+        .entries
+        .iter()
+        .find(|entry| entry.item_id.as_deref() == Some("compact"))
+        .unwrap();
+    assert_eq!(
+        started_entry.compaction.as_deref().unwrap().status,
+        CompactionFactStatus::Started
+    );
+
+    observer
+        .tool(
+            &ObservedTool {
+                thread_id: "parent".into(),
+                turn_id: "turn-1".into(),
+                item_id: "compact".into(),
+                outcome: Some(ObservedToolOutcome::Completed),
+                category: ToolCategory::Compaction,
+                compaction: Some(ObservedCompaction {
+                    context_window: Some(256),
+                    ..Default::default()
+                }),
+            },
+            now + Duration::from_millis(2),
+        )
+        .unwrap();
+    let completed = observer.snapshot_at(2, now + Duration::from_millis(2));
+    assert_eq!(
+        completed.compactions[0].status,
+        CompactionFactStatus::Completed
+    );
+    assert_eq!(completed.compactions[0].context_window, Some(256));
+
+    observer
+        .tool(
+            &ObservedTool {
+                thread_id: "parent".into(),
+                turn_id: "turn-1".into(),
+                item_id: "compact".into(),
+                outcome: None,
+                category: ToolCategory::Compaction,
+                compaction: Some(ObservedCompaction {
+                    total_tokens: Some(777),
+                    ..Default::default()
+                }),
+            },
+            now + Duration::from_millis(3),
+        )
+        .unwrap();
+    let late_start = observer.snapshot_at(2, now + Duration::from_millis(3));
+    assert_eq!(
+        late_start.compactions[0].status,
+        CompactionFactStatus::Completed
+    );
+    assert_eq!(late_start.compactions[0].total_tokens, Some(16));
+
+    observer
+        .tool(
+            &ObservedTool {
+                thread_id: "parent".into(),
+                turn_id: "turn-1".into(),
+                item_id: "compact".into(),
+                outcome: Some(ObservedToolOutcome::Completed),
+                category: ToolCategory::Compaction,
+                compaction: Some(ObservedCompaction {
+                    total_tokens: Some(42),
+                    ..Default::default()
+                }),
+            },
+            now + Duration::from_millis(4),
+        )
+        .unwrap();
+    let repeated = observer.snapshot_at(2, now + Duration::from_millis(4));
+    assert_eq!(
+        repeated.compactions[0].status,
+        CompactionFactStatus::Completed
+    );
+    assert_eq!(repeated.compactions[0].total_tokens, Some(42));
+
+    let mut open = root.clone();
+    open.state = TaskState::Running;
+    observer
+        .tool(
+            &ObservedTool {
+                thread_id: "parent".into(),
+                turn_id: "turn-1".into(),
+                item_id: "open".into(),
+                outcome: None,
+                category: ToolCategory::Compaction,
+                compaction: Some(Default::default()),
+            },
+            now,
+        )
+        .unwrap();
+    let mut ended = open.clone();
+    ended.state = TaskState::Succeeded;
+    observer
+        .reconcile(
+            ObservationFacts {
+                phase: SessionPhase::Completed,
+                root_thread: Some("parent"),
+                root_generation: 1,
+                root_task: Some(&ended),
+                children: Vec::new(),
+                requests: &[],
+                gate: None,
+            },
+            now + Duration::from_millis(3),
+        )
+        .unwrap();
+    let unknown = observer.snapshot_at(3, now + Duration::from_millis(3));
+    assert_eq!(
+        unknown
+            .compactions
+            .iter()
+            .find(|fact| fact.item_id == "open")
+            .unwrap()
+            .status,
+        CompactionFactStatus::Unknown
+    );
+
+    let encoded = serde_json::to_value(&completed).unwrap();
+    let mut legacy = encoded;
+    legacy.as_object_mut().unwrap().remove("compactions");
+    let decoded: ObservationSnapshot = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.compactions.is_empty());
+}
+
+#[test]
+fn compaction_fact_is_not_retained_when_activity_limit_rejects_creation() {
+    let now = Instant::now();
+    let root = root_task();
+    let mut observer = observer(now);
+    observer
+        .reconcile(facts(&root, &[], &[], None), now)
+        .unwrap();
+    for index in 0..1023 {
+        observer
+            .tool(&tool(&format!("tool-{index}"), None), now)
+            .unwrap();
+    }
+    let result = observer.tool(
+        &ObservedTool {
+            thread_id: "parent".into(),
+            turn_id: "turn-1".into(),
+            item_id: "rejected-compaction".into(),
+            outcome: None,
+            category: ToolCategory::Compaction,
+            compaction: Some(ObservedCompaction {
+                total_tokens: Some(99),
+                ..Default::default()
+            }),
+        },
+        now,
+    );
+    assert_eq!(result, Err(ObservationError::Limit));
+    assert!(observer.snapshot_at(1, now).compactions.is_empty());
 }
 
 #[test]

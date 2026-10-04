@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::gate::WaitTarget;
 use crate::interactions::RequestRef;
 use crate::observation::{
-    ActivityIdentity, ActivityKind, ActivityScope, Evidence, ExecutionState, InteractionState,
+    ActivityIdentity, ActivityKind, ActivityScope, CompactionFact, Evidence, ExecutionState,
+    InteractionState,
 };
 use crate::protocol::{RpcId, ToolCategory};
 
@@ -25,6 +26,7 @@ pub struct TimelineEntry {
     pub evidence: Evidence,
     pub request: Option<RequestRef>,
     pub wait_targets: Vec<WaitTarget>,
+    pub compaction: Option<Box<CompactionFact>>,
 }
 
 impl TimelineEntry {
@@ -47,6 +49,12 @@ impl TimelineEntry {
             + text_bytes(&self.identity.turn_id)
             + text_bytes(&self.item_id)
             + text_bytes(&self.evidence.item_id)
+            + self.compaction.as_ref().map_or(0, |fact| {
+                std::mem::size_of::<CompactionFact>()
+                    + fact.thread_id.capacity()
+                    + fact.turn_id.capacity()
+                    + fact.item_id.capacity()
+            })
             + self.evidence.request_id.as_ref().map_or(0, rpc_bytes)
             + self.request.as_ref().map_or(0, |request| {
                 rpc_bytes(&request.id) + request.thread_id.capacity() + request.turn_id.capacity()

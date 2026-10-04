@@ -35,6 +35,7 @@ fn event(id: u64, thread: &str, turn: &str, item: &str) -> Arc<TimelineEntry> {
         },
         request: None,
         wait_targets: Vec::new(),
+        compaction: None,
     })
 }
 

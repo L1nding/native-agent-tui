@@ -55,6 +55,7 @@ fn observed_compaction_snapshot(now: tokio::time::Instant, session: &str) -> Cor
                 item_id: "compaction-item".into(),
                 outcome: Some(ObservedToolOutcome::Completed),
                 category: ToolCategory::Compaction,
+                compaction: Some(Default::default()),
             },
             now,
         )

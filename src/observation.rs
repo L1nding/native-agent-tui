@@ -10,13 +10,14 @@ use tokio::time::Instant;
 use crate::agents::AgentSnapshot;
 use crate::gate::{ChildOutcome, WaitTarget};
 use crate::interactions::{RequestKind, RequestRef, RequestView};
-use crate::protocol::{RpcId, ToolCategory};
+use crate::protocol::{ObservedCompaction, RpcId, ToolCategory};
 use crate::scheduler::{TaskId, TaskSnapshot, TaskState};
 use crate::state::{GateSnapshot, SessionPhase};
 use crate::timeline::{Timeline, TimelineEntry, TimelineSnapshot};
 
 const ACTIVITY_LIMIT: usize = 1024;
 const RECENT_EVIDENCE: usize = 8;
+const COMPACTION_LIMIT: usize = 256;
 const MAX_THRESHOLD_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -369,6 +370,56 @@ pub struct ActivitySnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum CompactionFactStatus {
+    Started,
+    Completed,
+    Unknown,
+}
+
+/// 脱敏的上下文压缩事实。协议未提供的值保持 None。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionFact {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub status: CompactionFactStatus,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub completed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+}
+
+impl CompactionFact {
+    fn merge_usage(&mut self, usage: ObservedCompaction, terminal: bool) {
+        let merge = |current: &mut Option<u64>, next: Option<u64>| {
+            if terminal {
+                if next.is_some() {
+                    *current = next;
+                }
+            } else {
+                *current = current.or(next);
+            }
+        };
+        merge(&mut self.input_tokens, usage.input_tokens);
+        merge(&mut self.cached_input_tokens, usage.cached_input_tokens);
+        merge(&mut self.output_tokens, usage.output_tokens);
+        merge(&mut self.total_tokens, usage.total_tokens);
+        merge(&mut self.context_window, usage.context_window);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum WaitReason {
     Children,
     Approval,
@@ -396,6 +447,8 @@ pub struct ObservationSnapshot {
     pub monotonic_ms: u64,
     pub settings: AttentionSettings,
     pub activities: Vec<ActivitySnapshot>,
+    #[serde(default)]
+    pub compactions: Vec<CompactionFact>,
 }
 
 pub struct ChildFact<'a> {
@@ -466,6 +519,8 @@ pub struct Observer {
     settings: AttentionSettings,
     activities: BTreeMap<Key, Activity>,
     finalized_items: BTreeSet<(AgentKey, String)>,
+    compactions: BTreeMap<(String, String, String), CompactionFact>,
+    compaction_order: VecDeque<(String, String, String)>,
     raw_messages: u64,
     next_evidence: u64,
     active_gate: Option<(String, u64)>,
@@ -503,6 +558,8 @@ impl Observer {
             settings,
             activities: BTreeMap::new(),
             finalized_items: BTreeSet::new(),
+            compactions: BTreeMap::new(),
+            compaction_order: VecDeque::new(),
             raw_messages: 0,
             next_evidence: 0,
             active_gate: None,
@@ -618,6 +675,17 @@ impl Observer {
                 _ => None,
             },
             wait_targets: activity.targets.clone(),
+            compaction: (activity.tool_category == Some(ToolCategory::Compaction))
+                .then_some(())
+                .and_then(|_| {
+                    let thread = activity.identity.thread_id.as_ref()?;
+                    let turn = activity.identity.turn_id.as_ref()?;
+                    let item = activity.item_id.as_ref()?;
+                    self.compactions
+                        .get(&(thread.clone(), turn.clone(), item.clone()))
+                        .cloned()
+                        .map(Box::new)
+                }),
         });
         activity.evidence.push_back(evidence);
         while activity.evidence.len() > RECENT_EVIDENCE {
@@ -644,6 +712,87 @@ impl Observer {
             };
             activity.ended = Some(now);
             self.evidence(key, kind, source, now, None, 0);
+        }
+    }
+
+    fn record_compaction(&mut self, notice: &crate::protocol::ObservedTool, now: Instant) {
+        let Some(usage) = notice.compaction else {
+            return;
+        };
+        let key = (
+            notice.thread_id.clone(),
+            notice.turn_id.clone(),
+            notice.item_id.clone(),
+        );
+        let status = match notice.outcome {
+            None => CompactionFactStatus::Started,
+            Some(crate::protocol::ObservedToolOutcome::Completed) => {
+                CompactionFactStatus::Completed
+            }
+            Some(_) => CompactionFactStatus::Unknown,
+        };
+        let existed = self.compactions.contains_key(&key);
+        if !existed && self.compactions.len() >= COMPACTION_LIMIT {
+            while self.compactions.len() >= COMPACTION_LIMIT {
+                let Some(oldest) = self.compaction_order.pop_front() else {
+                    return;
+                };
+                self.compactions.remove(&oldest);
+            }
+        }
+        let wall = self.wall(now);
+        let fact = self
+            .compactions
+            .entry(key)
+            .or_insert_with(|| CompactionFact {
+                thread_id: notice.thread_id.clone(),
+                turn_id: notice.turn_id.clone(),
+                item_id: notice.item_id.clone(),
+                status,
+                started_at_ms: None,
+                completed_at_ms: None,
+                input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                context_window: None,
+            });
+        if !existed {
+            self.compaction_order.push_back((
+                notice.thread_id.clone(),
+                notice.turn_id.clone(),
+                notice.item_id.clone(),
+            ));
+        }
+        if existed
+            && matches!(
+                fact.status,
+                CompactionFactStatus::Completed | CompactionFactStatus::Unknown
+            )
+        {
+            if notice.outcome.is_some() {
+                fact.merge_usage(usage, true);
+            }
+            return;
+        }
+        fact.merge_usage(usage, status != CompactionFactStatus::Started);
+        if status == CompactionFactStatus::Started {
+            fact.started_at_ms = fact.started_at_ms.or(wall);
+        } else {
+            fact.status = status;
+            fact.completed_at_ms = wall;
+        }
+    }
+
+    fn mark_compactions_unknown(&mut self, thread: &str, turn: &str, now: Instant) {
+        let completed_at = self.wall(now);
+        for fact in self.compactions.values_mut().filter(|fact| {
+            fact.thread_id == thread
+                && fact.turn_id == turn
+                && fact.status == CompactionFactStatus::Started
+        }) {
+            fact.status = CompactionFactStatus::Unknown;
+            fact.completed_at_ms = completed_at;
         }
     }
     fn agent_for_turn(&self, thread: &str, turn: &str) -> Option<AgentKey> {
@@ -719,6 +868,7 @@ impl Observer {
             return Ok(());
         }
         let key = (agent, Slot::Tool(notice.item_id.clone()));
+        let existing_activity = self.activities.contains_key(&key);
         if !self.activities.contains_key(&key) {
             self.create(
                 key.clone(),
@@ -728,12 +878,18 @@ impl Observer {
                 ExecutionState::Running,
                 now,
             )?;
-            let activity = self.activities.get_mut(&key).unwrap();
-            activity.tool_category = Some(notice.category);
-            if notice.outcome.is_some() {
-                activity.start_known = false;
-                activity.started_wall = None;
-            } else {
+            {
+                let activity = self.activities.get_mut(&key).unwrap();
+                activity.tool_category = Some(notice.category);
+                if notice.outcome.is_some() {
+                    activity.start_known = false;
+                    activity.started_wall = None;
+                }
+            }
+            if notice.category == ToolCategory::Compaction {
+                self.record_compaction(notice, now);
+            }
+            if notice.outcome.is_none() {
                 self.evidence(
                     &key,
                     EvidenceKind::ToolStarted,
@@ -751,6 +907,9 @@ impl Observer {
                     0,
                 );
             }
+        }
+        if existing_activity && notice.category == ToolCategory::Compaction {
+            self.record_compaction(notice, now);
         }
         if notice.outcome.is_none()
             && self.activities[&key].execution.active()
@@ -1222,6 +1381,14 @@ impl Observer {
             .map(|(key, _)| key.clone())
             .collect();
         for key in live {
+            if self.activities[&key].tool_category == Some(ToolCategory::Compaction) {
+                if let (Some(thread), Some(turn)) = (
+                    self.activities[&key].identity.thread_id.clone(),
+                    self.activities[&key].identity.turn_id.clone(),
+                ) {
+                    self.mark_compactions_unknown(&thread, &turn, now);
+                }
+            }
             if self.activities[&key].interaction.is_some() {
                 self.activities.get_mut(&key).unwrap().interaction =
                     Some(InteractionState::Unavailable);
@@ -1302,6 +1469,14 @@ impl Observer {
                 .map(|(key, _)| key.clone())
                 .collect();
             for key in open {
+                if self.activities[&key].tool_category == Some(ToolCategory::Compaction) {
+                    if let (Some(thread), Some(turn)) = (
+                        self.activities[&key].identity.thread_id.clone(),
+                        self.activities[&key].identity.turn_id.clone(),
+                    ) {
+                        self.mark_compactions_unknown(&thread, &turn, now);
+                    }
+                }
                 self.finish(
                     &key,
                     ExecutionState::Unknown,
@@ -1367,6 +1542,7 @@ impl Observer {
             monotonic_ms: millis(now.saturating_duration_since(self.origin)),
             settings: self.settings.clone(),
             activities,
+            compactions: self.compactions.values().cloned().collect(),
         }
     }
 

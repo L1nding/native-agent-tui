@@ -29,6 +29,7 @@ fn entry(id: u64) -> TimelineEntry {
         },
         request: None,
         wait_targets: Vec::new(),
+        compaction: None,
     }
 }
 
@@ -80,4 +81,31 @@ fn byte_budget_evicts_whole_records_and_reports_oversized_gaps() {
     assert_eq!(gap.dropped_entries, kept.dropped_entries + 1);
     timeline.record(entry(42));
     assert_eq!(timeline.snapshot().entries.back().unwrap().evidence.id, 42);
+}
+
+#[test]
+fn compaction_fact_memory_is_counted_only_when_present() {
+    let base = entry(1);
+    let mut with_fact = base.clone();
+    with_fact.compaction = Some(Box::new(crate::observation::CompactionFact {
+        thread_id: "thread-id".into(),
+        turn_id: "turn-id".into(),
+        item_id: "item-id".into(),
+        status: crate::observation::CompactionFactStatus::Started,
+        started_at_ms: Some(1),
+        completed_at_ms: None,
+        input_tokens: Some(10),
+        cached_input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        context_window: None,
+    }));
+    let fact = with_fact.compaction.as_deref().unwrap();
+    assert_eq!(
+        with_fact.metadata_bytes() - base.metadata_bytes(),
+        std::mem::size_of_val(fact)
+            + fact.thread_id.capacity()
+            + fact.turn_id.capacity()
+            + fact.item_id.capacity()
+    );
 }

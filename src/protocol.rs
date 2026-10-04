@@ -36,6 +36,55 @@ pub struct ObservedTool {
     pub item_id: String,
     pub outcome: Option<ObservedToolOutcome>,
     pub category: ToolCategory,
+    pub compaction: Option<ObservedCompaction>,
+}
+
+/// Numeric facts accepted from a context compaction item. Textual item fields
+/// (summary, prompt, errors, paths) are intentionally ignored at the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObservedCompaction {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+fn number(params: &Value, paths: &[&str]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        let value = if let Some(path) = path.strip_prefix('/') {
+            params.pointer(&format!("/{path}"))
+        } else {
+            params.get(*path)
+        }?;
+        value.as_u64()
+    })
+}
+
+fn decode_compaction(item: &Value) -> ObservedCompaction {
+    let usage = item
+        .get("usage")
+        .or_else(|| item.get("tokenUsage"))
+        .unwrap_or(item);
+    ObservedCompaction {
+        input_tokens: number(usage, &["inputTokens", "input_tokens", "input"]),
+        cached_input_tokens: number(
+            usage,
+            &["cachedInputTokens", "cached_input_tokens", "cachedInput"],
+        ),
+        output_tokens: number(usage, &["outputTokens", "output_tokens", "output"]),
+        total_tokens: number(usage, &["totalTokens", "total_tokens", "total"]),
+        context_window: number(
+            item,
+            &["contextWindow", "context_window", "modelContextWindow"],
+        )
+        .or_else(|| {
+            number(
+                usage,
+                &["contextWindow", "context_window", "modelContextWindow"],
+            )
+        }),
+    }
 }
 
 pub fn decode_observed_tool(
@@ -120,6 +169,7 @@ pub fn decode_observed_tool(
             item_id,
             outcome,
             category,
+            compaction: (category == ToolCategory::Compaction).then(|| decode_compaction(item)),
         })
     })())
 }
@@ -593,6 +643,26 @@ mod tests {
         ] {
             assert!(decode_line(line).is_err(), "accepted {line}");
         }
+    }
+
+    #[test]
+    fn compaction_decoder_keeps_numeric_usage_and_drops_private_text() {
+        let params = serde_json::json!({
+            "threadId":"t", "turnId":"u",
+            "item":{
+                "id":"compact-1", "type":"contextCompaction",
+                "usage":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":4,"totalTokens":16},
+                "contextWindow":128,
+                "summary":"PRIVATE_SUMMARY", "path":"PRIVATE_PATH",
+                "error":{"message":"PRIVATE_ERROR"}
+            }
+        });
+        let notice = super::decode_observed_tool("item/completed", &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(notice.compaction.unwrap().total_tokens, Some(16));
+        let debug = format!("{notice:?}");
+        assert!(!debug.contains("PRIVATE_"));
     }
 
     #[test]

@@ -117,6 +117,7 @@ async fn main() {
                     item_id: id.into(),
                     category: ToolCategory::Shell,
                     outcome: None,
+                    compaction: None,
                 },
                 now,
             )
