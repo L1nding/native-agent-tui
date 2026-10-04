@@ -72,6 +72,7 @@ pub enum AgentError {
 #[derive(Debug)]
 struct Agent {
     info: AgentInfo,
+    registration_seq: usize,
     generation: u64,
     turn_id: Option<String>,
     started_seq: u64,
@@ -154,10 +155,12 @@ impl AgentRegistry {
         if depth > self.limits.max_depth {
             return Err(AgentError::DepthLimit(self.limits.max_depth));
         }
+        let registration_seq = self.agents.len();
         self.agents.insert(
             info.id.clone(),
             Agent {
                 info,
+                registration_seq,
                 generation: 0,
                 turn_id: None,
                 started_seq: 0,
@@ -345,18 +348,27 @@ impl AgentRegistry {
             .collect())
     }
 
+    /// 按首次登记顺序返回快照，供 UI 稳定展示；不代表服务端创建时间。
     pub fn snapshots(&self) -> Vec<AgentSnapshot> {
-        self.agents
+        let mut agents = self
+            .agents
             .values()
-            .map(|agent| AgentSnapshot {
-                info: agent.info.clone(),
-                generation: agent.generation,
-                turn_id: agent.turn_id.clone(),
-                outcome: agent.outcome.clone(),
-                awaiting_turn: agent.turn_id.is_none() || agent.awaiting_after.is_some(),
-                usage: agent.usage,
+            .map(|agent| {
+                (
+                    agent.registration_seq,
+                    AgentSnapshot {
+                        info: agent.info.clone(),
+                        generation: agent.generation,
+                        turn_id: agent.turn_id.clone(),
+                        outcome: agent.outcome.clone(),
+                        awaiting_turn: agent.turn_id.is_none() || agent.awaiting_after.is_some(),
+                        usage: agent.usage,
+                    },
+                )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        agents.sort_by_key(|(registration_seq, _)| *registration_seq);
+        agents.into_iter().map(|(_, agent)| agent).collect()
     }
 
     fn depth_for_parent(&self, parent: &str) -> usize {
@@ -419,6 +431,49 @@ mod tests {
             Err(AgentError::NotDirect(_))
         ));
     }
+
+    #[test]
+    fn snapshots_keep_first_registration_order_across_updates_and_failed_registration() {
+        let mut agents = AgentRegistry::with_limits(AgentLimits {
+            max_children: 2,
+            ..AgentLimits::default()
+        });
+        agents.register(child("z", "root")).unwrap();
+        agents.register(child("a", "root")).unwrap();
+        agents.started("z", "z-turn-1", 1).unwrap();
+        agents
+            .register(AgentInfo {
+                nickname: Some("updated".into()),
+                ..child("z", "root")
+            })
+            .unwrap();
+        agents
+            .register(child("rejected", "root"))
+            .expect_err("full direct-child capacity rejects registration");
+        agents
+            .completed("z", "z-turn-1", ChildOutcome::Completed)
+            .unwrap();
+        agents.started("z", "z-turn-2", 2).unwrap();
+        assert_eq!(
+            agents
+                .snapshots()
+                .iter()
+                .map(|agent| agent.info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+
+        agents.register(child("nested", "z")).unwrap();
+        assert_eq!(
+            agents
+                .snapshots()
+                .iter()
+                .map(|agent| agent.info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a", "nested"]
+        );
+    }
+
     #[test]
     fn followup_captures_the_new_generation_and_old_events_cannot_bind_it() {
         let mut agents = AgentRegistry::default();

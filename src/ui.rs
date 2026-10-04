@@ -907,17 +907,18 @@ fn handle_key(
         }
         KeyCode::F(3) => {
             local.conversation_focus = None;
+            let tree = project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref());
             let next = local
                 .agent_id
                 .as_ref()
                 .and_then(|id| {
-                    snapshot
-                        .agents
-                        .iter()
-                        .position(|agent| &agent.info.id == id)
+                    tree.iter()
+                        .position(|row| snapshot.agents[row.index].info.id.as_str() == id)
                 })
                 .map_or(0, |index| index + 1);
-            local.agent_id = snapshot.agents.get(next).map(|agent| agent.info.id.clone());
+            local.agent_id = tree
+                .get(next)
+                .map(|row| snapshot.agents[row.index].info.id.clone());
             local.scroll_from_bottom = 0;
         }
         KeyCode::Esc => {
@@ -1248,71 +1249,149 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(32), Constraint::Min(1)])
             .split(chunks[1]);
-        let mut agents = vec![Line::from(if selected_agent.is_none() {
-            "> root"
+        if area.height <= 16 {
+            let (name, status, generation, usage) = selected_agent.map_or_else(
+                || {
+                    let usage = if snapshot.usage.source == FactSource::ServerConfirmed {
+                        snapshot.usage.total_tokens.map_or_else(
+                            || "tokens: unavailable".into(),
+                            |tokens| format!("tokens:{tokens}"),
+                        )
+                    } else {
+                        "tokens: unavailable".into()
+                    };
+                    (
+                        "root",
+                        format!("{:?}", snapshot.phase),
+                        "unavailable".to_owned(),
+                        usage,
+                    )
+                },
+                |agent| {
+                    let status = if agent.awaiting_turn {
+                        "starting".to_owned()
+                    } else {
+                        agent
+                            .outcome
+                            .as_ref()
+                            .map_or_else(|| "running".to_owned(), |outcome| format!("{outcome:?}"))
+                    };
+                    let name = agent
+                        .info
+                        .path
+                        .as_deref()
+                        .or(agent.info.nickname.as_deref())
+                        .unwrap_or(&agent.info.id);
+                    (
+                        name,
+                        status,
+                        agent.generation.to_string(),
+                        agent_usage_brief(agent),
+                    )
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("Agent: {}", truncate_display_label(name, 25))),
+                    Line::from(format!("State: {status} / gen {generation}")),
+                    Line::from(usage),
+                ]),
+                panels[0],
+            );
+            panels[1]
         } else {
-            "  root"
-        })];
-        for agent in &snapshot.agents {
-            let status = if agent.awaiting_turn {
-                "starting".into()
+            let mut agents = vec![Line::from(if selected_agent.is_none() {
+                "> root"
             } else {
-                agent
-                    .outcome
-                    .as_ref()
-                    .map_or_else(|| "running".into(), |outcome| format!("{outcome:?}"))
-            };
-            let name = agent
-                .info
-                .path
-                .as_deref()
-                .or(agent.info.nickname.as_deref())
-                .unwrap_or(&agent.info.id);
-            let depth = agent_depth(&agent.info.id, &snapshot.agents);
-            let tree_prefix = if depth == 1 {
-                String::new()
-            } else {
-                format!("{}+- ", "  ".repeat(depth - 2))
-            };
-            agents.push(Line::from(display_text(&format!(
-                "{} {}{name}",
+                "  root"
+            })];
+            let mut selected_line = None;
+            for row in project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref()) {
+                let agent = &snapshot.agents[row.index];
+                let status = if agent.awaiting_turn {
+                    "starting".into()
+                } else {
+                    agent
+                        .outcome
+                        .as_ref()
+                        .map_or_else(|| "running".into(), |outcome| format!("{outcome:?}"))
+                };
+                let name = agent
+                    .info
+                    .path
+                    .as_deref()
+                    .or(agent.info.nickname.as_deref())
+                    .unwrap_or(&agent.info.id);
+                let tree_prefix = if row.depth == 1 {
+                    String::new()
+                } else {
+                    format!("{}+- ", "  ".repeat(row.depth - 2))
+                };
+                let parent_label = if row.parent_missing {
+                    "[parent unavailable] "
+                } else if row.relationship_unknown {
+                    "[parent unresolved] "
+                } else {
+                    ""
+                };
                 if Some(agent.info.id.as_str())
                     == selected_agent.map(|agent| agent.info.id.as_str())
                 {
-                    ">"
-                } else {
-                    " "
-                },
-                tree_prefix,
-            ))));
-            agents.push(Line::from(format!(
-                "    {}{status} / gen {}",
-                "  ".repeat(depth.saturating_sub(1)),
-                agent.generation,
-            )));
-            agents.push(Line::from(format!(
-                "    {}{}",
-                "  ".repeat(depth.saturating_sub(1)),
-                agent_usage_brief(agent)
-            )));
-            if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
+                    selected_line = Some(agents.len());
+                }
+                agents.push(Line::from(display_text(&format!(
+                    "{} {}{}{}",
+                    if Some(agent.info.id.as_str())
+                        == selected_agent.map(|agent| agent.info.id.as_str())
+                    {
+                        ">"
+                    } else {
+                        " "
+                    },
+                    tree_prefix,
+                    parent_label,
+                    name,
+                ))));
+                if row.depth_truncated {
+                    agents.push(Line::from("[depth truncated]"));
+                }
                 agents.push(Line::from(format!(
-                    "    {}{:?} / quiet {}",
-                    "  ".repeat(depth.saturating_sub(1)),
-                    activity.attention.level,
-                    age(activity.silence_ms)
+                    "    {}{status} / gen {}",
+                    "  ".repeat(row.depth.saturating_sub(1)),
+                    agent.generation,
                 )));
+                agents.push(Line::from(format!(
+                    "    {}{}",
+                    "  ".repeat(row.depth.saturating_sub(1)),
+                    agent_usage_brief(agent)
+                )));
+                if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
+                    agents.push(Line::from(format!(
+                        "    {}{:?} / quiet {}",
+                        "  ".repeat(row.depth.saturating_sub(1)),
+                        activity.attention.level,
+                        age(activity.silence_ms)
+                    )));
+                }
             }
+            let visible_height = panels[0].height.saturating_sub(2) as usize;
+            let scroll = selected_line
+                .unwrap_or(0)
+                .saturating_sub(visible_height / 3)
+                .min(agents.len().saturating_sub(visible_height))
+                .min(u16::MAX as usize) as u16;
+            frame.render_widget(
+                Paragraph::new(agents)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Agents · F3 "),
+                    )
+                    .scroll((scroll, 0)),
+                panels[0],
+            );
+            panels[1]
         }
-        frame.render_widget(
-            Paragraph::new(agents).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Agents · F3 "),
-            ),
-            panels[0],
-        );
-        panels[1]
     } else {
         chunks[1]
     };
@@ -2039,6 +2118,28 @@ fn agent_usage_brief(agent: &crate::agents::AgentSnapshot) -> String {
     }
 }
 
+fn truncate_display_label(text: &str, max_width: usize) -> String {
+    let text = display_text(text);
+    if UnicodeWidthStr::width(text.as_str()) <= max_width {
+        return text;
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut width = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width + 1 > max_width {
+            break;
+        }
+        output.push_str(grapheme);
+        width += grapheme_width;
+    }
+    output.push('…');
+    output
+}
+
 fn format_usage_evidence(snapshot: &CoreSnapshot) -> String {
     let usage = snapshot.usage;
     let total = usage.total_tokens;
@@ -2235,24 +2336,87 @@ fn draw_tasks(
     );
 }
 
-fn agent_depth(id: &str, agents: &[AgentSnapshot]) -> usize {
-    let mut depth: usize = 1;
-    let mut parent = agents
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentTreeRow {
+    index: usize,
+    depth: usize,
+    parent_missing: bool,
+    relationship_unknown: bool,
+    depth_truncated: bool,
+}
+
+/// 把快照投影为稳定的父子 DFS 顺序；渲染层不重新推断父链。
+fn project_agent_tree(agents: &[AgentSnapshot], root_id: Option<&str>) -> Vec<AgentTreeRow> {
+    let root_id = root_id.unwrap_or("root");
+    let known_ids = agents
         .iter()
-        .find(|agent| agent.info.id == id)
-        .map(|agent| agent.info.parent_id.as_str());
-    let mut seen = HashSet::new();
-    while let Some(parent_id) = parent {
-        if !seen.insert(parent_id) {
-            break;
-        }
-        let Some(parent_agent) = agents.iter().find(|agent| agent.info.id == parent_id) else {
-            break;
-        };
-        depth = depth.saturating_add(1);
-        parent = Some(parent_agent.info.parent_id.as_str());
+        .map(|agent| agent.info.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut children = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, agent) in agents.iter().enumerate() {
+        children
+            .entry(agent.info.parent_id.as_str())
+            .or_default()
+            .push(index);
     }
-    depth.min(8)
+    let mut seeds = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| {
+            agent.info.parent_id == root_id || !known_ids.contains(agent.info.parent_id.as_str())
+        })
+        .map(|(index, agent)| {
+            let parent_missing = agent.info.parent_id != root_id;
+            (index, parent_missing, false)
+        })
+        .collect::<Vec<_>>();
+    // 非 root 连通分量可能是循环；按快照顺序作兜底根，并标记关系未确认。
+    let mut is_seed = vec![false; agents.len()];
+    for (index, _, _) in &seeds {
+        is_seed[*index] = true;
+    }
+    for (index, _) in agents.iter().enumerate() {
+        if !is_seed[index] {
+            seeds.push((index, false, true));
+        }
+    }
+    let mut stack = seeds
+        .into_iter()
+        .rev()
+        .map(|(index, parent_missing, relationship_unknown)| {
+            (index, 1, parent_missing, relationship_unknown, false)
+        })
+        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(agents.len());
+    let mut visited = vec![false; agents.len()];
+    while let Some((index, actual_depth, parent_missing, relationship_unknown, depth_truncated)) =
+        stack.pop()
+    {
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        rows.push(AgentTreeRow {
+            index,
+            depth: actual_depth.min(8),
+            parent_missing,
+            relationship_unknown: relationship_unknown || !agents[index].info.confirmed,
+            depth_truncated,
+        });
+        if let Some(siblings) = children.get(agents[index].info.id.as_str()) {
+            for child in siblings.iter().rev() {
+                let child_depth = actual_depth.saturating_add(1);
+                stack.push((
+                    *child,
+                    child_depth,
+                    false,
+                    relationship_unknown,
+                    depth_truncated || child_depth > 8,
+                ));
+            }
+        }
+    }
+    rows
 }
 
 fn gate_status(snapshot: &CoreSnapshot, gate: &crate::state::GateSnapshot) -> String {
@@ -3860,6 +4024,333 @@ mod tests {
             &tx,
         );
         assert!(local.agent_id.is_none());
+    }
+
+    #[test]
+    fn agent_panel_uses_stable_dfs_and_marks_missing_parent_without_draft_leakage() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+
+        fn agent(id: &str, parent_id: &str, path: &str) -> AgentSnapshot {
+            AgentSnapshot {
+                info: AgentInfo {
+                    id: id.into(),
+                    parent_id: parent_id.into(),
+                    path: Some(path.into()),
+                    nickname: None,
+                    role: None,
+                    model: None,
+                    confirmed: true,
+                },
+                generation: 1,
+                turn_id: Some(format!("{id}-turn")),
+                outcome: None,
+                awaiting_turn: false,
+                usage: Default::default(),
+            }
+        }
+
+        let first = vec![
+            agent("c", "b", "/root/b/c"),
+            agent("orphan", "missing-parent", "orphan"),
+            agent("b", "root", "/root/b"),
+            agent("a", "root", "/root/a"),
+        ];
+        let ids = |agents: &[AgentSnapshot]| {
+            project_agent_tree(agents, Some("root"))
+                .into_iter()
+                .map(|row| agents[row.index].info.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ["orphan", "b", "c", "a"]);
+        let projected = project_agent_tree(&first, Some("root"));
+        assert_eq!(
+            projected.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            [1, 1, 2, 1]
+        );
+        assert!(projected[0].parent_missing);
+
+        let root_uuid = "thread-root-uuid";
+        let mut uuid_agents = first.clone();
+        for agent in &mut uuid_agents {
+            if agent.info.parent_id == "root" {
+                agent.info.parent_id = root_uuid.into();
+            }
+        }
+        let uuid_projection = project_agent_tree(&uuid_agents, Some(root_uuid));
+        assert_eq!(
+            uuid_projection
+                .iter()
+                .map(|row| uuid_agents[row.index].info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["orphan", "b", "c", "a"]
+        );
+        assert!(uuid_projection
+            .iter()
+            .filter(|row| uuid_agents[row.index].info.id != "orphan")
+            .all(|row| !row.parent_missing));
+        assert!(uuid_projection[0].parent_missing);
+
+        let mut tentative = first.clone();
+        tentative[2].info.confirmed = false;
+        let tentative_projection = project_agent_tree(&tentative, Some("root"));
+        assert!(
+            tentative_projection
+                .iter()
+                .find(|row| tentative[row.index].info.id == "b")
+                .unwrap()
+                .relationship_unknown
+        );
+        assert!(
+            !tentative_projection
+                .iter()
+                .find(|row| tentative[row.index].info.id == "c")
+                .unwrap()
+                .relationship_unknown
+        );
+
+        let cycle = vec![agent("a", "b", "a"), agent("b", "a", "b")];
+        let cycle_projection = project_agent_tree(&cycle, Some("root"));
+        assert_eq!(
+            cycle_projection
+                .iter()
+                .map(|row| cycle[row.index].info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(cycle_projection.iter().all(|row| row.relationship_unknown));
+
+        let mut deep = Vec::new();
+        for index in 0..10 {
+            let id = format!("deep-{index}");
+            let parent = if index == 0 {
+                "root".to_owned()
+            } else {
+                format!("deep-{}", index - 1)
+            };
+            deep.push(agent(&id, &parent, &format!("/root/{id}")));
+        }
+        let deep_projection = project_agent_tree(&deep, Some("root"));
+        assert_eq!(deep_projection.len(), deep.len());
+        assert_eq!(
+            deep_projection
+                .iter()
+                .map(|row| row.depth)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 8, 8]
+        );
+        assert!(deep_projection[..8].iter().all(|row| !row.depth_truncated));
+        assert!(deep_projection[8..].iter().all(|row| row.depth_truncated));
+
+        let deep_snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            agents: deep,
+            ..Default::default()
+        };
+        let mut deep_terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        deep_terminal
+            .draw(|frame| draw(frame, &deep_snapshot, &LocalState::default()))
+            .unwrap();
+        let deep_rendered: String = deep_terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(deep_rendered.contains("/root/deep-8"), "{deep_rendered}");
+        assert!(deep_rendered.contains("/root/deep-9"), "{deep_rendered}");
+        assert_eq!(deep_rendered.matches("[depth truncated]").count(), 2);
+
+        let siblings = (0..10)
+            .map(|index| {
+                let id = format!("sibling-{index}");
+                agent(&id, "root", &id)
+            })
+            .collect::<Vec<_>>();
+        let sibling_snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            agents: siblings,
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut sibling_local = LocalState::default();
+        for _ in 0..10 {
+            handle_key(
+                KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+                &sibling_snapshot,
+                &mut sibling_local,
+                &tx,
+            );
+        }
+        assert_eq!(sibling_local.agent_id.as_deref(), Some("sibling-9"));
+        assert!(rx.try_recv().is_err());
+        let mut sibling_terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        sibling_terminal
+            .draw(|frame| draw(frame, &sibling_snapshot, &sibling_local))
+            .unwrap();
+        let sibling_rows = sibling_terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let sibling_rendered = sibling_rows.join("\n");
+        assert!(
+            sibling_rendered.contains("> sibling-9"),
+            "{sibling_rendered}"
+        );
+        let selected_row = sibling_rows
+            .iter()
+            .position(|row| row.contains("> sibling-9"))
+            .expect("selected sibling visible");
+        assert!(sibling_rows[selected_row + 1].contains("running / gen 1"));
+        assert!(sibling_rows[selected_row + 2].contains("tokens: unavailable"));
+        for (width, height) in [
+            (100, 12),
+            (120, 12),
+            (100, 16),
+            (120, 16),
+            (100, 24),
+            (120, 24),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &sibling_snapshot, &sibling_local))
+                .unwrap();
+            let panel = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .take(32)
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(panel.contains("sibling-9"), "{width}x{height}: {panel}");
+            assert!(
+                panel.contains("running / gen 1"),
+                "{width}x{height}: {panel}"
+            );
+            assert!(
+                panel.contains("tokens: unavailable"),
+                "{width}x{height}: {panel}"
+            );
+        }
+        let long_name = truncate_display_label("C:/very/long/代理路径/worker-9", 25);
+        assert!(long_name.ends_with('…'));
+        assert!(UnicodeWidthStr::width(long_name.as_str()) <= 25);
+
+        handle_key(
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            &sibling_snapshot,
+            &mut sibling_local,
+            &tx,
+        );
+        assert!(sibling_local.agent_id.is_none());
+        let mut root_terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        root_terminal
+            .draw(|frame| draw(frame, &sibling_snapshot, &sibling_local))
+            .unwrap();
+        let root_panel = root_terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|cells| {
+                cells
+                    .iter()
+                    .take(32)
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(root_panel.contains("Agent: root"), "{root_panel}");
+        assert!(root_panel.contains("gen unavailable"), "{root_panel}");
+        assert!(root_panel.contains("tokens: unavailable"), "{root_panel}");
+
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            agents: first,
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        local.editor.insert("SECRET_DRAFT");
+        for (width, height) in [(120, 30), (100, 30), (80, 18), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let rows = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>();
+            let rendered = rows.join("\n");
+            assert!(rendered.contains("SECRET_DRAFT"), "{rendered}");
+            if width >= 100 {
+                let panel_start = rows
+                    .iter()
+                    .position(|row| row.contains("Agents · F3"))
+                    .expect("agent panel title");
+                let panel_end = rows[panel_start..]
+                    .iter()
+                    .position(|row| row.contains("└──────────────────────────────┘"))
+                    .map_or(rows.len() - panel_start - 1, |offset| offset);
+                let panel = rows[panel_start..=panel_start + panel_end]
+                    .iter()
+                    .map(|row| row.chars().take(32).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(panel.contains("Agents · F3"), "{panel}");
+                assert!(panel.contains("[parent unavailable] orphan"), "{panel}");
+                assert!(!panel.contains("SECRET_DRAFT"), "{panel}");
+                let a = panel.find("/root/a").expect("a in panel");
+                let b = panel.find("/root/b").expect("b in panel");
+                let c = panel.find("/root/b/c").expect("c in panel");
+                assert!(b < c && c < a, "{panel}");
+            }
+        }
+
+        let uuid_snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some(root_uuid.into()),
+            agents: uuid_agents,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &uuid_snapshot, &LocalState::default()))
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let rendered = rows.join("\n");
+        let a_line = rows
+            .iter()
+            .find(|line| line.contains("/root/a"))
+            .expect("uuid root child in panel");
+        let b_line = rows
+            .iter()
+            .find(|line| line.contains("/root/b"))
+            .expect("uuid root child in panel");
+        assert!(!a_line.contains("parent unavailable"), "{rendered}");
+        assert!(!b_line.contains("parent unavailable"), "{rendered}");
     }
 
     #[test]
