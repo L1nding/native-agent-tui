@@ -90,6 +90,13 @@ fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnaps
             pause_requested: false,
             cancel_requested: false,
             pending_requests: 0,
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            wait_targets: Vec::new(),
+            root_slot_reserved: false,
+            cancellation_epoch: 0,
         })
         .collect();
     snapshot
@@ -383,6 +390,7 @@ async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() 
     assert!(text.contains("needs_recovery=true"), "{text}");
     assert!(text.contains("requires_input=true"), "{text}");
     assert!(text.contains("can_resume=false"), "{text}");
+    assert!(text.contains("scheduler_restore=requires_input"), "{text}");
     assert!(text.contains("outbox_available=true"), "{text}");
     assert!(
         text.contains("outbox#1 method=turn/start request_id=rpc-1")
@@ -419,6 +427,7 @@ async fn recovery_cli_marks_closed_terminal_session_safe_without_input() {
     assert!(text.contains("needs_recovery=false"), "{text}");
     assert!(text.contains("requires_input=false"), "{text}");
     assert!(text.contains("can_resume=false"), "{text}");
+    assert!(text.contains("scheduler_restore=available"), "{text}");
     assert!(text.contains("tasks: active=0 unknown=0 queued=0 blocked=0 terminal=1"));
     assert_eq!(fixture.contents(), before);
 }
@@ -447,5 +456,6 @@ async fn recovery_cli_reports_torn_tail_without_reading_or_executing_it() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("uncommitted_tail=true"), "{text}");
     assert!(text.contains("needs_recovery=true"), "{text}");
+    assert!(text.contains("scheduler_restore=requires_input"), "{text}");
     assert_eq!(fixture.contents(), before);
 }

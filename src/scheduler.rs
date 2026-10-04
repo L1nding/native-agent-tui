@@ -133,7 +133,7 @@ impl RootTaskSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockedReason {
     DependencyFailed(TaskId),
     DependencyUnknown(TaskId),
@@ -232,6 +232,8 @@ pub enum SchedulerError {
     Stale,
     #[error("native child retries are controlled by the root agent")]
     NativeRetryUnsupported,
+    #[error("invalid scheduler snapshot: {0}")]
+    InvalidSnapshot(&'static str),
 }
 
 struct Task {
@@ -272,6 +274,233 @@ impl Default for Scheduler {
 }
 
 impl Scheduler {
+    /// Rebuilds the scheduler's read-only state from a persisted snapshot.
+    ///
+    /// Task bodies are intentionally unavailable in persisted snapshots, so a
+    /// restored scheduler can validate dependencies and lifecycle facts but
+    /// cannot dispatch work until the caller obtains fresh input.
+    pub fn restore(snapshot: &SchedulerSnapshot) -> Result<Self, SchedulerError> {
+        if snapshot.tasks.len() > TASK_LIMIT {
+            return Err(SchedulerError::InvalidSnapshot("task limit exceeded"));
+        }
+        if snapshot.stopping && !snapshot.paused {
+            return Err(SchedulerError::InvalidSnapshot(
+                "stopping workflow must be paused",
+            ));
+        }
+
+        let mut tasks = BTreeMap::new();
+        let mut children = BTreeMap::new();
+        let mut next_id = 1u64;
+        let mut next_seq = 0u64;
+        for (index, view) in snapshot.tasks.iter().enumerate() {
+            if view.id.0 == 0 || view.id.0 == u64::MAX || tasks.contains_key(&view.id) {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "task ids must be unique and non-zero",
+                ));
+            }
+            next_id = next_id.max(
+                view.id
+                    .0
+                    .checked_add(1)
+                    .ok_or(SchedulerError::InvalidSnapshot("task id overflow"))?,
+            );
+            next_seq = next_seq.max((index as u64).saturating_add(1));
+            if view.kind == TaskKind::RootTurn && view.parent.is_some() {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "root tasks cannot have a parent",
+                ));
+            }
+            if view.kind == TaskKind::NativeChild && !view.dependencies.is_empty() {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "native child tasks cannot have dependencies",
+                ));
+            }
+            if view.priority.abs_diff(0) > 1000 {
+                return Err(SchedulerError::InvalidSnapshot("priority is out of range"));
+            }
+            if matches!(view.policy, DependencyPolicy::Any) && view.dependencies.is_empty()
+                || matches!(view.policy, DependencyPolicy::Quorum(n) if n == 0 || n > view.dependencies.iter().collect::<BTreeSet<_>>().len())
+            {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "dependency policy is invalid",
+                ));
+            }
+            if let Some(parent) = view.parent {
+                if parent == view.id
+                    || !snapshot
+                        .tasks
+                        .iter()
+                        .any(|candidate| candidate.id == parent)
+                {
+                    return Err(SchedulerError::UnknownTask(parent));
+                }
+            }
+            if view.kind == TaskKind::NativeChild {
+                if let Some(external) = &view.external {
+                    if external.thread_id.is_empty()
+                        || children
+                            .insert(external.thread_id.clone(), view.id)
+                            .is_some()
+                    {
+                        return Err(SchedulerError::InvalidSnapshot(
+                            "native child thread identities must be unique",
+                        ));
+                    }
+                }
+            }
+            tasks.insert(
+                view.id,
+                Task {
+                    view: view.clone(),
+                    text: None,
+                    queued_at: Instant::now(),
+                    ready_seq: next_seq,
+                    waiting_children: view.state == TaskState::WaitingChildren,
+                },
+            );
+        }
+
+        let mut dependents = BTreeMap::<TaskId, BTreeSet<TaskId>>::new();
+        let mut graph = BTreeMap::<TaskId, Vec<TaskId>>::new();
+        for view in &snapshot.tasks {
+            graph.insert(view.id, view.dependencies.clone());
+            let mut unique = BTreeSet::new();
+            for dependency in &view.dependencies {
+                if !unique.insert(*dependency) {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "task dependencies must be unique",
+                    ));
+                }
+                let dependency_task = tasks
+                    .get(dependency)
+                    .ok_or(SchedulerError::UnknownTask(*dependency))?;
+                if dependency_task.view.kind == TaskKind::NativeChild {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "root dependencies cannot target native children",
+                    ));
+                }
+                dependents.entry(*dependency).or_default().insert(view.id);
+            }
+        }
+        fn visit(
+            id: TaskId,
+            graph: &BTreeMap<TaskId, Vec<TaskId>>,
+            visiting: &mut BTreeSet<TaskId>,
+            done: &mut BTreeSet<TaskId>,
+        ) -> bool {
+            if done.contains(&id) {
+                return true;
+            }
+            if !visiting.insert(id) {
+                return false;
+            }
+            for dependency in &graph[&id] {
+                if !visit(*dependency, graph, visiting, done) {
+                    return false;
+                }
+            }
+            visiting.remove(&id);
+            done.insert(id);
+            true
+        }
+        let mut done = BTreeSet::new();
+        for id in graph.keys() {
+            if !visit(*id, &graph, &mut BTreeSet::new(), &mut done) {
+                return Err(SchedulerError::Cycle);
+            }
+        }
+
+        let expected_ready: BTreeSet<_> = tasks
+            .values()
+            .filter(|task| {
+                task.view.kind == TaskKind::RootTurn && task.view.state == TaskState::Ready
+            })
+            .map(|task| task.view.id)
+            .collect();
+        let mut actual_ready = BTreeSet::new();
+        for id in &snapshot.ready_roots {
+            if !actual_ready.insert(*id) {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "ready root ids must be unique",
+                ));
+            }
+            let task = tasks.get(id).ok_or(SchedulerError::UnknownTask(*id))?;
+            if task.view.kind != TaskKind::RootTurn || task.view.state != TaskState::Ready {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "ready root list does not match task state",
+                ));
+            }
+        }
+        if actual_ready != expected_ready {
+            return Err(SchedulerError::InvalidSnapshot(
+                "ready root list does not match task state",
+            ));
+        }
+        let active_root = if let Some(attempt) = snapshot.active_root {
+            let task = tasks
+                .get(&attempt.task)
+                .ok_or(SchedulerError::UnknownTask(attempt.task))?;
+            if task.view.kind != TaskKind::RootTurn
+                || task.view.attempt != attempt.attempt
+                || !task.view.state.active()
+            {
+                return Err(SchedulerError::InvalidSnapshot("active root is invalid"));
+            }
+            Some(attempt)
+        } else {
+            None
+        };
+        if snapshot.disconnected && active_root.is_some() {
+            return Err(SchedulerError::InvalidSnapshot(
+                "disconnected workflow cannot have an active root",
+            ));
+        }
+        let root_slots_reserved = tasks
+            .values()
+            .filter(|task| task.view.root_slot_reserved)
+            .count();
+        if root_slots_reserved != snapshot.root_slots_reserved {
+            return Err(SchedulerError::InvalidSnapshot(
+                "root slot count does not match task state",
+            ));
+        }
+        let native_turns_observed = tasks
+            .values()
+            .filter(|task| {
+                task.view.kind == TaskKind::NativeChild
+                    && task.view.external.is_some()
+                    && task.view.state.active()
+            })
+            .count();
+        if native_turns_observed != snapshot.native_turns_observed {
+            return Err(SchedulerError::InvalidSnapshot(
+                "native turn count does not match task state",
+            ));
+        }
+        let queued_roots = tasks
+            .values()
+            .filter(|task| task.view.kind == TaskKind::RootTurn && task.view.state.unstarted())
+            .count();
+        if queued_roots != snapshot.queued_roots {
+            return Err(SchedulerError::InvalidSnapshot(
+                "queued root count does not match task state",
+            ));
+        }
+
+        Ok(Self {
+            tasks,
+            dependents,
+            children,
+            next_id,
+            next_seq,
+            active_root,
+            paused: snapshot.paused,
+            stopping: snapshot.stopping,
+            disconnected: snapshot.disconnected,
+        })
+    }
+
     pub fn task(&self, id: TaskId) -> Option<&TaskSnapshot> {
         self.tasks.get(&id).map(|task| &task.view)
     }
@@ -1257,5 +1486,47 @@ mod tests {
         let mut root = simple(2, &[]);
         root.dependencies.push(child);
         assert_eq!(s.enqueue(vec![root]), Err(SchedulerError::InvalidPolicy));
+    }
+
+    #[test]
+    fn restore_accepts_a_valid_dag_but_never_dispatches_without_task_text() {
+        let mut original = Scheduler::default();
+        original
+            .enqueue(vec![simple(1, &[]), simple(2, &[1])])
+            .unwrap();
+        let mut restored = Scheduler::restore(&original.snapshot()).unwrap();
+        assert_eq!(restored.snapshot().tasks.len(), 2);
+        assert!(restored.dispatch().is_none());
+    }
+
+    #[test]
+    fn restore_rejects_missing_dependencies_duplicate_ids_and_invalid_active_root() {
+        let mut original = Scheduler::default();
+        original.enqueue(vec![simple(1, &[])]).unwrap();
+
+        let mut missing = original.snapshot();
+        missing.tasks[0].dependencies = vec![TaskId(99)];
+        assert!(matches!(
+            Scheduler::restore(&missing),
+            Err(SchedulerError::UnknownTask(TaskId(99)))
+        ));
+
+        let mut duplicate = original.snapshot();
+        duplicate.tasks.push(duplicate.tasks[0].clone());
+        duplicate.queued_roots = 2;
+        assert!(matches!(
+            Scheduler::restore(&duplicate),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut invalid_active = original.snapshot();
+        invalid_active.active_root = Some(TaskAttempt {
+            task: TaskId(99),
+            attempt: 1,
+        });
+        assert!(matches!(
+            Scheduler::restore(&invalid_active),
+            Err(SchedulerError::UnknownTask(TaskId(99)))
+        ));
     }
 }

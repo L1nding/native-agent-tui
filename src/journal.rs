@@ -11,7 +11,10 @@ use thiserror::Error;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::observation::{ActivityScope, ExecutionState, ObservationSnapshot};
-use crate::scheduler::{ExternalTurn, TaskAttempt, TaskId, TaskKind, TaskState};
+use crate::scheduler::{
+    BlockedReason, DependencyPolicy, ExternalTurn, FailurePolicy, SchedulerSnapshot, TaskAttempt,
+    TaskId, TaskKind, TaskSnapshot, TaskState,
+};
 use crate::state::{CoreSnapshot, SessionPhase};
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -139,6 +142,20 @@ pub struct StoredTask {
     pub pause_requested: bool,
     pub cancel_requested: bool,
     pub pending_requests: usize,
+    #[serde(default)]
+    pub policy: DependencyPolicy,
+    #[serde(default)]
+    pub failure: FailurePolicy,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub blocked_reason: Option<BlockedReason>,
+    #[serde(default)]
+    pub wait_targets: Vec<TaskAttempt>,
+    #[serde(default)]
+    pub root_slot_reserved: bool,
+    #[serde(default)]
+    pub cancellation_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +176,16 @@ pub struct StoredSnapshot {
     pub root_start_requests: u64,
     pub workflow_paused: bool,
     pub workflow_stopping: bool,
+    #[serde(default)]
+    pub ready_roots: Vec<TaskId>,
+    #[serde(default)]
+    pub active_root: Option<TaskAttempt>,
+    #[serde(default)]
+    pub root_slots_reserved: usize,
+    #[serde(default)]
+    pub native_turns_observed: usize,
+    #[serde(default)]
+    pub scheduler_disconnected: bool,
     pub tasks: Vec<StoredTask>,
     pub observation: ObservationSnapshot,
     pub execution_result: Option<SessionPhase>,
@@ -219,6 +246,11 @@ impl StoredSnapshot {
             root_start_requests: core.root_start_requests,
             workflow_paused: core.scheduler.paused,
             workflow_stopping: core.scheduler.stopping,
+            ready_roots: core.scheduler.ready_roots.clone(),
+            active_root: core.scheduler.active_root,
+            root_slots_reserved: core.scheduler.root_slots_reserved,
+            native_turns_observed: core.scheduler.native_turns_observed,
+            scheduler_disconnected: core.scheduler.disconnected,
             tasks: core
                 .scheduler
                 .tasks
@@ -234,6 +266,13 @@ impl StoredSnapshot {
                     pause_requested: task.pause_requested,
                     cancel_requested: task.cancel_requested,
                     pending_requests: task.pending_requests,
+                    policy: task.policy,
+                    failure: task.failure,
+                    priority: task.priority,
+                    blocked_reason: task.blocked_reason.clone(),
+                    wait_targets: task.wait_targets.clone(),
+                    root_slot_reserved: task.root_slot_reserved,
+                    cancellation_epoch: task.cancellation_epoch,
                 })
                 .collect(),
             observation: core.observation.clone(),
@@ -359,6 +398,83 @@ impl StoredSnapshot {
         committed_seq: u64,
     ) -> RecoverySummary {
         RecoverySummary::from_snapshot(session_id.into(), committed_seq, self)
+    }
+
+    /// Converts the persisted, redacted scheduler projection into the
+    /// scheduler's read-only restore seam. Task bodies remain unavailable.
+    pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        let tasks: Vec<_> = self
+            .tasks
+            .iter()
+            .map(|task| TaskSnapshot {
+                id: task.id,
+                kind: task.kind,
+                state: task.state,
+                title: format!("task #{}", task.id.0),
+                parent: task.parent,
+                attempt: task.attempt,
+                dependencies: task.dependencies.clone(),
+                policy: task.policy,
+                failure: task.failure,
+                priority: task.priority,
+                blocked_reason: task.blocked_reason.clone(),
+                external: task.external.clone(),
+                pause_requested: task.pause_requested,
+                cancel_requested: task.cancel_requested,
+                pending_requests: task.pending_requests,
+                wait_targets: task.wait_targets.clone(),
+                root_slot_reserved: task.root_slot_reserved,
+                cancellation_epoch: task.cancellation_epoch,
+            })
+            .collect();
+        let ready_roots = if self.ready_roots.is_empty() {
+            tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::RootTurn && task.state == TaskState::Ready)
+                .map(|task| task.id)
+                .collect()
+        } else {
+            self.ready_roots.clone()
+        };
+        let computed_root_slots = tasks.iter().filter(|task| task.root_slot_reserved).count();
+        let computed_native_turns = tasks
+            .iter()
+            .filter(|task| {
+                task.kind == TaskKind::NativeChild && task.external.is_some() && task.state.active()
+            })
+            .count();
+        SchedulerSnapshot {
+            tasks,
+            ready_roots,
+            active_root: self.active_root,
+            paused: self.workflow_paused,
+            stopping: self.workflow_stopping,
+            disconnected: self.scheduler_disconnected,
+            queued_roots: self
+                .tasks
+                .iter()
+                .filter(|task| {
+                    task.kind == TaskKind::RootTurn
+                        && matches!(
+                            task.state,
+                            TaskState::Queued
+                                | TaskState::Ready
+                                | TaskState::Paused
+                                | TaskState::Blocked
+                        )
+                })
+                .count(),
+            root_slots_reserved: if self.root_slots_reserved == 0 {
+                computed_root_slots
+            } else {
+                self.root_slots_reserved
+            },
+            native_turns_observed: if self.native_turns_observed == 0 {
+                computed_native_turns
+            } else {
+                self.native_turns_observed
+            },
+        }
     }
 }
 

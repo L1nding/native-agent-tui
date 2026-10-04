@@ -8,7 +8,9 @@ use native_agent_tui::history::search::Query;
 use native_agent_tui::history::{HistoryHandle, HistoryRequest, HistoryResult};
 use native_agent_tui::journal::{self, JournalError, Replay};
 use native_agent_tui::outbox::{OutboxSnapshot, OutboxStatus};
-use native_agent_tui::scheduler::{RootTaskSpec, WorkflowPlan, WORKFLOW_BYTES};
+use native_agent_tui::scheduler::{
+    RootTaskSpec, Scheduler, TaskKind, TaskState, WorkflowPlan, WORKFLOW_BYTES,
+};
 use native_agent_tui::state::{display_text_for_cli, SessionPhase};
 use native_agent_tui::{ui, ClientHandle};
 
@@ -186,6 +188,23 @@ async fn execute() -> Result<(), (u8, String)> {
                 summary.session_closed,
                 summary.execution_result.unwrap_or(SessionPhase::Unknown)
             );
+            let stored = replay.latest_state();
+            let scheduler_restore = match Scheduler::restore(&stored.scheduler_snapshot()) {
+                Ok(_)
+                    if stored.tasks.iter().any(|task| {
+                        task.kind == TaskKind::RootTurn
+                            && !matches!(
+                                task.state,
+                                TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled
+                            )
+                    }) =>
+                {
+                    "requires_input"
+                }
+                Ok(_) => "available",
+                Err(_) => "invalid",
+            };
+            println!("scheduler_restore={scheduler_restore}");
             let outbox_path = config
                 .journal
                 .outbox_path(&config.cwd, &summary.session_id)
