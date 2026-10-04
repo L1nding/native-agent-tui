@@ -160,6 +160,8 @@ pub struct TaskSnapshot {
     pub priority: i32,
     pub blocked_reason: Option<BlockedReason>,
     pub external: Option<ExternalTurn>,
+    /// NativeChild 首轮启动前已由 children 索引确认的线程身份。
+    pub child_thread_id: Option<String>,
     pub pause_requested: bool,
     pub cancel_requested: bool,
     pub pending_requests: usize,
@@ -372,23 +374,48 @@ impl Scheduler {
                     return Err(SchedulerError::UnknownTask(parent));
                 }
             }
-            if view.kind == TaskKind::NativeChild {
-                if let Some(external) = &view.external {
-                    if external.thread_id.is_empty()
-                        || children
-                            .insert(external.thread_id.clone(), view.id)
-                            .is_some()
-                    {
-                        return Err(SchedulerError::InvalidSnapshot(
-                            "native child thread identities must be unique",
-                        ));
-                    }
+            let child_thread_id = view.child_thread_id.as_deref().or_else(|| {
+                (view.kind == TaskKind::NativeChild)
+                    .then(|| {
+                        view.external
+                            .as_ref()
+                            .map(|external| external.thread_id.as_str())
+                    })
+                    .flatten()
+            });
+            if let Some(thread_id) = child_thread_id {
+                if view.kind != TaskKind::NativeChild
+                    || thread_id.is_empty()
+                    || thread_id.len() > 1024
+                    || view
+                        .external
+                        .as_ref()
+                        .is_some_and(|external| external.thread_id != thread_id)
+                    || children.insert(thread_id.to_owned(), view.id).is_some()
+                {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "native child thread identities must be unique and consistent",
+                    ));
                 }
             }
+            if view.kind == TaskKind::NativeChild
+                && view.external.as_ref().is_some_and(|external| {
+                    external.turn_id.is_empty()
+                        || external.generation == 0
+                        || external.generation != view.attempt
+                })
+            {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "native child external turns must match the task attempt",
+                ));
+            }
+            let mut internal_view = view.clone();
+            // children 是唯一 thread→task 身份来源；快照字段只服务只读投影。
+            internal_view.child_thread_id = None;
             tasks.insert(
                 view.id,
                 Task {
-                    view: view.clone(),
+                    view: internal_view,
                     text: None,
                     queued_at: Instant::now(),
                     ready_seq: next_seq,
@@ -837,6 +864,7 @@ impl Scheduler {
                         priority: spec.priority,
                         blocked_reason: None,
                         external: None,
+                        child_thread_id: None,
                         pause_requested: false,
                         cancel_requested: false,
                         pending_requests: 0,
@@ -1015,6 +1043,7 @@ impl Scheduler {
                     priority: 0,
                     blocked_reason: None,
                     external: None,
+                    child_thread_id: None,
                     pause_requested: false,
                     cancel_requested: self.stopping,
                     pending_requests: 0,
@@ -1344,7 +1373,20 @@ impl Scheduler {
 
     pub fn snapshot(&self) -> SchedulerSnapshot {
         SchedulerSnapshot {
-            tasks: self.tasks.values().map(|task| task.view.clone()).collect(),
+            tasks: self
+                .tasks
+                .values()
+                .map(|task| {
+                    let mut view = task.view.clone();
+                    if view.kind == TaskKind::NativeChild {
+                        view.child_thread_id = self
+                            .children
+                            .iter()
+                            .find_map(|(thread, id)| (*id == view.id).then(|| thread.clone()));
+                    }
+                    view
+                })
+                .collect(),
             ready_roots: self.ordered_ready(),
             active_root: self.active_root,
             paused: self.paused,
@@ -1697,6 +1739,114 @@ mod tests {
         let mut restored = Scheduler::restore(&original.snapshot()).unwrap();
         assert_eq!(restored.snapshot().tasks.len(), 2);
         assert!(restored.dispatch().is_none());
+    }
+
+    #[test]
+    fn child_thread_identity_is_projected_from_the_scheduler_index() {
+        let mut scheduler = Scheduler::default();
+        let child = scheduler
+            .register_child("child-thread", None, "child")
+            .unwrap();
+        assert_eq!(scheduler.task(child).unwrap().child_thread_id, None);
+        assert_eq!(
+            scheduler.snapshot().tasks[0].child_thread_id.as_deref(),
+            Some("child-thread")
+        );
+
+        let mut legacy_started = scheduler.snapshot();
+        legacy_started.tasks[0].attempt = 2;
+        legacy_started.tasks[0].state = TaskState::Running;
+        legacy_started.tasks[0].external = Some(ExternalTurn {
+            thread_id: "child-thread".into(),
+            turn_id: "turn-2".into(),
+            generation: 2,
+        });
+        legacy_started.tasks[0].native_slot_reserved = true;
+        legacy_started.tasks[0].child_thread_id = None;
+        legacy_started.native_slots_reserved = 1;
+        legacy_started.native_turns_observed = 1;
+        let restored = Scheduler::restore(&legacy_started).unwrap();
+        assert_eq!(
+            restored.snapshot().tasks[0].child_thread_id.as_deref(),
+            Some("child-thread")
+        );
+
+        let mut inconsistent = legacy_started;
+        inconsistent.tasks[0].child_thread_id = Some("other-thread".into());
+        assert!(matches!(
+            Scheduler::restore(&inconsistent),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_invalid_child_thread_and_external_identities() {
+        let mut scheduler = Scheduler::default();
+        let child = scheduler
+            .register_child("child-thread", None, "child")
+            .unwrap();
+        let valid = scheduler.snapshot();
+
+        let mut duplicate = valid.clone();
+        let mut second = duplicate.tasks[0].clone();
+        second.id = TaskId(2);
+        duplicate.tasks.push(second);
+        assert!(matches!(
+            Scheduler::restore(&duplicate),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut too_long = valid.clone();
+        too_long.tasks[0].child_thread_id = Some("x".repeat(1025));
+        assert!(matches!(
+            Scheduler::restore(&too_long),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut root = Scheduler::default();
+        root.enqueue(vec![RootTaskSpec::input("root".into())])
+            .unwrap();
+        let mut root_has_child_identity = root.snapshot();
+        root_has_child_identity.tasks[0].child_thread_id = Some("child-thread".into());
+        assert!(matches!(
+            Scheduler::restore(&root_has_child_identity),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut started = valid;
+        started.tasks[0].attempt = 2;
+        started.tasks[0].state = TaskState::Running;
+        started.tasks[0].external = Some(ExternalTurn {
+            thread_id: "child-thread".into(),
+            turn_id: "turn-2".into(),
+            generation: 2,
+        });
+        started.tasks[0].native_slot_reserved = true;
+        started.native_slots_reserved = 1;
+        started.native_turns_observed = 1;
+
+        let mut stale_generation = started.clone();
+        stale_generation.tasks[0]
+            .external
+            .as_mut()
+            .unwrap()
+            .generation = 1;
+        assert!(matches!(
+            Scheduler::restore(&stale_generation),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+        let mut empty_turn = started;
+        empty_turn.tasks[0]
+            .external
+            .as_mut()
+            .unwrap()
+            .turn_id
+            .clear();
+        assert!(matches!(
+            Scheduler::restore(&empty_turn),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+        assert_eq!(child, TaskId(1));
     }
 
     #[test]

@@ -59,6 +59,7 @@ def main():
     if os.name == "nt":
         run([sys.executable, str(fixtures / "windows_terminal_input_check.py"), "--fixture", str(binary.parent / "examples/input_fixture.exe")])
         run([sys.executable, str(fixtures / "timeline_tui_check.py"), "--binary", str(binary)])
+        run([sys.executable, str(fixtures / "workflow_tui_check.py"), "--binary", str(binary)])
         run([sys.executable, str(fixtures / "process_identity_check.py")])
         run([sys.executable, str(fixtures / "process_ownership_check.py"), "--fixture", str(binary.parent / "examples/process_fixture.exe")])
     if args.live:

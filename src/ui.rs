@@ -114,6 +114,9 @@ struct LocalState {
     help: bool,
     tasks: bool,
     task_id: Option<TaskId>,
+    task_scroll: usize,
+    task_manual_scroll: bool,
+    task_link_cursor: Option<WorkflowLinkCursor>,
     confirm_stop: bool,
     request_selection: Option<RequestRef>,
     request_panel: bool,
@@ -124,6 +127,22 @@ struct LocalState {
     answering: Option<RequestRef>,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowLinkKind {
+    Dependency,
+    Gate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkflowLinkCursor {
+    origin: TaskId,
+    origin_attempt: u64,
+    target: TaskId,
+    kind: WorkflowLinkKind,
+    index: usize,
+    captured_attempt: Option<u64>,
 }
 
 #[derive(Default)]
@@ -356,6 +375,9 @@ pub async fn run_history(
 }
 
 fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
+    if local.tasks {
+        return;
+    }
     sync_local_requests(local, snapshot);
     if local.search.visible {
         local.search.paste(text);
@@ -715,6 +737,33 @@ fn handle_key(
         }
         return false;
     }
+    if local.tasks {
+        let plain = key.modifiers.is_empty();
+        let allowed = control && matches!(key.code, KeyCode::Char('q' | 'd' | 'c'))
+            || plain
+                && matches!(
+                    key.code,
+                    KeyCode::F(2)
+                        | KeyCode::F(4)
+                        | KeyCode::F(5)
+                        | KeyCode::F(6)
+                        | KeyCode::F(7)
+                        | KeyCode::F(8)
+                        | KeyCode::F(9)
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Enter
+                        | KeyCode::Esc
+                        | KeyCode::Char('d' | 'g' | '+' | '-')
+                );
+        if !allowed {
+            return false;
+        }
+    }
     if key.code != KeyCode::F(9) {
         local.confirm_stop = false;
     }
@@ -811,6 +860,60 @@ fn handle_key(
         KeyCode::F(4) => {
             local.request_panel = false;
             local.tasks = !local.tasks;
+            local.task_scroll = 0;
+            local.task_manual_scroll = false;
+            local.task_link_cursor = None;
+        }
+        KeyCode::PageUp if local.tasks => {
+            local.task_manual_scroll = true;
+            local.task_scroll = local.task_scroll.saturating_sub(8);
+        }
+        KeyCode::PageDown if local.tasks => {
+            local.task_manual_scroll = true;
+            local.task_scroll = local.task_scroll.saturating_add(8);
+        }
+        KeyCode::Home if local.tasks => {
+            local.task_manual_scroll = true;
+            local.task_scroll = 0;
+        }
+        KeyCode::End if local.tasks => {
+            local.task_manual_scroll = true;
+            local.task_scroll = usize::MAX;
+        }
+        KeyCode::Char('d') if local.tasks && key.modifiers.is_empty() => {
+            navigate_workflow_link(snapshot, local, WorkflowLinkKind::Dependency);
+        }
+        KeyCode::Char('g') if local.tasks && key.modifiers.is_empty() => {
+            navigate_workflow_link(snapshot, local, WorkflowLinkKind::Gate);
+        }
+        KeyCode::Enter if local.tasks && !control => {
+            if let Some(task) = selected_task(snapshot, local) {
+                if stale_gate_link(snapshot, local, task) {
+                    local.notice = Some(
+                        "The captured Gate attempt is no longer current; use Up/Down to reselect the task before opening it.".into(),
+                    );
+                } else {
+                    match workflow_conversation(snapshot, task) {
+                        ConversationTarget::Root => {
+                            local.notice = None;
+                            local.agent_id = None;
+                            local.conversation_focus = None;
+                            local.scroll_from_bottom = 0;
+                            local.tasks = false;
+                        }
+                        ConversationTarget::Child(agent) => {
+                            local.notice = None;
+                            local.agent_id = Some(agent.info.id.clone());
+                            local.conversation_focus = None;
+                            local.scroll_from_bottom = 0;
+                            local.tasks = false;
+                        }
+                        ConversationTarget::Unavailable(message) => {
+                            local.notice = Some(message.into());
+                        }
+                    }
+                }
+            }
         }
         KeyCode::F(5) => {
             send(
@@ -825,17 +928,23 @@ fn handle_key(
         }
         KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) if local.tasks => {
             if let Some(task) = selected_task(snapshot, local) {
-                let command = match key.code {
-                    KeyCode::F(6) if task.pause_requested => SchedulerCommand::Resume(task.id),
-                    KeyCode::F(6) => SchedulerCommand::Pause(task.id),
-                    KeyCode::F(7) => SchedulerCommand::Cancel(task.id),
-                    _ => SchedulerCommand::Retry(task.id),
-                };
-                let attempt = TaskAttempt {
-                    task: task.id,
-                    attempt: task.attempt,
-                };
-                send(Command::ScheduleTask { attempt, command }, tx, local);
+                if stale_gate_link(snapshot, local, task) {
+                    local.notice = Some(
+                        "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
+                    );
+                } else {
+                    let command = match key.code {
+                        KeyCode::F(6) if task.pause_requested => SchedulerCommand::Resume(task.id),
+                        KeyCode::F(6) => SchedulerCommand::Pause(task.id),
+                        KeyCode::F(7) => SchedulerCommand::Cancel(task.id),
+                        _ => SchedulerCommand::Retry(task.id),
+                    };
+                    let attempt = TaskAttempt {
+                        task: task.id,
+                        attempt: task.attempt,
+                    };
+                    send(Command::ScheduleTask { attempt, command }, tx, local);
+                }
             }
         }
         KeyCode::F(9) if local.tasks => {
@@ -848,41 +957,50 @@ fn handle_key(
             }
         }
         KeyCode::Up | KeyCode::Down if local.tasks => {
-            let tasks = &snapshot.scheduler.tasks;
+            let tasks = project_workflow(snapshot).order;
             if !tasks.is_empty() {
                 let index = selected_task(snapshot, local)
-                    .and_then(|task| tasks.iter().position(|other| other.id == task.id))
+                    .and_then(|task| tasks.iter().position(|id| *id == task.id))
                     .unwrap_or(0);
                 let next = if key.code == KeyCode::Up {
                     index.saturating_sub(1)
                 } else {
                     (index + 1).min(tasks.len() - 1)
                 };
-                local.task_id = Some(tasks[next].id);
+                local.task_id = Some(tasks[next]);
+                local.task_scroll = 0;
+                local.task_manual_scroll = false;
+                local.task_link_cursor = None;
             }
         }
-        KeyCode::Char('+') | KeyCode::Char('-') if local.tasks && !control => {
+        KeyCode::Char('+') | KeyCode::Char('-') if local.tasks && key.modifiers.is_empty() => {
             if let Some(task) = selected_task(snapshot, local) {
-                let priority = task.priority
-                    + if key.code == KeyCode::Char('+') {
-                        1
-                    } else {
-                        -1
-                    };
-                send(
-                    Command::ScheduleTask {
-                        attempt: TaskAttempt {
-                            task: task.id,
-                            attempt: task.attempt,
+                if stale_gate_link(snapshot, local, task) {
+                    local.notice = Some(
+                        "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
+                    );
+                } else {
+                    let priority = task.priority
+                        + if key.code == KeyCode::Char('+') {
+                            1
+                        } else {
+                            -1
+                        };
+                    send(
+                        Command::ScheduleTask {
+                            attempt: TaskAttempt {
+                                task: task.id,
+                                attempt: task.attempt,
+                            },
+                            command: SchedulerCommand::Reprioritize {
+                                task_id: task.id,
+                                priority,
+                            },
                         },
-                        command: SchedulerCommand::Reprioritize {
-                            task_id: task.id,
-                            priority,
-                        },
-                    },
-                    tx,
-                    local,
-                );
+                        tx,
+                        local,
+                    );
+                }
             }
         }
         KeyCode::F(1) => local.help = !local.help,
@@ -924,6 +1042,13 @@ fn handle_key(
         KeyCode::Esc => {
             if local.request_panel {
                 local.request_panel = false;
+                return false;
+            }
+            if local.tasks {
+                local.tasks = false;
+                local.task_link_cursor = None;
+                local.task_scroll = 0;
+                local.task_manual_scroll = false;
                 return false;
             }
             local.help = false;
@@ -1041,6 +1166,259 @@ fn selected_task<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&
         .task_id
         .and_then(|id| snapshot.scheduler.tasks.iter().find(|task| task.id == id))
         .or_else(|| snapshot.scheduler.tasks.first())
+}
+
+/// 工作流行序只根据快照中的显式 parent 建树；依赖与 Gate 目标单独呈现。
+fn workflow_order(tasks: &[TaskSnapshot]) -> Vec<TaskId> {
+    fn visit(
+        id: TaskId,
+        children: &BTreeMap<TaskId, Vec<TaskId>>,
+        seen: &mut HashSet<TaskId>,
+        output: &mut Vec<TaskId>,
+    ) {
+        if !seen.insert(id) {
+            return;
+        }
+        output.push(id);
+        if let Some(direct) = children.get(&id) {
+            for child in direct {
+                visit(*child, children, seen, output);
+            }
+        }
+    }
+    let known = tasks.iter().map(|task| task.id).collect::<HashSet<_>>();
+    let mut children = BTreeMap::<TaskId, Vec<TaskId>>::new();
+    for task in tasks {
+        if let Some(parent) = task.parent.filter(|parent| known.contains(parent)) {
+            children.entry(parent).or_default().push(task.id);
+        }
+    }
+    for direct in children.values_mut() {
+        direct.sort();
+    }
+    let mut roots = tasks
+        .iter()
+        .filter(|task| task.parent.is_none() || !known.contains(&task.parent.unwrap()))
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    roots.sort();
+    let mut seen = HashSet::new();
+    let mut output = Vec::with_capacity(tasks.len());
+    for root in roots {
+        visit(root, &children, &mut seen, &mut output);
+    }
+    for task in tasks {
+        visit(task.id, &children, &mut seen, &mut output);
+    }
+    output
+}
+
+struct WorkflowProjection {
+    order: Vec<TaskId>,
+    agents: HashMap<String, AgentTreeRow>,
+}
+
+/// 键盘导航和 F4 共用任务序；关联 Agent 的顺序/层级沿用既有 DFS 投影。
+fn project_workflow(snapshot: &CoreSnapshot) -> WorkflowProjection {
+    let agents = project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref())
+        .into_iter()
+        .filter_map(|row| {
+            snapshot
+                .agents
+                .get(row.index)
+                .map(|agent| (agent.info.id.clone(), row))
+        })
+        .collect();
+    WorkflowProjection {
+        order: workflow_order(&snapshot.scheduler.tasks),
+        agents,
+    }
+}
+
+fn navigate_workflow_link(snapshot: &CoreSnapshot, local: &mut LocalState, kind: WorkflowLinkKind) {
+    let Some(current) = selected_task(snapshot, local) else {
+        local.notice = Some("No workflow task is selected.".into());
+        return;
+    };
+    let cursor = local.task_link_cursor.filter(|cursor| {
+        cursor.kind == kind
+            && cursor.target == current.id
+            && snapshot
+                .scheduler
+                .tasks
+                .iter()
+                .find(|task| task.id == cursor.origin)
+                .is_some_and(|task| task.attempt == cursor.origin_attempt)
+    });
+    let origin = cursor.map_or(current.id, |cursor| cursor.origin);
+    let Some(source) = snapshot
+        .scheduler
+        .tasks
+        .iter()
+        .find(|task| task.id == origin)
+    else {
+        local.notice = Some("The workflow link source is unavailable.".into());
+        return;
+    };
+    let count = match kind {
+        WorkflowLinkKind::Dependency => source.dependencies.len(),
+        WorkflowLinkKind::Gate => source.wait_targets.len(),
+    };
+    if count == 0 {
+        local.notice = Some(match kind {
+            WorkflowLinkKind::Dependency => "Selected task has no dependencies.".into(),
+            WorkflowLinkKind::Gate => "Selected task has no captured Gate wait targets.".into(),
+        });
+        local.task_link_cursor = None;
+        return;
+    }
+    let index = cursor.map_or(0, |cursor| (cursor.index + 1) % count);
+    let (target, captured_attempt) = match kind {
+        WorkflowLinkKind::Dependency => (source.dependencies[index], None),
+        WorkflowLinkKind::Gate => {
+            let target = source.wait_targets[index];
+            (target.task, Some(target.attempt))
+        }
+    };
+    if !snapshot
+        .scheduler
+        .tasks
+        .iter()
+        .any(|task| task.id == target)
+    {
+        local.notice = Some(format!(
+            "Workflow link target #{} is unavailable.",
+            target.0
+        ));
+        local.task_link_cursor = None;
+        return;
+    }
+    local.task_id = Some(target);
+    local.task_scroll = 0;
+    local.task_manual_scroll = false;
+    local.task_link_cursor = Some(WorkflowLinkCursor {
+        origin,
+        origin_attempt: source.attempt,
+        target,
+        kind,
+        index,
+        captured_attempt,
+    });
+    local.notice = None;
+}
+
+fn stale_gate_link(snapshot: &CoreSnapshot, local: &LocalState, task: &TaskSnapshot) -> bool {
+    let Some(cursor) = local
+        .task_link_cursor
+        .filter(|cursor| cursor.kind == WorkflowLinkKind::Gate && cursor.target == task.id)
+    else {
+        return false;
+    };
+    let origin_is_current = snapshot
+        .scheduler
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == cursor.origin)
+        .is_some_and(|origin| origin.attempt == cursor.origin_attempt);
+    !origin_is_current || cursor.captured_attempt != Some(task.attempt)
+}
+
+enum ConversationTarget<'a> {
+    Root,
+    Child(&'a AgentSnapshot),
+    Unavailable(&'static str),
+}
+
+fn workflow_conversation<'a>(
+    snapshot: &'a CoreSnapshot,
+    task: &'a TaskSnapshot,
+) -> ConversationTarget<'a> {
+    match task.kind {
+        crate::scheduler::TaskKind::RootTurn => {
+            let active = snapshot.scheduler.active_root
+                == Some(TaskAttempt {
+                    task: task.id,
+                    attempt: task.attempt,
+                });
+            let current_thread = snapshot.thread_id.as_deref();
+            let current_turn = snapshot.turn_id.as_deref();
+            let exact_turn = task.external.as_ref().is_some_and(|turn| {
+                !turn.turn_id.is_empty()
+                    && turn.generation > 0
+                    && Some(turn.thread_id.as_str()) == current_thread
+                    && Some(turn.turn_id.as_str()) == current_turn
+            });
+            let observed = task.external.as_ref().is_some_and(|turn| {
+                snapshot.observation.activities.iter().any(|activity| {
+                    activity.scope == ActivityScope::Turn
+                        && activity.identity.agent_id == "root"
+                        && activity.identity.task_id == Some(task.id)
+                        && activity.identity.attempt_id == Some(task.attempt)
+                        && activity.identity.thread_id.as_deref() == Some(turn.thread_id.as_str())
+                        && activity.identity.turn_id.as_deref() == Some(turn.turn_id.as_str())
+                        && activity.identity.generation == Some(turn.generation)
+                })
+            });
+            if snapshot.phase != crate::state::SessionPhase::StartingTurn
+                && exact_turn
+                && observed
+                && (!task.state.active() || active)
+            {
+                ConversationTarget::Root
+            } else {
+                ConversationTarget::Unavailable(
+                    "This root task does not match the currently confirmed conversation turn.",
+                )
+            }
+        }
+        crate::scheduler::TaskKind::NativeChild => {
+            let Some(thread_id) = task.child_thread_id.as_deref() else {
+                return ConversationTarget::Unavailable(
+                    "This child task has no confirmed thread identity.",
+                );
+            };
+            if task.external.as_ref().is_some_and(|turn| {
+                turn.thread_id != thread_id
+                    || turn.generation != task.attempt
+                    || turn.generation == 0
+                    || turn.turn_id.is_empty()
+            }) {
+                return ConversationTarget::Unavailable(
+                    "The child task identity is stale or inconsistent.",
+                );
+            }
+            let Some(agent) = snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.info.id == thread_id)
+            else {
+                return ConversationTarget::Unavailable(
+                    "No observed agent is available for this child thread.",
+                );
+            };
+            if let Some(turn) = &task.external {
+                if agent.turn_id.as_deref() == Some(turn.turn_id.as_str())
+                    && agent.generation == turn.generation
+                {
+                    ConversationTarget::Child(agent)
+                } else {
+                    ConversationTarget::Unavailable(
+                        "The child task's observed agent turn is stale or unavailable.",
+                    )
+                }
+            } else if task.attempt == 0
+                && agent.generation == 0
+                && agent.turn_id.is_none()
+                && agent.awaiting_turn
+            {
+                ConversationTarget::Child(agent)
+            } else {
+                ConversationTarget::Unavailable(
+                    "The child thread has started without a matching confirmed task turn.",
+                )
+            }
+        }
+    }
 }
 
 fn selected_agent_id<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> &'a str {
@@ -2224,114 +2602,213 @@ fn draw_tasks(
 ) {
     let scheduler = &snapshot.scheduler;
     let selected = selected_task(snapshot, local);
-    let height = area.height.saturating_sub(2) as usize;
-    let details = if height >= 6 { 3 } else { 0 };
-    let summary = if height > 1 {
-        let width = area.width.saturating_sub(2) as usize;
-        let native_reserved = scheduler
-            .native_slot_capacity
-            .map(|capacity| format!("{}/{}", scheduler.native_slots_reserved, capacity))
-            .unwrap_or_else(|| format!("{}/unavailable", scheduler.native_slots_reserved));
-        let full = vec![format!(
+    let projection = project_workflow(snapshot);
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let viewport = area.height.saturating_sub(2) as usize;
+    let by_id = scheduler
+        .tasks
+        .iter()
+        .map(|task| (task.id, task))
+        .collect::<BTreeMap<_, _>>();
+    let ready = if scheduler.ready_roots.is_empty() {
+        "none".into()
+    } else {
+        scheduler
+            .ready_roots
+            .iter()
+            .map(|id| format!("#{}", id.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut raw = vec![format!(
+        "Workflow: {}{}{} | ready roots: {ready}",
+        if scheduler.paused {
+            "paused"
+        } else {
+            "dispatch active"
+        },
+        if scheduler.stopping {
+            " · stopping"
+        } else {
+            ""
+        },
+        if scheduler.disconnected {
+            " · disconnected"
+        } else {
+            ""
+        },
+    )];
+    let native_reserved = scheduler
+        .native_slot_capacity
+        .map(|capacity| format!("{}/{}", scheduler.native_slots_reserved, capacity))
+        .unwrap_or_else(|| format!("{}/unavailable", scheduler.native_slots_reserved));
+    let summaries = [
+        vec![format!(
             "Root slots: {} | native reserved: {} | native turns observed: {}",
             scheduler.root_slots_reserved, native_reserved, scheduler.native_turns_observed
-        )];
-        let medium = vec![
+        )],
+        vec![
             format!(
                 "Root slots: {} | native reserved: {}",
                 scheduler.root_slots_reserved, native_reserved
             ),
             format!("Native turns observed: {}", scheduler.native_turns_observed),
-        ];
-        let narrow = vec![
-            format!("native reserved: {}", native_reserved),
+        ],
+        vec![
+            format!("native reserved: {native_reserved}"),
             format!("native observed: {}", scheduler.native_turns_observed),
-        ];
-        let compact = vec![
-            format!("N reserved: {}", native_reserved),
+        ],
+        vec![
+            format!("N reserved: {native_reserved}"),
             format!("N observed: {}", scheduler.native_turns_observed),
-        ];
-        [full, medium, narrow, compact]
+        ],
+    ];
+    raw.extend(
+        summaries
             .into_iter()
             .find(|candidate| candidate.iter().all(|line| line.width() <= width))
             .unwrap_or_else(|| {
                 vec![
-                    format!("N:{}", native_reserved),
+                    format!("N:{native_reserved}"),
                     format!("O:{}", scheduler.native_turns_observed),
                 ]
-            })
-    } else {
-        Vec::new()
-    };
-    let capacity = height.saturating_sub(details + summary.len()).max(1);
-    let index = selected
-        .and_then(|task| scheduler.tasks.iter().position(|other| other.id == task.id))
-        .unwrap_or(0);
-    let start = index.saturating_sub(capacity.saturating_sub(1));
-    let mut lines = Vec::new();
-    for line in summary {
-        lines.push(Line::from(line));
-    }
-    for task in scheduler.tasks.iter().skip(start).take(capacity) {
+            }),
+    );
+    let mut selected_visual = None;
+    for id in &projection.order {
+        let Some(task) = by_id.get(id).copied() else {
+            continue;
+        };
+        let selected_row = selected.is_some_and(|selected| selected.id == task.id);
+        let marker = if selected_row { ">" } else { " " };
+        let tree = if task.parent.is_some() {
+            "  └─ "
+        } else {
+            ""
+        };
         let slot = match task.kind {
             crate::scheduler::TaskKind::NativeChild if task.native_slot_reserved => {
-                " [slot reserved]"
+                " · slot reserved"
             }
-            crate::scheduler::TaskKind::NativeChild => " [slot free]",
+            crate::scheduler::TaskKind::NativeChild => " · slot free",
             crate::scheduler::TaskKind::RootTurn => "",
         };
-        lines.push(Line::from(display_text(&format!(
-            "{} #{} {:?}{} a{} p{} {}{} {}",
-            if selected.is_some_and(|selected| selected.id == task.id) {
-                ">"
-            } else {
-                " "
-            },
-            task.id.0,
-            task.state,
-            slot,
-            task.attempt,
-            task.priority,
+        let flags = format!(
+            "{}{}",
             if task.pause_requested {
-                "pause requested "
+                " · pause requested"
             } else {
                 ""
             },
             if task.cancel_requested {
-                "cancel requested "
+                " · cancel requested"
             } else {
                 ""
+            }
+        );
+        let text = format!(
+            "{marker}{tree}#{} {:?} · attempt {} · priority {}{slot}{flags} · {}",
+            task.id.0, task.state, task.attempt, task.priority, task.title
+        );
+        if selected_row {
+            selected_visual = Some(
+                raw.iter()
+                    .map(|line| wrap(line, width).len())
+                    .sum::<usize>(),
+            );
+        }
+        raw.push(text);
+    }
+    if let Some(task) = selected {
+        raw.push(format!(
+            "Task #{}: {} · {:?} · attempt {} · blocked: {:?} · requests: {}",
+            task.id.0,
+            task.title,
+            task.state,
+            task.attempt,
+            task.blocked_reason,
+            task.pending_requests
+        ));
+        let parent = task.parent.map_or_else(
+            || match task.kind {
+                crate::scheduler::TaskKind::RootTurn => "none".into(),
+                crate::scheduler::TaskKind::NativeChild => "unconfirmed / unavailable".into(),
             },
-            task.title
-        ))));
+            |id| task_reference(id, &by_id),
+        );
+        raw.push(format!(
+            "Parent: {parent} | dependency policy: {:?} | failure policy: {:?}",
+            task.policy, task.failure
+        ));
+        if task.dependencies.is_empty() {
+            raw.push("Dependencies: none".into());
+        } else {
+            raw.push(format!("Dependencies ({:?}):", task.policy));
+            for id in &task.dependencies {
+                raw.push(format!("  {}", task_reference(*id, &by_id)));
+            }
+        }
+        if task.wait_targets.is_empty() {
+            raw.push("Gate wait targets: none".into());
+        } else {
+            raw.push("Gate wait targets (captured attempts):".into());
+            for target in &task.wait_targets {
+                let current = by_id.get(&target.task).map_or_else(
+                    || format!("#{} unavailable", target.task.0),
+                    |linked| {
+                        format!(
+                            "{} · current attempt {} · {:?}",
+                            task_reference(target.task, &by_id),
+                            linked.attempt,
+                            linked.state
+                        )
+                    },
+                );
+                raw.push(format!(
+                    "  captured #{} attempt {} → {current}",
+                    target.task.0, target.attempt
+                ));
+            }
+        }
+        raw.push(format!(
+            "Conversation: {}",
+            workflow_agent_label(snapshot, task, &projection.agents)
+        ));
+        if let Some(cursor) = local
+            .task_link_cursor
+            .filter(|cursor| cursor.target == task.id)
+        {
+            if let Some(captured) = cursor.captured_attempt {
+                raw.push(format!(
+                    "Selected Gate link captured attempt {captured}; current task attempt is {}.",
+                    task.attempt
+                ));
+            }
+        }
+    } else {
+        raw.push("No workflow tasks.".into());
     }
-    if let Some(task) = selected.filter(|_| details > 0) {
-        lines.push(Line::from(format!(
-            "Dependencies: {:?} | wait: {:?}",
-            task.dependencies, task.wait_targets
-        )));
-        lines.push(Line::from(format!(
-            "Blocked: {:?} | requests: {}",
-            task.blocked_reason, task.pending_requests
-        )));
-        lines.push(Line::from(display_text(
-            &task.external.as_ref().map_or_else(
-                || "External turn: pending".into(),
-                |external| {
-                    format!(
-                        "External: {} / {} / gen {}",
-                        external.thread_id, external.turn_id, external.generation
-                    )
-                },
-            ),
-        )));
+    let lines = raw
+        .iter()
+        .flat_map(|text| wrap(text, width).into_iter().map(Line::from))
+        .collect::<Vec<_>>();
+    let max_scroll = lines.len().saturating_sub(viewport);
+    let mut scroll = local.task_scroll.min(max_scroll);
+    if !local.task_manual_scroll {
+        if let Some(selected_row) = selected_visual {
+            if selected_row < scroll {
+                scroll = selected_row;
+            } else if selected_row >= scroll.saturating_add(viewport) && viewport > 0 {
+                scroll = selected_row + 1 - viewport;
+            }
+        }
     }
+    let title =
+        " Workflow · ↑/↓ select · d dependencies · g Gate · Enter conversation · PgUp/PgDn scroll ";
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Tasks · F4 close · F5 pause dispatch "),
-        ),
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -2417,6 +2894,37 @@ fn project_agent_tree(agents: &[AgentSnapshot], root_id: Option<&str>) -> Vec<Ag
         }
     }
     rows
+}
+
+fn task_reference(id: TaskId, tasks: &BTreeMap<TaskId, &TaskSnapshot>) -> String {
+    tasks.get(&id).map_or_else(
+        || format!("#{} unavailable", id.0),
+        |task| format!("#{} {} [{:?}]", id.0, task.title, task.state),
+    )
+}
+
+fn workflow_agent_label(
+    snapshot: &CoreSnapshot,
+    task: &TaskSnapshot,
+    agent_rows: &HashMap<String, AgentTreeRow>,
+) -> String {
+    match workflow_conversation(snapshot, task) {
+        ConversationTarget::Root => format!(
+            "root thread {} · current task attempt {}",
+            snapshot.thread_id.as_deref().unwrap_or("unknown"),
+            task.attempt
+        ),
+        ConversationTarget::Child(agent) => {
+            let depth = agent_rows
+                .get(&agent.info.id)
+                .map_or("unknown".to_string(), |row| row.depth.to_string());
+            format!(
+                "agent {} · Agent tree depth {} · generation {} · {:?}",
+                agent.info.id, depth, agent.generation, agent.outcome
+            )
+        }
+        ConversationTarget::Unavailable(message) => message.into(),
+    }
 }
 
 fn gate_status(snapshot: &CoreSnapshot, gate: &crate::state::GateSnapshot) -> String {
@@ -3655,7 +4163,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            assert!(rendered.contains("Tasks · F4"), "{rendered}");
+            assert!(rendered.contains("Workflow"), "{rendered}");
             assert!(rendered.contains("#1 Running"), "{rendered}");
             if width >= 80 {
                 assert!(rendered.replace(' ', "").contains("任务一中文"));
@@ -3706,6 +4214,12 @@ mod tests {
         );
         local.editor.insert("explicit followup");
         handle_key(
+            KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             &snapshot,
             &mut local,
@@ -3751,6 +4265,7 @@ mod tests {
             priority: 0,
             blocked_reason: None,
             external: None,
+            child_thread_id: None,
             pause_requested: false,
             cancel_requested: false,
             pending_requests: 0,
@@ -3776,6 +4291,7 @@ mod tests {
                 turn_id: "turn-1".into(),
                 generation: 1,
             }),
+            child_thread_id: Some("child-reserved".into()),
             pause_requested: false,
             cancel_requested: false,
             pending_requests: 0,
@@ -3797,6 +4313,7 @@ mod tests {
             priority: 0,
             blocked_reason: None,
             external: None,
+            child_thread_id: Some("child-free".into()),
             pause_requested: false,
             cancel_requested: false,
             pending_requests: 0,
@@ -3879,6 +4396,711 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(unavailable_rendered.contains("native reserved: 12/unavailable"));
+    }
+
+    #[test]
+    fn workflow_enter_opens_only_the_exact_child_turn_and_keeps_the_draft() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+        use crate::scheduler::{ExternalTurn, SchedulerSnapshot, TaskKind, TaskState};
+
+        let task = TaskSnapshot {
+            id: TaskId(2),
+            kind: TaskKind::NativeChild,
+            state: TaskState::Running,
+            title: "child".into(),
+            parent: None,
+            attempt: 3,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: Some(ExternalTurn {
+                thread_id: "child-thread".into(),
+                turn_id: "turn-3".into(),
+                generation: 3,
+            }),
+            child_thread_id: Some("child-thread".into()),
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: false,
+            native_slot_reserved: true,
+            cancellation_epoch: 0,
+        };
+        let agent = AgentSnapshot {
+            info: AgentInfo {
+                id: "child-thread".into(),
+                parent_id: "root-thread".into(),
+                path: None,
+                nickname: None,
+                role: None,
+                model: None,
+                confirmed: true,
+            },
+            generation: 3,
+            turn_id: Some("turn-3".into()),
+            outcome: None,
+            awaiting_turn: false,
+            usage: Default::default(),
+        };
+        let snapshot = CoreSnapshot {
+            agents: vec![agent.clone()],
+            scheduler: SchedulerSnapshot {
+                tasks: vec![task.clone()],
+                native_slots_reserved: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        local.editor.insert("unsent draft");
+        local.tasks = true;
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.tasks);
+        assert_eq!(local.agent_id.as_deref(), Some("child-thread"));
+        assert_eq!(local.editor.text, "unsent draft");
+        assert!(rx.try_recv().is_err());
+
+        let mut stale = snapshot.clone();
+        stale.agents[0].turn_id = Some("newer-turn".into());
+        local.tasks = true;
+        local.agent_id = None;
+        local.notice = None;
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &stale,
+            &mut local,
+            &tx,
+        );
+        assert!(local.tasks);
+        assert!(local.agent_id.is_none());
+        assert!(local.notice.as_deref().unwrap().contains("stale"));
+
+        let mut mismatch = snapshot.clone();
+        mismatch.scheduler.tasks[0].child_thread_id = Some("other-thread".into());
+        local.notice = None;
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mismatch,
+            &mut local,
+            &tx,
+        );
+        assert!(local.tasks);
+        assert!(local.agent_id.is_none());
+        assert!(local.notice.as_deref().unwrap().contains("inconsistent"));
+
+        let mut unbound_started = snapshot;
+        unbound_started.scheduler.tasks[0].external = None;
+        unbound_started.scheduler.tasks[0].attempt = 1;
+        local.notice = None;
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &unbound_started,
+            &mut local,
+            &tx,
+        );
+        assert!(local.tasks);
+        assert!(local.agent_id.is_none());
+        assert!(local
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("without a matching"));
+    }
+
+    #[test]
+    fn workflow_panel_is_modal_and_preserves_task_and_secret_drafts() {
+        let approval = RequestView::decode(
+            RpcId::Number(911),
+            "item/commandExecution/requestApproval",
+            &serde_json::json!({
+                "threadId":"root-thread",
+                "turnId":"turn",
+                "command":"review",
+                "availableDecisions":["accept", "decline", "cancel"]
+            }),
+        )
+        .unwrap();
+        let approval_reference = approval.reference();
+        let snapshot = observed_snapshot_with_requests(&[approval]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState {
+            tasks: true,
+            answers: BTreeMap::from([("secret-question".into(), vec!["SECRET_DRAFT".into()])]),
+            ..Default::default()
+        };
+        local.editor.insert("TASK_DRAFT");
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+        ] {
+            handle_key(key, &snapshot, &mut local, &tx);
+        }
+        handle_paste("SECRET_PASTE", &snapshot, &mut local);
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert_eq!(
+            local.answers.get("secret-question").unwrap(),
+            &["SECRET_DRAFT".to_string()]
+        );
+        assert!(rx.try_recv().is_err());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.tasks);
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert_eq!(
+            local.answers.get("secret-question").unwrap(),
+            &["SECRET_DRAFT".to_string()]
+        );
+        assert!(rx.try_recv().is_err());
+
+        // F2 explicitly opens the request context; approval shortcuts work there.
+        handle_key(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.tasks);
+        assert!(local.request_panel);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::AnswerApproval {
+                request: approval_reference,
+                decision: ApprovalDecision::Accept,
+            }
+        );
+
+        local.tasks = true;
+        local.request_panel = false;
+        handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(rx.try_recv().unwrap(), Command::Interrupt);
+        assert!(handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        ));
+    }
+
+    #[test]
+    fn stale_gate_link_blocks_task_actions_until_explicit_reselection() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+        use crate::scheduler::{ExternalTurn, SchedulerSnapshot, TaskKind, TaskState};
+
+        let origin = TaskSnapshot {
+            id: TaskId(1),
+            kind: TaskKind::RootTurn,
+            state: TaskState::Succeeded,
+            title: "gate owner".into(),
+            parent: None,
+            attempt: 2,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: None,
+            child_thread_id: None,
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: vec![TaskAttempt {
+                task: TaskId(2),
+                attempt: 1,
+            }],
+            root_slot_reserved: false,
+            native_slot_reserved: false,
+            cancellation_epoch: 0,
+        };
+        let target = TaskSnapshot {
+            id: TaskId(2),
+            kind: TaskKind::NativeChild,
+            state: TaskState::Running,
+            title: "current child attempt".into(),
+            parent: Some(TaskId(1)),
+            attempt: 2,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: Some(ExternalTurn {
+                thread_id: "child-thread".into(),
+                turn_id: "turn-2".into(),
+                generation: 2,
+            }),
+            child_thread_id: Some("child-thread".into()),
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: false,
+            native_slot_reserved: true,
+            cancellation_epoch: 0,
+        };
+        let snapshot = CoreSnapshot {
+            agents: vec![AgentSnapshot {
+                info: AgentInfo {
+                    id: "child-thread".into(),
+                    parent_id: "root-thread".into(),
+                    path: None,
+                    nickname: None,
+                    role: None,
+                    model: None,
+                    confirmed: true,
+                },
+                generation: 2,
+                turn_id: Some("turn-2".into()),
+                outcome: None,
+                awaiting_turn: false,
+                usage: Default::default(),
+            }],
+            scheduler: SchedulerSnapshot {
+                tasks: vec![origin, target],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let stale_cursor = WorkflowLinkCursor {
+            origin: TaskId(1),
+            origin_attempt: 2,
+            target: TaskId(2),
+            kind: WorkflowLinkKind::Gate,
+            index: 0,
+            captured_attempt: Some(1),
+        };
+
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
+        ] {
+            let mut local = LocalState {
+                tasks: true,
+                task_id: Some(TaskId(2)),
+                task_link_cursor: Some(stale_cursor),
+                ..Default::default()
+            };
+            handle_key(key, &snapshot, &mut local, &tx);
+            assert!(local.tasks, "stale Gate action {:?} left F4", key.code);
+            assert_eq!(local.task_id, Some(TaskId(2)));
+            assert!(local
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("captured Gate attempt"));
+            assert!(
+                rx.try_recv().is_err(),
+                "stale Gate action {:?} sent a command",
+                key.code
+            );
+        }
+
+        let mut local = LocalState {
+            tasks: true,
+            task_id: Some(TaskId(2)),
+            task_link_cursor: Some(stale_cursor),
+            ..Default::default()
+        };
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.task_id, Some(TaskId(1)));
+        assert!(local.task_link_cursor.is_none());
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.task_id, Some(TaskId(2)));
+        assert!(local.task_link_cursor.is_none());
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.tasks);
+        assert_eq!(local.agent_id.as_deref(), Some("child-thread"));
+        assert!(rx.try_recv().is_err());
+
+        // A cursor from an earlier source attempt is also invalid even if its
+        // captured target attempt happens to match the current task attempt.
+        let mut source_stale = LocalState {
+            tasks: true,
+            task_id: Some(TaskId(2)),
+            task_link_cursor: Some(WorkflowLinkCursor {
+                origin_attempt: 1,
+                captured_attempt: Some(2),
+                ..stale_cursor
+            }),
+            ..Default::default()
+        };
+        handle_key(
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &snapshot,
+            &mut source_stale,
+            &tx,
+        );
+        assert!(source_stale
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("captured Gate attempt"));
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &snapshot,
+            &mut source_stale,
+            &tx,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &snapshot,
+            &mut source_stale,
+            &tx,
+        );
+        assert_eq!(source_stale.task_id, Some(TaskId(2)));
+        assert!(source_stale.task_link_cursor.is_none());
+        handle_key(
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &snapshot,
+            &mut source_stale,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::ScheduleTask {
+                attempt: TaskAttempt {
+                    task: TaskId(2),
+                    attempt: 2,
+                },
+                command: SchedulerCommand::Pause(TaskId(2)),
+            }
+        );
+    }
+
+    #[test]
+    fn root_conversation_link_uses_current_activity_generation_not_task_attempt() {
+        use crate::scheduler::{ExternalTurn, SchedulerSnapshot, TaskKind, TaskState};
+        let root = |id: u64, state: TaskState, generation: u64, turn: &str| TaskSnapshot {
+            id: TaskId(id),
+            kind: TaskKind::RootTurn,
+            state,
+            title: format!("root-{id}"),
+            parent: None,
+            attempt: 1,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: Some(ExternalTurn {
+                thread_id: "root-thread".into(),
+                turn_id: turn.into(),
+                generation,
+            }),
+            child_thread_id: None,
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: state.active(),
+            native_slot_reserved: false,
+            cancellation_epoch: 0,
+        };
+        let mut snapshot = observed_snapshot();
+        snapshot.scheduler = SchedulerSnapshot {
+            tasks: vec![
+                root(1, TaskState::Succeeded, 2, "old-turn"),
+                root(2, TaskState::Running, 3, "current-turn"),
+            ],
+            active_root: Some(TaskAttempt {
+                task: TaskId(2),
+                attempt: 1,
+            }),
+            root_slots_reserved: 1,
+            ..Default::default()
+        };
+        snapshot.turn_id = Some("current-turn".into());
+        snapshot.observation.activities[0].identity = crate::observation::ActivityIdentity {
+            agent_id: "root".into(),
+            task_id: Some(TaskId(2)),
+            attempt_id: Some(1),
+            thread_id: Some("root-thread".into()),
+            turn_id: Some("current-turn".into()),
+            generation: Some(3),
+        };
+        assert!(matches!(
+            workflow_conversation(&snapshot, &snapshot.scheduler.tasks[1]),
+            ConversationTarget::Root
+        ));
+        assert!(matches!(
+            workflow_conversation(&snapshot, &snapshot.scheduler.tasks[0]),
+            ConversationTarget::Unavailable(_)
+        ));
+
+        snapshot.phase = SessionPhase::StartingTurn;
+        snapshot.turn_id = None;
+        snapshot.scheduler.active_root = Some(TaskAttempt {
+            task: TaskId(1),
+            attempt: 1,
+        });
+        assert!(matches!(
+            workflow_conversation(&snapshot, &snapshot.scheduler.tasks[0]),
+            ConversationTarget::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn workflow_links_cycle_and_keep_gate_capture_separate_from_current_attempt() {
+        use crate::scheduler::{SchedulerSnapshot, TaskAttempt, TaskKind, TaskState};
+        let task = |id, attempt, dependencies, wait_targets| TaskSnapshot {
+            id: TaskId(id),
+            kind: TaskKind::NativeChild,
+            state: TaskState::Running,
+            title: format!("child-{id}"),
+            parent: None,
+            attempt,
+            dependencies,
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: None,
+            child_thread_id: Some(format!("thread-{id}")),
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets,
+            root_slot_reserved: false,
+            native_slot_reserved: false,
+            cancellation_epoch: 0,
+        };
+        let snapshot = CoreSnapshot {
+            scheduler: SchedulerSnapshot {
+                tasks: vec![
+                    task(1, 2, Vec::new(), Vec::new()),
+                    task(2, 2, Vec::new(), Vec::new()),
+                    task(
+                        3,
+                        1,
+                        vec![TaskId(1), TaskId(2)],
+                        vec![TaskAttempt {
+                            task: TaskId(2),
+                            attempt: 1,
+                        }],
+                    ),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState {
+            tasks: true,
+            task_id: Some(TaskId(3)),
+            ..Default::default()
+        };
+        handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.task_id, Some(TaskId(1)));
+        handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.task_id, Some(TaskId(2)));
+
+        local.task_id = Some(TaskId(3));
+        local.task_link_cursor = None;
+        handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.task_id, Some(TaskId(2)));
+        assert_eq!(local.task_link_cursor.unwrap().captured_attempt, Some(1));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_tasks(frame, frame.area(), &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("captured attempt 1"), "{rendered}");
+        assert!(rendered.contains("current task attempt is 2"), "{rendered}");
+        assert!(rx.try_recv().is_err());
+
+        local.task_id = Some(TaskId(1));
+        local.task_link_cursor = None;
+        handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("no captured Gate wait targets"));
+    }
+
+    #[test]
+    fn workflow_end_scroll_reaches_the_selected_task_relationship_details() {
+        use crate::scheduler::{SchedulerSnapshot, TaskKind, TaskState};
+        let task = TaskSnapshot {
+            id: TaskId(1),
+            kind: TaskKind::RootTurn,
+            state: TaskState::Queued,
+            title: "a root task with relationship details".into(),
+            parent: None,
+            attempt: 1,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: None,
+            child_thread_id: None,
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: false,
+            native_slot_reserved: false,
+            cancellation_epoch: 0,
+        };
+        let snapshot = CoreSnapshot {
+            scheduler: SchedulerSnapshot {
+                tasks: vec![task],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            tasks: true,
+            task_manual_scroll: true,
+            task_scroll: usize::MAX,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(48, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_tasks(frame, frame.area(), &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Conversation:"), "{rendered}");
+
+        let parent_local = LocalState {
+            tasks: true,
+            task_id: Some(TaskId(1)),
+            task_manual_scroll: true,
+            task_scroll: 0,
+            ..Default::default()
+        };
+        let mut parent_terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+        parent_terminal
+            .draw(|frame| draw_tasks(frame, frame.area(), &snapshot, &parent_local))
+            .unwrap();
+        let parent_rendered: String = parent_terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            parent_rendered.contains("Parent: none"),
+            "{parent_rendered}"
+        );
+
+        let mut child_snapshot = snapshot.clone();
+        child_snapshot.scheduler.tasks[0].kind = TaskKind::NativeChild;
+        let mut child_terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+        child_terminal
+            .draw(|frame| draw_tasks(frame, frame.area(), &child_snapshot, &parent_local))
+            .unwrap();
+        let child_rendered: String = child_terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            child_rendered.contains("Parent: unconfirmed / unavailable"),
+            "{child_rendered}"
+        );
+        assert!(!child_rendered.contains("Parent: none"), "{child_rendered}");
+
+        local.task_scroll = 0;
+        local.task_manual_scroll = true;
+        handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tokio::sync::mpsc::channel(1).0,
+        );
+        assert_eq!(local.task_scroll, usize::MAX);
     }
 
     #[test]

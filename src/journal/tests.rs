@@ -723,6 +723,16 @@ fn native_child_reservation_round_trips_through_journal() {
             .unwrap()
             .native_slot_reserved
     );
+    assert_eq!(
+        captured
+            .tasks
+            .iter()
+            .find(|task| task.id == child)
+            .unwrap()
+            .child_thread_id
+            .as_deref(),
+        Some("native-child")
+    );
 
     let decoded: StoredSnapshot =
         serde_json::from_str(&serde_json::to_string(&captured).unwrap()).unwrap();
@@ -745,6 +755,30 @@ fn native_child_reservation_round_trips_through_journal() {
     let legacy_without_capacity: StoredSnapshot = serde_json::from_value(legacy_json).unwrap();
     assert_eq!(legacy_without_capacity.native_slot_capacity, None);
     assert!(Scheduler::restore(&legacy_without_capacity.scheduler_snapshot()).is_ok());
+
+    let mut old_task_field = serde_json::to_value(&decoded).unwrap();
+    old_task_field["tasks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|task| task["id"] == child.0)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("child_thread_id");
+    let old_task_field: StoredSnapshot = serde_json::from_value(old_task_field).unwrap();
+    let restored_old_task = Scheduler::restore(&old_task_field.scheduler_snapshot()).unwrap();
+    assert_eq!(
+        restored_old_task
+            .snapshot()
+            .tasks
+            .iter()
+            .find(|task| task.id == child)
+            .unwrap()
+            .child_thread_id
+            .as_deref(),
+        Some("native-child")
+    );
 
     let mut legacy = decoded.clone();
     legacy.native_slots_complete = false;

@@ -139,6 +139,8 @@ pub struct StoredTask {
     pub parent: Option<TaskId>,
     pub dependencies: Vec<TaskId>,
     pub external: Option<ExternalTurn>,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
     pub pause_requested: bool,
     pub cancel_requested: bool,
     pub pending_requests: usize,
@@ -276,6 +278,7 @@ impl StoredSnapshot {
                     parent: task.parent,
                     dependencies: task.dependencies.clone(),
                     external: task.external.clone(),
+                    child_thread_id: task.child_thread_id.clone(),
                     pause_requested: task.pause_requested,
                     cancel_requested: task.cancel_requested,
                     pending_requests: task.pending_requests,
@@ -437,6 +440,15 @@ impl StoredSnapshot {
                 priority: task.priority,
                 blocked_reason: task.blocked_reason.clone(),
                 external: task.external.clone(),
+                child_thread_id: task.child_thread_id.clone().or_else(|| {
+                    (task.kind == TaskKind::NativeChild)
+                        .then(|| {
+                            task.external
+                                .as_ref()
+                                .map(|external| external.thread_id.clone())
+                        })
+                        .flatten()
+                }),
                 pause_requested: task.pause_requested,
                 cancel_requested: task.cancel_requested,
                 pending_requests: task.pending_requests,

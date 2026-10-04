@@ -115,7 +115,18 @@ try:
             turn_id = f"turn-{turn_count}"
             send({"id": message["id"], "result": {"turn": {"id": turn_id}}})
             send({"method": "item/agentMessage/delta", "params": {"threadId": "root", "turnId": turn_id, "itemId": "message", "delta": "PRIVATE_OUTPUT 中文"}})
-            if mode.startswith("approval") or mode == "request_details":
+            if mode == "workflow_child":
+                send({"method": "thread/started", "params": {"thread": {
+                    "id": "child-thread", "parentThreadId": "root",
+                    "source": {"subAgent": {"thread_spawn": {
+                        "parent_thread_id": "root", "depth": 1,
+                        "agent_path": "/root/child-thread"}}}}}})
+                send({"method": "turn/started", "params": {
+                    "threadId": "child-thread", "turn": {"id": "child-turn-1"}}})
+                send({"method": "item/agentMessage/delta", "params": {
+                    "threadId": "child-thread", "turnId": "child-turn-1",
+                    "itemId": "child-message", "delta": "CHILD_OUTPUT"}})
+            elif mode.startswith("approval") or mode == "request_details":
                 approval(7)
             elif mode in ("input", "input_hang", "input_paste"):
                 send({"id": "input-request", "method": "item/tool/requestUserInput",
@@ -125,7 +136,7 @@ try:
                 terminal("failed")
             elif mode == "disconnect":
                 break
-            elif mode != "hold":
+            elif mode not in ("hold", "workflow_child"):
                 terminal()
         elif method == "turn/interrupt":
             send({"id": message["id"], "result": {}})

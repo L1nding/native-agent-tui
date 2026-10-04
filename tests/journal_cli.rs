@@ -98,6 +98,7 @@ fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnaps
                 turn_id: "recovery".into(),
                 generation: 1,
             }),
+            child_thread_id: None,
             pause_requested: false,
             cancel_requested: false,
             pending_requests: 0,

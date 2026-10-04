@@ -615,3 +615,16 @@ fn export_identity_budget_fails_explicitly_and_keeps_numeric_request_ids_typed()
         Err(HistoryError::IdentityLimit)
     );
 }
+
+#[test]
+fn child_thread_projection_and_confirmed_external_identity_share_one_redacted_alias() {
+    let mut redactor = Redactor::default();
+    let mut value = serde_json::json!({
+        "child_thread_id": "Bearer PRIVATE_KEY",
+        "external": {"thread_id": "Bearer PRIVATE_KEY", "turn_id": "turn-secret"}
+    });
+    redactor.value("", &mut value).unwrap();
+    assert_eq!(value["child_thread_id"], value["external"]["thread_id"]);
+    assert_ne!(value["child_thread_id"], "Bearer PRIVATE_KEY");
+    assert_ne!(value["external"]["turn_id"], "turn-secret");
+}
