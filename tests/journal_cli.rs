@@ -12,7 +12,7 @@ use native_agent_tui::state::{CoreSnapshot, SessionPhase};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-fn observed_compaction_snapshot(now: tokio::time::Instant) -> CoreSnapshot {
+fn observed_compaction_snapshot(now: tokio::time::Instant, session: &str) -> CoreSnapshot {
     let mut scheduler = Scheduler::default();
     scheduler
         .enqueue(vec![RootTaskSpec::input("PRIVATE_PROMPT".into())])
@@ -28,7 +28,7 @@ fn observed_compaction_snapshot(now: tokio::time::Instant) -> CoreSnapshot {
             },
         )
         .unwrap();
-    let mut observer = Observer::new_at("cli-session".into(), Default::default(), now, Some(1000));
+    let mut observer = Observer::new_at(session.into(), Default::default(), now, Some(1000));
     observer
         .reconcile(
             ObservationFacts {
@@ -199,8 +199,15 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
     let fixture = Fixture::new();
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let now = tokio::time::Instant::now();
-    let core = observed_compaction_snapshot(now);
+    let core = observed_compaction_snapshot(now, "cli-session");
     let journal = Journal::open(&fixture.settings(), cwd, StoredSnapshot::capture(&core)).unwrap();
+    let second_core = observed_compaction_snapshot(now, "cli-session-second");
+    let second_journal = Journal::open(
+        &fixture.settings(),
+        cwd,
+        StoredSnapshot::capture(&second_core),
+    )
+    .unwrap();
     let active_before = fixture.contents();
     let active = fixture.run(&["--replay", "cli-session", "--json-events"]);
     assert!(active.status.success(), "{:?}", active);
@@ -254,14 +261,18 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
     assert!(text_replay.contains("Some(Compaction)"));
     let listing = fixture.run(&["--sessions"]);
     assert!(listing.status.success());
-    assert!(String::from_utf8(listing.stdout)
-        .unwrap()
-        .contains("cli-session"));
+    let listing_text = String::from_utf8(listing.stdout).unwrap();
+    assert!(listing_text.contains("cli-session"));
+    assert!(listing_text.contains("cli-session-second"));
     let search = fixture.run(&["--search", "compaction"]);
     assert!(search.status.success(), "{search:?}");
     let search_text = String::from_utf8(search.stdout).unwrap();
-    assert!(search_text.contains("Search results:"));
+    assert!(
+        search_text.contains("Search results: 8 hits across 2 sessions"),
+        "{search_text}"
+    );
     assert!(search_text.contains("session#1 event"));
+    assert!(search_text.contains("session#2 event"));
     assert!(!search_text.contains("PRIVATE_PROMPT"));
     assert!(search.stderr.is_empty());
     for args in [
@@ -279,4 +290,5 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
         before,
         "Replay and session listing must leave history untouched"
     );
+    drop(second_journal);
 }
