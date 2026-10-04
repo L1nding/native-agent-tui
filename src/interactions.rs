@@ -35,16 +35,6 @@ pub enum ApprovalDecision {
     Cancel,
 }
 
-impl ApprovalDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Accept => "accept",
-            Self::Decline => "decline",
-            Self::Cancel => "cancel",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InputOption {
     pub label: String,
@@ -264,7 +254,12 @@ impl RequestView {
         {
             return Err(InteractionError::DecisionUnavailable);
         }
-        Ok(json!({"decision":decision.as_str()}))
+        let decision = match decision {
+            ApprovalDecision::Accept => "accept",
+            ApprovalDecision::Decline => "decline",
+            ApprovalDecision::Cancel => "cancel",
+        };
+        Ok(json!({"decision": decision}))
     }
 
     pub fn input_result(
