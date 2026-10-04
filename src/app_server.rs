@@ -39,7 +39,7 @@ pub(crate) struct AppServer {
 }
 
 impl AppServer {
-    pub async fn spawn(config: &Config) -> Result<Self, AppServerError> {
+    pub(crate) async fn spawn(config: &Config) -> Result<Self, AppServerError> {
         let version = query_output(
             config,
             &["--version"],
@@ -101,7 +101,7 @@ impl AppServer {
         })
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), AppServerError> {
+    pub(crate) async fn shutdown(&mut self) -> Result<(), AppServerError> {
         if let Some(pipe) = &mut self.pipe {
             pipe.close_writer().await;
         }
