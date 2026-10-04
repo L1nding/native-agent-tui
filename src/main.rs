@@ -205,6 +205,28 @@ async fn execute() -> Result<(), (u8, String)> {
                     };
                     outbox_counts[index] += 1;
                 }
+                let mut shown = 0usize;
+                let mut truncated = false;
+                for record in outbox.records() {
+                    if shown >= 256 {
+                        truncated = true;
+                        break;
+                    }
+                    println!(
+                        "outbox#{} method={} request_id={} task={:?} status={:?} action={:?}",
+                        record.intent.id,
+                        record.intent.method,
+                        record.intent.request_id,
+                        record.intent.task,
+                        record.status,
+                        record.status.recovery_action()
+                    );
+                    shown += 1;
+                }
+                println!(
+                    "outbox_records_shown={} outbox_records_truncated={}",
+                    shown, truncated
+                );
             }
             println!(
                 "outbox_available={} pending={} sent={} confirmed={} unknown={} failed={}",

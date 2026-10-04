@@ -384,7 +384,11 @@ async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() 
     assert!(text.contains("requires_input=true"), "{text}");
     assert!(text.contains("can_resume=false"), "{text}");
     assert!(text.contains("outbox_available=true"), "{text}");
-    assert!(text.contains("unknown=1"), "{text}");
+    assert!(
+        text.contains("outbox#1 method=turn/start request_id=rpc-1")
+            && text.contains("status=Unknown action=InspectExternalOutcome"),
+        "{text}"
+    );
     assert!(
         text.contains("tasks: active=1 unknown=1 queued=1 blocked=1 terminal=1"),
         "{text}"

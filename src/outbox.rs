@@ -72,6 +72,24 @@ pub enum OutboxStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxRecoveryAction {
+    DoNotReplay,
+    InspectExternalOutcome,
+    Terminal,
+}
+
+impl OutboxStatus {
+    pub fn recovery_action(self) -> OutboxRecoveryAction {
+        match self {
+            Self::Pending => OutboxRecoveryAction::DoNotReplay,
+            Self::Sent | Self::Unknown => OutboxRecoveryAction::InspectExternalOutcome,
+            Self::Confirmed | Self::Failed => OutboxRecoveryAction::Terminal,
+        }
+    }
+}
+
 impl OutboxStatus {
     fn can_transition_to(self, next: Self) -> bool {
         matches!(
