@@ -10,7 +10,7 @@ use native_agent_tui::observation::{ChildFact, ObservationFacts, Observer};
 use native_agent_tui::outbox::{Outbox, OutboxIntent};
 use native_agent_tui::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 use native_agent_tui::scheduler::{
-    ExternalTurn, RootTaskSpec, Scheduler, TaskId, TaskKind, TaskState,
+    ExternalTurn, RootTaskSpec, Scheduler, TaskAttempt, TaskId, TaskKind, TaskState,
 };
 use native_agent_tui::state::{CoreSnapshot, SessionPhase};
 
@@ -76,6 +76,12 @@ fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnaps
         ..Default::default()
     };
     let mut snapshot = StoredSnapshot::capture(&core);
+    let active_root = states.iter().enumerate().find_map(|(index, state)| {
+        state.active().then_some(TaskAttempt {
+            task: TaskId((index + 1) as u64),
+            attempt: 1,
+        })
+    });
     snapshot.tasks = states
         .iter()
         .enumerate()
@@ -83,10 +89,14 @@ fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnaps
             id: TaskId((index + 1) as u64),
             kind: TaskKind::RootTurn,
             state: *state,
-            attempt: 0,
+            attempt: if state.active() { 1 } else { 0 },
             parent: None,
             dependencies: Vec::new(),
-            external: None,
+            external: state.active().then_some(ExternalTurn {
+                thread_id: "root".into(),
+                turn_id: "recovery".into(),
+                generation: 1,
+            }),
             pause_requested: false,
             cancel_requested: false,
             pending_requests: 0,
@@ -95,10 +105,20 @@ fn snapshot_with_task_states(session: &str, states: &[TaskState]) -> StoredSnaps
             priority: 0,
             blocked_reason: None,
             wait_targets: Vec::new(),
-            root_slot_reserved: false,
+            root_slot_reserved: state.active(),
             cancellation_epoch: 0,
         })
         .collect();
+    snapshot.ready_roots = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| {
+            (*state == TaskState::Ready).then_some(TaskId((index + 1) as u64))
+        })
+        .collect();
+    snapshot.active_root = active_root;
+    snapshot.root_slots_reserved = states.iter().filter(|state| state.active()).count();
+    snapshot.native_turns_observed = 0;
     snapshot
 }
 

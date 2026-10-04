@@ -316,6 +316,12 @@ impl Scheduler {
                     "native child tasks cannot have dependencies",
                 ));
             }
+            if view.root_slot_reserved && (view.kind != TaskKind::RootTurn || !view.state.active())
+            {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "only active root tasks can reserve root slots",
+                ));
+            }
             if view.priority.abs_diff(0) > 1000 {
                 return Err(SchedulerError::InvalidSnapshot("priority is out of range"));
             }
@@ -359,6 +365,91 @@ impl Scheduler {
                     waiting_children: view.state == TaskState::WaitingChildren,
                 },
             );
+        }
+
+        for view in &snapshot.tasks {
+            if let Some(parent) = view.parent {
+                let parent_task = tasks
+                    .get(&parent)
+                    .ok_or(SchedulerError::UnknownTask(parent))?;
+                if parent_task.view.kind != TaskKind::RootTurn {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "task parents must target root tasks",
+                    ));
+                }
+            }
+        }
+
+        for view in &snapshot.tasks {
+            if view.kind == TaskKind::NativeChild && view.blocked_reason.is_some() {
+                return Err(SchedulerError::InvalidSnapshot(
+                    "native child tasks cannot have blocked reasons",
+                ));
+            }
+            for target in &view.wait_targets {
+                if target.attempt == 0 {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "wait target attempts must be positive",
+                    ));
+                }
+                let target_task = tasks
+                    .get(&target.task)
+                    .ok_or(SchedulerError::UnknownTask(target.task))?;
+                if target_task.view.kind != TaskKind::NativeChild {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "wait targets must reference native children",
+                    ));
+                }
+            }
+            if let Some(reason) = &view.blocked_reason {
+                let dependency = match reason {
+                    BlockedReason::DependencyFailed(id) | BlockedReason::DependencyUnknown(id) => {
+                        *id
+                    }
+                };
+                tasks
+                    .get(&dependency)
+                    .ok_or(SchedulerError::UnknownTask(dependency))?;
+                if !view.dependencies.contains(&dependency) {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "blocked reason must reference a direct dependency",
+                    ));
+                }
+                if !matches!(
+                    view.state,
+                    TaskState::Blocked | TaskState::Paused | TaskState::Cancelled
+                ) {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "blocked reason requires a blocked, paused, or cancelled task",
+                    ));
+                }
+                let dependency_task = tasks.get(&dependency).unwrap();
+                let matches_dependency_state = match reason {
+                    BlockedReason::DependencyFailed(_) => {
+                        matches!(
+                            dependency_task.view.state,
+                            TaskState::Failed | TaskState::Cancelled
+                        ) || matches!(dependency_task.view.state, TaskState::Blocked)
+                            && matches!(
+                                dependency_task.view.blocked_reason,
+                                Some(BlockedReason::DependencyFailed(_))
+                            )
+                    }
+                    BlockedReason::DependencyUnknown(_) => {
+                        dependency_task.view.state == TaskState::Unknown
+                            || matches!(dependency_task.view.state, TaskState::Blocked)
+                                && matches!(
+                                    dependency_task.view.blocked_reason,
+                                    Some(BlockedReason::DependencyUnknown(_))
+                                )
+                    }
+                };
+                if !matches_dependency_state {
+                    return Err(SchedulerError::InvalidSnapshot(
+                        "blocked reason does not match dependency state",
+                    ));
+                }
+            }
         }
 
         let mut dependents = BTreeMap::<TaskId, BTreeSet<TaskId>>::new();
@@ -451,6 +542,26 @@ impl Scheduler {
         } else {
             None
         };
+        let active_roots: Vec<_> = tasks
+            .values()
+            .filter(|task| task.view.kind == TaskKind::RootTurn && task.view.state.active())
+            .map(|task| TaskAttempt {
+                task: task.view.id,
+                attempt: task.view.attempt,
+            })
+            .collect();
+        if active_roots.len() > 1 {
+            return Err(SchedulerError::InvalidSnapshot(
+                "multiple root tasks are active",
+            ));
+        }
+        if active_root.is_none() && !active_roots.is_empty()
+            || active_root.is_some() && active_roots != vec![active_root.unwrap()]
+        {
+            return Err(SchedulerError::InvalidSnapshot(
+                "active root does not match root task states",
+            ));
+        }
         if snapshot.disconnected && active_root.is_some() {
             return Err(SchedulerError::InvalidSnapshot(
                 "disconnected workflow cannot have an active root",
@@ -1527,6 +1638,188 @@ mod tests {
         assert!(matches!(
             Scheduler::restore(&invalid_active),
             Err(SchedulerError::UnknownTask(TaskId(99)))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_inconsistent_parent_and_child_slot_facts() {
+        let mut original = Scheduler::default();
+        original.enqueue(vec![simple(1, &[])]).unwrap();
+        let first_child = original.register_child("child-1", None, "child").unwrap();
+        let second_child = original.register_child("child-2", None, "child").unwrap();
+
+        let mut wrong_parent = original.snapshot();
+        wrong_parent
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == second_child)
+            .unwrap()
+            .parent = Some(first_child);
+        assert!(matches!(
+            Scheduler::restore(&wrong_parent),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut reserved_child = original.snapshot();
+        reserved_child
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == first_child)
+            .unwrap()
+            .root_slot_reserved = true;
+        assert!(matches!(
+            Scheduler::restore(&reserved_child),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_invalid_wait_targets_and_blocked_reasons() {
+        let mut original = Scheduler::default();
+        original
+            .enqueue(vec![simple(1, &[]), simple(2, &[1]), simple(3, &[])])
+            .unwrap();
+        let child = original.register_child("child", None, "child").unwrap();
+
+        let mut zero_attempt = original.snapshot();
+        zero_attempt.tasks[0].wait_targets = vec![TaskAttempt {
+            task: child,
+            attempt: 0,
+        }];
+        assert!(matches!(
+            Scheduler::restore(&zero_attempt),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut wrong_wait_target_kind = original.snapshot();
+        wrong_wait_target_kind.tasks[0].wait_targets = vec![TaskAttempt {
+            task: TaskId(1),
+            attempt: 1,
+        }];
+        assert!(matches!(
+            Scheduler::restore(&wrong_wait_target_kind),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut wrong_blocked_reason = original.snapshot();
+        wrong_blocked_reason.tasks[1].blocked_reason =
+            Some(BlockedReason::DependencyFailed(TaskId(3)));
+        assert!(matches!(
+            Scheduler::restore(&wrong_blocked_reason),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn restore_requires_active_root_to_match_active_root_task_states() {
+        let mut original = Scheduler::default();
+        original
+            .enqueue(vec![simple(1, &[]), simple(2, &[])])
+            .unwrap();
+        let active = original.dispatch().unwrap().attempt;
+
+        let mut missing_active_root = original.snapshot();
+        missing_active_root.active_root = None;
+        assert!(matches!(
+            Scheduler::restore(&missing_active_root),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut multiple_active_roots = original.snapshot();
+        multiple_active_roots.tasks[1].state = TaskState::Running;
+        assert!(matches!(
+            Scheduler::restore(&multiple_active_roots),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut valid = original.snapshot();
+        assert_eq!(
+            Scheduler::restore(&valid).unwrap().active_root(),
+            Some(active)
+        );
+        valid.tasks[0].state = TaskState::Ready;
+        assert!(matches!(
+            Scheduler::restore(&valid),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn restore_requires_consistent_root_slots_and_blocked_reasons() {
+        let mut queued = Scheduler::default();
+        queued.enqueue(vec![simple(1, &[])]).unwrap();
+        let mut reserved = queued.snapshot();
+        reserved.tasks[0].root_slot_reserved = true;
+        assert!(matches!(
+            Scheduler::restore(&reserved),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut failed = Scheduler::default();
+        failed
+            .enqueue(vec![simple(1, &[]), simple(2, &[1])])
+            .unwrap();
+        let attempt = failed.dispatch().unwrap().attempt;
+        failed.finish(attempt, ChildOutcome::Failed);
+        let valid_failed = failed.snapshot();
+        assert!(Scheduler::restore(&valid_failed).is_ok());
+
+        let mut paused_blocked = failed;
+        paused_blocked
+            .command(SchedulerCommand::Pause(TaskId(2)))
+            .unwrap();
+        assert_eq!(
+            paused_blocked.task(TaskId(2)).unwrap().state,
+            TaskState::Paused
+        );
+        assert_eq!(
+            paused_blocked.task(TaskId(2)).unwrap().blocked_reason,
+            Some(BlockedReason::DependencyFailed(TaskId(1)))
+        );
+        assert!(Scheduler::restore(&paused_blocked.snapshot()).is_ok());
+
+        let mut wrong_task_state = valid_failed.clone();
+        wrong_task_state.tasks[1].state = TaskState::Queued;
+        assert!(matches!(
+            Scheduler::restore(&wrong_task_state),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut wrong_dependency_state = valid_failed.clone();
+        wrong_dependency_state.tasks[0].state = TaskState::Succeeded;
+        assert!(matches!(
+            Scheduler::restore(&wrong_dependency_state),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut unknown = Scheduler::default();
+        unknown
+            .enqueue(vec![simple(1, &[]), simple(2, &[1])])
+            .unwrap();
+        unknown.dispatch().unwrap();
+        unknown.disconnected();
+        let valid_unknown = unknown.snapshot();
+        assert!(Scheduler::restore(&valid_unknown).is_ok());
+        let mut wrong_unknown_state = valid_unknown.clone();
+        wrong_unknown_state.tasks[1].state = TaskState::Queued;
+        assert!(matches!(
+            Scheduler::restore(&wrong_unknown_state),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut child = Scheduler::default();
+        child.enqueue(vec![simple(1, &[])]).unwrap();
+        let child_id = child.register_child("child", None, "child").unwrap();
+        let mut child_reason = child.snapshot();
+        child_reason
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == child_id)
+            .unwrap()
+            .blocked_reason = Some(BlockedReason::DependencyFailed(TaskId(1)));
+        assert!(matches!(
+            Scheduler::restore(&child_reason),
+            Err(SchedulerError::InvalidSnapshot(_))
         ));
     }
 }
