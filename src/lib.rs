@@ -13,6 +13,7 @@ pub mod interactions;
 pub mod journal;
 pub mod json_events;
 pub mod observation;
+pub mod outbox;
 mod owned_process;
 pub mod protocol;
 pub mod scheduler;
