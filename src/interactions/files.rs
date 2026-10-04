@@ -47,30 +47,8 @@ impl FilePreviews {
         {
             return;
         }
-        let preview = decode(item, seq);
-        for request in requests {
-            if matches!(request.kind, RequestKind::FileApproval)
-                && request.thread_id == thread
-                && request.turn_id == turn
-                && request.details.item_id.as_deref() == Some(id)
-            {
-                request.details.file_preview = Some(preview.clone());
-            }
-        }
-        self.entries
-            .retain(|entry| entry.thread != thread || entry.turn != turn || entry.item != id);
-        let entry = Entry {
-            thread: thread.into(),
-            turn: turn.into(),
-            item: id.into(),
-            preview,
-        };
-        while self.entries.len() >= CACHE_ITEMS
-            || self.entries.iter().map(Entry::bytes).sum::<usize>() + entry.bytes() > CACHE_BYTES
-        {
-            self.entries.pop_front();
-        }
-        self.entries.push_back(entry);
+        let preview = decode(item.get("changes"), seq);
+        self.store(thread, turn, id, preview, requests);
     }
 
     pub fn attach(&self, request: &mut RequestView) {
@@ -88,10 +66,95 @@ impl FilePreviews {
             .map(|entry| entry.preview.clone());
     }
 
+    pub fn observe_patch_updated(
+        &mut self,
+        params: &Value,
+        seq: u64,
+        requests: &mut [RequestView],
+    ) {
+        let (Some(thread), Some(turn), Some(item)) = (
+            params.get("threadId").and_then(Value::as_str),
+            params.get("turnId").and_then(Value::as_str),
+            params.get("itemId").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let Some(changes) = params.get("changes") else {
+            return;
+        };
+        if [thread, turn, item]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 1024)
+            || !changes
+                .as_array()
+                .is_some_and(|changes| changes.iter().all(valid_change))
+        {
+            return;
+        }
+        let preview = decode(Some(changes), seq);
+        self.store(thread, turn, item, preview, requests);
+    }
+
+    fn store(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        item: &str,
+        preview: FilePreview,
+        requests: &mut [RequestView],
+    ) {
+        for request in requests {
+            if matches!(request.kind, RequestKind::FileApproval)
+                && request.thread_id == thread
+                && request.turn_id == turn
+                && request.details.item_id.as_deref() == Some(item)
+            {
+                request.details.file_preview = Some(preview.clone());
+            }
+        }
+        self.entries
+            .retain(|entry| entry.thread != thread || entry.turn != turn || entry.item != item);
+        let entry = Entry {
+            thread: thread.into(),
+            turn: turn.into(),
+            item: item.into(),
+            preview,
+        };
+        while self.entries.len() >= CACHE_ITEMS
+            || self.entries.iter().map(Entry::bytes).sum::<usize>() + entry.bytes() > CACHE_BYTES
+        {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
     pub fn retire(&mut self, thread: &str, turn: &str) {
         self.entries
             .retain(|entry| entry.thread != thread || entry.turn != turn);
     }
+}
+
+fn valid_change(change: &Value) -> bool {
+    let valid_shape = change
+        .get("path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.is_empty() && path.len() <= 4096)
+        && change.get("diff").and_then(Value::as_str).is_some()
+        && matches!(
+            change.pointer("/kind/type").and_then(Value::as_str),
+            Some("add" | "delete" | "update")
+        );
+    if !valid_shape {
+        return false;
+    }
+    let kind = change.pointer("/kind/type").and_then(Value::as_str);
+    kind != Some("update")
+        || change.pointer("/kind/move_path").is_none_or(|move_path| {
+            move_path.is_null()
+                || move_path
+                    .as_str()
+                    .is_some_and(|path| !path.is_empty() && path.len() <= 4096)
+        })
 }
 
 fn append(text: &mut String, value: &str, truncated: &mut bool) {
@@ -104,14 +167,14 @@ fn append(text: &mut String, value: &str, truncated: &mut bool) {
     *truncated |= end < value.len();
 }
 
-fn decode(item: &Value, seq: u64) -> FilePreview {
+fn decode(changes_value: Option<&Value>, seq: u64) -> FilePreview {
     let mut preview = FilePreview {
         text: String::new(),
         source_seq: seq,
         truncated: false,
         unavailable: false,
     };
-    let Some(changes) = item["changes"].as_array() else {
+    let Some(changes) = changes_value.and_then(Value::as_array) else {
         preview.unavailable = true;
         return preview;
     };
@@ -175,5 +238,42 @@ mod tests {
         assert!(request.details.file_preview.is_none());
         cache.retire("root", "one");
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn patch_updates_reject_malformed_move_paths_without_replacing_cached_preview() {
+        let mut cache = FilePreviews::default();
+        let mut requests = [RequestView::decode(
+            RpcId::Number(8),
+            "item/fileChange/requestApproval",
+            &json!({"threadId":"root","turnId":"one","itemId":"file-1"}),
+        )
+        .unwrap()];
+        cache.observe(
+            &json!({"threadId":"root","turnId":"one","item":{"id":"file-1","type":"fileChange","changes":[{"path":"old.rs","kind":{"type":"update"},"diff":"old"}]}}),
+            1,
+            &mut requests,
+        );
+        cache.attach(&mut requests[0]);
+        let old_preview = requests[0].details.file_preview.clone().unwrap();
+
+        cache.observe_patch_updated(
+            &json!({"threadId":"root","turnId":"one","itemId":"file-1","changes":[{"path":"new.rs","kind":{"type":"update","move_path":42},"diff":"new"}]}),
+            2,
+            &mut requests,
+        );
+        cache.attach(&mut requests[0]);
+        assert_eq!(requests[0].details.file_preview, Some(old_preview.clone()));
+        assert_eq!(cache.entries[0].preview, old_preview);
+
+        cache.observe_patch_updated(
+            &json!({"threadId":"root","turnId":"one","itemId":"file-1","changes":[{"path":"new.rs","kind":{"type":"update","move_path":null},"diff":"new"}]}),
+            3,
+            &mut requests,
+        );
+        cache.attach(&mut requests[0]);
+        let updated = requests[0].details.file_preview.as_ref().unwrap();
+        assert_eq!(updated.source_seq, 3);
+        assert!(updated.text.contains("new"));
     }
 }

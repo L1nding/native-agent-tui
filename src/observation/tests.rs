@@ -184,7 +184,7 @@ fn compaction_fact_tracks_lifecycle_unknown_and_legacy_decode() {
     );
     assert_eq!(late_start.compactions[0].total_tokens, Some(16));
 
-    observer
+    assert!(!observer
         .tool(
             &ObservedTool {
                 thread_id: "parent".into(),
@@ -199,7 +199,7 @@ fn compaction_fact_tracks_lifecycle_unknown_and_legacy_decode() {
             },
             now + Duration::from_millis(4),
         )
-        .unwrap();
+        .unwrap());
     let repeated = observer.snapshot_at(2, now + Duration::from_millis(4));
     assert_eq!(
         repeated.compactions[0].status,

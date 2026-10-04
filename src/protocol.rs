@@ -9,6 +9,7 @@ pub const WAIT_TOOL: &str = "wait_for_subagent_completion";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservedToolOutcome {
     Completed,
+    CompletedUnknown,
     Failed,
     Interrupted,
     Unknown,
@@ -37,6 +38,79 @@ pub struct ObservedTool {
     pub outcome: Option<ObservedToolOutcome>,
     pub category: ToolCategory,
     pub compaction: Option<ObservedCompaction>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedToolDetails {
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub parameters: Option<String>,
+    pub result: Option<String>,
+    pub output: Option<String>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<u64>,
+}
+
+const DETAIL_BYTES: usize = 64 * 1024;
+
+fn bounded_text(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?;
+    let mut end = text.len().min(DETAIL_BYTES);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(text[..end].to_owned())
+}
+
+fn bounded_json(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    let text = serde_json::to_string(value).ok()?;
+    let mut end = text.len().min(DETAIL_BYTES);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(text[..end].to_owned())
+}
+
+pub fn decode_observed_tool_details(item: &Value, category: ToolCategory) -> ObservedToolDetails {
+    let command = (category == ToolCategory::Shell)
+        .then(|| bounded_text(item.get("command")))
+        .flatten();
+    let cwd = (category == ToolCategory::Shell)
+        .then(|| bounded_text(item.get("cwd")))
+        .flatten();
+    let parameters = match category {
+        ToolCategory::Mcp | ToolCategory::Dynamic => bounded_json(item.get("arguments")),
+        _ => None,
+    };
+    let result = match category {
+        ToolCategory::Shell => None,
+        ToolCategory::File => item.get("changes").and_then(|changes| {
+            let count = changes.as_array()?.len();
+            Some(format!("file changes: {count}"))
+        }),
+        ToolCategory::Mcp => bounded_json(item.get("result").filter(|v| !v.is_null()))
+            .or_else(|| bounded_json(item.get("error"))),
+        ToolCategory::Dynamic => bounded_json(item.get("contentItems")),
+        _ => bounded_text(item.get("error")),
+    };
+    let output = (category == ToolCategory::Shell)
+        .then(|| bounded_text(item.get("aggregatedOutput")))
+        .flatten();
+    let exit_code = item.get("exitCode").and_then(Value::as_i64);
+    let duration_ms = item.get("durationMs").and_then(Value::as_u64);
+    ObservedToolDetails {
+        command,
+        cwd,
+        parameters,
+        result,
+        output,
+        exit_code,
+        duration_ms,
+    }
 }
 
 /// Numeric facts accepted from a context compaction item. Textual item fields
@@ -95,7 +169,8 @@ pub fn decode_observed_tool(
         return None;
     }
     let item = &params["item"];
-    let category = match item["type"].as_str()? {
+    let item_type = item["type"].as_str()?;
+    let category = match item_type {
         "commandExecution" => ToolCategory::Shell,
         "fileChange" => ToolCategory::File,
         "mcpToolCall" => ToolCategory::Mcp,
@@ -125,40 +200,20 @@ pub fn decode_observed_tool(
             None
         } else {
             Some(match item["status"].as_str() {
-                Some("completed")
-                    if category != ToolCategory::Compaction
-                        && item["exitCode"].as_i64().is_none_or(|code| code == 0)
-                        && item["success"].as_bool() != Some(false)
-                        && item["error"].is_null() =>
-                {
+                Some("completed") if completion_outcome(item) == Some(true) => {
                     ObservedToolOutcome::Completed
                 }
-                Some("completed")
-                    if category == ToolCategory::Compaction
-                        && item
-                            .get("exitCode")
-                            .is_none_or(|code| code.is_null() || code.as_i64() == Some(0))
-                        && item.get("success").is_none_or(|success| {
-                            success.is_null() || success.as_bool() == Some(true)
-                        })
-                        && item.get("error").is_none_or(Value::is_null) =>
-                {
-                    ObservedToolOutcome::Completed
+                Some("completed") if completion_outcome(item) == Some(false) => {
+                    ObservedToolOutcome::Failed
                 }
-                Some("completed" | "failed" | "declined") => ObservedToolOutcome::Failed,
+                Some("failed" | "declined") => ObservedToolOutcome::Failed,
+                Some("completed") => ObservedToolOutcome::Unknown,
                 Some("interrupted" | "cancelled") => ObservedToolOutcome::Interrupted,
-                None if category == ToolCategory::Compaction
-                    && item.get("status").is_none()
-                    && item
-                        .get("exitCode")
-                        .is_none_or(|code| code.is_null() || code.as_i64() == Some(0))
-                    && item.get("success").is_none_or(|success| {
-                        success.is_null() || success.as_bool() == Some(true)
-                    })
-                    && item.get("error").is_none_or(Value::is_null) =>
-                {
-                    // 0.159.2 的 contextCompactionThreadItem 只有 id/type；其完成事件由 item/completed 确认。
+                None if item_type == "contextCompaction" && statusless_flags_valid(item) => {
                     ObservedToolOutcome::Completed
+                }
+                None if statusless_item_valid(item_type, item) && statusless_flags_valid(item) => {
+                    ObservedToolOutcome::CompletedUnknown
                 }
                 _ => ObservedToolOutcome::Unknown,
             })
@@ -174,6 +229,55 @@ pub fn decode_observed_tool(
     })())
 }
 
+fn statusless_item_valid(item_type: &str, item: &Value) -> bool {
+    match item_type {
+        "webSearch" => item.get("query").and_then(Value::as_str).is_some(),
+        "imageView" => item.get("path").and_then(Value::as_str).is_some(),
+        "sleep" => item.get("durationMs").and_then(Value::as_u64).is_some(),
+        "enteredReviewMode" | "exitedReviewMode" => {
+            item.get("review").and_then(Value::as_str).is_some()
+        }
+        "contextCompaction" => true,
+        _ => false,
+    }
+}
+
+fn statusless_flags_valid(item: &Value) -> bool {
+    !item
+        .as_object()
+        .is_some_and(|object| object.contains_key("status"))
+        && item.get("error").is_none_or(Value::is_null)
+        && item.get("failure").is_none_or(Value::is_null)
+        && item
+            .get("success")
+            .is_none_or(|success| success.as_bool() == Some(true))
+        && item
+            .get("exitCode")
+            .is_none_or(|code| code.as_i64() == Some(0))
+}
+
+/// `Some(true)` is a confirmed success, `Some(false)` is a typed failure, and
+/// `None` means a malformed field prevents a safe conclusion.
+fn completion_outcome(item: &Value) -> Option<bool> {
+    let success = match item.get("success") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return None,
+    };
+    let exit_ok = match item.get("exitCode") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_i64()? == 0),
+    };
+    if item.get("error").is_some_and(|value| !value.is_null())
+        || item.get("failure").is_some_and(|value| !value.is_null())
+        || success == Some(false)
+        || exit_ok == Some(false)
+    {
+        return Some(false);
+    }
+    Some(true)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservedOutputKind {
     Reasoning,
@@ -185,6 +289,7 @@ pub struct ObservedOutput {
     pub item_id: String,
     pub bytes: usize,
     pub kind: ObservedOutputKind,
+    pub text: String,
 }
 pub fn decode_observed_output(
     method: &str,
@@ -219,6 +324,7 @@ pub fn decode_observed_output(
                 ))?
                 .len(),
             kind,
+            text: params["delta"].as_str().unwrap_or_default().to_owned(),
         })
     })())
 }
@@ -583,6 +689,97 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(ordinary.outcome, Some(ObservedToolOutcome::Unknown));
+    }
+
+    #[test]
+    fn completed_tool_requires_well_typed_success_fields() {
+        use super::{decode_observed_tool, ObservedToolOutcome};
+        let invalid = [
+            serde_json::json!({"id":"tool","type":"commandExecution","status":"completed","exitCode":"1"}),
+            serde_json::json!({"id":"tool","type":"commandExecution","status":"completed","success":"false"}),
+            serde_json::json!({"id":"tool","type":"imageGeneration","status":"completed","failure":{"message":"failed"}}),
+        ];
+        for item in invalid {
+            let notice = decode_observed_tool(
+                "item/completed",
+                &serde_json::json!({"threadId":"t","turnId":"u","item":item}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_ne!(notice.outcome, Some(ObservedToolOutcome::Completed));
+        }
+
+        for item in [
+            serde_json::json!({"id":"tool","type":"commandExecution","status":"completed"}),
+            serde_json::json!({"id":"tool","type":"commandExecution","status":"completed","exitCode":null,"success":null}),
+            serde_json::json!({"id":"tool","type":"commandExecution","status":"completed","exitCode":0,"success":true}),
+        ] {
+            let notice = decode_observed_tool(
+                "item/completed",
+                &serde_json::json!({"threadId":"t","turnId":"u","item":item}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(notice.outcome, Some(ObservedToolOutcome::Completed));
+        }
+    }
+
+    #[test]
+    fn statusless_completion_is_limited_to_schema_items_with_confirmed_fields() {
+        use super::{decode_observed_tool, ObservedToolOutcome};
+        for item in [
+            serde_json::json!({"id":"web","type":"webSearch","query":"safe"}),
+            serde_json::json!({"id":"image-view","type":"imageView","path":"/tmp/image.png"}),
+            serde_json::json!({"id":"sleep","type":"sleep","durationMs":10}),
+            serde_json::json!({"id":"review","type":"enteredReviewMode","review":"review"}),
+        ] {
+            let notice = decode_observed_tool(
+                "item/completed",
+                &serde_json::json!({"threadId":"t","turnId":"u","item":item}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(notice.outcome, Some(ObservedToolOutcome::CompletedUnknown));
+        }
+
+        for item in [
+            serde_json::json!({"id":"image","type":"imageGeneration","result":"ok"}),
+            serde_json::json!({"id":"web","type":"webSearch","query":"safe","success":null}),
+            serde_json::json!({"id":"sleep","type":"sleep","durationMs":10,"exitCode":null}),
+        ] {
+            let notice = decode_observed_tool(
+                "item/completed",
+                &serde_json::json!({"threadId":"t","turnId":"u","item":item}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_ne!(notice.outcome, Some(ObservedToolOutcome::CompletedUnknown));
+        }
+    }
+
+    #[test]
+    fn tool_details_keep_aggregate_shell_output_out_of_result_and_use_schema_fields() {
+        use super::{decode_observed_tool_details, ToolCategory};
+
+        let shell = decode_observed_tool_details(
+            &serde_json::json!({"command":"echo","aggregatedOutput":"done"}),
+            ToolCategory::Shell,
+        );
+        assert_eq!(shell.result, None);
+        assert_eq!(shell.output.as_deref(), Some("done"));
+
+        let dynamic = decode_observed_tool_details(
+            &serde_json::json!({"arguments":{"input":"x"},"contentItems":[{"type":"text","text":"result"}]}),
+            ToolCategory::Dynamic,
+        );
+        assert_eq!(dynamic.parameters.as_deref(), Some(r#"{"input":"x"}"#));
+        assert!(dynamic.result.as_deref().unwrap().contains("result"));
+
+        let mcp = decode_observed_tool_details(
+            &serde_json::json!({"result":null,"error":{"message":"failed"}}),
+            ToolCategory::Mcp,
+        );
+        assert!(mcp.result.as_deref().unwrap().contains("failed"));
     }
 
     #[test]

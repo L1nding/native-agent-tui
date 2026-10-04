@@ -21,6 +21,7 @@ mod shell_check;
 pub mod skills;
 pub mod state;
 pub mod timeline;
+pub mod tool_details;
 pub mod transport;
 pub mod ui;
 

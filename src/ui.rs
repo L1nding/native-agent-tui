@@ -37,6 +37,7 @@ mod requests;
 mod scope;
 mod search;
 mod timeline;
+mod tool_detail;
 
 use input::{InputEvent, TerminalInput};
 

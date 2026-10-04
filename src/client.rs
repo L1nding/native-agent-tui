@@ -25,6 +25,7 @@ use crate::state::{
     CoreSnapshot, FactSource, GateSnapshot, PersistenceState, SessionPhase, SessionState,
     TokenBudgetSnapshot, UsageSummary, MESSAGE_BYTES,
 };
+use crate::tool_details::{ToolDetailLocator, ToolDetails, ToolLifecycle};
 use crate::transport::{PipeTransport, TransportError};
 
 #[cfg(all(test, windows))]
@@ -258,6 +259,7 @@ impl ClientHandle {
                 wait: None,
                 ingress_seq: 0,
                 file_previews: FilePreviews::default(),
+                tool_details: ToolDetails::default(),
                 collab_starts: HashMap::new(),
                 completed_collab: VecDeque::new(),
                 completed_waits: VecDeque::new(),
@@ -352,6 +354,7 @@ struct Core {
     wait: Option<PendingTool>,
     ingress_seq: u64,
     file_previews: FilePreviews,
+    tool_details: ToolDetails,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -803,6 +806,16 @@ impl Core {
             .journal
             .take());
         self.state.view.timeline = self.observer.timeline_snapshot();
+        if matches!(
+            self.state.view.phase,
+            SessionPhase::Unknown
+                | SessionPhase::Disconnected
+                | SessionPhase::Stopping
+                | SessionPhase::Stopped
+        ) {
+            self.tool_details.execution_unavailable();
+        }
+        self.state.view.tool_details = self.tool_details.snapshot();
         let transport = self.pipe.stats();
         self.state.view.diagnostics.transport_bytes_in = transport.bytes_in;
         self.state.view.diagnostics.transport_bytes_out = transport.bytes_out;
@@ -2072,6 +2085,79 @@ impl Core {
         }
     }
 
+    fn tool_locator(&self, thread: &str, turn: &str, item: &str) -> Option<ToolDetailLocator> {
+        let (agent_id, task_id, attempt_id, generation) =
+            if self.state.view.thread_id.as_deref() == Some(thread) {
+                let attempt = self.root_attempt?;
+                (
+                    "root".to_owned(),
+                    Some(attempt.task),
+                    Some(attempt.attempt),
+                    Some(self.generation),
+                )
+            } else {
+                let agent = self.state.agents.snapshots().into_iter().find(|agent| {
+                    agent.info.id == thread && agent.turn_id.as_deref() == Some(turn)
+                })?;
+                let task = self.scheduler.child_task(thread)?;
+                let external = task.external.as_ref()?;
+                if external.thread_id != thread
+                    || external.turn_id != turn
+                    || external.generation != agent.generation
+                    || task.attempt != agent.generation
+                {
+                    return None;
+                }
+                (
+                    thread.to_owned(),
+                    Some(task.id),
+                    Some(task.attempt),
+                    Some(agent.generation),
+                )
+            };
+        Some(ToolDetailLocator {
+            session_id: self.state.view.observation.session_id.clone(),
+            identity: crate::observation::ActivityIdentity {
+                agent_id,
+                task_id,
+                attempt_id,
+                thread_id: Some(thread.to_owned()),
+                turn_id: Some(turn.to_owned()),
+                generation,
+            },
+            item_id: item.to_owned(),
+        })
+    }
+
+    fn observe_tool_detail_event(&mut self, notice: &protocol::ObservedTool, params: &Value) {
+        let Some(locator) = self.tool_locator(&notice.thread_id, &notice.turn_id, &notice.item_id)
+        else {
+            return;
+        };
+        let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
+        if notice.outcome.is_none() {
+            self.tool_details
+                .observe_started(locator, notice.category, fields);
+        } else {
+            let lifecycle = match notice.outcome {
+                Some(protocol::ObservedToolOutcome::Completed) => ToolLifecycle::Completed,
+                Some(protocol::ObservedToolOutcome::CompletedUnknown) => {
+                    ToolLifecycle::EndedUnknown
+                }
+                Some(protocol::ObservedToolOutcome::Failed) => ToolLifecycle::Failed,
+                Some(protocol::ObservedToolOutcome::Interrupted) => ToolLifecycle::Interrupted,
+                _ => ToolLifecycle::Unknown,
+            };
+            self.tool_details.observe_completed(
+                &locator,
+                notice.category,
+                lifecycle,
+                fields,
+                notice.outcome != Some(protocol::ObservedToolOutcome::Unknown),
+            );
+        }
+    }
+
     fn observe_collab(&mut self, method: &str, item: &Value) {
         let Some(id) = item["id"].as_str() else {
             return;
@@ -2407,6 +2493,13 @@ impl Core {
                 ))
                 || self.state.agents.active_turn(thread, turn);
             if owned {
+                if method == "item/fileChange/patchUpdated" {
+                    self.file_previews.observe_patch_updated(
+                        &params,
+                        self.ingress_seq,
+                        &mut self.state.view.requests,
+                    );
+                }
                 if matches!(method, "item/started" | "item/completed") {
                     self.file_previews.observe(
                         &params,
@@ -2416,11 +2509,13 @@ impl Core {
                 }
                 if let Some(notice) = protocol::decode_observed_tool(method, &params) {
                     match notice {
-                        Ok(notice) => {
-                            if let Err(error) = self.observer.tool(&notice, Instant::now()) {
+                        Ok(notice) => match self.observer.tool(&notice, Instant::now()) {
+                            Ok(true) => self.observe_tool_detail_event(&notice, &params),
+                            Ok(false) => {}
+                            Err(error) => {
                                 self.state.error(SessionPhase::Unknown, error.to_string());
                             }
-                        }
+                        },
                         Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
                     }
                 }
@@ -2440,6 +2535,11 @@ impl Core {
                                 }
                             }
                             protocol::ObservedOutputKind::Tool(category) => {
+                                if let Some(locator) =
+                                    self.tool_locator(thread, turn, &output.item_id)
+                                {
+                                    self.tool_details.observe_output(&locator, &output.text);
+                                }
                                 if let Err(error) = self.observer.tool_output(
                                     thread,
                                     turn,
@@ -2501,9 +2601,35 @@ impl Core {
                 if let Some(turn) = params.pointer("/turn/id").and_then(Value::as_str) {
                     let event = match method {
                         "turn/started" => {
+                            let previous_turn = self
+                                .state
+                                .agents
+                                .snapshots()
+                                .into_iter()
+                                .find(|agent| agent.info.id == thread)
+                                .and_then(|agent| {
+                                    agent.turn_id.map(|turn| (turn, agent.generation))
+                                });
                             match self.state.agents.started(thread, turn, self.ingress_seq) {
                                 Ok(event) => {
                                     if event.is_some() {
+                                        if let Some((old_turn, generation)) =
+                                            previous_turn.filter(|(old_turn, _)| old_turn != turn)
+                                        {
+                                            self.observer.retire_child_turn(
+                                                thread,
+                                                &old_turn,
+                                                generation,
+                                                Instant::now(),
+                                            );
+                                            let session = &self.state.view.observation.session_id;
+                                            self.tool_details.retire(session, thread, &old_turn);
+                                            self.file_previews.retire(thread, &old_turn);
+                                            self.state.view.requests.retain(|request| {
+                                                request.thread_id != thread
+                                                    || request.turn_id != old_turn
+                                            });
+                                        }
                                         self.read_agent_identity(thread);
                                     }
                                     event
@@ -2533,6 +2659,11 @@ impl Core {
                                 };
                             let event = self.state.agents.completed(thread, turn, outcome);
                             if event.is_some() {
+                                self.tool_details.retire(
+                                    &self.state.view.observation.session_id,
+                                    thread,
+                                    turn,
+                                );
                                 self.file_previews.retire(thread, turn);
                                 self.state.view.requests.retain(|request| {
                                     request.thread_id != thread || request.turn_id != turn
@@ -2589,6 +2720,11 @@ impl Core {
                         || r.turn_id != id.unwrap_or("")
                 });
                 if let Some(thread) = self.state.view.thread_id.as_deref() {
+                    self.tool_details.retire(
+                        &self.state.view.observation.session_id,
+                        thread,
+                        id.unwrap(),
+                    );
                     self.file_previews.retire(thread, id.unwrap());
                 }
                 self.state.view.tool_activity = None;
@@ -2763,6 +2899,8 @@ fn preserve_cumulative_total(previous: UsageSummary, mut current: UsageSummary) 
 
 #[cfg(test)]
 mod tests {
+    mod tool_details;
+
     use super::*;
     use crate::journal::{tests::Fixture as JournalFixture, JournalView, Payload, Replay};
     use serde_json::json;
@@ -3797,13 +3935,30 @@ mod tests {
             .file_preview
             .is_none());
         observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":item}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":null},"diff":"PRIVATE_PATCH_UPDATED"}]}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":42},"diff":"PRIVATE_MALFORMED_PATCH"}]}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"old-turn","itemId":"file-1","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":null},"diff":"PRIVATE_STALE_PATCH"}]}})).await;
         assert!(client.snapshots.borrow().requests[0]
             .details
             .file_preview
             .as_ref()
             .unwrap()
             .text
-            .contains("PRIVATE_DIFF"));
+            .contains("PRIVATE_PATCH_UPDATED"));
+        assert!(!client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("PRIVATE_MALFORMED_PATCH"));
+        assert!(!client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("PRIVATE_STALE_PATCH"));
         observation_event(&mut client, &mut server, json!({"id":8,"method":"item/fileChange/requestApproval","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1"}})).await;
         assert!(client.snapshots.borrow().requests[1]
             .details
@@ -3814,6 +3969,9 @@ mod tests {
         for private in [
             "PRIVATE_FILE",
             "PRIVATE_DIFF",
+            "PRIVATE_PATCH_UPDATED",
+            "PRIVATE_MALFORMED_PATCH",
+            "PRIVATE_STALE_PATCH",
             "PRIVATE_REASON",
             "PRIVATE_ROOT",
         ] {

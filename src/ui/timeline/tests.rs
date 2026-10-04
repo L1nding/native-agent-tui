@@ -8,7 +8,11 @@ use crate::observation::{
 use crate::protocol::RpcId;
 use crate::state::ConversationItem;
 use crate::timeline::TimelineSnapshot;
+use crate::tool_details::{
+    ToolDetail, ToolDetailLocator, ToolDetailsSnapshot, ToolLifecycle, ToolTextSource,
+};
 use serde_json::json;
+use std::collections::VecDeque;
 
 fn event(id: u64, thread: &str, turn: &str, item: &str) -> Arc<TimelineEntry> {
     Arc::new(TimelineEntry {
@@ -40,6 +44,41 @@ fn event(id: u64, thread: &str, turn: &str, item: &str) -> Arc<TimelineEntry> {
         wait_targets: Vec::new(),
         compaction: None,
     })
+}
+
+fn tool_event(id: u64) -> Arc<TimelineEntry> {
+    let mut entry = (*event(id, "root", "turn-1", "tool-1")).clone();
+    entry.scope = ActivityScope::Tool;
+    entry.activity_kind = ActivityKind::ToolRunning;
+    entry.tool_category = Some(crate::protocol::ToolCategory::Shell);
+    entry.execution_state = ExecutionState::Completed;
+    entry.evidence.kind = EvidenceKind::ToolCompleted;
+    Arc::new(entry)
+}
+
+fn tool_details(locator: ToolDetailLocator) -> ToolDetailsSnapshot {
+    let detail = ToolDetail {
+        locator,
+        category: crate::protocol::ToolCategory::Shell,
+        lifecycle: ToolLifecycle::Completed,
+        command: Some("echo result".into()),
+        cwd: None,
+        parameters: None,
+        result: None,
+        output: "result".into(),
+        output_source: ToolTextSource::CommandAggregate,
+        exit_code: Some(0),
+        duration_ms: Some(1),
+        bytes_observed: 6,
+        bytes_retained: 6,
+        clipped: false,
+        authoritative: true,
+    };
+    ToolDetailsSnapshot {
+        entries: Arc::new(VecDeque::from([Arc::new(detail)])),
+        retained_bytes: 1,
+        dropped_entries: 0,
+    }
 }
 
 fn source(entries: Vec<Arc<TimelineEntry>>) -> CoreSnapshot {
@@ -182,6 +221,125 @@ fn selection_and_bookmarks_never_open_evicted_or_reused_request_deliveries() {
     panel.sync(&current);
     assert!(panel.rows(&current).is_empty());
     assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+}
+
+#[test]
+fn enter_opens_only_the_exact_tool_locator_and_escape_returns_without_commands() {
+    let entry = tool_event(1);
+    let mut current = source(vec![entry.clone()]);
+    let locator = ToolDetailLocator {
+        session_id: current.timeline.session_id.clone(),
+        identity: entry.identity.clone(),
+        item_id: entry.item_id.clone().unwrap(),
+    };
+    current.tool_details = tool_details(locator.clone());
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+
+    assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+    assert_eq!(panel.tool_detail, Some(locator));
+    assert!(key(&mut panel, KeyCode::Esc, &current).is_none());
+    assert!(panel.visible);
+    assert!(panel.tool_detail.is_none());
+
+    assert!(key(&mut panel, KeyCode::End, &current).is_none());
+    panel.open("child".into(), &current);
+    assert!(panel.tool_detail.is_none());
+    assert_eq!(panel.scroll.get(), 0);
+
+    panel.open("root".into(), &current);
+    assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+    let mut new_session = current.clone();
+    new_session.timeline.session_id = "another-session".into();
+    panel.sync(&new_session);
+    assert!(panel.tool_detail.is_none());
+    assert_eq!(panel.scroll.get(), 0);
+}
+
+#[test]
+fn attempt_generation_mismatch_and_evicted_tool_details_show_unavailable() {
+    let entry = tool_event(1);
+    let mut current = source(vec![entry.clone()]);
+    let locator = ToolDetailLocator {
+        session_id: current.timeline.session_id.clone(),
+        identity: entry.identity.clone(),
+        item_id: entry.item_id.clone().unwrap(),
+    };
+
+    for mismatch in ["attempt", "generation", "evicted"] {
+        let mut stale = locator.clone();
+        match mismatch {
+            "attempt" => stale.identity.attempt_id = Some(2),
+            "generation" => stale.identity.generation = Some(2),
+            _ => {}
+        }
+        current.tool_details = if mismatch == "evicted" {
+            ToolDetailsSnapshot::default()
+        } else {
+            tool_details(stale)
+        };
+        let mut panel = TimelinePanel::default();
+        panel.open("root".into(), &current);
+        assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+        assert!(
+            panel.tool_detail.is_none(),
+            "{mismatch} must not open stale details"
+        );
+        assert!(panel
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("unavailable")));
+    }
+}
+
+#[test]
+fn tool_detail_end_and_page_navigation_use_the_resized_content_range() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let entry = tool_event(1);
+    let mut current = source(vec![entry.clone()]);
+    let locator = ToolDetailLocator {
+        session_id: current.timeline.session_id.clone(),
+        identity: entry.identity.clone(),
+        item_id: entry.item_id.clone().unwrap(),
+    };
+    let mut details = tool_details(locator);
+    let mut long = details.entries[0].as_ref().clone();
+    long.output = "界".repeat(300);
+    long.bytes_observed = long.output.len();
+    long.bytes_retained = long.output.len();
+    details.entries = Arc::new(VecDeque::from([Arc::new(long)]));
+    current.tool_details = details;
+
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+    assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+    let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+    terminal
+        .draw(|frame| panel.draw(frame, frame.area(), &current))
+        .unwrap();
+    let wide_max = panel.tool_detail_max_scroll.get();
+    assert!(wide_max > 0);
+    key(&mut panel, KeyCode::End, &current);
+    let at_end = panel.scroll.get();
+    assert_eq!(at_end, wide_max);
+    key(&mut panel, KeyCode::PageUp, &current);
+    assert_eq!(panel.scroll.get(), at_end - 1);
+
+    drop(terminal);
+    let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+    terminal
+        .draw(|frame| panel.draw(frame, frame.area(), &current))
+        .unwrap();
+    let narrow_max = panel.tool_detail_max_scroll.get();
+    assert!(narrow_max > wide_max);
+    key(&mut panel, KeyCode::End, &current);
+    assert_eq!(panel.scroll.get(), narrow_max);
+    key(&mut panel, KeyCode::PageUp, &current);
+    assert_eq!(panel.scroll.get(), narrow_max - 1);
+    key(&mut panel, KeyCode::PageDown, &current);
+    assert_eq!(panel.scroll.get(), narrow_max);
 }
 
 #[test]

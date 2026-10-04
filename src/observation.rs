@@ -859,16 +859,23 @@ impl Observer {
         &mut self,
         notice: &crate::protocol::ObservedTool,
         now: Instant,
-    ) -> Result<(), ObservationError> {
+    ) -> Result<bool, ObservationError> {
         let Some(agent) = self.agent_for_turn(&notice.thread_id, &notice.turn_id) else {
-            return Ok(());
+            return Ok(false);
         };
         let main = (agent.clone(), Slot::Main);
         if !self.activities[&main].execution.active() {
-            return Ok(());
+            return Ok(false);
         }
         let key = (agent, Slot::Tool(notice.item_id.clone()));
         let existing_activity = self.activities.contains_key(&key);
+        if existing_activity && !self.activities[&key].execution.active() {
+            // 终态 compaction 重复通知只补充数值 usage，不再接受为工具事件。
+            if notice.category == ToolCategory::Compaction {
+                self.record_compaction(notice, now);
+            }
+            return Ok(false);
+        }
         if !self.activities.contains_key(&key) {
             self.create(
                 key.clone(),
@@ -938,11 +945,9 @@ impl Observer {
             );
         }
         if let Some(outcome) = notice.outcome {
-            if !self.activities[&key].execution.active() {
-                return Ok(());
-            }
             let execution = match outcome {
                 crate::protocol::ObservedToolOutcome::Completed => ExecutionState::Completed,
+                crate::protocol::ObservedToolOutcome::CompletedUnknown => ExecutionState::Completed,
                 crate::protocol::ObservedToolOutcome::Failed => ExecutionState::Failed,
                 crate::protocol::ObservedToolOutcome::Interrupted => ExecutionState::Interrupted,
                 crate::protocol::ObservedToolOutcome::Unknown => ExecutionState::Unknown,
@@ -963,7 +968,35 @@ impl Observer {
                 0,
             );
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// 子代理换轮时，将旧代活动工具明确结束为未知。
+    pub fn retire_child_turn(&mut self, thread: &str, turn: &str, generation: u64, now: Instant) {
+        let live: Vec<_> = self
+            .activities
+            .iter()
+            .filter(|(_, activity)| {
+                activity.scope == ActivityScope::Tool
+                    && activity.execution.active()
+                    && activity.identity.thread_id.as_deref() == Some(thread)
+                    && activity.identity.turn_id.as_deref() == Some(turn)
+                    && activity.identity.generation == Some(generation)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in live {
+            if self.activities[&key].tool_category == Some(ToolCategory::Compaction) {
+                self.mark_compactions_unknown(thread, turn, now);
+            }
+            self.finish(
+                &key,
+                ExecutionState::Unknown,
+                now,
+                EvidenceKind::ExecutionUnknown,
+                EvidenceSource::Core,
+            );
+        }
     }
     pub fn tool_output(
         &mut self,

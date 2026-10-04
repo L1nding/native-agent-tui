@@ -86,6 +86,33 @@
         "threadId",
         "turnId"
       ]
+    },
+    "v2/ItemCompletedNotification.json": {
+      "sha256": "0106e0ed8d9a771d8db681946f6e627b1bdabff0df14887f78e8ff0d6a9fac59",
+      "required": [
+        "completedAtMs",
+        "item",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "v2/FileChangePatchUpdatedNotification.json": {
+      "sha256": "1f855fc8876fa1771c711431db1e75df75ba9dec6aa5c448f6e98599ba2f6fdc",
+      "required": [
+        "changes",
+        "itemId",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "v2/CommandExecutionOutputDeltaNotification.json": {
+      "sha256": "1f46a991f4a2a5a930f64804d9b05e591354c2cd0a913d40bdd94b0adabcf9ea",
+      "required": [
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
+      ]
     }
   }
 }

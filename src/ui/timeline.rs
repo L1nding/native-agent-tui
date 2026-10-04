@@ -1,4 +1,5 @@
 //! Local browsing state for Core's bounded evidence archive. No execution sender.
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,11 +10,13 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::scope::Scope;
+use super::tool_detail;
 use super::{search, wrap, Editor};
 use crate::interactions::RequestRef;
 use crate::observation::{EvidenceKind, ExecutionState};
 use crate::state::{display_text, CoreSnapshot};
 use crate::timeline::{TimelineEntry, BYTE_LIMIT, ENTRY_LIMIT};
+use crate::tool_details::ToolDetailLocator;
 
 const FIELD_BYTES: usize = 1024;
 const BOOKMARK_LIMIT: usize = 64;
@@ -101,7 +104,9 @@ pub(super) struct TimelinePanel {
     bookmarks: Vec<Bookmark>,
     bookmarks_only: bool,
     pending_only: bool,
-    scroll: usize,
+    scroll: Cell<usize>,
+    tool_detail_max_scroll: Cell<usize>,
+    tool_detail: Option<ToolDetailLocator>,
     help: bool,
     notice: Option<String>,
 }
@@ -115,6 +120,9 @@ impl TimelinePanel {
             self.thread = thread;
             self.session = current.timeline.session_id.clone();
             self.selected = None;
+            self.tool_detail = None;
+            self.scroll.set(0);
+            self.tool_detail_max_scroll.set(0);
         }
         if self.thread.is_empty() {
             self.scope = Scope::All;
@@ -134,6 +142,9 @@ impl TimelinePanel {
         if self.session != current.timeline.session_id {
             self.session = current.timeline.session_id.clone();
             self.selected = None;
+            self.tool_detail = None;
+            self.scroll.set(0);
+            self.tool_detail_max_scroll.set(0);
         }
         if self.selected.is_none() {
             self.select_latest(current);
@@ -196,7 +207,7 @@ impl TimelinePanel {
 
     fn select_latest(&mut self, current: &CoreSnapshot) {
         self.selected = self.rows(current).last().map(|entry| entry.evidence.id);
-        self.scroll = 0;
+        self.scroll.set(0);
         self.notice = None;
     }
 
@@ -273,21 +284,44 @@ impl TimelinePanel {
     pub fn key(&mut self, key: KeyEvent, current: &CoreSnapshot) -> Option<Locate> {
         self.sync(current);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.tool_detail.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.tool_detail = None;
+                    self.scroll.set(0);
+                    self.tool_detail_max_scroll.set(0);
+                    self.notice = None;
+                }
+                KeyCode::PageUp => self.scroll.set(self.scroll.get().saturating_sub(1)),
+                KeyCode::PageDown => {
+                    self.scroll.set(
+                        self.scroll
+                            .get()
+                            .saturating_add(1)
+                            .min(self.tool_detail_max_scroll.get()),
+                    );
+                }
+                KeyCode::Home => self.scroll.set(0),
+                KeyCode::End => self.scroll.set(self.tool_detail_max_scroll.get()),
+                _ => {}
+            }
+            return None;
+        }
         if key.code == KeyCode::Esc {
             self.close();
             return None;
         }
         if key.code == KeyCode::F(1) {
             self.help = !self.help;
-            self.scroll = 0;
+            self.scroll.set(0);
             return None;
         }
         if self.help {
             match key.code {
-                KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(1),
-                KeyCode::PageDown => self.scroll = self.scroll.saturating_add(1),
-                KeyCode::Home => self.scroll = 0,
-                KeyCode::End => self.scroll = usize::MAX,
+                KeyCode::PageUp => self.scroll.set(self.scroll.get().saturating_sub(1)),
+                KeyCode::PageDown => self.scroll.set(self.scroll.get().saturating_add(1)),
+                KeyCode::Home => self.scroll.set(0),
+                KeyCode::End => self.scroll.set(usize::MAX),
                 _ => {}
             }
             return None;
@@ -349,8 +383,8 @@ impl TimelinePanel {
                 self.bookmarks_only = !self.bookmarks_only;
                 self.select_latest(current);
             }
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::PageUp => self.scroll.set(self.scroll.get().saturating_sub(1)),
+            KeyCode::PageDown => self.scroll.set(self.scroll.get().saturating_add(1)),
             KeyCode::Up
             | KeyCode::Down
             | KeyCode::Home
@@ -375,7 +409,7 @@ impl TimelinePanel {
                     _ => index.map_or(0, |index| (index + 1).min(rows.len().saturating_sub(1))),
                 };
                 self.selected = rows.get(next).map(|entry| entry.evidence.id);
-                self.scroll = 0;
+                self.scroll.set(0);
                 self.notice = None;
             }
             KeyCode::Enter if !ctrl => {
@@ -401,6 +435,31 @@ impl TimelinePanel {
                     }
                     self.notice =
                         Some("This request delivery has ended; no current request matches.".into());
+                } else if matches!(
+                    entry.evidence.kind,
+                    EvidenceKind::ToolStarted | EvidenceKind::ToolCompleted
+                ) {
+                    let Some(item_id) = entry.item_id.clone() else {
+                        self.notice =
+                            Some("Tool detail unavailable: item identity is missing.".into());
+                        return None;
+                    };
+                    let locator = ToolDetailLocator {
+                        session_id: current.timeline.session_id.clone(),
+                        identity: entry.identity.clone(),
+                        item_id,
+                    };
+                    if current.tool_details.get(&locator).is_some() {
+                        self.tool_detail = Some(locator);
+                        self.scroll.set(0);
+                        self.tool_detail_max_scroll.set(0);
+                        self.notice = None;
+                    } else {
+                        self.notice = Some(
+                            "Tool detail unavailable or evicted for this exact item identity."
+                                .into(),
+                        );
+                    }
                 } else if matches!(
                     entry.evidence.kind,
                     EvidenceKind::Output | EvidenceKind::MessageFinalized
@@ -430,6 +489,19 @@ impl TimelinePanel {
     pub fn draw(&self, frame: &mut ratatui::Frame<'_>, area: Rect, current: &CoreSnapshot) {
         frame.render_widget(Clear, area);
         if area.height == 0 {
+            return;
+        }
+        if let Some(locator) = &self.tool_detail {
+            let max = tool_detail::draw(
+                frame,
+                area,
+                current,
+                locator,
+                self.scroll.get(),
+                self.notice.as_deref(),
+            );
+            self.tool_detail_max_scroll.set(max);
+            self.scroll.set(self.scroll.get().min(max));
             return;
         }
         let rows = self.rows(current);
@@ -620,6 +692,7 @@ impl TimelinePanel {
             .collect();
         let start = self
             .scroll
+            .get()
             .min(lines.len().saturating_sub(detail_area.height as usize));
         frame.render_widget(
             Paragraph::new(

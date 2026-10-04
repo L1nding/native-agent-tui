@@ -126,6 +126,16 @@ try:
                 send({"method": "item/agentMessage/delta", "params": {
                     "threadId": "child-thread", "turnId": "child-turn-1",
                     "itemId": "child-message", "delta": "CHILD_OUTPUT"}})
+            elif mode == "tool_details":
+                send({"method": "item/started", "params": {"threadId": "root", "turnId": turn_id,
+                      "item": {"id": "detail-tool", "type": "commandExecution", "status": "inProgress",
+                               "command": "PRIVATE_COMMAND", "cwd": "PRIVATE_CWD"}}})
+                for delta in ("PRIVATE_DELTA_ONE", "PRIVATE_DELTA_TWO"):
+                    send({"method": "item/commandExecution/outputDelta", "params": {
+                        "threadId": "root", "turnId": turn_id, "itemId": "detail-tool", "delta": delta}})
+                send({"method": "item/completed", "params": {"threadId": "root", "turnId": turn_id,
+                      "item": {"id": "detail-tool", "type": "commandExecution", "status": "completed",
+                               "exitCode": 0, "aggregatedOutput": "PRIVATE_AGGREGATE"}}})
             elif mode.startswith("approval") or mode == "request_details":
                 approval(7)
             elif mode in ("input", "input_hang", "input_paste"):
@@ -136,7 +146,7 @@ try:
                 terminal("failed")
             elif mode == "disconnect":
                 break
-            elif mode not in ("hold", "workflow_child"):
+            elif mode not in ("hold", "workflow_child", "tool_details"):
                 terminal()
         elif method == "turn/interrupt":
             send({"id": message["id"], "result": {}})

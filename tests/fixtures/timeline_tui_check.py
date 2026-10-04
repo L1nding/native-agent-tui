@@ -210,8 +210,11 @@ class Console:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True, type=Path)
+    parser.add_argument('--tool-details', action='store_true', help='Exercise exact-identity tool details in the live TUI')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
+    if args.tool_details:
+        return tool_details_check(args.binary.resolve(), repo)
     root = repo / 'target' / ('timeline-tui-' + uuid.uuid4().hex)
     root.mkdir()
     fake = root / 'codex.cmd'
@@ -300,6 +303,56 @@ def main():
     (root / 'validation.json').write_text(json.dumps({'root_starts': 1, 'interrupts': 0,
         'approval_answers': 3, 'secret_answer_valid': True, 'cleanup_confirmed': True}), encoding='utf-8')
     print(f'Native timeline TUI passed: scopes/filters/bookmark/help/resize/request ID reuse/secret draft/history, zero observation RPC; {root}')
+
+
+def tool_details_check(binary, repo):
+    root = repo / 'target' / ('tool-details-tui-' + uuid.uuid4().hex)
+    root.mkdir()
+    fake = root / 'codex.cmd'
+    fake.write_text(f'@echo off\n"{sys.executable}" -u "{repo / "tests/fixtures/jsonl_app_server.py"}" %*\n')
+    os.environ['NATIVE_JSONL_FIXTURE_ROOT'] = str(root)
+    os.environ['NATIVE_JSONL_FIXTURE_MODE'] = 'tool_details'
+    console = Console([str(binary), '--cwd', str(repo), '--codex', str(fake),
+                       '--journal-dir', str(root / 'journal'), '--tui', 'PRIVATE_PROMPT'], repo)
+
+    def rpc():
+        path = root / 'rpc.jsonl'
+        if not path.exists(): return []
+        text = path.read_text()
+        if text and not text.endswith('\n'): text = text.rsplit('\n', 1)[0] if '\n' in text else ''
+        return [json.loads(line) for line in text.splitlines()]
+
+    try:
+        console.wait(lambda screen: 'PRIVATE_OUTPUT' in screen, 'fixture turn did not start')
+        console.write('\x14')
+        console.wait(lambda screen: 'Evidence timeline' in screen, 'timeline did not open')
+        console.write('\x1b[F\r')
+        console.wait(
+            lambda screen: 'Tool detail' in screen and 'PRIVATE_COMMAND' in screen
+            and 'PRIVATE_AGGREGATE' in screen,
+            'exact-identity tool detail did not render',
+        )
+        screen = console.stable()
+        assert 'PRIVATE_CWD' in screen
+        assert 'PRIVATE_DELTA_ONE' not in screen and 'PRIVATE_DELTA_TWO' not in screen
+        before = rpc()
+        console.write('\x1b')
+        console.wait(lambda screen: 'Evidence timeline' in screen, 'Escape did not return to timeline')
+        assert rpc() == before, 'opening and closing tool details sent an execution request'
+        console.write('\x1b\x11')
+        assert k.WaitForSingleObject(console.process.process, 10000) == 0
+        code = w.DWORD(); check(k.GetExitCodeProcess(console.process.process, c.byref(code))); assert code.value == 0
+    except BaseException:
+        masked = re.sub(r'PRIVATE_[A-Z_]+', '<REDACTED>', console.read())
+        (root / 'failure-screen.txt').write_text(masked, encoding='utf-8')
+        raise
+    finally:
+        console.close()
+        check_clean(root)
+    calls = rpc()
+    methods = [row['method'] for row in calls]
+    assert methods.count('turn/start') == 1
+    assert not any(method is None for method in methods)
 
 
 if __name__ == '__main__': main()

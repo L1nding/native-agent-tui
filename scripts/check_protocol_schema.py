@@ -25,6 +25,9 @@ def main():
         'v2/SkillsListParams.json',
         'v2/SkillsListResponse.json',
         'v2/SkillsChangedNotification.json',
+        'v2/ItemCompletedNotification.json',
+        'v2/FileChangePatchUpdatedNotification.json',
+        'v2/CommandExecutionOutputDeltaNotification.json',
     ]
     for name in retained:
         schema = json.loads((FIXTURES / Path(name).name).read_text(encoding='utf-8'))
