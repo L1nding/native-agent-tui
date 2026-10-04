@@ -369,6 +369,10 @@ async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() 
         text.contains("tasks: active=1 unknown=1 queued=1 blocked=1 terminal=1"),
         "{text}"
     );
+    assert!(text.contains("action UnknownAfterRestart"), "{text}");
+    assert!(text.contains("action NeedsInput"), "{text}");
+    assert!(text.contains("action ResolveBlock"), "{text}");
+    assert!(text.contains("action Terminal"), "{text}");
     assert!(!text.contains("PRIVATE_PROMPT"));
     assert_eq!(fixture.contents(), before);
 }

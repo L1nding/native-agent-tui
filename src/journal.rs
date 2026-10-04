@@ -375,6 +375,26 @@ impl RecoveryTaskClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryTaskAction {
+    UnknownAfterRestart,
+    NeedsInput,
+    ResolveBlock,
+    Terminal,
+}
+
+impl RecoveryTaskAction {
+    fn from_class(class: RecoveryTaskClass) -> Self {
+        match class {
+            RecoveryTaskClass::Active | RecoveryTaskClass::Unknown => Self::UnknownAfterRestart,
+            RecoveryTaskClass::Queued => Self::NeedsInput,
+            RecoveryTaskClass::Blocked => Self::ResolveBlock,
+            RecoveryTaskClass::Terminal => Self::Terminal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryTaskSummary {
@@ -382,6 +402,7 @@ pub struct RecoveryTaskSummary {
     pub kind: TaskKind,
     pub state: TaskState,
     pub class: RecoveryTaskClass,
+    pub action: RecoveryTaskAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,11 +424,15 @@ impl RecoverySummary {
         let tasks = snapshot
             .tasks
             .iter()
-            .map(|task| RecoveryTaskSummary {
-                id: task.id,
-                kind: task.kind,
-                state: task.state,
-                class: RecoveryTaskClass::classify(task.state),
+            .map(|task| {
+                let class = RecoveryTaskClass::classify(task.state);
+                RecoveryTaskSummary {
+                    id: task.id,
+                    kind: task.kind,
+                    state: task.state,
+                    class,
+                    action: RecoveryTaskAction::from_class(class),
+                }
             })
             .collect::<Vec<_>>();
         let requires_input = snapshot.needs_recovery()
