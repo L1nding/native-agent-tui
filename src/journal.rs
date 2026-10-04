@@ -414,6 +414,11 @@ pub struct RecoveryTaskSummary {
     pub id: TaskId,
     pub kind: TaskKind,
     pub state: TaskState,
+    pub attempt: u64,
+    pub parent: Option<TaskId>,
+    pub dependencies: Vec<TaskId>,
+    pub external: Option<ExternalTurn>,
+    pub pending_requests: usize,
     pub class: RecoveryTaskClass,
     pub action: RecoveryTaskAction,
 }
@@ -443,6 +448,11 @@ impl RecoverySummary {
                     id: task.id,
                     kind: task.kind,
                     state: task.state,
+                    attempt: task.attempt,
+                    parent: task.parent,
+                    dependencies: task.dependencies.clone(),
+                    external: task.external.clone(),
+                    pending_requests: task.pending_requests,
                     class,
                     action: RecoveryTaskAction::from_class(class),
                 }

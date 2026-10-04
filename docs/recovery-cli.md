@@ -15,6 +15,6 @@ native-agent-tui --journal-dir PATH --recovery SESSION_ID
 - `can_resume=false`：历史检查不会恢复外部执行，也不会自动重放副作用。
 - `uncommitted_tail`：提交高水位之后是否还有未提交的文件尾部；该尾部不会被读取或执行。
 - `outbox_available` 及其计数：只读显示该会话是否有 durable outbox，以及 `pending`、`sent`、`confirmed`、`unknown`、`failed` intent 数量。缺少 outbox 的旧会话会显示 `outbox_available=false`，不会创建文件。
-- 任务按 `active`、`unknown`、`queued`、`blocked`、`terminal` 分类，并显示数量与脱敏的任务 ID、类型、状态和建议动作。动作映射为：活动或未知任务 `UnknownAfterRestart`，排队、ready 或 paused 任务 `NeedsInput`，blocked 任务 `ResolveBlock`，终态任务 `Terminal`。
+- 任务按 `active`、`unknown`、`queued`、`blocked`、`terminal` 分类，并显示数量与脱敏的任务 ID、类型、状态、attempt、父子/依赖关系、外部 thread/turn/generation 身份、待处理请求数和建议动作。动作映射为：活动或未知任务 `UnknownAfterRestart`，排队、ready 或 paused 任务 `NeedsInput`，blocked 任务 `ResolveBlock`，终态任务 `Terminal`。
 
 完成且清理已确认的会话会报告 `needs_recovery=false`。损坏记录、撕裂尾部、缺失会话和非法身份沿用 replay 的错误码与错误文本。查询结果不包含 prompt、答案、命令、秘密或原始工具输出。

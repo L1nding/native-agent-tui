@@ -452,4 +452,14 @@ mod tests {
         assert!(matches!(Outbox::open(&path), Err(OutboxError::Corrupt)));
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn read_only_snapshot_does_not_create_a_missing_outbox() {
+        let path = fixture("missing");
+        assert!(matches!(
+            OutboxSnapshot::open(&path),
+            Err(OutboxError::Io(_))
+        ));
+        assert!(!path.exists());
+    }
 }

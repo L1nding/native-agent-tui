@@ -232,8 +232,20 @@ async fn execute() -> Result<(), (u8, String)> {
             );
             for task in summary.tasks {
                 println!(
-                    "task#{} {:?} {:?} | class {:?} | action {:?}",
-                    task.id.0, task.kind, task.state, task.class, task.action
+                    "task#{} {:?} {:?} | attempt={} parent={:?} deps={:?} external={:?} pending_requests={} | class {:?} | action {:?}",
+                    task.id.0,
+                    task.kind,
+                    task.state,
+                    task.attempt,
+                    task.parent.map(|id| id.0),
+                    task.dependencies
+                        .iter()
+                        .map(|id| id.0)
+                        .collect::<Vec<_>>(),
+                    task.external,
+                    task.pending_requests,
+                    task.class,
+                    task.action
                 );
             }
         }
