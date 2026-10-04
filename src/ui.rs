@@ -2066,23 +2066,60 @@ fn draw_tasks(
     let selected = selected_task(snapshot, local);
     let height = area.height.saturating_sub(2) as usize;
     let details = if height >= 6 { 3 } else { 0 };
-    let capacity = height
-        .saturating_sub(details + usize::from(height > 1))
-        .max(1);
+    let summary = if height > 1 {
+        let width = area.width.saturating_sub(2) as usize;
+        let full = vec![format!(
+            "Root slots: {} | native slots reserved: {} | native turns observed: {}",
+            scheduler.root_slots_reserved,
+            scheduler.native_slots_reserved,
+            scheduler.native_turns_observed
+        )];
+        let medium = vec![
+            format!(
+                "Root slots: {} | native reserved: {}",
+                scheduler.root_slots_reserved, scheduler.native_slots_reserved
+            ),
+            format!("Native turns observed: {}", scheduler.native_turns_observed),
+        ];
+        let narrow = vec![
+            format!("native reserved: {}", scheduler.native_slots_reserved),
+            format!("native observed: {}", scheduler.native_turns_observed),
+        ];
+        let compact = vec![
+            format!("N reserved: {}", scheduler.native_slots_reserved),
+            format!("N observed: {}", scheduler.native_turns_observed),
+        ];
+        [full, medium, narrow, compact]
+            .into_iter()
+            .find(|candidate| candidate.iter().all(|line| line.width() <= width))
+            .unwrap_or_else(|| {
+                vec![
+                    format!("R:{}", scheduler.native_slots_reserved),
+                    format!("O:{}", scheduler.native_turns_observed),
+                ]
+            })
+    } else {
+        Vec::new()
+    };
+    let capacity = height.saturating_sub(details + summary.len()).max(1);
     let index = selected
         .and_then(|task| scheduler.tasks.iter().position(|other| other.id == task.id))
         .unwrap_or(0);
     let start = index.saturating_sub(capacity.saturating_sub(1));
     let mut lines = Vec::new();
-    if height > 1 {
-        lines.push(Line::from(format!(
-            "Root slots: {} | native turns observed: {}",
-            scheduler.root_slots_reserved, scheduler.native_turns_observed
-        )));
+    for line in summary {
+        lines.push(Line::from(line));
     }
     for task in scheduler.tasks.iter().skip(start).take(capacity) {
+        let slot = match task.kind {
+            crate::scheduler::TaskKind::NativeChild if task.native_slot_reserved => {
+                " [slot reserved]"
+            }
+            crate::scheduler::TaskKind::NativeChild => " [slot free]",
+            crate::scheduler::TaskKind::RootTurn => "",
+        };
         lines.push(Line::from(display_text(&format!(
-            "{} #{} {:?} a{} p{} {}{} {}",
+            "{} #{} {:?}{} a{} p{} {}{} {}",
             if selected.is_some_and(|selected| selected.id == task.id) {
                 ">"
             } else {
@@ -2090,6 +2127,7 @@ fn draw_tasks(
             },
             task.id.0,
             task.state,
+            slot,
             task.attempt,
             task.priority,
             if task.pause_requested {
@@ -3374,6 +3412,132 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(rendered.contains("attempt changed"));
+    }
+
+    #[test]
+    fn tasks_panel_shows_native_reservations_separately_from_observed_turns() {
+        use crate::scheduler::{SchedulerSnapshot, TaskKind, TaskState};
+
+        let root = TaskSnapshot {
+            id: TaskId(1),
+            kind: TaskKind::RootTurn,
+            state: TaskState::Running,
+            title: "root task".into(),
+            parent: None,
+            attempt: 1,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: None,
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: true,
+            native_slot_reserved: false,
+            cancellation_epoch: 0,
+        };
+        let native_reserved = TaskSnapshot {
+            id: TaskId(2),
+            kind: TaskKind::NativeChild,
+            state: TaskState::Running,
+            title: "reserved child".into(),
+            parent: Some(root.id),
+            attempt: 1,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: Some(crate::scheduler::ExternalTurn {
+                thread_id: "child-reserved".into(),
+                turn_id: "turn-1".into(),
+                generation: 1,
+            }),
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: false,
+            native_slot_reserved: true,
+            cancellation_epoch: 0,
+        };
+        let native_free = TaskSnapshot {
+            id: TaskId(3),
+            kind: TaskKind::NativeChild,
+            state: TaskState::Starting,
+            title: "free child".into(),
+            parent: Some(root.id),
+            attempt: 0,
+            dependencies: Vec::new(),
+            policy: Default::default(),
+            failure: Default::default(),
+            priority: 0,
+            blocked_reason: None,
+            external: None,
+            pause_requested: false,
+            cancel_requested: false,
+            pending_requests: 0,
+            wait_targets: Vec::new(),
+            root_slot_reserved: false,
+            native_slot_reserved: false,
+            cancellation_epoch: 0,
+        };
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            scheduler: SchedulerSnapshot {
+                tasks: vec![root, native_reserved, native_free],
+                root_slots_reserved: 12,
+                native_slots_reserved: 12,
+                native_turns_observed: 12,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let local = LocalState {
+            tasks: true,
+            ..Default::default()
+        };
+        let render = |width, height| {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_tasks(frame, frame.area(), &snapshot, &local))
+                .unwrap();
+            let width = terminal.backend().buffer().area().width as usize;
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width)
+                .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let rows = render(120, 20);
+        let rendered = rows.join("\n");
+        assert!(rendered.contains("native slots reserved: 12"), "{rendered}");
+        assert!(rendered.contains("native turns observed: 12"), "{rendered}");
+        assert!(rendered.contains("slot reserved"), "{rendered}");
+        assert!(rendered.contains("slot free"), "{rendered}");
+        let root_row = rows
+            .iter()
+            .find(|row| row.contains("#1") && row.contains("root task"))
+            .expect("root task row");
+        assert!(!root_row.contains("slot"), "{root_row}");
+
+        let medium = render(66, 12).join("\n");
+        assert!(medium.contains("native reserved: 12"), "{medium}");
+        assert!(medium.contains("Native turns observed: 12"), "{medium}");
+
+        let narrow = render(34, 12).join("\n");
+        assert!(narrow.contains("native reserved: 12"), "{narrow}");
+        assert!(narrow.contains("native observed: 12"), "{narrow}");
+
+        let compact = render(24, 8).join("\n");
+        assert!(compact.contains("native reserved: 12"), "{compact}");
+        assert!(compact.contains("native observed: 12"), "{compact}");
     }
 
     #[test]
