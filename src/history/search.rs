@@ -28,6 +28,19 @@ pub enum Category {
 }
 
 impl Category {
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "all" => Self::All,
+            "lifecycle" => Self::Lifecycle,
+            "output" => Self::Output,
+            "tool" => Self::Tool,
+            "compaction" => Self::Compaction,
+            "request" => Self::Request,
+            "waiting" => Self::Waiting,
+            _ => return None,
+        })
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::All => "all",

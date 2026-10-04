@@ -30,7 +30,7 @@ Usage:
   native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
   native-agent-tui --check-shell [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
-  native-agent-tui --search QUERY [--cwd PATH] [--journal-dir PATH]
+  native-agent-tui --search QUERY [--search-category CATEGORY] [--search-thread ID] [--search-turn ID] [OPTIONS]
   native-agent-tui --replay SESSION_ID [--since SEQ] [--json-events] [OPTIONS]
   native-agent-tui --history [SESSION_ID] [OPTIONS]
   native-agent-tui --export SESSION_ID [--since SEQ] [--output NEW_FILE] [OPTIONS]
@@ -60,6 +60,7 @@ never launches app-server. --json-events streams committed redacted state.
 --history opens offline read-only observation. --export previews the range;
 --output writes that captured range with stable identity aliases to a new file.
 --search scans retained redacted evidence across sessions without launching Codex.
+  Search filters: all, lifecycle, output, tool, compaction, request, waiting.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
 See docs/scheduler-usage.md and docs/workflow-example.json.
 
@@ -161,7 +162,13 @@ async fn execute() -> Result<(), (u8, String)> {
                 );
             }
         }
-        CliCommand::Search { query, config } => {
+        CliCommand::Search {
+            query,
+            category,
+            thread,
+            turn,
+            config,
+        } => {
             let mut history = HistoryHandle::start(config.journal, config.cwd)
                 .map_err(|error| (2, error.to_string()))?;
             let result = async {
@@ -182,7 +189,9 @@ async fn execute() -> Result<(), (u8, String)> {
                     session_ids,
                     Query {
                         text: query,
-                        ..Query::default()
+                        category,
+                        thread,
+                        turn,
                     },
                 )?;
                 let results = history.search.response(search).await?;

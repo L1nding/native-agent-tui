@@ -275,6 +275,21 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
     assert!(search_text.contains("session#2 event"));
     assert!(!search_text.contains("PRIVATE_PROMPT"));
     assert!(search.stderr.is_empty());
+    let filtered = fixture.run(&[
+        "--search",
+        "compaction",
+        "--search-category",
+        "compaction",
+        "--search-thread",
+        "root-thread",
+        "--search-turn",
+        "compaction-turn",
+    ]);
+    assert!(filtered.status.success(), "{filtered:?}");
+    let filtered_text = String::from_utf8(filtered.stdout).unwrap();
+    assert!(filtered_text.contains("Search results: 2 hits across 2 sessions"));
+    assert_eq!(filtered_text.matches("session#1 event").count(), 1);
+    assert_eq!(filtered_text.matches("session#2 event").count(), 1);
     for args in [
         vec!["--replay", "../cli-session"],
         vec!["--replay", "missing"],

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::agents::{
     DEFAULT_MAX_NATIVE_CHILDREN, DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_NATIVE_TURNS,
 };
+use crate::history::search::Category;
 use crate::journal::JournalSettings;
 use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
 use thiserror::Error;
@@ -55,6 +56,9 @@ pub enum CliCommand {
     Sessions(Config),
     Search {
         query: String,
+        category: Category,
+        thread: String,
+        turn: String,
         config: Config,
     },
     History {
@@ -110,6 +114,8 @@ pub enum CliError {
         "--json-events requires --run TASK, --workflow FILE --headless, or --replay SESSION_ID"
     )]
     JsonEventsOptions,
+    #[error("search filters require --search QUERY")]
+    SearchOptions,
 }
 
 pub fn parse_args<I, S>(args: I) -> Result<CliCommand, CliError>
@@ -128,6 +134,9 @@ where
     let mut since = None;
     let mut json_events = false;
     let mut output = None;
+    let mut search_category = None;
+    let mut search_thread = None;
+    let mut search_turn = None;
     while index < args.len() {
         let option = &args[index];
         index += 1;
@@ -179,6 +188,23 @@ where
                 config.max_total_tokens = Some(parsed);
             }
             "--json-events" if !json_events => json_events = true,
+            "--search-category" if search_category.is_none() => {
+                let raw = value(&args, &mut index, option)?;
+                search_category = Some(Category::from_label(&raw).ok_or_else(|| {
+                    CliError::InvalidValue {
+                        option: option.clone(),
+                        value:
+                            "expected all, lifecycle, output, tool, compaction, request, or waiting"
+                                .into(),
+                    }
+                })?);
+            }
+            "--search-thread" if search_thread.is_none() => {
+                search_thread = Some(value(&args, &mut index, option)?);
+            }
+            "--search-turn" if search_turn.is_none() => {
+                search_turn = Some(value(&args, &mut index, option)?);
+            }
             "--output" if output.is_none() => {
                 output = Some(PathBuf::from(value(&args, &mut index, option)?))
             }
@@ -256,6 +282,11 @@ where
     {
         return Err(CliError::JsonEventsOptions);
     }
+    if (search_category.is_some() || search_thread.is_some() || search_turn.is_some())
+        && mode != Some("--search")
+    {
+        return Err(CliError::SearchOptions);
+    }
     if let Some(path) = attention_file {
         let mut bytes = Vec::new();
         std::fs::File::open(path)
@@ -276,6 +307,9 @@ where
         Some("--sessions") => CliCommand::Sessions(config),
         Some("--search") => CliCommand::Search {
             query: goal.unwrap(),
+            category: search_category.unwrap_or_default(),
+            thread: search_thread.unwrap_or_default(),
+            turn: search_turn.unwrap_or_default(),
             config,
         },
         Some("--history") => CliCommand::History {
@@ -425,6 +459,34 @@ mod tests {
         assert!(matches!(
             parse_args(["--search", "waiting"]).unwrap(),
             CliCommand::Search { query, .. } if query == "waiting"
+        ));
+        let CliCommand::Search {
+            query,
+            category,
+            thread,
+            turn,
+            ..
+        } = parse_args([
+            "--search",
+            "compaction",
+            "--search-category",
+            "compaction",
+            "--search-thread",
+            "root-thread",
+            "--search-turn",
+            "turn-42",
+        ])
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(query, "compaction");
+        assert_eq!(category, Category::Compaction);
+        assert_eq!(thread, "root-thread");
+        assert_eq!(turn, "turn-42");
+        assert!(matches!(
+            parse_args(["--search", "x", "--search-category", "unknown"]),
+            Err(CliError::InvalidValue { .. })
         ));
         assert!(matches!(
             parse_args(["--replay", "s"]).unwrap(),
