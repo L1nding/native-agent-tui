@@ -24,13 +24,13 @@ impl Command {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.0.env(key, value);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
         self.0.env_remove(key);
         self

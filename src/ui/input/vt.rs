@@ -82,6 +82,7 @@ impl Decoder {
         self.queued()
     }
 
+    #[cfg(windows)]
     pub(super) fn resize(&mut self, width: u16, height: u16) {
         self.events.push_back(InputEvent::Resize(width, height));
     }
