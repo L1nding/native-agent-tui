@@ -1794,8 +1794,8 @@ fn draw_evidence(
     rows.push(format_token_budget_evidence(snapshot));
     if let Some(journal) = &snapshot.journal {
         rows.push(format!(
-            "Session {} / committed {} / submitted {}",
-            journal.session_id, journal.committed_seq, journal.submitted_seq
+            "Session {} / committed {} / submitted {} / persistence {:?}",
+            journal.session_id, journal.committed_seq, journal.submitted_seq, snapshot.persistence
         ));
     }
     let compactions = snapshot
@@ -2899,6 +2899,14 @@ mod tests {
         snapshot.diagnostics.transport_bytes_out = 456;
         snapshot.diagnostics.control_events = 7;
         snapshot.diagnostics.telemetry_events = 8;
+        snapshot.journal = Some(crate::journal::JournalView {
+            session_id: "session".into(),
+            submitted_seq: 2,
+            committed_seq: 1,
+            committed_version: 1,
+            error: None,
+        });
+        snapshot.persistence = crate::state::PersistenceState::Submitted;
         for (width, height) in [(40, 12), (80, 24), (160, 45)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut local = LocalState::default();
@@ -2934,6 +2942,9 @@ mod tests {
             if height > 16 {
                 assert!(rendered.contains("tokens:4/10"), "{rendered}");
                 assert!(rendered.contains("Session token budget"), "{rendered}");
+            }
+            if width >= 100 && height > 16 {
+                assert!(rendered.contains("persistence Submitted"), "{rendered}");
             }
             local.attention_editor = Some(AttentionEditor::new(&snapshot, 0));
             terminal

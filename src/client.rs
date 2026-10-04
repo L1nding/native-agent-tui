@@ -20,8 +20,8 @@ use crate::scheduler::{
     TaskKind, TaskSnapshot,
 };
 use crate::state::{
-    CoreSnapshot, FactSource, GateSnapshot, SessionPhase, SessionState, TokenBudgetSnapshot,
-    UsageSummary, MESSAGE_BYTES,
+    CoreSnapshot, FactSource, GateSnapshot, PersistenceState, SessionPhase, SessionState,
+    TokenBudgetSnapshot, UsageSummary, MESSAGE_BYTES,
 };
 use crate::transport::{PipeTransport, TransportError};
 
@@ -98,7 +98,9 @@ impl ClientHandle {
     async fn launch(config: Config, check_only: bool) -> Result<Self, ClientError> {
         let config = app_server::normalize_config(config)?;
         let observer = Observer::new(config.attention.clone());
-        let initial = Self::initial(&config, &observer);
+        let mut initial = Self::initial(&config, &observer);
+        // Journal::open 已同步提交首个快照。
+        initial.persistence = PersistenceState::Committed;
         let journal = Journal::open(
             &config.journal,
             &config.cwd,
@@ -185,6 +187,11 @@ impl ClientHandle {
         };
         let mut initial = Self::initial(&config, &observer);
         initial.journal = journal.as_ref().map(Journal::view);
+        initial.persistence = if initial.journal.is_some() {
+            PersistenceState::Committed
+        } else {
+            PersistenceState::Uncertain
+        };
         let (snapshot_tx, snapshots) = watch::channel(Arc::new(initial.clone()));
         let join = tokio::spawn(
             Core {
@@ -316,6 +323,20 @@ struct PendingTool {
     parent_turn: String,
     generation: u64,
     token: WaitToken,
+}
+
+fn persistence_state(
+    view: Option<&crate::journal::JournalView>,
+    journal_error: Option<&JournalError>,
+) -> PersistenceState {
+    match view {
+        Some(view) if journal_error.is_some() || view.error.is_some() => {
+            PersistenceState::Uncertain
+        }
+        Some(view) if view.committed_seq >= view.submitted_seq => PersistenceState::Committed,
+        Some(_) => PersistenceState::Submitted,
+        None => PersistenceState::Uncertain,
+    }
 }
 
 impl Core {
@@ -732,6 +753,7 @@ impl Core {
         if let Some(view) = &mut self.state.view.journal {
             view.error = self.journal_error.clone().or(view.error.take());
         }
+        self.project_persistence_state();
         self.snapshot_tx.send_replace(self.state.snapshot());
     }
 
@@ -742,8 +764,17 @@ impl Core {
         if let Some(view) = &mut self.state.view.journal {
             view.error = self.journal_error.clone().or(view.error.take());
         }
+        self.project_persistence_state();
         self.state.view.observation.snapshot_version = self.state.view.version + 1;
         self.snapshot_tx.send_replace(self.state.snapshot());
+    }
+
+    /// 将 journal 的提交水位投影为 Core 可消费的脱敏状态。
+    fn project_persistence_state(&mut self) {
+        self.state.view.persistence = persistence_state(
+            self.state.view.journal.as_ref(),
+            self.journal_error.as_ref(),
+        );
     }
 
     fn reconcile_observation(&mut self) {
@@ -2538,7 +2569,7 @@ fn preserve_cumulative_total(previous: UsageSummary, mut current: UsageSummary) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{tests::Fixture as JournalFixture, Payload, Replay};
+    use crate::journal::{tests::Fixture as JournalFixture, JournalView, Payload, Replay};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -2591,6 +2622,37 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[test]
+    fn persistence_projection_distinguishes_submission_commit_and_uncertainty() {
+        let mut view = JournalView {
+            session_id: "session".into(),
+            submitted_seq: 2,
+            committed_seq: 1,
+            committed_version: 1,
+            error: None,
+        };
+        assert_eq!(
+            persistence_state(Some(&view), None),
+            PersistenceState::Submitted
+        );
+        view.committed_seq = 2;
+        assert_eq!(
+            persistence_state(Some(&view), None),
+            PersistenceState::Committed
+        );
+        view.error = Some(JournalError::Io);
+        assert_eq!(
+            persistence_state(Some(&view), None),
+            PersistenceState::Uncertain
+        );
+        view.error = None;
+        assert_eq!(
+            persistence_state(Some(&view), Some(&JournalError::Closed)),
+            PersistenceState::Uncertain
+        );
+        assert_eq!(persistence_state(None, None), PersistenceState::Uncertain);
     }
 
     #[tokio::test]

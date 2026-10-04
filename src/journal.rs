@@ -465,6 +465,9 @@ pub struct Record {
     pub snapshot_version: u64,
     pub recorded_at: Option<u64>,
     pub payload: Payload,
+    /// JSONL 输出时标记为 committed；journal 文件本身不保存这个瞬时投影。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<crate::state::PersistenceState>,
     /// 回放保留历史时钟值；它们不能当作当前进程的新鲜度。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub historical: Option<bool>,
@@ -498,6 +501,7 @@ impl Record {
             snapshot_version: snapshot.observation.snapshot_version,
             recorded_at: wall_ms(),
             payload: Payload::Snapshot(Box::new(snapshot)),
+            persistence: None,
             historical: None,
         }
     }
@@ -1318,8 +1322,10 @@ fn supported_schema(version: Option<u64>) -> bool {
 }
 
 pub(crate) fn write_record(writer: &mut impl Write, record: &Record) -> Result<(), JournalError> {
+    let mut output = record.clone();
+    output.persistence = Some(crate::state::PersistenceState::Committed);
     writer
-        .write_all(&record.encode()?)
+        .write_all(&output.encode()?)
         .map_err(|_| JournalError::Output)
 }
 

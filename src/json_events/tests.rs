@@ -65,6 +65,9 @@ async fn live_jsonl_tails_committed_records_and_flushes_a_final_snapshot_after_c
         ]
     );
     assert!(records.iter().all(|r| r.historical.is_none()));
+    assert!(records
+        .iter()
+        .all(|r| { r.persistence == Some(crate::state::PersistenceState::Committed) }));
     assert_eq!(
         records.last().unwrap().state().unwrap().execution_result,
         Some(SessionPhase::Completed)

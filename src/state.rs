@@ -28,6 +28,19 @@ pub enum SessionPhase {
     Unknown,
 }
 
+/// Core 对最新快照的持久化确认状态。
+///
+/// Submitted 只表示快照已交给 journal writer；只有提交序号追平后才是 Committed。
+/// writer 出错或 journal 不可用时结果为 Uncertain。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceState {
+    Submitted,
+    Committed,
+    #[default]
+    Uncertain,
+}
+
 impl SessionPhase {
     pub fn can_submit(self) -> bool {
         matches!(
@@ -129,6 +142,7 @@ pub struct CoreSnapshot {
     pub timeline: crate::timeline::TimelineSnapshot,
     pub diagnostics: crate::diagnostics::CoreMetrics,
     pub journal: Option<crate::journal::JournalView>,
+    pub persistence: PersistenceState,
     pub agents: Vec<AgentSnapshot>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -170,6 +184,7 @@ impl Default for CoreSnapshot {
             timeline: Default::default(),
             diagnostics: Default::default(),
             journal: None,
+            persistence: PersistenceState::default(),
             agents: Vec::new(),
             thread_id: None,
             turn_id: None,

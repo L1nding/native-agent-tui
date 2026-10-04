@@ -15,6 +15,7 @@ fn panel() -> HistoryPanel {
         snapshot_version: 0,
         recorded_at: None,
         payload: Payload::Snapshot(Box::new(state)),
+        persistence: None,
         historical: Some(true),
     };
     HistoryPanel {
