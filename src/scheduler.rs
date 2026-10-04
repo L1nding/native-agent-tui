@@ -182,6 +182,8 @@ pub struct SchedulerSnapshot {
     pub root_slots_reserved: usize,
     /// 当前 NativeChild attempt 的活动槽位 reservation 数量。
     pub native_slots_reserved: usize,
+    /// 客户端配置的 NativeChild 活动槽位上限；旧快照缺失时为 None。
+    pub native_slot_capacity: Option<usize>,
     /// Native turns are observed; this count is not a client-enforced capacity.
     pub native_turns_observed: usize,
 }
@@ -236,6 +238,10 @@ pub enum SchedulerError {
     Stale,
     #[error("native child retries are controlled by the root agent")]
     NativeRetryUnsupported,
+    #[error("native slot capacity {capacity} is below current reservations {reserved}")]
+    NativeCapacityExceeded { capacity: usize, reserved: usize },
+    #[error("native slot capacity must be at least 1")]
+    InvalidNativeCapacity,
     #[error("invalid scheduler snapshot: {0}")]
     InvalidSnapshot(&'static str),
 }
@@ -259,6 +265,7 @@ pub struct Scheduler {
     paused: bool,
     stopping: bool,
     disconnected: bool,
+    native_slot_capacity: Option<usize>,
 }
 
 impl Default for Scheduler {
@@ -273,6 +280,7 @@ impl Default for Scheduler {
             paused: false,
             stopping: false,
             disconnected: false,
+            native_slot_capacity: None,
         }
     }
 }
@@ -620,6 +628,22 @@ impl Scheduler {
                 "native slot count does not match task state",
             ));
         }
+        if snapshot
+            .native_slot_capacity
+            .is_some_and(|capacity| capacity == 0)
+        {
+            return Err(SchedulerError::InvalidSnapshot(
+                "native slot capacity must be positive",
+            ));
+        }
+        if snapshot
+            .native_slot_capacity
+            .is_some_and(|capacity| native_slots_reserved > capacity)
+        {
+            return Err(SchedulerError::InvalidSnapshot(
+                "native slot reservations exceed capacity",
+            ));
+        }
         let queued_roots = tasks
             .values()
             .filter(|task| task.view.kind == TaskKind::RootTurn && task.view.state.unstarted())
@@ -640,7 +664,30 @@ impl Scheduler {
             paused: snapshot.paused,
             stopping: snapshot.stopping,
             disconnected: snapshot.disconnected,
+            native_slot_capacity: snapshot.native_slot_capacity,
         })
+    }
+
+    /// 设置 NativeChild 槽位上限的只读投影；运行时准入仍由 AgentRegistry 负责。
+    pub fn set_native_slot_capacity(
+        &mut self,
+        capacity: Option<usize>,
+    ) -> Result<(), SchedulerError> {
+        let reserved = self
+            .tasks
+            .values()
+            .filter(|task| task.view.native_slot_reserved)
+            .count();
+        if let Some(capacity) = capacity {
+            if capacity == 0 {
+                return Err(SchedulerError::InvalidNativeCapacity);
+            }
+            if reserved > capacity {
+                return Err(SchedulerError::NativeCapacityExceeded { capacity, reserved });
+            }
+        }
+        self.native_slot_capacity = capacity;
+        Ok(())
     }
 
     pub fn task(&self, id: TaskId) -> Option<&TaskSnapshot> {
@@ -1314,6 +1361,7 @@ impl Scheduler {
                 .values()
                 .filter(|task| task.view.native_slot_reserved)
                 .count(),
+            native_slot_capacity: self.native_slot_capacity,
             native_turns_observed: self
                 .tasks
                 .values()
@@ -1933,6 +1981,7 @@ mod tests {
     #[test]
     fn restore_validates_native_child_reservation_and_count() {
         let mut scheduler = Scheduler::default();
+        scheduler.set_native_slot_capacity(Some(1)).unwrap();
         let child = scheduler.register_child("child", None, "child").unwrap();
         scheduler
             .child_event(&GateEvent {
@@ -1944,7 +1993,13 @@ mod tests {
             .unwrap();
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.native_slots_reserved, 1);
+        assert_eq!(snapshot.native_slot_capacity, Some(1));
         assert!(Scheduler::restore(&snapshot).is_ok());
+
+        assert_eq!(
+            scheduler.set_native_slot_capacity(Some(0)),
+            Err(SchedulerError::InvalidNativeCapacity)
+        );
 
         let mut missing_reservation = snapshot.clone();
         missing_reservation
@@ -1958,11 +2013,61 @@ mod tests {
             Err(SchedulerError::InvalidSnapshot(_))
         ));
 
-        let mut wrong_count = snapshot;
+        let mut wrong_count = snapshot.clone();
         wrong_count.native_slots_reserved = 0;
         assert!(matches!(
             Scheduler::restore(&wrong_count),
             Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let mut over_capacity = snapshot;
+        over_capacity.native_slot_capacity = Some(0);
+        assert!(matches!(
+            Scheduler::restore(&over_capacity),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+
+        let zero_capacity = SchedulerSnapshot {
+            native_slot_capacity: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Scheduler::restore(&zero_capacity),
+            Err(SchedulerError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn positive_capacity_rejects_two_native_reservations_when_limit_is_one() {
+        let mut scheduler = Scheduler::default();
+        scheduler.set_native_slot_capacity(Some(2)).unwrap();
+        for (thread, turn) in [("a", "a-1"), ("b", "b-1")] {
+            scheduler.register_child(thread, None, thread).unwrap();
+            scheduler
+                .child_event(&GateEvent {
+                    target: thread.into(),
+                    generation: 1,
+                    turn_id: turn.into(),
+                    outcome: None,
+                })
+                .unwrap();
+        }
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.native_slots_reserved, 2);
+        assert_eq!(
+            scheduler.set_native_slot_capacity(Some(1)),
+            Err(SchedulerError::NativeCapacityExceeded {
+                capacity: 1,
+                reserved: 2,
+            })
+        );
+        let mut over_capacity = snapshot;
+        over_capacity.native_slot_capacity = Some(1);
+        assert!(matches!(
+            Scheduler::restore(&over_capacity),
+            Err(SchedulerError::InvalidSnapshot(
+                "native slot reservations exceed capacity"
+            ))
         ));
     }
 }

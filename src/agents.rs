@@ -238,9 +238,9 @@ impl AgentRegistry {
         if agent.awaiting_after.is_some_and(|after| seq <= after) {
             return Ok(None);
         }
-        let has_active_slot =
-            agent.turn_id.is_some() && agent.outcome.is_none() && agent.awaiting_after.is_none();
-        if !has_active_slot && self.active_turn_count() >= self.limits.max_active_turns {
+        // 同一 agent 的新轮次可以替换尚未终态的旧轮次；其他 agent 必须等待旧轮次终态。
+        let replaces_active_slot = agent.turn_id.is_some() && agent.outcome.is_none();
+        if !replaces_active_slot && self.active_turn_count() >= self.limits.max_active_turns {
             return Err(AgentError::ActiveTurnLimit(self.limits.max_active_turns));
         }
         let agent = self.agents.get_mut(id).expect("agent was checked above");
@@ -376,9 +376,7 @@ impl AgentRegistry {
     fn active_turn_count(&self) -> usize {
         self.agents
             .values()
-            .filter(|agent| {
-                agent.turn_id.is_some() && agent.outcome.is_none() && agent.awaiting_after.is_none()
-            })
+            .filter(|agent| agent.turn_id.is_some() && agent.outcome.is_none())
             .count()
     }
 }
@@ -496,6 +494,39 @@ mod tests {
             .completed("a", "a-1", ChildOutcome::Completed)
             .unwrap();
         agents.started("b", "b-1", 3).unwrap().unwrap();
+    }
+
+    #[test]
+    fn rearm_keeps_old_slot_until_replacement_or_terminal_and_ignores_stale_terminal() {
+        let mut agents = AgentRegistry::with_limits(AgentLimits {
+            max_children: 2,
+            max_depth: 1,
+            max_active_turns: 1,
+        });
+        agents.register(child("a", "root")).unwrap();
+        agents.register(child("b", "root")).unwrap();
+        let old = agents.started("a", "a-old", 1).unwrap().unwrap();
+
+        agents.rearm("a", 2);
+        assert!(matches!(
+            agents.started("b", "b-1", 3),
+            Err(AgentError::ActiveTurnLimit(1))
+        ));
+
+        let replacement = agents.started("a", "a-new", 4).unwrap().unwrap();
+        assert_eq!(replacement.generation, old.generation + 1);
+        assert!(agents
+            .completed("a", "a-old", ChildOutcome::Completed)
+            .is_none());
+        assert!(matches!(
+            agents.started("b", "b-2", 5),
+            Err(AgentError::ActiveTurnLimit(1))
+        ));
+
+        agents
+            .completed("a", "a-new", ChildOutcome::Completed)
+            .unwrap();
+        agents.started("b", "b-3", 6).unwrap().unwrap();
     }
 
     #[test]

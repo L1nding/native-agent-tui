@@ -663,6 +663,7 @@ fn native_child_reservation_round_trips_through_journal() {
     let fixture = Fixture::new();
     let now = tokio::time::Instant::now();
     let mut scheduler = Scheduler::default();
+    scheduler.set_native_slot_capacity(Some(4)).unwrap();
     let child = scheduler
         .register_child("native-child", None, "child")
         .unwrap();
@@ -683,6 +684,7 @@ fn native_child_reservation_round_trips_through_journal() {
     };
     let captured = StoredSnapshot::capture(&core);
     assert_eq!(captured.native_slots_reserved, 1);
+    assert_eq!(captured.native_slot_capacity, Some(4));
     assert!(
         captured
             .tasks
@@ -695,6 +697,7 @@ fn native_child_reservation_round_trips_through_journal() {
     let decoded: StoredSnapshot =
         serde_json::from_str(&serde_json::to_string(&captured).unwrap()).unwrap();
     assert_eq!(decoded.native_slots_reserved, 1);
+    assert_eq!(decoded.native_slot_capacity, Some(4));
     assert!(
         decoded
             .tasks
@@ -704,9 +707,19 @@ fn native_child_reservation_round_trips_through_journal() {
             .native_slot_reserved
     );
 
+    let mut legacy_json = serde_json::to_value(&decoded).unwrap();
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("native_slot_capacity");
+    let legacy_without_capacity: StoredSnapshot = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy_without_capacity.native_slot_capacity, None);
+    assert!(Scheduler::restore(&legacy_without_capacity.scheduler_snapshot()).is_ok());
+
     let mut legacy = decoded.clone();
     legacy.native_slots_complete = false;
     legacy.native_slots_reserved = 0;
+    legacy.native_slot_capacity = None;
     legacy
         .tasks
         .iter_mut()
@@ -721,5 +734,6 @@ fn native_child_reservation_round_trips_through_journal() {
     let replayed = replay(&fixture, "native-reservation", 0).unwrap();
     let latest = replayed.latest_state();
     assert_eq!(latest.native_slots_reserved, 1);
+    assert_eq!(latest.native_slot_capacity, Some(4));
     assert!(Scheduler::restore(&latest.scheduler_snapshot()).is_ok());
 }

@@ -156,6 +156,10 @@ impl ClientHandle {
             cwd: config.cwd.display().to_string(),
             sandbox: config.sandbox.clone(),
             approval_policy: config.approval_policy.clone(),
+            scheduler: crate::scheduler::SchedulerSnapshot {
+                native_slot_capacity: Some(config.max_native_turns.max(1)),
+                ..Default::default()
+            },
             token_budget: TokenBudgetSnapshot {
                 limit: config.max_total_tokens,
                 per_agent_limit: config.max_agent_tokens,
@@ -211,6 +215,10 @@ impl ClientHandle {
             PersistenceState::Uncertain
         };
         let (snapshot_tx, snapshots) = watch::channel(Arc::new(initial.clone()));
+        let mut scheduler = Scheduler::default();
+        scheduler
+            .set_native_slot_capacity(Some(config.max_native_turns.max(1)))
+            .expect("initial native slot capacity must fit an empty scheduler");
         let join = tokio::spawn(
             Core {
                 pipe,
@@ -233,7 +241,7 @@ impl ClientHandle {
                 next_id: 1,
                 next_outbox_id: 1,
                 outbox_pending: HashMap::new(),
-                scheduler: Scheduler::default(),
+                scheduler,
                 child_interrupts: VecDeque::new(),
                 interrupt_requested: false,
                 interrupt_sent: false,
@@ -5387,6 +5395,10 @@ mod tests {
         })
         .await;
         running_root(&mut client, &mut server).await;
+        assert_eq!(
+            client.snapshots.borrow().scheduler.native_slot_capacity,
+            Some(1)
+        );
         child(&mut server, "a", "a-1").await;
         send(
             &mut server,
@@ -5673,6 +5685,204 @@ mod tests {
         .unwrap();
         assert_eq!(data["targets"][0]["turnId"], "new");
         assert_eq!(data["targets"][0]["generation"], 2);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rearmed_active_child_keeps_capacity_slot_for_other_agents() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_native_children: 2,
+            max_native_turns: 1,
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        send(
+            &mut server,
+            json!({
+                "method":"thread/started",
+                "params":{"thread":{"id":"a","parentThreadId":"root","source":{"subAgent":{}}}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"item/started",
+                "params":{"threadId":"root","turnId":"root-turn","item":{
+                    "id":"spawn-a","type":"subAgentActivity","agentThreadId":"a",
+                    "agentPath":"/root/a","kind":"started"
+                }}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"a","turn":{"id":"old"}}}),
+        )
+        .await;
+        let identity = next(&mut server).await;
+        assert_eq!(identity["method"], "thread/read");
+        send(
+            &mut server,
+            json!({
+                "id":identity["id"],
+                "result":{"thread":{"id":"a","parentThreadId":"root"}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"item/started",
+                "params":{"threadId":"root","turnId":"root-turn","item":{
+                    "id":"followup-capacity","type":"collabAgentToolCall","senderThreadId":"root",
+                    "receiverThreadIds":["a"],"tool":"followupTask","status":"in_progress"
+                }}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"item/completed",
+                "params":{"threadId":"root","turnId":"root-turn","item":{
+                    "id":"followup-capacity","type":"collabAgentToolCall","senderThreadId":"root",
+                    "receiverThreadIds":["a"],"tool":"followupTask","status":"completed",
+                    "agentsStates":{"a":{"status":"completed"}}
+                }}
+            }),
+        )
+        .await;
+        child(&mut server, "b", "b-1").await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| snapshot.phase == SessionPhase::Unknown)
+            .await
+            .unwrap()
+            .clone();
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("active turn capacity")));
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rearmed_active_child_replacement_reuses_one_capacity_slot() {
+        let (mut client, mut server) = harness_with_config(Config {
+            max_native_children: 2,
+            max_native_turns: 1,
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        send(
+            &mut server,
+            json!({
+                "method":"thread/started",
+                "params":{"thread":{"id":"a","parentThreadId":"root","source":{"subAgent":{}}}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"item/started",
+                "params":{"threadId":"root","turnId":"root-turn","item":{
+                    "id":"spawn-a-replace","type":"subAgentActivity","agentThreadId":"a",
+                    "agentPath":"/root/a","kind":"started"
+                }}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"a","turn":{"id":"old"}}}),
+        )
+        .await;
+        let identity = next(&mut server).await;
+        assert_eq!(identity["method"], "thread/read");
+        send(
+            &mut server,
+            json!({
+                "id":identity["id"],
+                "result":{"thread":{"id":"a","parentThreadId":"root"}}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"item/started",
+                "params":{"threadId":"root","turnId":"root-turn","item":{
+                    "id":"followup-replace","type":"collabAgentToolCall","senderThreadId":"root",
+                    "receiverThreadIds":["a"],"tool":"followupTask","status":"in_progress"
+                }}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"item/completed",
+                "params":{"threadId":"root","turnId":"root-turn","item":{
+                    "id":"followup-replace","type":"collabAgentToolCall","senderThreadId":"root",
+                    "receiverThreadIds":["a"],"tool":"followupTask","status":"completed",
+                    "agentsStates":{"a":{"status":"completed"}}
+                }}
+            }),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({
+                "method":"turn/started",
+                "params":{"threadId":"a","turn":{"id":"new"}}
+            }),
+        )
+        .await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.scheduler.tasks.iter().any(|task| {
+                    task.external.as_ref().is_some_and(|external| {
+                        external.thread_id == "a"
+                            && external.turn_id == "new"
+                            && task.native_slot_reserved
+                    })
+                })
+            })
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(snapshot.scheduler.native_slot_capacity, Some(1));
+        assert_eq!(snapshot.scheduler.native_slots_reserved, 1);
+        assert_eq!(snapshot.phase, SessionPhase::Running);
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"old","status":"completed"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"new","status":"completed"}}}),
+        )
+        .await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| snapshot.scheduler.native_slots_reserved == 0)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.scheduler.native_slot_capacity, Some(1));
+        drop(snapshot);
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Completed).await;
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

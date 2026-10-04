@@ -186,6 +186,9 @@ pub struct StoredSnapshot {
     pub root_slots_reserved: usize,
     #[serde(default)]
     pub native_slots_reserved: usize,
+    /// 客户端配置的 NativeChild 活动槽位上限；旧 journal 缺失时保持不可用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_slot_capacity: Option<usize>,
     /// 新快照明确记录 reservation 一致性；缺失时按旧快照只读推导。
     #[serde(default)]
     pub native_slots_complete: bool,
@@ -257,6 +260,7 @@ impl StoredSnapshot {
             active_root: core.scheduler.active_root,
             root_slots_reserved: core.scheduler.root_slots_reserved,
             native_slots_reserved: core.scheduler.native_slots_reserved,
+            native_slot_capacity: core.scheduler.native_slot_capacity,
             native_slots_complete: true,
             native_turns_observed: core.scheduler.native_turns_observed,
             scheduler_disconnected: core.scheduler.disconnected,
@@ -502,6 +506,7 @@ impl StoredSnapshot {
                 self.root_slots_reserved
             },
             native_slots_reserved,
+            native_slot_capacity: self.native_slot_capacity,
             native_turns_observed: if self.native_turns_observed == 0 {
                 computed_native_turns
             } else {

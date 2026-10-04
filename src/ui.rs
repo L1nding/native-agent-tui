@@ -2068,25 +2068,27 @@ fn draw_tasks(
     let details = if height >= 6 { 3 } else { 0 };
     let summary = if height > 1 {
         let width = area.width.saturating_sub(2) as usize;
+        let native_reserved = scheduler
+            .native_slot_capacity
+            .map(|capacity| format!("{}/{}", scheduler.native_slots_reserved, capacity))
+            .unwrap_or_else(|| format!("{}/unavailable", scheduler.native_slots_reserved));
         let full = vec![format!(
-            "Root slots: {} | native slots reserved: {} | native turns observed: {}",
-            scheduler.root_slots_reserved,
-            scheduler.native_slots_reserved,
-            scheduler.native_turns_observed
+            "Root slots: {} | native reserved: {} | native turns observed: {}",
+            scheduler.root_slots_reserved, native_reserved, scheduler.native_turns_observed
         )];
         let medium = vec![
             format!(
                 "Root slots: {} | native reserved: {}",
-                scheduler.root_slots_reserved, scheduler.native_slots_reserved
+                scheduler.root_slots_reserved, native_reserved
             ),
             format!("Native turns observed: {}", scheduler.native_turns_observed),
         ];
         let narrow = vec![
-            format!("native reserved: {}", scheduler.native_slots_reserved),
+            format!("native reserved: {}", native_reserved),
             format!("native observed: {}", scheduler.native_turns_observed),
         ];
         let compact = vec![
-            format!("N reserved: {}", scheduler.native_slots_reserved),
+            format!("N reserved: {}", native_reserved),
             format!("N observed: {}", scheduler.native_turns_observed),
         ];
         [full, medium, narrow, compact]
@@ -2094,7 +2096,7 @@ fn draw_tasks(
             .find(|candidate| candidate.iter().all(|line| line.width() <= width))
             .unwrap_or_else(|| {
                 vec![
-                    format!("R:{}", scheduler.native_slots_reserved),
+                    format!("N:{}", native_reserved),
                     format!("O:{}", scheduler.native_turns_observed),
                 ]
             })
@@ -3492,6 +3494,7 @@ mod tests {
                 tasks: vec![root, native_reserved, native_free],
                 root_slots_reserved: 12,
                 native_slots_reserved: 12,
+                native_slot_capacity: Some(12),
                 native_turns_observed: 12,
                 ..Default::default()
             },
@@ -3517,7 +3520,7 @@ mod tests {
         };
         let rows = render(120, 20);
         let rendered = rows.join("\n");
-        assert!(rendered.contains("native slots reserved: 12"), "{rendered}");
+        assert!(rendered.contains("native reserved: 12/12"), "{rendered}");
         assert!(rendered.contains("native turns observed: 12"), "{rendered}");
         assert!(rendered.contains("slot reserved"), "{rendered}");
         assert!(rendered.contains("slot free"), "{rendered}");
@@ -3528,16 +3531,36 @@ mod tests {
         assert!(!root_row.contains("slot"), "{root_row}");
 
         let medium = render(66, 12).join("\n");
-        assert!(medium.contains("native reserved: 12"), "{medium}");
+        assert!(medium.contains("native reserved: 12/12"), "{medium}");
         assert!(medium.contains("Native turns observed: 12"), "{medium}");
 
         let narrow = render(34, 12).join("\n");
-        assert!(narrow.contains("native reserved: 12"), "{narrow}");
+        assert!(narrow.contains("native reserved: 12/12"), "{narrow}");
         assert!(narrow.contains("native observed: 12"), "{narrow}");
 
         let compact = render(24, 8).join("\n");
-        assert!(compact.contains("native reserved: 12"), "{compact}");
+        assert!(compact.contains("native reserved: 12/12"), "{compact}");
         assert!(compact.contains("native observed: 12"), "{compact}");
+
+        let unavailable = CoreSnapshot {
+            scheduler: SchedulerSnapshot {
+                native_slot_capacity: None,
+                ..snapshot.scheduler.clone()
+            },
+            ..snapshot.clone()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_tasks(frame, frame.area(), &unavailable, &local))
+            .unwrap();
+        let unavailable_rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(unavailable_rendered.contains("native reserved: 12/unavailable"));
     }
 
     #[test]
