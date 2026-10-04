@@ -189,6 +189,14 @@ pub struct StoredTokenBudgetSnapshot {
     pub confirmed_complete: bool,
     pub limit: Option<u64>,
     pub stop_triggered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_agent_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub per_agent_stop_triggered: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl StoredSnapshot {
@@ -236,12 +244,16 @@ impl StoredSnapshot {
                 (budget.confirmed_total_tokens.is_some()
                     || budget.confirmed_complete
                     || budget.limit.is_some()
-                    || budget.stop_triggered)
+                    || budget.stop_triggered
+                    || budget.per_agent_limit.is_some()
+                    || budget.per_agent_stop_triggered)
                     .then_some(StoredTokenBudgetSnapshot {
                         confirmed_total_tokens: budget.confirmed_total_tokens,
                         confirmed_complete: budget.confirmed_complete,
                         limit: budget.limit,
                         stop_triggered: budget.stop_triggered,
+                        per_agent_limit: budget.per_agent_limit,
+                        per_agent_stop_triggered: budget.per_agent_stop_triggered,
                     })
             },
             skills: (core.skills.freshness != crate::skills::SkillFreshness::Unknown)

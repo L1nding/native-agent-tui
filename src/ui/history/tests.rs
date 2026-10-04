@@ -121,6 +121,8 @@ fn historical_details_render_persisted_usage_and_budget_without_private_content(
         confirmed_complete: true,
         limit: Some(30),
         stop_triggered: false,
+        per_agent_limit: Some(15),
+        per_agent_stop_triggered: true,
     });
     state.observation.session_id = "history-session".into();
     let evidence = crate::observation::Evidence {
@@ -191,6 +193,10 @@ fn historical_details_render_persisted_usage_and_budget_without_private_content(
     assert!(screen.contains("total 20"), "{screen}");
     assert!(screen.contains("Recorded token budget"), "{screen}");
     assert!(screen.contains("20 / 30"), "{screen}");
+    assert!(
+        screen.contains("per-agent: limit 15, stop triggered: true"),
+        "{screen}"
+    );
     assert!(screen.contains("Compactions retained: 1"), "{screen}");
     assert!(screen.contains("source Some(AppServer)"), "{screen}");
     assert!(

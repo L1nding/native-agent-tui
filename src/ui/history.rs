@@ -597,11 +597,20 @@ impl HistoryPanel {
                 }
                 if let Some(budget) = state.token_budget {
                     rows.push(format!(
-                        "Recorded token budget: {} / {} | complete: {} | stop triggered: {}",
+                        "Recorded token budget: {} / {} | complete: {} | stop triggered: {} | per-agent: {}",
                         history_value(budget.confirmed_total_tokens),
                         history_value(budget.limit),
                         budget.confirmed_complete,
                         budget.stop_triggered,
+                        budget.per_agent_limit.map_or_else(
+                            || "not set".to_owned(),
+                            |limit| {
+                                format!(
+                                    "limit {limit}, stop triggered: {}",
+                                    budget.per_agent_stop_triggered
+                                )
+                            },
+                        ),
                     ));
                 }
                 if let Some(skills) = state.skills {

@@ -547,6 +547,8 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
         confirmed_complete: true,
         limit: Some(200),
         stop_triggered: false,
+        per_agent_limit: Some(80),
+        per_agent_stop_triggered: true,
     };
     core.model = Some("PRIVATE_MODEL".into());
     core.last_error = Some("PRIVATE_SECRET".into());
@@ -594,10 +596,14 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
             confirmed_complete: true,
             limit: Some(200),
             stop_triggered: false,
+            per_agent_limit: Some(80),
+            per_agent_stop_triggered: true,
         })
     );
     let serialized = serde_json::to_string(&captured).unwrap();
     assert!(!serialized.contains("PRIVATE_"));
+    assert!(serialized.contains("\"perAgentLimit\":80"));
+    assert!(serialized.contains("\"perAgentStopTriggered\":true"));
     assert!(captured.skills.is_some());
     assert!(!serialized.contains("skills/list"));
 
@@ -623,6 +629,21 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
     assert!(output.contains("\"totalTokens\":165"));
     assert!(output.contains("\"confirmedTotalTokens\":165"));
     assert!(!output.contains("PRIVATE_"));
+}
+
+#[test]
+fn legacy_token_budget_defaults_per_agent_visibility_fields() {
+    let legacy = serde_json::json!({
+        "confirmedTotalTokens": 10,
+        "confirmedComplete": true,
+        "limit": 20,
+        "stopTriggered": false,
+    });
+    let decoded: StoredTokenBudgetSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.confirmed_total_tokens, Some(10));
+    assert_eq!(decoded.limit, Some(20));
+    assert_eq!(decoded.per_agent_limit, None);
+    assert!(!decoded.per_agent_stop_triggered);
 }
 
 #[test]

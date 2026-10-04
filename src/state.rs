@@ -92,12 +92,17 @@ pub struct UsageSummary {
 }
 
 /// 会话级预算投影；数字只来自服务端确认的 usage。
+///
+/// `per_agent_*` 是当前会话配置的单 agent/turn 预算及其触发摘要，
+/// 不携带 thread、turn 或 prompt 等私有执行内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenBudgetSnapshot {
     pub confirmed_total_tokens: Option<u64>,
     pub confirmed_complete: bool,
     pub limit: Option<u64>,
     pub stop_triggered: bool,
+    pub per_agent_limit: Option<u64>,
+    pub per_agent_stop_triggered: bool,
 }
 
 impl UsageSummary {

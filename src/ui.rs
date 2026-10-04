@@ -1952,9 +1952,24 @@ fn token_budget_brief(snapshot: &CoreSnapshot) -> String {
 fn format_token_budget_evidence(snapshot: &CoreSnapshot) -> String {
     let budget = snapshot.token_budget;
     format!(
-        "Session token budget: {} | stop triggered: {}",
+        "Session token budget: {} | stop triggered: {} | Per-agent token budget: {}",
         token_budget_brief(snapshot),
-        if budget.stop_triggered { "yes" } else { "no" }
+        if budget.stop_triggered { "yes" } else { "no" },
+        per_agent_budget_brief(budget)
+    )
+}
+
+fn per_agent_budget_brief(budget: crate::state::TokenBudgetSnapshot) -> String {
+    let Some(limit) = budget.per_agent_limit else {
+        return "not set".to_owned();
+    };
+    format!(
+        "limit {limit} | stop triggered: {}",
+        if budget.per_agent_stop_triggered {
+            "yes"
+        } else {
+            "no"
+        }
     )
 }
 
@@ -3013,7 +3028,18 @@ mod tests {
         snapshot.token_budget.stop_triggered = true;
         assert_eq!(
             format_token_budget_evidence(&snapshot),
-            "Session token budget: tokens:4/10 | stop triggered: yes"
+            "Session token budget: tokens:4/10 | stop triggered: yes | Per-agent token budget: not set"
+        );
+
+        snapshot.token_budget.per_agent_limit = Some(6);
+        assert_eq!(
+            format_token_budget_evidence(&snapshot),
+            "Session token budget: tokens:4/10 | stop triggered: yes | Per-agent token budget: limit 6 | stop triggered: no"
+        );
+        snapshot.token_budget.per_agent_stop_triggered = true;
+        assert_eq!(
+            format_token_budget_evidence(&snapshot),
+            "Session token budget: tokens:4/10 | stop triggered: yes | Per-agent token budget: limit 6 | stop triggered: yes"
         );
 
         snapshot.token_budget.limit = None;

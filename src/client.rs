@@ -138,6 +138,7 @@ impl ClientHandle {
             approval_policy: config.approval_policy.clone(),
             token_budget: TokenBudgetSnapshot {
                 limit: config.max_total_tokens,
+                per_agent_limit: config.max_agent_tokens,
                 ..Default::default()
             },
             observation: observer.snapshot_at(0, Instant::now()),
@@ -353,6 +354,8 @@ impl Core {
             confirmed_complete,
             limit: self.config.max_total_tokens,
             stop_triggered: self.token_budget_stop_started,
+            per_agent_limit: self.config.max_agent_tokens,
+            per_agent_stop_triggered: !self.agent_budget_interrupts.is_empty(),
         };
     }
 
@@ -7087,6 +7090,17 @@ mod tests {
         })
         .await;
         running_root(&mut client, &mut server).await;
+        assert_eq!(
+            client.snapshots.borrow().token_budget.per_agent_limit,
+            Some(10)
+        );
+        assert!(
+            !client
+                .snapshots
+                .borrow()
+                .token_budget
+                .per_agent_stop_triggered
+        );
         send(
             &mut server,
             json!({"method":"thread/tokenUsage/updated","params":{"threadId":"root","turnId":"root-turn","tokenUsage":{"total":{"totalTokens":10}}}}),
@@ -7106,6 +7120,13 @@ mod tests {
                     && notice.contains("thread=root")
                     && notice.contains("turn=root-turn")
             }));
+        assert!(
+            client
+                .snapshots
+                .borrow()
+                .token_budget
+                .per_agent_stop_triggered
+        );
         send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
         send(
             &mut server,
@@ -7146,6 +7167,10 @@ mod tests {
         .await;
         running_root(&mut client, &mut server).await;
         child(&mut server, "child", "child-turn").await;
+        assert_eq!(
+            client.snapshots.borrow().token_budget.per_agent_limit,
+            Some(10)
+        );
         send(
             &mut server,
             json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":10}}}}),
@@ -7157,6 +7182,13 @@ mod tests {
         assert_eq!(interrupt["method"], "turn/interrupt");
         assert_eq!(interrupt["params"]["threadId"], "child");
         assert_eq!(interrupt["params"]["turnId"], "child-turn");
+        assert!(
+            client
+                .snapshots
+                .borrow()
+                .token_budget
+                .per_agent_stop_triggered
+        );
         send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
         send(
             &mut server,
