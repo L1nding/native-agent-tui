@@ -29,6 +29,15 @@ pub enum SkillFreshness {
     Queued,
 }
 
+/// 最近一次成功 skills/list 刷新的触发来源，不包含路径或请求内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkillRefreshSource {
+    Initial,
+    Changed,
+    Manual,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillEntry {
     pub name: String,
@@ -45,6 +54,8 @@ pub struct SkillsSnapshot {
     pub enabled_count: u32,
     pub scan_error_count: u32,
     pub truncated: bool,
+    /// 最近一次成功刷新来源；尚未成功刷新时为空。
+    pub refresh_source: Option<SkillRefreshSource>,
     pub entries: Vec<SkillEntry>,
 }
 
@@ -133,6 +144,8 @@ pub struct StoredSkillsSummary {
     pub enabled_count: u32,
     pub scan_error_count: u32,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_source: Option<SkillRefreshSource>,
 }
 
 impl From<&SkillsSnapshot> for StoredSkillsSummary {
@@ -144,15 +157,20 @@ impl From<&SkillsSnapshot> for StoredSkillsSummary {
             enabled_count: value.enabled_count,
             scan_error_count: value.scan_error_count,
             truncated: value.truncated,
+            refresh_source: value.refresh_source,
         }
     }
 }
 
 impl StoredSkillsSummary {
     pub fn brief(&self) -> String {
+        let source = self.refresh_source.map_or_else(
+            || "source unavailable".to_owned(),
+            |source| format!("source: {source:?}"),
+        );
         match self.availability {
             SkillAvailability::Available => format!(
-                "server-confirmed | {:?} | {} skills observed, {} enabled | scan errors: {}{}",
+                "server-confirmed | {source} | {:?} | {} skills observed, {} enabled | scan errors: {}{}",
                 self.freshness,
                 self.skill_count,
                 self.enabled_count,
@@ -160,14 +178,17 @@ impl StoredSkillsSummary {
                 if self.truncated { " | truncated" } else { "" },
             ),
             SkillAvailability::Partial => format!(
-                "server-confirmed partial | {:?} | at least {} skills observed, {} enabled | scan errors: {}{}",
+                "server-confirmed partial | {source} | {:?} | at least {} skills observed, {} enabled | scan errors: {}{}",
                 self.freshness,
                 self.skill_count,
                 self.enabled_count,
                 self.scan_error_count,
                 if self.truncated { " | truncated" } else { "" },
             ),
-            reason => format!("{:?} / {:?} | skill counts unavailable", reason, self.freshness),
+            reason => format!(
+                "{:?} / {:?} | {source} | skill counts unavailable",
+                reason, self.freshness
+            ),
         }
     }
 }
@@ -181,6 +202,7 @@ mod tests {
     fn parses_only_bounded_display_fields_and_discards_sensitive_metadata() {
         let value = json!({"data":[{"cwd":"/workspace","errors":[{"path":"SECRET_PATH","message":"SECRET_ERROR"}],"skills":[{"name":"build","description":"SECRET_DESCRIPTION","enabled":true,"path":"/workspace/.agents/skills/build/SKILL.md","scope":"repo","interface":{"defaultPrompt":"SECRET_PROMPT"},"dependencies":{"tools":[{"type":"mcp","value":"SECRET_DEPENDENCY"}]}}]}]});
         let snapshot = parse_result(&value, "/workspace").unwrap();
+        assert_eq!(snapshot.refresh_source, None);
         assert_eq!(snapshot.availability, SkillAvailability::Partial);
         assert_eq!(snapshot.skill_count, 1);
         assert_eq!(snapshot.enabled_count, 1);
@@ -189,6 +211,26 @@ mod tests {
         let stored = serde_json::to_string(&StoredSkillsSummary::from(&snapshot)).unwrap();
         assert!(!stored.contains("SECRET_"));
         assert!(!stored.contains("/workspace"));
+    }
+
+    #[test]
+    fn stored_refresh_source_round_trips_and_legacy_field_defaults() {
+        let snapshot = SkillsSnapshot {
+            availability: SkillAvailability::Available,
+            freshness: SkillFreshness::Current,
+            refresh_source: Some(SkillRefreshSource::Manual),
+            ..Default::default()
+        };
+        let stored = StoredSkillsSummary::from(&snapshot);
+        let encoded = serde_json::to_value(stored).unwrap();
+        assert_eq!(encoded["refreshSource"], "manual");
+        let decoded: StoredSkillsSummary = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.refresh_source, Some(SkillRefreshSource::Manual));
+
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("refreshSource");
+        let decoded: StoredSkillsSummary = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.refresh_source, None);
     }
 
     #[test]

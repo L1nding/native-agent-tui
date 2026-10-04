@@ -20,6 +20,7 @@ use crate::scheduler::{
     ExternalTurn, InterruptEffect, RootTaskSpec, Scheduler, SchedulerCommand, TaskAttempt,
     TaskKind, TaskSnapshot,
 };
+use crate::skills::SkillRefreshSource;
 use crate::state::{
     CoreSnapshot, FactSource, GateSnapshot, PersistenceState, SessionPhase, SessionState,
     TokenBudgetSnapshot, UsageSummary, MESSAGE_BYTES,
@@ -266,6 +267,7 @@ impl ClientHandle {
                 skills_generation: 0,
                 skills_refresh_queued: false,
                 skills_refresh_force_reload: false,
+                skills_refresh_source: None,
             }
             .run(),
         );
@@ -283,10 +285,20 @@ enum RpcKind {
     ThreadStart,
     Preflight,
     AgentRead,
-    StartTurn { generation: u64 },
-    Interrupt { generation: u64 },
-    ChildInterrupt { attempt: TaskAttempt },
-    SkillsList { generation: u64, force_reload: bool },
+    StartTurn {
+        generation: u64,
+    },
+    Interrupt {
+        generation: u64,
+    },
+    ChildInterrupt {
+        attempt: TaskAttempt,
+    },
+    SkillsList {
+        generation: u64,
+        force_reload: bool,
+        source: SkillRefreshSource,
+    },
 }
 
 impl RpcKind {
@@ -349,6 +361,7 @@ struct Core {
     skills_generation: u64,
     skills_refresh_queued: bool,
     skills_refresh_force_reload: bool,
+    skills_refresh_source: Option<SkillRefreshSource>,
 }
 
 struct PendingTool {
@@ -633,8 +646,7 @@ impl Core {
                                 self.state.view.notice = None;
                                 self.preflight_passed = true;
                                 self.skills_generation = self.skills_generation.wrapping_add(1);
-                                self.skills_refresh_queued = true;
-                                self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+                                self.queue_skills_refresh(SkillRefreshSource::Initial, false);
                             }
                             Outcome::TimedOut => self.shell_timeout(),
                             Outcome::Cancelled => self.state.error(SessionPhase::Failed, "Shell preflight cancelled; no model turn was started"),
@@ -872,6 +884,21 @@ impl Core {
             && !scheduler.tasks.iter().any(|task| task.state.active())
     }
 
+    fn queue_skills_refresh(&mut self, source: SkillRefreshSource, force_reload: bool) {
+        self.skills_refresh_source = Some(match (self.skills_refresh_source, source) {
+            (Some(SkillRefreshSource::Manual), _) | (_, SkillRefreshSource::Manual) => {
+                SkillRefreshSource::Manual
+            }
+            (Some(SkillRefreshSource::Changed), _) | (_, SkillRefreshSource::Changed) => {
+                SkillRefreshSource::Changed
+            }
+            _ => SkillRefreshSource::Initial,
+        });
+        self.skills_refresh_queued = true;
+        self.skills_refresh_force_reload |= force_reload;
+        self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+    }
+
     fn flush_skills_refresh(&mut self) {
         if !self.skills_refresh_queued
             || !self.skills_idle_for_refresh()
@@ -885,6 +912,9 @@ impl Core {
         let kind = RpcKind::SkillsList {
             generation: self.skills_generation,
             force_reload: self.skills_refresh_force_reload,
+            source: self
+                .skills_refresh_source
+                .unwrap_or(SkillRefreshSource::Initial),
         };
         if let Err(error) = self.send_rpc(kind) {
             self.skills_failed(crate::skills::SkillAvailability::TransportUnavailable);
@@ -893,6 +923,7 @@ impl Core {
         } else {
             self.skills_refresh_queued = false;
             self.skills_refresh_force_reload = false;
+            self.skills_refresh_source = None;
         }
     }
 
@@ -1173,9 +1204,7 @@ impl Core {
             Command::RefreshSkills => {
                 self.skills_generation = self.skills_generation.wrapping_add(1);
                 self.state.view.skills.freshness = crate::skills::SkillFreshness::Stale;
-                self.skills_refresh_queued = true;
-                self.skills_refresh_force_reload = true;
-                self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+                self.queue_skills_refresh(SkillRefreshSource::Manual, true);
             }
             Command::Schedule(command) => self.schedule(command),
             Command::ScheduleTask { attempt, command } => {
@@ -1715,12 +1744,18 @@ impl Core {
                         if !self.skills_rpc_is_current(&pending) {
                             return;
                         }
+                        let RpcKind::SkillsList { source, .. } = pending.kind else {
+                            return;
+                        };
                         self.skills_refresh_queued = false;
                         if let Some(skills) = crate::skills::parse_result(
                             &envelope.result.unwrap_or(Value::Null),
                             cwd,
                         ) {
+                            let mut skills = skills;
+                            skills.refresh_source = Some(source);
                             self.state.view.skills = skills;
+                            self.skills_refresh_source = None;
                         } else {
                             self.skills_failed(crate::skills::SkillAvailability::Malformed);
                         }
@@ -1798,8 +1833,7 @@ impl Core {
                 self.preflight_passed = true;
                 if !self.check_only {
                     self.skills_generation = self.skills_generation.wrapping_add(1);
-                    self.skills_refresh_queued = true;
-                    self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+                    self.queue_skills_refresh(SkillRefreshSource::Initial, false);
                 }
                 None
             }
@@ -2263,7 +2297,6 @@ impl Core {
     fn notification(&mut self, method: &str, params: Value) {
         if method == "skills/changed" {
             self.skills_generation = self.skills_generation.wrapping_add(1);
-            self.skills_refresh_queued = true;
             self.skills_refresh_force_reload |= self.pending.values().any(|rpc| {
                 matches!(
                     rpc.kind,
@@ -2273,7 +2306,7 @@ impl Core {
                     }
                 )
             });
-            self.state.view.skills.freshness = crate::skills::SkillFreshness::Queued;
+            self.queue_skills_refresh(SkillRefreshSource::Changed, false);
             return;
         }
         if method == "thread/started" {
@@ -6444,6 +6477,43 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(
+            client.snapshots.borrow().skills.refresh_source,
+            Some(crate::skills::SkillRefreshSource::Initial)
+        );
+
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        let changed_request = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
+            .await
+            .unwrap();
+        assert_eq!(changed_request["method"], "skills/list");
+        assert_eq!(changed_request["params"]["forceReload"], false);
+        send(
+            &mut server,
+            json!({"id":changed_request["id"],"result":{"data":[{"cwd":changed_request["params"]["cwds"][0],"errors":[],"skills":[{"name":"changed","enabled":true,"path":"/workspace/changed/SKILL.md","scope":"repo"}]}]}}),
+        )
+        .await;
+        let changed = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+                    && snapshot.skills.refresh_source
+                        == Some(crate::skills::SkillRefreshSource::Changed)
+                    && snapshot
+                        .skills
+                        .entries
+                        .iter()
+                        .any(|entry| entry.name == "changed")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            changed.skills.refresh_source,
+            Some(crate::skills::SkillRefreshSource::Changed)
+        );
+        drop(changed);
 
         send(&mut server, json!({"method":"skills/changed","params":{}})).await;
         let stale_request = tokio::time::timeout(Duration::from_secs(3), next(&mut server))
@@ -6492,6 +6562,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(current.skills.entries.len(), 1);
+        assert_eq!(
+            current.skills.refresh_source,
+            Some(crate::skills::SkillRefreshSource::Manual)
+        );
         assert_eq!(current.phase, SessionPhase::Ready);
         assert_eq!(current.root_turn_count, 0);
         assert_eq!(current.root_start_requests, 0);
@@ -6501,6 +6575,46 @@ mod tests {
             .await
             .expect("Core did not stop after Quit")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_inventory_refresh_records_changed_source() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+            })
+            .await
+            .unwrap();
+
+        send(&mut server, json!({"method":"skills/changed","params":{}})).await;
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "skills/list");
+        assert_eq!(request["params"]["forceReload"], false);
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"data":[{"cwd":request["params"]["cwds"][0],"errors":[],"skills":[]}]}}),
+        )
+        .await;
+
+        let snapshot = client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
+                    && snapshot.skills.refresh_source
+                        == Some(crate::skills::SkillRefreshSource::Changed)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.skills.refresh_source,
+            Some(crate::skills::SkillRefreshSource::Changed)
+        );
+        drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

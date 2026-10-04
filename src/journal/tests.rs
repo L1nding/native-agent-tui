@@ -560,6 +560,7 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
         enabled_count: 1,
         scan_error_count: 0,
         truncated: false,
+        refresh_source: Some(crate::skills::SkillRefreshSource::Initial),
         entries: vec![crate::skills::SkillEntry {
             name: "PRIVATE_SKILL_NAME".into(),
             path: "PRIVATE_SKILL_PATH".into(),
@@ -606,7 +607,28 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
     assert!(serialized.contains("\"perAgentLimit\":80"));
     assert!(serialized.contains("\"perAgentStopTriggered\":true"));
     assert!(captured.skills.is_some());
+    assert_eq!(
+        captured
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.refresh_source),
+        Some(crate::skills::SkillRefreshSource::Initial)
+    );
     assert!(!serialized.contains("skills/list"));
+
+    let mut legacy_snapshot = serde_json::to_value(&captured).unwrap();
+    legacy_snapshot["skills"]
+        .as_object_mut()
+        .unwrap()
+        .remove("refreshSource");
+    let decoded_legacy: StoredSnapshot = serde_json::from_value(legacy_snapshot).unwrap();
+    assert_eq!(
+        decoded_legacy
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.refresh_source),
+        None
+    );
 
     let _store = store(&fixture, captured);
     let replay = replay(&fixture, "usage-budget", 0).unwrap();
@@ -623,6 +645,14 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
             context_window: Some(32_000),
             source: StoredUsageSource::ServerConfirmed,
         })
+    );
+    assert_eq!(
+        replay
+            .latest_state()
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.refresh_source),
+        Some(crate::skills::SkillRefreshSource::Initial)
     );
     let mut bytes = Vec::new();
     replay.write_jsonl(&mut bytes).unwrap();
