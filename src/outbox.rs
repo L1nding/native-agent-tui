@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::scheduler::TaskAttempt;
 
 pub const SCHEMA_VERSION: u32 = 1;
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PayloadHash(u64);
@@ -174,6 +175,8 @@ pub enum OutboxError {
     },
     #[error("outbox sequence overflow")]
     SequenceOverflow,
+    #[error("outbox storage budget is full")]
+    Budget,
 }
 
 impl From<io::Error> for OutboxError {
@@ -189,6 +192,28 @@ pub struct Outbox {
     next_seq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxSnapshot {
+    records: BTreeMap<u64, OutboxRecord>,
+}
+
+impl OutboxSnapshot {
+    /// Read an existing outbox without creating or opening it for append.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, OutboxError> {
+        let file = File::open(path)?;
+        let (records, _) = load_records(BufReader::new(file))?;
+        Ok(Self { records })
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &OutboxRecord> {
+        self.records.values()
+    }
+
+    pub fn get(&self, id: u64) -> Option<&OutboxRecord> {
+        self.records.get(&id)
+    }
+}
+
 impl Outbox {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OutboxError> {
         let path = path.as_ref();
@@ -197,48 +222,8 @@ impl Outbox {
             .append(true)
             .read(true)
             .open(path)?;
-        let mut records = BTreeMap::new();
-        let mut next_seq = 0;
         let reader = BufReader::new(file.try_clone()?);
-        for line in reader.lines() {
-            let line = line.map_err(OutboxError::Io)?;
-            let event: OutboxLine =
-                serde_json::from_str(&line).map_err(|_| OutboxError::Corrupt)?;
-            if event.schema_version != SCHEMA_VERSION || event.seq != next_seq {
-                return Err(OutboxError::Corrupt);
-            }
-            match event.event {
-                OutboxEvent::Intent { intent, updated_at } => {
-                    intent.validate()?;
-                    if records.contains_key(&intent.id) {
-                        return Err(OutboxError::Corrupt);
-                    }
-                    records.insert(
-                        intent.id,
-                        OutboxRecord {
-                            intent,
-                            status: OutboxStatus::Pending,
-                            updated_at,
-                        },
-                    );
-                }
-                OutboxEvent::Status {
-                    id,
-                    status,
-                    updated_at,
-                } => {
-                    let record = records.get_mut(&id).ok_or(OutboxError::Corrupt)?;
-                    if !record.status.can_transition_to(status) {
-                        return Err(OutboxError::Corrupt);
-                    }
-                    record.status = status;
-                    record.updated_at = updated_at;
-                }
-            }
-            next_seq = next_seq
-                .checked_add(1)
-                .ok_or(OutboxError::SequenceOverflow)?;
-        }
+        let (records, next_seq) = load_records(reader)?;
         Ok(Self {
             file,
             records,
@@ -322,7 +307,12 @@ impl Outbox {
             seq: self.next_seq,
             event,
         };
-        serde_json::to_writer(&mut self.file, &line).map_err(|_| OutboxError::Corrupt)?;
+        let bytes = serde_json::to_vec(&line).map_err(|_| OutboxError::Corrupt)?;
+        let current = self.file.metadata()?.len();
+        if current.saturating_add(bytes.len() as u64).saturating_add(1) > MAX_BYTES {
+            return Err(OutboxError::Budget);
+        }
+        self.file.write_all(&bytes)?;
         self.file.write_all(b"\n")?;
         self.file.sync_data()?;
         self.next_seq = self
@@ -331,6 +321,50 @@ impl Outbox {
             .ok_or(OutboxError::SequenceOverflow)?;
         Ok(())
     }
+}
+
+fn load_records(reader: impl BufRead) -> Result<(BTreeMap<u64, OutboxRecord>, u64), OutboxError> {
+    let mut records = BTreeMap::new();
+    let mut next_seq = 0;
+    for line in reader.lines() {
+        let line = line.map_err(OutboxError::Io)?;
+        let event: OutboxLine = serde_json::from_str(&line).map_err(|_| OutboxError::Corrupt)?;
+        if event.schema_version != SCHEMA_VERSION || event.seq != next_seq {
+            return Err(OutboxError::Corrupt);
+        }
+        match event.event {
+            OutboxEvent::Intent { intent, updated_at } => {
+                intent.validate()?;
+                if records.contains_key(&intent.id) {
+                    return Err(OutboxError::Corrupt);
+                }
+                records.insert(
+                    intent.id,
+                    OutboxRecord {
+                        intent,
+                        status: OutboxStatus::Pending,
+                        updated_at,
+                    },
+                );
+            }
+            OutboxEvent::Status {
+                id,
+                status,
+                updated_at,
+            } => {
+                let record = records.get_mut(&id).ok_or(OutboxError::Corrupt)?;
+                if !record.status.can_transition_to(status) {
+                    return Err(OutboxError::Corrupt);
+                }
+                record.status = status;
+                record.updated_at = updated_at;
+            }
+        }
+        next_seq = next_seq
+            .checked_add(1)
+            .ok_or(OutboxError::SequenceOverflow)?;
+    }
+    Ok((records, next_seq))
 }
 
 fn now() -> u64 {

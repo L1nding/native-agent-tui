@@ -15,6 +15,13 @@ Each intent stores only:
 The payload itself is never written. `Outbox` owns the append-only file and is
 not cloneable, so callers have one mutable writer. Every append is followed by
 `sync_data`; reopening the file reconstructs the committed state in sequence.
+The Core uses this seam for app-server requests and responses: response-bearing
+requests become `confirmed` only after the matching RPC response, while timeout
+or disconnect leaves them `unknown`.
+
+`OutboxSnapshot` is the read-only recovery view. `--recovery SESSION_ID` opens
+that view without creating or appending a file, and reports status counts beside
+the committed journal summary.
 
 The state machine intentionally rejects `unknown -> sent` and all other replay
 transitions. An uncertain side effect therefore stays uncertain until a future

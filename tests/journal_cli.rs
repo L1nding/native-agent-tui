@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use native_agent_tui::journal::{Journal, JournalSettings, StoredSnapshot, StoredTask};
 use native_agent_tui::observation::{ChildFact, ObservationFacts, Observer};
+use native_agent_tui::outbox::{Outbox, OutboxIntent};
 use native_agent_tui::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 use native_agent_tui::scheduler::{
     ExternalTurn, RootTaskSpec, Scheduler, TaskId, TaskKind, TaskState,
@@ -356,6 +357,23 @@ async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() 
     let journal = Journal::open(&fixture.settings(), cwd, active.clone()).unwrap();
     active.observation.snapshot_version = 1;
     journal.finish(active).await.unwrap();
+    let outbox_path = fixture
+        .settings()
+        .outbox_path(cwd, "recovery-active")
+        .unwrap();
+    let mut outbox = Outbox::open(outbox_path).unwrap();
+    outbox
+        .record_intent(OutboxIntent::new(
+            1,
+            "recovery-active",
+            None,
+            "rpc-1",
+            "turn/start",
+            b"PRIVATE_PROMPT",
+        ))
+        .unwrap();
+    outbox.mark_unknown(1).unwrap();
+    drop(outbox);
     let before = fixture.contents();
 
     let output = fixture.run(&["--recovery", "recovery-active"]);
@@ -365,6 +383,8 @@ async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() 
     assert!(text.contains("needs_recovery=true"), "{text}");
     assert!(text.contains("requires_input=true"), "{text}");
     assert!(text.contains("can_resume=false"), "{text}");
+    assert!(text.contains("outbox_available=true"), "{text}");
+    assert!(text.contains("unknown=1"), "{text}");
     assert!(
         text.contains("tasks: active=1 unknown=1 queued=1 blocked=1 terminal=1"),
         "{text}"

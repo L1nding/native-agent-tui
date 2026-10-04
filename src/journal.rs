@@ -59,6 +59,19 @@ impl JournalSettings {
         .ok_or(JournalError::Directory)?;
         Ok(base.join("native-agent-tui").join("journal"))
     }
+
+    /// Return the side-effect outbox path paired with a journal session.
+    ///
+    /// The outbox intentionally uses a distinct extension so journal replay
+    /// never consumes it as a state record, while retention can still account
+    /// for and remove it with the owning session.
+    pub fn outbox_path(&self, cwd: &Path, session_id: &str) -> Result<PathBuf, JournalError> {
+        validate_session(session_id)?;
+        let workspace = workspace_id(cwd)?;
+        Ok(self
+            .directory()?
+            .join(format!("{workspace}_{session_id}.outbox")))
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -1016,11 +1029,13 @@ fn reclaim(root: &Path, settings: &JournalSettings, required: u64) -> Result<(),
             atomic_metadata(&removed, &info)?;
         }
         drop(lease);
-        for extension in ["jsonl", "cursor", "lease"] {
+        for extension in ["jsonl", "cursor", "lease", "outbox"] {
             let path = path.with_extension(extension);
-            let length = fs::metadata(&path)?.len();
-            fs::remove_file(path)?;
-            bytes = bytes.saturating_sub(length);
+            if path.exists() {
+                let length = fs::metadata(&path)?.len();
+                fs::remove_file(path)?;
+                bytes = bytes.saturating_sub(length);
+            }
         }
         bytes = bytes.saturating_add(fs::metadata(removed)?.len());
     }

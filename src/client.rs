@@ -14,6 +14,7 @@ use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequ
 use crate::interactions::{files::FilePreviews, ApprovalDecision, RequestRef, RequestView};
 use crate::journal::{Journal, JournalError, StoredSnapshot};
 use crate::observation::{AttentionClass, ChildFact, ObservationFacts, Observer};
+use crate::outbox::{Outbox, OutboxError, OutboxIntent};
 use crate::protocol::{self, Envelope, RpcId};
 use crate::scheduler::{
     ExternalTurn, InterruptEffect, RootTaskSpec, Scheduler, SchedulerCommand, TaskAttempt,
@@ -78,6 +79,8 @@ pub enum ClientError {
     AppServer(#[from] AppServerError),
     #[error(transparent)]
     Journal(#[from] JournalError),
+    #[error(transparent)]
+    Outbox(#[from] OutboxError),
 }
 
 pub struct ClientHandle {
@@ -106,6 +109,21 @@ impl ClientHandle {
             &config.cwd,
             StoredSnapshot::capture(&initial),
         )?;
+        let outbox = match Outbox::open(
+            config
+                .journal
+                .outbox_path(&config.cwd, &initial.observation.session_id)?,
+        ) {
+            Ok(outbox) => outbox,
+            Err(error) => {
+                let mut failure = StoredSnapshot::capture(&initial);
+                failure.phase = SessionPhase::Failed;
+                failure.issue = Some(crate::journal::PersistenceIssue::JournalUnavailable);
+                failure.close(SessionPhase::Failed, false);
+                let _ = journal.finish(failure).await;
+                return Err(error.into());
+            }
+        };
         let mut server = match AppServer::spawn(&config).await {
             Ok(server) => server,
             Err(error) => {
@@ -128,7 +146,7 @@ impl ClientHandle {
             config,
             Some(server),
             check_only,
-            Some((observer, journal)),
+            Some((observer, journal, outbox)),
         ))
     }
 
@@ -154,7 +172,7 @@ impl ClientHandle {
         config: Config,
         server: Option<AppServer>,
         check_only: bool,
-        prepared: Option<(Observer, Journal)>,
+        prepared: Option<(Observer, Journal, Outbox)>,
     ) -> Self {
         let shell_source = if cfg!(windows) && !check_only {
             server
@@ -172,7 +190,7 @@ impl ClientHandle {
         config: Config,
         server: Option<AppServer>,
         check_only: bool,
-        prepared: Option<(Observer, Journal)>,
+        prepared: Option<(Observer, Journal, Outbox)>,
         shell_source: Option<crate::shell_check::Source>,
     ) -> Self {
         let agent_limits = AgentLimits {
@@ -181,9 +199,9 @@ impl ClientHandle {
             max_active_turns: config.max_native_turns,
         };
         let (commands, command_rx) = mpsc::channel(32);
-        let (observer, journal) = match prepared {
-            Some((observer, journal)) => (observer, Some(journal)),
-            None => (Observer::new(config.attention.clone()), None),
+        let (observer, journal, outbox) = match prepared {
+            Some((observer, journal, outbox)) => (observer, Some(journal), Some(outbox)),
+            None => (Observer::new(config.attention.clone()), None, None),
         };
         let mut initial = Self::initial(&config, &observer);
         initial.journal = journal.as_ref().map(Journal::view);
@@ -198,7 +216,9 @@ impl ClientHandle {
                 pipe,
                 observer,
                 journal,
+                outbox,
                 journal_error: None,
+                outbox_error: None,
                 root_attempt: None,
                 root_observed: None,
                 config,
@@ -211,6 +231,8 @@ impl ClientHandle {
                 },
                 pending: HashMap::new(),
                 next_id: 1,
+                next_outbox_id: 1,
+                outbox_pending: HashMap::new(),
                 scheduler: Scheduler::default(),
                 child_interrupts: VecDeque::new(),
                 interrupt_requested: false,
@@ -278,7 +300,9 @@ struct PendingRpc {
 struct Core {
     observer: Observer,
     journal: Option<Journal>,
+    outbox: Option<Outbox>,
     journal_error: Option<JournalError>,
+    outbox_error: Option<OutboxError>,
     root_attempt: Option<TaskAttempt>,
     root_observed: Option<TaskSnapshot>,
     pipe: PipeTransport,
@@ -289,6 +313,8 @@ struct Core {
     state: SessionState,
     pending: HashMap<RpcId, PendingRpc>,
     next_id: i64,
+    next_outbox_id: u64,
+    outbox_pending: HashMap<RpcId, u64>,
     scheduler: Scheduler,
     child_interrupts: VecDeque<InterruptEffect>,
     interrupt_requested: bool,
@@ -336,6 +362,13 @@ fn persistence_state(
         Some(view) if view.committed_seq >= view.submitted_seq => PersistenceState::Committed,
         Some(_) => PersistenceState::Submitted,
         None => PersistenceState::Uncertain,
+    }
+}
+
+fn rpc_id_text(id: &RpcId) -> String {
+    match id {
+        RpcId::Number(value) => value.to_string(),
+        RpcId::String(value) => value.clone(),
     }
 }
 
@@ -611,6 +644,7 @@ impl Core {
                     let expired = self.pending.iter().find(|(_, rpc)| rpc.deadline <= Instant::now()).map(|(id, rpc)| (id.clone(), rpc.kind));
                     if let Some((id, kind)) = expired {
                         self.pending.remove(&id);
+                        self.unknown_outbox(&id);
                         if let RpcKind::SkillsList { generation, .. } = kind {
                             // 旧代次超时只丢弃结果；保留排队刷新并在本轮循环末重发。
                             if generation == self.skills_generation {
@@ -640,11 +674,13 @@ impl Core {
             self.publish();
             if self.state.view.phase == SessionPhase::Unknown {
                 // A late reply cannot turn an uncertain side effect into a fresh success.
+                self.unknown_pending_outbox();
                 self.pending.clear();
                 break;
             }
         }
 
+        self.unknown_pending_outbox();
         let outcome = self.state.view.phase;
         self.scheduler.disconnected();
         self.gate.disconnect();
@@ -869,6 +905,107 @@ impl Core {
             && generation == self.skills_generation
     }
 
+    fn outbox_failure(error: OutboxError) -> TransportError {
+        TransportError::Failed(format!("durable outbox failed: {error}"))
+    }
+
+    /// Record an effect before handing it to the single transport writer.
+    ///
+    /// A successful `PipeTransport::send` means the frame entered the bounded
+    /// writer queue, not that the server processed it. Callers that expect a
+    /// response retain the returned intent id and confirm it at the response
+    /// boundary; unresolved ids become `unknown` on disconnect or timeout.
+    fn send_effect(
+        &mut self,
+        envelope: Envelope,
+        task: Option<TaskAttempt>,
+    ) -> Result<Option<u64>, TransportError> {
+        let outbox_id = if let Some(outbox) = self.outbox.as_mut() {
+            let id = self.next_outbox_id;
+            self.next_outbox_id = self
+                .next_outbox_id
+                .checked_add(1)
+                .ok_or_else(|| TransportError::Failed("outbox id exhausted".into()))?;
+            let payload = serde_json::to_vec(&envelope)
+                .map_err(|error| TransportError::Failed(error.to_string()))?;
+            let request_id = envelope
+                .id
+                .as_ref()
+                .map(rpc_id_text)
+                .unwrap_or_else(|| format!("outbox-{id}"));
+            let method = envelope.method.clone().unwrap_or_else(|| "response".into());
+            let intent = OutboxIntent::new(
+                id,
+                self.state.view.observation.session_id.clone(),
+                task,
+                request_id,
+                method,
+                &payload,
+            );
+            outbox.record_intent(intent).map_err(Self::outbox_failure)?;
+            Some(id)
+        } else {
+            None
+        };
+
+        if let Err(error) = self.pipe.send(envelope) {
+            if let Some(id) = outbox_id {
+                if let Some(outbox) = &mut self.outbox {
+                    let _ = outbox.mark_unknown(id);
+                }
+            }
+            return Err(error);
+        }
+        if let Some(id) = outbox_id {
+            if let Some(outbox) = &mut self.outbox {
+                if let Err(error) = outbox.mark_sent(id) {
+                    let _ = outbox.mark_unknown(id);
+                    return Err(Self::outbox_failure(error));
+                }
+            }
+        }
+        Ok(outbox_id)
+    }
+
+    fn track_outbox(&mut self, request_id: &RpcId, outbox_id: Option<u64>) {
+        if let Some(outbox_id) = outbox_id {
+            self.outbox_pending.insert(request_id.clone(), outbox_id);
+        }
+    }
+
+    fn confirm_outbox(&mut self, request_id: &RpcId) {
+        let Some(outbox_id) = self.outbox_pending.remove(request_id) else {
+            return;
+        };
+        if let Some(outbox) = &mut self.outbox {
+            if let Err(error) = outbox.mark_confirmed(outbox_id) {
+                self.outbox_error = Some(error);
+                self.state.error(
+                    SessionPhase::Unknown,
+                    "Durable outbox confirmation failed; external outcome is unknown",
+                );
+            }
+        }
+    }
+
+    fn unknown_outbox(&mut self, request_id: &RpcId) {
+        let Some(outbox_id) = self.outbox_pending.remove(request_id) else {
+            return;
+        };
+        if let Some(outbox) = &mut self.outbox {
+            if let Err(error) = outbox.mark_unknown(outbox_id) {
+                self.outbox_error = Some(error);
+            }
+        }
+    }
+
+    fn unknown_pending_outbox(&mut self) {
+        let ids: Vec<RpcId> = self.outbox_pending.keys().cloned().collect();
+        for request_id in ids {
+            self.unknown_outbox(&request_id);
+        }
+    }
+
     fn send_rpc(&mut self, kind: RpcKind) -> Result<(), TransportError> {
         if matches!(kind, RpcKind::Preflight) {
             if let Some(source) = self.shell_source.take() {
@@ -902,7 +1039,8 @@ impl Core {
                 ))
             }
         };
-        self.pipe.send(envelope)?;
+        let outbox_id = self.send_effect(envelope, None)?;
+        self.track_outbox(&id, outbox_id);
         if matches!(kind, RpcKind::Preflight) {
             self.state.view.phase = SessionPhase::CheckingShell;
             self.state.view.notice =
@@ -1245,12 +1383,10 @@ impl Core {
         }
         let id = RpcId::Number(self.next_id);
         self.next_id += 1;
-        match self.pipe.send(app_server::interrupt(
-            id.clone(),
-            &external.thread_id,
-            &external.turn_id,
-        )) {
-            Ok(()) => {
+        let request = app_server::interrupt(id.clone(), &external.thread_id, &external.turn_id);
+        match self.send_effect(request, Some(effect.attempt)) {
+            Ok(outbox_id) => {
+                self.track_outbox(&id, outbox_id);
                 self.pending.insert(
                     id,
                     PendingRpc {
@@ -1276,15 +1412,18 @@ impl Core {
 
     fn respond(&mut self, id: RpcId, result: Result<Value, String>) {
         match result {
-            Ok(result) => match self.pipe.send(Envelope::response(id.clone(), Some(result))) {
-                Ok(()) => {
-                    if let Some(request) = self.state.view.requests.iter_mut().find(|r| r.id == id)
-                    {
-                        request.responding = true;
+            Ok(result) => {
+                match self.send_effect(Envelope::response(id.clone(), Some(result)), None) {
+                    Ok(_) => {
+                        if let Some(request) =
+                            self.state.view.requests.iter_mut().find(|r| r.id == id)
+                        {
+                            request.responding = true;
+                        }
                     }
+                    Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
                 }
-                Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
-            },
+            }
             Err(error) => self.state.view.notice = Some(error),
         }
     }
@@ -1300,35 +1439,36 @@ impl Core {
         let id = RpcId::Number(self.next_id);
         self.next_id += 1;
         let thread = self.state.view.thread_id.as_deref().unwrap();
-        match self
-            .pipe
-            .send(app_server::turn_start(id.clone(), thread, text))
-        {
-            Ok(()) => {
-                self.state.view.root_start_requests += 1;
-                self.generation += 1;
-                self.state.view.turn_id = None;
-                self.state.submission(text);
-                self.interrupt_requested = false;
-                self.interrupt_sent = false;
-                self.collab_starts.clear();
-                self.completed_collab.clear();
-                self.pending
-                    .retain(|_, rpc| rpc.kind.generation().is_none());
-                self.pending.insert(
-                    id,
-                    PendingRpc {
-                        kind: RpcKind::StartTurn {
-                            generation: self.generation,
-                        },
-                        deadline: Instant::now() + Duration::from_secs(30),
-                        identity_thread: None,
-                        skills_cwd: None,
-                    },
-                );
+        let request = app_server::turn_start(id.clone(), thread, text);
+        let outbox_id = match self.send_effect(request, self.root_attempt) {
+            Ok(outbox_id) => outbox_id,
+            Err(error) => {
+                self.state.error(SessionPhase::Unknown, error.to_string());
+                return;
             }
-            Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
-        }
+        };
+        self.track_outbox(&id, outbox_id);
+        self.state.view.root_start_requests += 1;
+        self.generation += 1;
+        self.state.view.turn_id = None;
+        self.state.submission(text);
+        self.interrupt_requested = false;
+        self.interrupt_sent = false;
+        self.collab_starts.clear();
+        self.completed_collab.clear();
+        self.pending
+            .retain(|_, rpc| rpc.kind.generation().is_none());
+        self.pending.insert(
+            id,
+            PendingRpc {
+                kind: RpcKind::StartTurn {
+                    generation: self.generation,
+                },
+                deadline: Instant::now() + Duration::from_secs(30),
+                identity_thread: None,
+                skills_cwd: None,
+            },
+        );
     }
 
     fn issue_interrupt(&mut self) {
@@ -1411,11 +1551,14 @@ impl Core {
                                     SessionPhase::Running | SessionPhase::GatePending
                                 ))
                         {
-                            if let Err(error) = self.pipe.send(Envelope::error_response(
-                                id,
-                                -32602,
-                                "Request does not belong to the active turn",
-                            )) {
+                            if let Err(error) = self.send_effect(
+                                Envelope::error_response(
+                                    id,
+                                    -32602,
+                                    "Request does not belong to the active turn",
+                                ),
+                                None,
+                            ) {
                                 self.state.error(SessionPhase::Unknown, error.to_string());
                             }
                         } else if self.state.view.requests.iter().any(|r| r.id == id) {
@@ -1425,11 +1568,14 @@ impl Core {
                             self.file_previews.attach(&mut request);
                             self.state.view.requests.push(request);
                         } else {
-                            let _ = self.pipe.send(Envelope::error_response(
-                                id,
-                                -32000,
-                                "Too many pending interaction requests",
-                            ));
+                            let _ = self.send_effect(
+                                Envelope::error_response(
+                                    id,
+                                    -32000,
+                                    "Too many pending interaction requests",
+                                ),
+                                None,
+                            );
                             self.state.error(
                                 SessionPhase::Unknown,
                                 "Too many pending interaction requests",
@@ -1437,9 +1583,10 @@ impl Core {
                         }
                     }
                     Err(error) => {
-                        let result =
-                            self.pipe
-                                .send(Envelope::error_response(id, -32601, error.to_string()));
+                        let result = self.send_effect(
+                            Envelope::error_response(id, -32601, error.to_string()),
+                            None,
+                        );
                         self.state.view.notice = Some(error.to_string());
                         // Unsupported permissions or dynamic tools must not silently resume the root.
                         if result.is_err() {
@@ -1456,6 +1603,7 @@ impl Core {
                 self.notification(method, envelope.params.unwrap_or(Value::Null))
             }
             (None, Some(id)) => {
+                self.confirm_outbox(&id);
                 let Some(pending) = self.pending.remove(&id) else {
                     return;
                 };
@@ -1586,7 +1734,9 @@ impl Core {
                     self.state.error(SessionPhase::Failed, error.to_string());
                     return;
                 }
-                if let Err(error) = self.pipe.send(Envelope::notification("initialized", None)) {
+                if let Err(error) =
+                    self.send_effect(Envelope::notification("initialized", None), None)
+                {
                     self.state.error(SessionPhase::Failed, error.to_string());
                     return;
                 }
@@ -1756,7 +1906,7 @@ impl Core {
     }
 
     fn reject_wait(&mut self, id: RpcId, reason: String) {
-        if let Err(error) = self.pipe.send(Envelope::error_response(id, -32602, reason)) {
+        if let Err(error) = self.send_effect(Envelope::error_response(id, -32602, reason), None) {
             self.state.error(SessionPhase::Unknown, error.to_string());
         }
     }
@@ -2039,10 +2189,14 @@ impl Core {
             "thread/read",
             Some(json!({"threadId":id,"includeTurns":false})),
         );
-        if let Err(error) = self.pipe.send(request) {
-            self.state.error(SessionPhase::Unknown, error.to_string());
-            return;
-        }
+        let outbox_id = match self.send_effect(request, None) {
+            Ok(outbox_id) => outbox_id,
+            Err(error) => {
+                self.state.error(SessionPhase::Unknown, error.to_string());
+                return;
+            }
+        };
+        self.track_outbox(&request_id, outbox_id);
         self.pending.insert(
             request_id,
             PendingRpc {
@@ -2594,6 +2748,8 @@ mod tests {
             StoredSnapshot::capture(&initial),
         )
         .unwrap();
+        let outbox =
+            Outbox::open(config.journal.outbox_path(&config.cwd, &session).unwrap()).unwrap();
         let (client, server) = tokio::io::duplex(65536);
         let (read, write) = tokio::io::split(client);
         (
@@ -2602,7 +2758,7 @@ mod tests {
                 config.clone(),
                 None,
                 false,
-                Some((observer, journal)),
+                Some((observer, journal, outbox)),
             ),
             BufReader::new(server),
             config,
@@ -2622,6 +2778,47 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_outbox_confirms_root_submission_without_persisting_prompt() {
+        let fixture = JournalFixture::new();
+        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        ready(&mut server).await;
+        let prompt = "PRIVATE_ROOT_PROMPT";
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: prompt.into(),
+            })
+            .await
+            .unwrap();
+        let turn = next(&mut server).await;
+        assert_eq!(turn["method"], "turn/start");
+        let path = config.journal.outbox_path(&config.cwd, &session).unwrap();
+        let sent = Outbox::open(&path).unwrap();
+        let record = sent
+            .records()
+            .find(|record| record.intent.method == "turn/start")
+            .expect("turn/start intent must be durable before sending");
+        assert_eq!(record.status, crate::outbox::OutboxStatus::Sent);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(prompt));
+
+        send(
+            &mut server,
+            json!({"id":turn["id"],"result":{"turn":{"id":"turn-1"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        let confirmed = Outbox::open(&path).unwrap();
+        let record = confirmed
+            .records()
+            .find(|record| record.intent.method == "turn/start")
+            .unwrap();
+        assert_eq!(record.status, crate::outbox::OutboxStatus::Confirmed);
+
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[test]
@@ -4342,11 +4539,18 @@ mod tests {
             StoredSnapshot::capture(&initial),
         )
         .unwrap();
+        let outbox =
+            Outbox::open(config.journal.outbox_path(&config.cwd, &session).unwrap()).unwrap();
         let replay_config = config.clone();
         let mut server = AppServer::spawn_command(command).unwrap();
         let pipe = server.pipe.take().unwrap();
-        let mut client =
-            ClientHandle::start(pipe, config, Some(server), false, Some((observer, journal)));
+        let mut client = ClientHandle::start(
+            pipe,
+            config,
+            Some(server),
+            false,
+            Some((observer, journal, outbox)),
+        );
         client
             .commands
             .send(Command::SubmitRootInput {

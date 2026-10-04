@@ -7,6 +7,7 @@ use native_agent_tui::config::{self, CliCommand, Config};
 use native_agent_tui::history::search::Query;
 use native_agent_tui::history::{HistoryHandle, HistoryRequest, HistoryResult};
 use native_agent_tui::journal::{self, JournalError, Replay};
+use native_agent_tui::outbox::{OutboxSnapshot, OutboxStatus};
 use native_agent_tui::scheduler::{RootTaskSpec, WorkflowPlan, WORKFLOW_BYTES};
 use native_agent_tui::state::{display_text_for_cli, SessionPhase};
 use native_agent_tui::{ui, ClientHandle};
@@ -61,7 +62,7 @@ Sessions persist redacted snapshots by default. Replay is read-only and
 never launches app-server. --json-events streams committed redacted state.
 --history opens offline read-only observation. --export previews the range;
 --output writes that captured range with stable identity aliases to a new file.
---recovery summarizes committed recovery facts without launching Codex or writing journal.
+--recovery summarizes committed recovery facts and outbox delivery states without launching Codex or writing journal.
 --search scans retained redacted evidence across sessions without launching Codex.
   Search filters: all, lifecycle, output, tool, compaction, request, waiting.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
@@ -184,6 +185,35 @@ async fn execute() -> Result<(), (u8, String)> {
                 "session_closed={} execution_result={:?}",
                 summary.session_closed,
                 summary.execution_result.unwrap_or(SessionPhase::Unknown)
+            );
+            let outbox_path = config
+                .journal
+                .outbox_path(&config.cwd, &summary.session_id)
+                .map_err(replay_error)?;
+            let mut outbox_counts = [0usize; 5];
+            let outbox_available = outbox_path.exists();
+            if outbox_available {
+                let outbox =
+                    OutboxSnapshot::open(&outbox_path).map_err(|error| (2, error.to_string()))?;
+                for record in outbox.records() {
+                    let index = match record.status {
+                        OutboxStatus::Pending => 0,
+                        OutboxStatus::Sent => 1,
+                        OutboxStatus::Confirmed => 2,
+                        OutboxStatus::Unknown => 3,
+                        OutboxStatus::Failed => 4,
+                    };
+                    outbox_counts[index] += 1;
+                }
+            }
+            println!(
+                "outbox_available={} pending={} sent={} confirmed={} unknown={} failed={}",
+                outbox_available,
+                outbox_counts[0],
+                outbox_counts[1],
+                outbox_counts[2],
+                outbox_counts[3],
+                outbox_counts[4]
             );
             let mut counts = [0usize; 5];
             for task in &summary.tasks {
