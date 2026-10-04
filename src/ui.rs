@@ -1553,8 +1553,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     }
 }
 
-const SKILLS_PANEL_FULL_HEADER_LINES: u16 = 6;
-const SKILLS_PANEL_COMPACT_HEADER_LINES: u16 = 4;
+const SKILLS_PANEL_FULL_HEADER_LINES: u16 = 7;
+const SKILLS_PANEL_COMPACT_HEADER_LINES: u16 = 5;
+
+fn skill_refresh_source_label(source: Option<crate::skills::SkillRefreshSource>) -> &'static str {
+    match source {
+        Some(crate::skills::SkillRefreshSource::Initial) => "Initial",
+        Some(crate::skills::SkillRefreshSource::Changed) => "Changed",
+        Some(crate::skills::SkillRefreshSource::Manual) => "Manual",
+        None => "unavailable",
+    }
+}
 
 fn skills_panel_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let width = area.width.saturating_sub(4).clamp(1, 100);
@@ -1617,6 +1626,17 @@ fn draw_skills(
         snapshot.phase,
         snapshot.requests.len()
     ));
+    let refresh_source = if compact {
+        Line::from(format!(
+            "Refresh: {}",
+            skill_refresh_source_label(skills.refresh_source)
+        ))
+    } else {
+        Line::from(format!(
+            "Refresh source: {}",
+            skill_refresh_source_label(skills.refresh_source)
+        ))
+    };
     let source = if matches!(
         skills.availability,
         crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
@@ -1645,6 +1665,7 @@ fn draw_skills(
             directory,
             compact_status,
             compact_source,
+            refresh_source,
             Line::from(format!(
                 "{:?} req {} · Enter/F2",
                 snapshot.phase,
@@ -1657,6 +1678,7 @@ fn draw_skills(
             status,
             session,
             source,
+            refresh_source,
             Line::from("Listed entries do not confirm loaded, invoked, completed, or failed."),
             Line::from("Enter refresh · Esc/Ctrl+K close · ↑/↓ scroll · F2 requests"),
         ]
@@ -2446,7 +2468,7 @@ mod tests {
         assert!(initial.contains("Skills inventory"));
         assert!(initial.contains("Source: AppServer"));
         assert!(initial.contains("skill-0"));
-        assert!(initial.contains("skill-1"));
+        let page_size = skills_panel_entries_capacity(local.viewport).max(1);
 
         handle_key(
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
@@ -2464,7 +2486,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(scrolled.contains("skill-2"));
+        assert!(scrolled.contains(&format!("skill-{page_size}")));
         assert!(!scrolled.contains("skill-0"));
 
         snapshot.skills.availability = crate::skills::SkillAvailability::Unsupported;
@@ -2524,6 +2546,55 @@ mod tests {
                 tail.contains("skill-19"),
                 "last entry clipped at {width}x{height}"
             );
+        }
+    }
+
+    #[test]
+    fn skills_panel_renders_refresh_source_and_legacy_unavailable_value() {
+        use ratatui::backend::TestBackend;
+
+        let mut snapshot = observed_snapshot();
+        snapshot.skills.entries.clear();
+        snapshot.skills.skill_count = 0;
+        snapshot.skills.enabled_count = 0;
+        snapshot.skills.availability = crate::skills::SkillAvailability::Available;
+        snapshot.skills.freshness = crate::skills::SkillFreshness::Current;
+        let mut local = LocalState {
+            skills: true,
+            ..Default::default()
+        };
+
+        for (source, label) in [
+            (Some(crate::skills::SkillRefreshSource::Initial), "Initial"),
+            (Some(crate::skills::SkillRefreshSource::Changed), "Changed"),
+            (Some(crate::skills::SkillRefreshSource::Manual), "Manual"),
+            (None, "unavailable"),
+        ] {
+            snapshot.skills.refresh_source = source;
+            for (width, height) in [(30, 10), (80, 24)] {
+                local.viewport = ratatui::layout::Rect::new(0, 0, width, height);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &snapshot, &local))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                let refresh_line = if height < 20 {
+                    format!("Refresh: {label}")
+                } else {
+                    format!("Refresh source: {label}")
+                };
+                assert!(
+                    text.contains(&refresh_line),
+                    "refresh source clipped at {width}x{height}"
+                );
+                assert!(!text.contains("PRIVATE_PROMPT"));
+            }
         }
     }
 
