@@ -226,10 +226,6 @@ impl OutboxSnapshot {
     pub fn records(&self) -> impl Iterator<Item = &OutboxRecord> {
         self.records.values()
     }
-
-    pub fn get(&self, id: u64) -> Option<&OutboxRecord> {
-        self.records.get(&id)
-    }
 }
 
 impl Outbox {
