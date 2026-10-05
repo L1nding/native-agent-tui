@@ -21,10 +21,6 @@ pub(super) struct WorkflowLinkCursor {
     pub(super) captured_attempt: Option<u64>,
 }
 
-pub(super) struct WorkflowProjection {
-    pub(super) order: Vec<TaskId>,
-}
-
 pub(super) struct WorkflowLinkNavigation {
     pub(super) task_id: Option<TaskId>,
     pub(super) cursor: Option<WorkflowLinkCursor>,
@@ -46,10 +42,8 @@ pub(super) fn selected_task(
         .or_else(|| snapshot.scheduler.tasks.first())
 }
 
-pub(super) fn project_workflow(snapshot: &CoreSnapshot) -> WorkflowProjection {
-    WorkflowProjection {
-        order: workflow_order(&snapshot.scheduler.tasks),
-    }
+pub(super) fn project_workflow(snapshot: &CoreSnapshot) -> Vec<TaskId> {
+    workflow_order(&snapshot.scheduler.tasks)
 }
 
 /// 工作流行序只根据快照中的显式 parent 建树；依赖与 Gate 目标单独呈现。

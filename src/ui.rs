@@ -955,7 +955,7 @@ fn handle_key(
             }
         }
         KeyCode::Up | KeyCode::Down if local.tasks => {
-            let tasks = project_workflow(snapshot).order;
+            let tasks = project_workflow(snapshot);
             if !tasks.is_empty() {
                 let index = selected_task(snapshot, local.task_id)
                     .and_then(|task| tasks.iter().position(|id| *id == task.id))
@@ -2350,7 +2350,7 @@ fn draw_tasks(
 ) {
     let scheduler = &snapshot.scheduler;
     let selected = selected_task(snapshot, local.task_id);
-    let projection = project_workflow(snapshot);
+    let workflow_order = project_workflow(snapshot);
     let agent_rows = project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref())
         .into_iter()
         .filter_map(|row| {
@@ -2432,7 +2432,7 @@ fn draw_tasks(
             }),
     );
     let mut selected_visual = None;
-    for id in &projection.order {
+    for id in &workflow_order {
         let Some(task) = by_id.get(id).copied() else {
             continue;
         };
