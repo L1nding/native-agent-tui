@@ -87,6 +87,7 @@ impl Bookmark {
 pub(super) enum Locate {
     Message(search::Focus),
     Request(RequestRef),
+    ToolSearch(String),
 }
 
 #[derive(Default)]
@@ -286,6 +287,12 @@ impl TimelinePanel {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.tool_detail.is_some() {
             match key.code {
+                KeyCode::Char('s') if !ctrl => {
+                    return Some(Locate::ToolSearch(self.thread.clone()));
+                }
+                KeyCode::Char('f') if ctrl => {
+                    return Some(Locate::ToolSearch(self.thread.clone()));
+                }
                 KeyCode::Esc => {
                     self.tool_detail = None;
                     self.scroll.set(0);

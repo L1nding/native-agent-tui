@@ -336,8 +336,29 @@ def tool_details_check(binary, repo):
         assert 'PRIVATE_CWD' in screen
         assert 'PRIVATE_DELTA_ONE' not in screen and 'PRIVATE_DELTA_TWO' not in screen
         before = rpc()
+        # Tool-detail search is a local UI operation: it must find retained
+        # aggregate output, open the exact detail, and never add an RPC.
+        console.write('s')
+        console.wait(
+            lambda screen: 'Search: retained tool details' in screen,
+            'tool search did not open from the detail view',
+        )
+        console.write('\x06PRIVATE_AGGREGATE\r')
+        console.wait(
+            lambda screen: 'Hit 1/1' in screen and 'PRIVATE_AGGREGATE' in screen,
+            'tool search did not locate aggregate output',
+        )
+        assert 'PRIVATE_DELTA_ONE' not in console.read()
+        console.write('\r')
+        console.wait(
+            lambda screen: 'Tool detail' in screen and 'PRIVATE_AGGREGATE' in screen,
+            'tool search hit did not open the exact detail',
+        )
+        assert rpc() == before, 'tool search sent an execution request'
         console.write('\x1b')
-        console.wait(lambda screen: 'Evidence timeline' in screen, 'Escape did not return to timeline')
+        console.wait(lambda screen: 'Hit 1/1' in screen, 'tool search did not return to results')
+        console.write('\x1b')
+        console.wait(lambda screen: 'PRIVATE_OUTPUT' in screen, 'Escape did not return to conversation')
         assert rpc() == before, 'opening and closing tool details sent an execution request'
         console.write('\x1b\x11')
         assert k.WaitForSingleObject(console.process.process, 10000) == 0

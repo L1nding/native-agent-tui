@@ -8,6 +8,7 @@
 - `tool_details` 管理独立的实时缓存，包括字段合并、UTF-8 截断、预算和生命周期。
 - Core 在确认当前线程与轮次归属后绑定 session、thread、turn、item、task attempt 和 generation。
 - `ui/timeline` 只负责选择和定位；`ui/tool_detail` 渲染只读详情，不发送执行请求。
+- 工具正文搜索由独立的 `ui/tool_search` 扫描，统一搜索面板只保存字段定位和 revision；使用与过期命中规则见[工具详情搜索](tool-search.md)。
 
 条目事件先由 Observer 接受，再更新详情。已有终态事实的条目即使正文被淘汰，重复事件也不能重新插入详情。断连或执行关闭将运行中的详情标为 Unknown，保留已接收的部分输出；子代理换轮时，为旧轮运行中的工具记录 Unknown，并清理旧详情、文件预览和审批请求。
 

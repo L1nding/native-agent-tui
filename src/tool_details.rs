@@ -38,6 +38,8 @@ pub enum ToolTextSource {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ToolDetail {
     pub locator: ToolDetailLocator,
+    /// 内容或生命周期变化时递增，用于拒绝过期搜索命中。
+    pub revision: u64,
     pub category: ToolCategory,
     pub lifecycle: ToolLifecycle,
     pub command: Option<String>,
@@ -146,6 +148,9 @@ impl ToolDetails {
             ) {
                 return;
             }
+            let changed = (existing.command.is_none() && fields.command.is_some())
+                || (existing.cwd.is_none() && fields.cwd.is_some())
+                || (existing.parameters.is_none() && fields.parameters.is_some());
             if existing.command.is_none() {
                 existing.command = fields.command;
             }
@@ -156,11 +161,15 @@ impl ToolDetails {
                 existing.parameters = fields.parameters;
             }
             normalize_detail(existing);
+            if changed {
+                existing.revision = existing.revision.saturating_add(1);
+            }
             self.rebalance();
             return;
         }
         let detail = ToolDetail {
             locator,
+            revision: 1,
             category,
             lifecycle: ToolLifecycle::Running,
             command: fields.command,
@@ -193,6 +202,7 @@ impl ToolDetails {
         let Some(detail) = self.find_mut(locator) else {
             let mut detail = ToolDetail {
                 locator: locator.clone(),
+                revision: 1,
                 category,
                 lifecycle,
                 command: fields.command,
@@ -231,6 +241,22 @@ impl ToolDetails {
         ) {
             return;
         }
+        let next_result = if category == ToolCategory::Shell {
+            None
+        } else {
+            fields.result.as_deref()
+        };
+        let changed = detail.lifecycle != lifecycle
+            || detail.result.as_deref() != next_result
+            || (detail.command.is_none() && fields.command.is_some())
+            || (detail.cwd.is_none() && fields.cwd.is_some())
+            || (detail.parameters.is_none() && fields.parameters.is_some())
+            || fields.exit_code != detail.exit_code
+            || fields.duration_ms != detail.duration_ms
+            || authoritative != detail.authoritative
+            || (fields.output.as_ref().is_some_and(|output| {
+                detail.output != *output || detail.output_source != ToolTextSource::CommandAggregate
+            }));
         detail.lifecycle = lifecycle;
         detail.result = if category == ToolCategory::Shell {
             None
@@ -256,6 +282,9 @@ impl ToolDetails {
             detail.authoritative = true;
         }
         normalize_detail(detail);
+        if changed {
+            detail.revision = detail.revision.saturating_add(1);
+        }
         self.rebalance();
     }
 
@@ -276,8 +305,12 @@ impl ToolDetails {
         ) {
             return;
         }
+        let old_len = detail.output.len();
         append_text(detail, text);
         normalize_detail(detail);
+        if detail.output.len() != old_len {
+            detail.revision = detail.revision.saturating_add(1);
+        }
         self.rebalance();
     }
 
@@ -286,6 +319,7 @@ impl ToolDetails {
             let detail = Arc::make_mut(entry);
             if detail.lifecycle == ToolLifecycle::Running {
                 detail.lifecycle = ToolLifecycle::Unknown;
+                detail.revision = detail.revision.saturating_add(1);
                 normalize_detail(detail);
             }
         }
@@ -439,6 +473,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        let initial_revision = store.entries.back().unwrap().revision;
         store.observe_started(
             key.clone(),
             ToolCategory::Shell,
@@ -447,9 +482,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert_eq!(store.entries.back().unwrap().revision, initial_revision);
         store.observe_output(&key, "同一块");
+        let first_output_revision = store.entries.back().unwrap().revision;
         store.observe_output(&key, "同一块");
         assert_eq!(store.entries.back().unwrap().output, "同一块同一块");
+        assert_eq!(
+            store.entries.back().unwrap().revision,
+            first_output_revision + 1
+        );
     }
 
     #[test]

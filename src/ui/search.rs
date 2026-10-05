@@ -1,4 +1,5 @@
 //! Bounded, read-only search of the retained conversation projection.
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::scope::Scope;
+use super::tool_search::{self, CategoryFilter, LifecycleFilter};
 use super::{wrap, Editor};
 use crate::state::{display_text, ConversationItem, CoreSnapshot};
 
@@ -35,6 +37,24 @@ enum State {
     Truncated,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ContentScope {
+    #[default]
+    Messages,
+    Tools,
+    Both,
+}
+
+impl ContentScope {
+    fn next(self) -> Self {
+        match self {
+            Self::Messages => Self::Tools,
+            Self::Tools => Self::Both,
+            Self::Both => Self::Messages,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Filter {
     text: String,
@@ -43,6 +63,9 @@ struct Filter {
     scope: Scope,
     role: Role,
     state: State,
+    content: ContentScope,
+    tool_category: CategoryFilter,
+    tool_lifecycle: LifecycleFilter,
 }
 
 impl Filter {
@@ -159,24 +182,67 @@ struct Job {
 
 struct Results {
     id: u64,
-    source: Arc<CoreSnapshot>,
+    source: Option<MessageSource>,
+    snapshot_version: u64,
     filter: Filter,
     hits: Vec<Hit>,
     total: usize,
+    tool_hits: Vec<tool_search::Hit>,
+    tool_total: usize,
+}
+
+struct OpenedToolHit {
+    locator: crate::tool_details::ToolDetailLocator,
+    field: tool_search::Field,
+    range: Range<usize>,
+    revision: u64,
+}
+
+struct MessageSource {
+    messages: Vec<ConversationItem>,
+    history_truncated: bool,
+}
+
+impl Results {
+    fn message_hits(&self) -> usize {
+        if self.filter.content == ContentScope::Tools {
+            0
+        } else {
+            self.hits.len()
+        }
+    }
+
+    fn tool_hits(&self) -> usize {
+        if self.filter.content == ContentScope::Messages {
+            0
+        } else {
+            self.tool_hits.len()
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.message_hits() + self.tool_hits()
+    }
 }
 
 async fn scan(job: Arc<Job>) -> Results {
     let threads = job.filter.threads(&job.source);
     let mut hits = Vec::new();
+    let mut matched_messages = Vec::new();
+    let mut message_indexes = HashMap::new();
     let mut total = 0;
-    if !job.filter.text.is_empty() {
+    if !job.filter.text.is_empty() && job.filter.content != ContentScope::Tools {
         for (message, item) in job.source.messages.iter().enumerate() {
             if job.filter.accepts(item, &threads) {
                 for (offset, _) in item.text.match_indices(&job.filter.text) {
                     total += 1;
                     if hits.len() < HIT_LIMIT {
+                        let projected = *message_indexes.entry(message).or_insert_with(|| {
+                            matched_messages.push(item.clone());
+                            matched_messages.len() - 1
+                        });
                         hits.push(Hit {
-                            message,
+                            message: projected,
                             range: offset..offset + job.filter.text.len(),
                         });
                     }
@@ -188,12 +254,35 @@ async fn scan(job: Arc<Job>) -> Results {
             tokio::task::yield_now().await;
         }
     }
+    let (tool_hits, tool_total) = if job.filter.content != ContentScope::Messages {
+        tool_search::scan(
+            &job.source.tool_details,
+            &job.filter.text,
+            if job.filter.scope == Scope::All {
+                None
+            } else {
+                Some(threads.as_slice())
+            },
+            &job.filter.turn,
+            job.filter.tool_category,
+            job.filter.tool_lifecycle,
+            HIT_LIMIT.saturating_sub(hits.len()),
+        )
+    } else {
+        (Vec::new(), 0)
+    };
     Results {
         id: job.id,
-        source: job.source.clone(),
+        source: (job.filter.content != ContentScope::Tools).then(|| MessageSource {
+            messages: matched_messages,
+            history_truncated: job.source.history_truncated,
+        }),
+        snapshot_version: job.source.version,
         filter: job.filter.clone(),
         hits,
         total,
+        tool_hits,
+        tool_total,
     }
 }
 
@@ -292,6 +381,7 @@ pub(super) struct SearchPanel {
     scroll: usize,
     help: bool,
     notice: Option<String>,
+    opened_tool: Option<OpenedToolHit>,
 }
 
 impl SearchPanel {
@@ -301,7 +391,18 @@ impl SearchPanel {
         self.turn_field = false;
         self.help = false;
         self.filter.thread = thread;
+        self.filter.content = ContentScope::Messages;
+        self.opened_tool = None;
+        self.filter.tool_category = CategoryFilter::default();
+        self.filter.tool_lifecycle = LifecycleFilter::default();
         self.invalidate();
+    }
+
+    pub fn open_tools(&mut self, thread: String) {
+        self.open(thread);
+        self.filter.content = ContentScope::Tools;
+        self.submit = true;
+        self.editing = false;
     }
 
     pub fn close(&mut self) {
@@ -343,18 +444,56 @@ impl SearchPanel {
         let Some(results) = status.as_ref().filter(|r| self.pending == Some(r.id)) else {
             return;
         };
-        let old = self.results.as_ref().and_then(|r| {
-            r.hits.get(self.selected).map(|hit| {
+        let old_message = self.results.as_ref().and_then(|r| {
+            (self.selected < r.message_hits())
+                .then(|| {
+                    r.hits.get(self.selected).and_then(|hit| {
+                        r.source.as_ref().map(|source| {
+                            (
+                                MessageKey::of(&source.messages[hit.message]),
+                                hit.range.clone(),
+                            )
+                        })
+                    })
+                })
+                .flatten()
+        });
+        let old_tool = self.results.as_ref().and_then(|r| {
+            if self.selected < r.message_hits() {
+                return None;
+            }
+            let index = self.selected.saturating_sub(r.message_hits());
+            r.tool_hits.get(index).map(|hit| {
                 (
-                    MessageKey::of(&r.source.messages[hit.message]),
+                    hit.locator.clone(),
+                    hit.field,
                     hit.range.clone(),
+                    hit.revision,
                 )
             })
         });
-        self.selected = old
+        self.selected = old_message
             .and_then(|(key, range)| {
                 results.hits.iter().position(|hit| {
-                    key.matches(&results.source.messages[hit.message]) && range == hit.range
+                    results
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| key.matches(&source.messages[hit.message]))
+                        && range == hit.range
+                })
+            })
+            .or_else(|| {
+                old_tool.and_then(|(locator, field, range, revision)| {
+                    results
+                        .tool_hits
+                        .iter()
+                        .position(|hit| {
+                            hit.locator == locator
+                                && hit.field == field
+                                && hit.range == range
+                                && hit.revision == revision
+                        })
+                        .map(|index| results.message_hits() + index)
                 })
             })
             .unwrap_or(0);
@@ -392,6 +531,17 @@ impl SearchPanel {
 
     pub fn key(&mut self, key: KeyEvent, current: &CoreSnapshot) -> Option<Focus> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.opened_tool.is_some() {
+            if key.code == KeyCode::Esc {
+                self.opened_tool = None;
+                self.scroll = 0;
+            } else if key.code == KeyCode::PageUp {
+                self.scroll = self.scroll.saturating_sub(1);
+            } else if key.code == KeyCode::PageDown {
+                self.scroll = self.scroll.saturating_add(1);
+            }
+            return None;
+        }
         if key.code == KeyCode::Esc {
             self.close();
             return None;
@@ -399,6 +549,30 @@ impl SearchPanel {
         if key.code == KeyCode::F(1) {
             self.help = !self.help;
             self.scroll = 0;
+            return None;
+        }
+        if key.code == KeyCode::F(5) {
+            self.filter.content = self.filter.content.next();
+            self.invalidate();
+            if !self.editing {
+                self.submit = true;
+            }
+            return None;
+        }
+        if key.code == KeyCode::F(8) && self.filter.content != ContentScope::Messages {
+            self.filter.tool_category = self.filter.tool_category.next();
+            self.invalidate();
+            if !self.editing {
+                self.submit = true;
+            }
+            return None;
+        }
+        if key.code == KeyCode::F(9) && self.filter.content != ContentScope::Messages {
+            self.filter.tool_lifecycle = self.filter.tool_lifecycle.next();
+            self.invalidate();
+            if !self.editing {
+                self.submit = true;
+            }
             return None;
         }
         match key.code {
@@ -514,14 +688,33 @@ impl SearchPanel {
                 self.selected = (self.selected + 1).min(
                     self.results
                         .as_ref()
-                        .map_or(0, |r| r.hits.len().saturating_sub(1)),
+                        .map_or(0, |r| r.count().saturating_sub(1)),
                 );
                 self.scroll = 0;
             }
             KeyCode::Enter if self.pending.is_none() => {
                 let results = self.results.as_ref()?;
+                let message_hits = results.message_hits();
+                if self.selected >= message_hits {
+                    let hit = results.tool_hits.get(self.selected - message_hits)?;
+                    if !tool_search::valid(hit, &current.tool_details) {
+                        self.notice = Some(
+                            "Selected tool content changed or was evicted. Press r to refresh."
+                                .into(),
+                        );
+                        return None;
+                    }
+                    self.opened_tool = Some(OpenedToolHit {
+                        locator: hit.locator.clone(),
+                        field: hit.field,
+                        range: hit.range.clone(),
+                        revision: hit.revision,
+                    });
+                    self.scroll = 0;
+                    return None;
+                }
                 let hit = results.hits.get(self.selected)?;
-                let message = &results.source.messages[hit.message];
+                let message = &results.source.as_ref()?.messages[hit.message];
                 let focus = Focus {
                     key: MessageKey::of(message),
                     offset: hit.range.start,
@@ -542,6 +735,32 @@ impl SearchPanel {
 
     pub fn draw(&self, frame: &mut ratatui::Frame<'_>, area: Rect, current: &CoreSnapshot) {
         frame.render_widget(Clear, area);
+        if let Some(opened) = &self.opened_tool {
+            let hit = tool_search::Hit {
+                locator: opened.locator.clone(),
+                field: opened.field,
+                range: opened.range.clone(),
+                revision: opened.revision,
+            };
+            if tool_search::valid(&hit, &current.tool_details) {
+                let _ = super::tool_detail::draw(
+                    frame,
+                    area,
+                    current,
+                    &opened.locator,
+                    self.scroll,
+                    self.notice.as_deref(),
+                );
+            } else {
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    Paragraph::new("Selected tool search hit changed or was evicted. Press Esc to return to results.")
+                        .block(Block::default().borders(Borders::ALL).title(" Tool search hit expired ")),
+                    area,
+                );
+            }
+            return;
+        }
         let query_height = area.height.min(3);
         let editor = if self.turn_field {
             &self.turn
@@ -561,6 +780,8 @@ impl SearchPanel {
                     .borders(Borders::ALL)
                     .title(if self.turn_field {
                         " Search: exact turn ID "
+                    } else if self.filter.content != ContentScope::Messages {
+                        " Search: retained tool details "
                     } else {
                         " Search: literal text "
                     }),
@@ -580,8 +801,17 @@ impl SearchPanel {
         };
         let filters = vec![
             format!(
-                "{:?} | role={:?} | state={:?}",
-                self.filter.scope, self.filter.role, self.filter.state
+                "mode={} | {:?} | role={:?} | state={:?} | tool={:?}/{:?}",
+                match self.filter.content {
+                    ContentScope::Messages => "messages",
+                    ContentScope::Tools => "tools",
+                    ContentScope::Both => "messages + tools",
+                },
+                self.filter.scope,
+                self.filter.role,
+                self.filter.state,
+                self.filter.tool_category,
+                self.filter.tool_lifecycle
             ),
             format!(
                 "Thread: {} | turn: {}",
@@ -603,6 +833,7 @@ impl SearchPanel {
                     "Tab: thread/subtree/path/all agents",
                     "F6: role filter",
                     "F7: state filter",
+                    "F5: messages/tools/both; F8 category; F9 lifecycle",
                     "Up/Down or N/n: previous/next retained hit",
                     "PgUp/Dn: scroll one row",
                     "Ctrl+Home/End: first/last",
@@ -611,7 +842,7 @@ impl SearchPanel {
                     "Ctrl+C: interrupt root",
                     "Ctrl+Q: quit",
                     "Literal, case-sensitive Unicode; no regex",
-                    "Only retained conversation text is searched",
+                    "Only retained messages or live tool details are searched",
                     "Queries and results are never saved to journal",
                 ]
                 .into_iter()
@@ -623,18 +854,87 @@ impl SearchPanel {
         } else if self.pending.is_some() || self.submit || self.cancel {
             rows.push("Searching; old results disabled.".into());
         } else if let Some(results) = &self.results {
+            let message_count = results.message_hits();
+            let tool_count = results.tool_hits();
+            let total_count = message_count + tool_count;
+            let total = (if results.filter.content == ContentScope::Tools {
+                0
+            } else {
+                results.total
+            }) + (if results.filter.content == ContentScope::Messages {
+                0
+            } else {
+                results.tool_total
+            });
             rows.push(format!(
                 "Hit {}/{} | {} total",
-                if results.hits.is_empty() {
+                if total_count == 0 {
                     0
                 } else {
                     self.selected + 1
                 },
-                results.hits.len(),
-                results.total
+                total_count,
+                total
             ));
-            if let Some(hit) = results.hits.get(self.selected) {
-                let message = &results.source.messages[hit.message];
+            rows.extend(filters);
+            rows.push(format!(
+                "Snapshot {}{}",
+                results.snapshot_version,
+                if results.snapshot_version != current.version {
+                    " (fixed; r refreshes)"
+                } else {
+                    ""
+                }
+            ));
+            if self.selected >= message_count && tool_count > 0 {
+                let hit = &results.tool_hits[self.selected - message_count];
+                rows.push(format!(
+                    "Tool {:?} | UTF-8 bytes {}..{} | revision {}",
+                    hit.field, hit.range.start, hit.range.end, hit.revision
+                ));
+                let detail = current.tool_details.get(&hit.locator);
+                if tool_search::valid(hit, &current.tool_details) {
+                    if let Some(detail) = detail {
+                        let text = hit.field.text(&detail).unwrap_or_default();
+                        let before: String = text[..hit.range.start]
+                            .graphemes(true)
+                            .rev()
+                            .take(6)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        let after: String =
+                            text[hit.range.end..].graphemes(true).take(32).collect();
+                        rows.push(format!("{before}⟦{}⟧{after}", results.filter.text));
+                        rows.push(format!(
+                            "Category: {:?} | lifecycle: {:?}",
+                            detail.category, detail.lifecycle
+                        ));
+                    }
+                    rows.push(format!(
+                        "Thread: {} | turn: {} | item: {}",
+                        hit.locator
+                            .identity
+                            .thread_id
+                            .as_deref()
+                            .unwrap_or("unavailable"),
+                        hit.locator
+                            .identity
+                            .turn_id
+                            .as_deref()
+                            .unwrap_or("unavailable"),
+                        hit.locator.item_id
+                    ));
+                    rows.push("Enter opens this retained tool detail.".into());
+                } else {
+                    rows.push(
+                        "Live tool content changed/evicted; opening disabled until refresh.".into(),
+                    );
+                }
+            } else if self.selected < message_count {
+                let hit = &results.hits[self.selected];
+                let message = &results.source.as_ref().unwrap().messages[hit.message];
                 let before: String = message.text[..hit.range.start]
                     .graphemes(true)
                     .rev()
@@ -648,33 +948,9 @@ impl SearchPanel {
                     .take(32)
                     .collect();
                 rows.push(format!("{before}⟦{}⟧{after}", results.filter.text));
-            }
-            rows.extend(filters);
-            rows.push(format!(
-                "Snapshot {}{}",
-                results.source.version,
-                if results.source.version != current.version {
-                    " (fixed; r refreshes)"
-                } else {
-                    ""
-                }
-            ));
-            if results.total > HIT_LIMIT {
-                rows.push("Result limit reached: narrow text, turn, role or scope.".into());
-            }
-            if results.source.history_truncated
-                || results.source.messages.iter().any(|m| m.truncated)
-            {
-                rows.push(
-                    "Older content unavailable; some retained messages may be truncated.".into(),
-                );
-            }
-            if let Some(hit) = results.hits.get(self.selected) {
-                let message = &results.source.messages[hit.message];
                 rows.push(format!(
-                    "Hit {}/{} | {} | {}",
+                    "Hit {} | {} | {}",
                     self.selected + 1,
-                    results.hits.len(),
                     message.role,
                     if message.complete {
                         "complete"
@@ -707,7 +983,15 @@ impl SearchPanel {
                 rows.push("--- retained message ---".into());
                 rows.push(message.text.clone());
             } else {
-                rows.push("No matches in this retained range.".into());
+                rows.push("No matches in the selected retained content.".into());
+            }
+            if total > HIT_LIMIT {
+                rows.push("Result limit reached: narrow query or filters.".into());
+            }
+            if results.source.as_ref().is_some_and(|source| {
+                source.history_truncated || source.messages.iter().any(|m| m.truncated)
+            }) {
+                rows.push("Older content unavailable.".into());
             }
         }
         if let Some(notice) = &self.notice {
@@ -732,8 +1016,10 @@ impl SearchPanel {
             frame.render_widget(
                 Paragraph::new(if self.editing {
                     "Enter search  Esc close  F1 help"
+                } else if self.opened_tool.is_some() {
+                    "Esc back  PgUp/PgDn scroll"
                 } else {
-                    "Enter open  Esc close  F1 help"
+                    "Enter open  F5 mode  Esc close  F1 help"
                 }),
                 Rect {
                     y: area.y + area.height - 1,
@@ -749,6 +1035,12 @@ impl SearchPanel {
 mod tests {
     use super::*;
     use crate::agents::{AgentInfo, AgentSnapshot};
+    use crate::observation::ActivityIdentity;
+    use crate::protocol::ToolCategory;
+    use crate::tool_details::{
+        ToolDetail, ToolDetailLocator, ToolDetailsSnapshot, ToolLifecycle, ToolTextSource,
+    };
+    use std::collections::VecDeque;
 
     fn message(thread: &str, turn: &str, item: &str, text: &str) -> ConversationItem {
         ConversationItem {
@@ -791,6 +1083,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_and_both_searches_keep_only_hit_metadata_and_matching_message_projection() {
+        let detail = ToolDetail {
+            locator: ToolDetailLocator {
+                session_id: "session".into(),
+                identity: ActivityIdentity {
+                    agent_id: "root".into(),
+                    task_id: None,
+                    attempt_id: Some(1),
+                    thread_id: Some("root".into()),
+                    turn_id: Some("turn".into()),
+                    generation: Some(1),
+                },
+                item_id: "tool-item".into(),
+            },
+            revision: 7,
+            category: ToolCategory::Shell,
+            lifecycle: ToolLifecycle::Running,
+            command: Some("needle 中文".into()),
+            cwd: None,
+            parameters: None,
+            result: None,
+            output: "private output".into(),
+            output_source: ToolTextSource::OutputDelta,
+            exit_code: None,
+            duration_ms: None,
+            bytes_observed: 14,
+            bytes_retained: 14,
+            clipped: false,
+            authoritative: false,
+        };
+        let source = Arc::new(CoreSnapshot {
+            thread_id: Some("root".into()),
+            messages: vec![message("root", "turn", "message-item", "needle message")],
+            tool_details: ToolDetailsSnapshot {
+                entries: Arc::new(VecDeque::from([Arc::new(detail)])),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        for content in [ContentScope::Tools, ContentScope::Both] {
+            let results = found(
+                source.clone(),
+                Filter {
+                    text: "needle".into(),
+                    thread: "root".into(),
+                    content,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(results.tool_hits.len(), 1);
+            assert_eq!(results.tool_total, 1);
+            assert_eq!(
+                results.count(),
+                if content == ContentScope::Tools { 1 } else { 2 }
+            );
+            if content == ContentScope::Tools {
+                assert!(results.source.is_none());
+            } else {
+                let messages = &results.source.as_ref().unwrap().messages;
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].text, "needle message");
+            }
+            let tool_index = if content == ContentScope::Tools { 0 } else { 1 };
+            let mut panel = SearchPanel {
+                visible: true,
+                filter: Filter {
+                    content,
+                    ..Default::default()
+                },
+                selected: tool_index,
+                results: Some(Arc::new(results)),
+                ..Default::default()
+            };
+            assert!(panel
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &source)
+                .is_none());
+            assert!(panel.opened_tool.is_some());
+
+            let mut changed = source.as_ref().clone();
+            let mut entries = (*changed.tool_details.entries).clone();
+            Arc::make_mut(&mut entries[0]).revision += 1;
+            changed.tool_details.entries = Arc::new(entries);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| panel.draw(frame, frame.area(), &changed))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("expired"));
+        }
+    }
+
+    #[tokio::test]
     async fn search_uses_confirmed_relationships_and_exact_turn_role_state_filters() {
         let mut source = CoreSnapshot {
             thread_id: Some("root".into()),
@@ -828,7 +1220,9 @@ mod tests {
                 results
                     .hits
                     .iter()
-                    .map(|hit| results.source.messages[hit.message].thread_id.as_str())
+                    .map(|hit| results.source.as_ref().unwrap().messages[hit.message]
+                        .thread_id
+                        .as_str())
                     .collect::<Vec<_>>(),
                 expected
             );
@@ -837,11 +1231,11 @@ mod tests {
         source.messages[2].complete = false;
         source.messages[3].truncated = true;
         source.messages[4].turn_id = "two".into();
-        for (role, state, turn, expected) in [
-            (Role::You, State::Complete, "one", vec![1]),
-            (Role::Agent, State::Streaming, "one", vec![2]),
-            (Role::All, State::Truncated, "one", vec![3]),
-            (Role::All, State::All, "two", vec![4]),
+        for (role, state, turn, expected_thread) in [
+            (Role::You, State::Complete, "one", "child"),
+            (Role::Agent, State::Streaming, "one", "grandchild"),
+            (Role::All, State::Truncated, "one", "sibling"),
+            (Role::All, State::All, "two", "unconfirmed"),
         ] {
             let results = found(
                 Arc::new(source.clone()),
@@ -859,9 +1253,13 @@ mod tests {
                 results
                     .hits
                     .iter()
-                    .map(|hit| hit.message)
+                    .map(|hit| {
+                        results.source.as_ref().unwrap().messages[hit.message]
+                            .thread_id
+                            .as_str()
+                    })
                     .collect::<Vec<_>>(),
-                expected
+                vec![expected_thread]
             );
         }
     }
@@ -902,7 +1300,7 @@ mod tests {
         .await;
         assert_eq!(results.total, 700);
         assert_eq!(results.hits.len(), HIT_LIMIT);
-        assert!(results.source.history_truncated);
+        assert!(results.source.as_ref().unwrap().history_truncated);
     }
 
     #[test]

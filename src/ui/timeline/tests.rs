@@ -59,6 +59,7 @@ fn tool_event(id: u64) -> Arc<TimelineEntry> {
 fn tool_details(locator: ToolDetailLocator) -> ToolDetailsSnapshot {
     let detail = ToolDetail {
         locator,
+        revision: 1,
         category: crate::protocol::ToolCategory::Shell,
         lifecycle: ToolLifecycle::Completed,
         command: Some("echo result".into()),
@@ -238,6 +239,10 @@ fn enter_opens_only_the_exact_tool_locator_and_escape_returns_without_commands()
 
     assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
     assert_eq!(panel.tool_detail, Some(locator));
+    assert!(matches!(
+        key(&mut panel, KeyCode::Char('s'), &current),
+        Some(Locate::ToolSearch(thread)) if thread == "root"
+    ));
     assert!(key(&mut panel, KeyCode::Esc, &current).is_none());
     assert!(panel.visible);
     assert!(panel.tool_detail.is_none());

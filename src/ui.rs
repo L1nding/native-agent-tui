@@ -38,6 +38,7 @@ mod scope;
 mod search;
 mod timeline;
 mod tool_detail;
+mod tool_search;
 
 use input::{InputEvent, TerminalInput};
 
@@ -625,6 +626,14 @@ fn handle_key(
                     local.tasks = false;
                     local.evidence = false;
                     sync_local_requests(local, snapshot);
+                    local.notice = None;
+                }
+                Some(timeline::Locate::ToolSearch(thread)) => {
+                    local.timeline.close();
+                    local.search.open_tools(thread);
+                    local.tasks = false;
+                    local.evidence = false;
+                    local.request_panel = false;
                     local.notice = None;
                 }
                 None => {}
