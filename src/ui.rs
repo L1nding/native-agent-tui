@@ -39,8 +39,14 @@ mod search;
 mod timeline;
 mod tool_detail;
 mod tool_search;
+mod workflow;
 
 use input::{InputEvent, TerminalInput};
+use workflow::{
+    navigate_workflow_link, project_workflow, selected_task, stale_gate_link, task_reference,
+    workflow_conversation, ConversationTarget, WorkflowLinkCursor, WorkflowLinkKind,
+    WorkflowLinkNavigation,
+};
 
 const PASTE_REJECTED: &str = "Paste exceeds 32 KiB; the entire paste was discarded.";
 
@@ -129,22 +135,6 @@ struct LocalState {
     answering: Option<RequestRef>,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkflowLinkKind {
-    Dependency,
-    Gate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkflowLinkCursor {
-    origin: TaskId,
-    origin_attempt: u64,
-    target: TaskId,
-    kind: WorkflowLinkKind,
-    index: usize,
-    captured_attempt: Option<u64>,
 }
 
 #[derive(Default)]
@@ -873,14 +863,30 @@ fn handle_key(
             local.task_scroll = usize::MAX;
         }
         KeyCode::Char('d') if local.tasks && key.modifiers.is_empty() => {
-            navigate_workflow_link(snapshot, local, WorkflowLinkKind::Dependency);
+            apply_workflow_navigation(
+                navigate_workflow_link(
+                    snapshot,
+                    local.task_id,
+                    local.task_link_cursor,
+                    WorkflowLinkKind::Dependency,
+                ),
+                local,
+            );
         }
         KeyCode::Char('g') if local.tasks && key.modifiers.is_empty() => {
-            navigate_workflow_link(snapshot, local, WorkflowLinkKind::Gate);
+            apply_workflow_navigation(
+                navigate_workflow_link(
+                    snapshot,
+                    local.task_id,
+                    local.task_link_cursor,
+                    WorkflowLinkKind::Gate,
+                ),
+                local,
+            );
         }
         KeyCode::Enter if local.tasks && !control => {
-            if let Some(task) = selected_task(snapshot, local) {
-                if stale_gate_link(snapshot, local, task) {
+            if let Some(task) = selected_task(snapshot, local.task_id) {
+                if stale_gate_link(snapshot, local.task_link_cursor, task) {
                     local.notice = Some(
                         "The captured Gate attempt is no longer current; use Up/Down to reselect the task before opening it.".into(),
                     );
@@ -919,8 +925,8 @@ fn handle_key(
             );
         }
         KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) if local.tasks => {
-            if let Some(task) = selected_task(snapshot, local) {
-                if stale_gate_link(snapshot, local, task) {
+            if let Some(task) = selected_task(snapshot, local.task_id) {
+                if stale_gate_link(snapshot, local.task_link_cursor, task) {
                     local.notice = Some(
                         "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
                     );
@@ -951,7 +957,7 @@ fn handle_key(
         KeyCode::Up | KeyCode::Down if local.tasks => {
             let tasks = project_workflow(snapshot).order;
             if !tasks.is_empty() {
-                let index = selected_task(snapshot, local)
+                let index = selected_task(snapshot, local.task_id)
                     .and_then(|task| tasks.iter().position(|id| *id == task.id))
                     .unwrap_or(0);
                 let next = if key.code == KeyCode::Up {
@@ -966,8 +972,8 @@ fn handle_key(
             }
         }
         KeyCode::Char('+') | KeyCode::Char('-') if local.tasks && key.modifiers.is_empty() => {
-            if let Some(task) = selected_task(snapshot, local) {
-                if stale_gate_link(snapshot, local, task) {
+            if let Some(task) = selected_task(snapshot, local.task_id) {
+                if stale_gate_link(snapshot, local.task_link_cursor, task) {
                     local.notice = Some(
                         "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
                     );
@@ -1153,272 +1159,22 @@ fn handle_key(
     false
 }
 
-fn selected_task<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> Option<&'a TaskSnapshot> {
-    local
-        .task_id
-        .and_then(|id| snapshot.scheduler.tasks.iter().find(|task| task.id == id))
-        .or_else(|| snapshot.scheduler.tasks.first())
-}
-
-/// 工作流行序只根据快照中的显式 parent 建树；依赖与 Gate 目标单独呈现。
-fn workflow_order(tasks: &[TaskSnapshot]) -> Vec<TaskId> {
-    fn visit(
-        id: TaskId,
-        children: &BTreeMap<TaskId, Vec<TaskId>>,
-        seen: &mut HashSet<TaskId>,
-        output: &mut Vec<TaskId>,
-    ) {
-        if !seen.insert(id) {
-            return;
-        }
-        output.push(id);
-        if let Some(direct) = children.get(&id) {
-            for child in direct {
-                visit(*child, children, seen, output);
-            }
-        }
-    }
-    let known = tasks.iter().map(|task| task.id).collect::<HashSet<_>>();
-    let mut children = BTreeMap::<TaskId, Vec<TaskId>>::new();
-    for task in tasks {
-        if let Some(parent) = task.parent.filter(|parent| known.contains(parent)) {
-            children.entry(parent).or_default().push(task.id);
-        }
-    }
-    for direct in children.values_mut() {
-        direct.sort();
-    }
-    let mut roots = tasks
-        .iter()
-        .filter(|task| task.parent.is_none() || !known.contains(&task.parent.unwrap()))
-        .map(|task| task.id)
-        .collect::<Vec<_>>();
-    roots.sort();
-    let mut seen = HashSet::new();
-    let mut output = Vec::with_capacity(tasks.len());
-    for root in roots {
-        visit(root, &children, &mut seen, &mut output);
-    }
-    for task in tasks {
-        visit(task.id, &children, &mut seen, &mut output);
-    }
-    output
-}
-
-struct WorkflowProjection {
-    order: Vec<TaskId>,
-    agents: HashMap<String, AgentTreeRow>,
-}
-
-/// 键盘导航和 F4 共用任务序；关联 Agent 的顺序/层级沿用既有 DFS 投影。
-fn project_workflow(snapshot: &CoreSnapshot) -> WorkflowProjection {
-    let agents = project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref())
-        .into_iter()
-        .filter_map(|row| {
-            snapshot
-                .agents
-                .get(row.index)
-                .map(|agent| (agent.info.id.clone(), row))
-        })
-        .collect();
-    WorkflowProjection {
-        order: workflow_order(&snapshot.scheduler.tasks),
-        agents,
-    }
-}
-
-fn navigate_workflow_link(snapshot: &CoreSnapshot, local: &mut LocalState, kind: WorkflowLinkKind) {
-    let Some(current) = selected_task(snapshot, local) else {
-        local.notice = Some("No workflow task is selected.".into());
-        return;
-    };
-    let cursor = local.task_link_cursor.filter(|cursor| {
-        cursor.kind == kind
-            && cursor.target == current.id
-            && snapshot
-                .scheduler
-                .tasks
-                .iter()
-                .find(|task| task.id == cursor.origin)
-                .is_some_and(|task| task.attempt == cursor.origin_attempt)
-    });
-    let origin = cursor.map_or(current.id, |cursor| cursor.origin);
-    let Some(source) = snapshot
-        .scheduler
-        .tasks
-        .iter()
-        .find(|task| task.id == origin)
-    else {
-        local.notice = Some("The workflow link source is unavailable.".into());
-        return;
-    };
-    let count = match kind {
-        WorkflowLinkKind::Dependency => source.dependencies.len(),
-        WorkflowLinkKind::Gate => source.wait_targets.len(),
-    };
-    if count == 0 {
-        local.notice = Some(match kind {
-            WorkflowLinkKind::Dependency => "Selected task has no dependencies.".into(),
-            WorkflowLinkKind::Gate => "Selected task has no captured Gate wait targets.".into(),
-        });
-        local.task_link_cursor = None;
-        return;
-    }
-    let index = cursor.map_or(0, |cursor| (cursor.index + 1) % count);
-    let (target, captured_attempt) = match kind {
-        WorkflowLinkKind::Dependency => (source.dependencies[index], None),
-        WorkflowLinkKind::Gate => {
-            let target = source.wait_targets[index];
-            (target.task, Some(target.attempt))
-        }
-    };
-    if !snapshot
-        .scheduler
-        .tasks
-        .iter()
-        .any(|task| task.id == target)
-    {
-        local.notice = Some(format!(
-            "Workflow link target #{} is unavailable.",
-            target.0
-        ));
-        local.task_link_cursor = None;
-        return;
-    }
-    local.task_id = Some(target);
-    local.task_scroll = 0;
-    local.task_manual_scroll = false;
-    local.task_link_cursor = Some(WorkflowLinkCursor {
-        origin,
-        origin_attempt: source.attempt,
-        target,
-        kind,
-        index,
-        captured_attempt,
-    });
-    local.notice = None;
-}
-
-fn stale_gate_link(snapshot: &CoreSnapshot, local: &LocalState, task: &TaskSnapshot) -> bool {
-    let Some(cursor) = local
-        .task_link_cursor
-        .filter(|cursor| cursor.kind == WorkflowLinkKind::Gate && cursor.target == task.id)
-    else {
-        return false;
-    };
-    let origin_is_current = snapshot
-        .scheduler
-        .tasks
-        .iter()
-        .find(|candidate| candidate.id == cursor.origin)
-        .is_some_and(|origin| origin.attempt == cursor.origin_attempt);
-    !origin_is_current || cursor.captured_attempt != Some(task.attempt)
-}
-
-enum ConversationTarget<'a> {
-    Root,
-    Child(&'a AgentSnapshot),
-    Unavailable(&'static str),
-}
-
-fn workflow_conversation<'a>(
-    snapshot: &'a CoreSnapshot,
-    task: &'a TaskSnapshot,
-) -> ConversationTarget<'a> {
-    match task.kind {
-        crate::scheduler::TaskKind::RootTurn => {
-            let active = snapshot.scheduler.active_root
-                == Some(TaskAttempt {
-                    task: task.id,
-                    attempt: task.attempt,
-                });
-            let current_thread = snapshot.thread_id.as_deref();
-            let current_turn = snapshot.turn_id.as_deref();
-            let exact_turn = task.external.as_ref().is_some_and(|turn| {
-                !turn.turn_id.is_empty()
-                    && turn.generation > 0
-                    && Some(turn.thread_id.as_str()) == current_thread
-                    && Some(turn.turn_id.as_str()) == current_turn
-            });
-            let observed = task.external.as_ref().is_some_and(|turn| {
-                snapshot.observation.activities.iter().any(|activity| {
-                    activity.scope == ActivityScope::Turn
-                        && activity.identity.agent_id == "root"
-                        && activity.identity.task_id == Some(task.id)
-                        && activity.identity.attempt_id == Some(task.attempt)
-                        && activity.identity.thread_id.as_deref() == Some(turn.thread_id.as_str())
-                        && activity.identity.turn_id.as_deref() == Some(turn.turn_id.as_str())
-                        && activity.identity.generation == Some(turn.generation)
-                })
-            });
-            if snapshot.phase != crate::state::SessionPhase::StartingTurn
-                && exact_turn
-                && observed
-                && (!task.state.active() || active)
-            {
-                ConversationTarget::Root
-            } else {
-                ConversationTarget::Unavailable(
-                    "This root task does not match the currently confirmed conversation turn.",
-                )
-            }
-        }
-        crate::scheduler::TaskKind::NativeChild => {
-            let Some(thread_id) = task.child_thread_id.as_deref() else {
-                return ConversationTarget::Unavailable(
-                    "This child task has no confirmed thread identity.",
-                );
-            };
-            if task.external.as_ref().is_some_and(|turn| {
-                turn.thread_id != thread_id
-                    || turn.generation != task.attempt
-                    || turn.generation == 0
-                    || turn.turn_id.is_empty()
-            }) {
-                return ConversationTarget::Unavailable(
-                    "The child task identity is stale or inconsistent.",
-                );
-            }
-            let Some(agent) = snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.info.id == thread_id)
-            else {
-                return ConversationTarget::Unavailable(
-                    "No observed agent is available for this child thread.",
-                );
-            };
-            if let Some(turn) = &task.external {
-                if agent.turn_id.as_deref() == Some(turn.turn_id.as_str())
-                    && agent.generation == turn.generation
-                {
-                    ConversationTarget::Child(agent)
-                } else {
-                    ConversationTarget::Unavailable(
-                        "The child task's observed agent turn is stale or unavailable.",
-                    )
-                }
-            } else if task.attempt == 0
-                && agent.generation == 0
-                && agent.turn_id.is_none()
-                && agent.awaiting_turn
-            {
-                ConversationTarget::Child(agent)
-            } else {
-                ConversationTarget::Unavailable(
-                    "The child thread has started without a matching confirmed task turn.",
-                )
-            }
-        }
-    }
-}
-
 fn selected_agent_id<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> &'a str {
     local
         .agent_id
         .as_ref()
         .and_then(|id| snapshot.agents.iter().find(|agent| &agent.info.id == id))
         .map_or("root", |agent| agent.info.id.as_str())
+}
+
+fn apply_workflow_navigation(result: WorkflowLinkNavigation, local: &mut LocalState) {
+    if let Some(task_id) = result.task_id {
+        local.task_id = Some(task_id);
+        local.task_scroll = 0;
+        local.task_manual_scroll = false;
+    }
+    local.task_link_cursor = result.cursor;
+    local.notice = result.notice;
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -2593,8 +2349,17 @@ fn draw_tasks(
     local: &LocalState,
 ) {
     let scheduler = &snapshot.scheduler;
-    let selected = selected_task(snapshot, local);
+    let selected = selected_task(snapshot, local.task_id);
     let projection = project_workflow(snapshot);
+    let agent_rows = project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref())
+        .into_iter()
+        .filter_map(|row| {
+            snapshot
+                .agents
+                .get(row.index)
+                .map(|agent| (agent.info.id.clone(), row))
+        })
+        .collect();
     let width = area.width.saturating_sub(2).max(1) as usize;
     let viewport = area.height.saturating_sub(2) as usize;
     let by_id = scheduler
@@ -2764,7 +2529,7 @@ fn draw_tasks(
         }
         raw.push(format!(
             "Conversation: {}",
-            workflow_agent_label(snapshot, task, &projection.agents)
+            workflow_agent_label(snapshot, task, &agent_rows)
         ));
         if let Some(cursor) = local
             .task_link_cursor
@@ -2886,13 +2651,6 @@ fn project_agent_tree(agents: &[AgentSnapshot], root_id: Option<&str>) -> Vec<Ag
         }
     }
     rows
-}
-
-fn task_reference(id: TaskId, tasks: &BTreeMap<TaskId, &TaskSnapshot>) -> String {
-    tasks.get(&id).map_or_else(
-        || format!("#{} unavailable", id.0),
-        |task| format!("#{} {} [{:?}]", id.0, task.title, task.state),
-    )
 }
 
 fn workflow_agent_label(
@@ -4167,7 +3925,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        let selected = selected_task(&snapshot, &local).unwrap();
+        let selected = selected_task(&snapshot, local.task_id).unwrap();
         assert_eq!(selected.state, TaskState::Ready);
         let attempt = TaskAttempt {
             task: selected.id,
