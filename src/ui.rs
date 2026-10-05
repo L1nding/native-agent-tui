@@ -28,6 +28,7 @@ use crate::scheduler::{
 use crate::state::{display_text, CoreSnapshot, FactSource, MESSAGE_BYTES};
 
 mod activity;
+mod context;
 mod history;
 mod input;
 mod reminders;
@@ -134,6 +135,7 @@ struct LocalState {
     notice: Option<String>,
     help: bool,
     workflow: workflow::WorkflowPanel,
+    context: context::ContextPanel,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -493,6 +495,28 @@ fn handle_key(
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if local.context.visible {
+        if control && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d')) {
+            return true;
+        }
+        if control && key.code == KeyCode::Char('c') {
+            send(Command::Interrupt, tx, local);
+            return false;
+        }
+        local.context.handle_key(key, 8);
+        return false;
+    }
+    if control && key.code == KeyCode::Char('g') {
+        local.search.close();
+        local.timeline.close();
+        local.skills = false;
+        local.request_panel = false;
+        local.evidence = false;
+        local.workflow.visible = false;
+        local.attention_editor = None;
+        local.context.toggle();
+        return false;
+    }
     if local.skills {
         match key.code {
             KeyCode::Char('q') if control => return true,
@@ -1386,6 +1410,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         return;
     }
 
+    if local.context.visible {
+        local.context.draw(frame, area, snapshot, selected_agent);
+        return;
+    }
+
     let conversation_area = if area.width >= 100 && !snapshot.agents.is_empty() {
         let panels = Layout::default()
             .direction(Direction::Horizontal)
@@ -1648,7 +1677,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+G context | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
         notice.clone()
     } else if let Some(request) = request {
@@ -2294,6 +2323,291 @@ mod tests {
         );
         assert!(!local.skills);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn context_panel_routes_locally_and_scrolls_or_closes_without_commands() {
+        let snapshot = observed_snapshot();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.editor.text, "c");
+        local.attention_editor = Some(AttentionEditor::new(&snapshot, 0));
+        local.request_panel = true;
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.context.visible);
+        assert!(local.attention_editor.is_none());
+        assert!(!local.request_panel);
+        assert_eq!(local.editor.text, "c");
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 8);
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 0);
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 0);
+        handle_key(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 0);
+        handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 0);
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 8);
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.context.scroll, 0);
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.context.visible);
+        assert_eq!(local.context.scroll, 0);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.context.visible);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn context_panel_uses_selected_agent_usage_and_keeps_budget_session_wide() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+        use crate::observation::{CompactionFact, CompactionFactStatus};
+
+        let mut snapshot = observed_snapshot();
+        snapshot.usage = crate::state::UsageSummary {
+            total_tokens: Some(900),
+            input_tokens: Some(800),
+            source: FactSource::ServerConfirmed,
+            ..Default::default()
+        };
+        snapshot.token_budget = crate::state::TokenBudgetSnapshot {
+            confirmed_total_tokens: Some(900),
+            confirmed_complete: true,
+            limit: Some(1_000),
+            stop_triggered: false,
+            per_agent_limit: Some(300),
+            per_agent_stop_triggered: true,
+        };
+        let child = AgentSnapshot {
+            info: AgentInfo {
+                id: "child-thread".into(),
+                parent_id: "root-thread".into(),
+                path: Some("/root/worker".into()),
+                nickname: None,
+                role: None,
+                model: None,
+                confirmed: true,
+            },
+            generation: 1,
+            turn_id: Some("child-turn".into()),
+            outcome: None,
+            awaiting_turn: false,
+            usage: crate::state::UsageSummary {
+                total_tokens: Some(12),
+                input_tokens: Some(7),
+                cached_input_tokens: Some(3),
+                output_tokens: Some(4),
+                reasoning_tokens: Some(2),
+                context_window: Some(80),
+                source: FactSource::ServerConfirmed,
+            },
+        };
+        snapshot.agents.push(child.clone());
+        snapshot.observation.compactions.push(CompactionFact {
+            thread_id: "root-thread".into(),
+            turn_id: "root-turn".into(),
+            item_id: "root-compaction".into(),
+            status: CompactionFactStatus::Completed,
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            input_tokens: Some(900),
+            cached_input_tokens: Some(100),
+            output_tokens: Some(80),
+            total_tokens: Some(980),
+            context_window: Some(1_000),
+        });
+        snapshot.observation.compactions.push(CompactionFact {
+            thread_id: "child-thread".into(),
+            turn_id: "child-turn".into(),
+            item_id: "child-compaction".into(),
+            status: CompactionFactStatus::Unknown,
+            started_at_ms: None,
+            completed_at_ms: None,
+            input_tokens: Some(8),
+            cached_input_tokens: None,
+            output_tokens: None,
+            total_tokens: Some(9),
+            context_window: None,
+        });
+
+        for selected in [None, Some(&child)] {
+            let mut context_panel = context::ContextPanel::default();
+            context_panel.visible = true;
+            let local = LocalState {
+                context: context_panel,
+                agent_id: selected.map(|agent| agent.info.id.clone()),
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(screen.contains("Session-wide token budget"), "{screen}");
+            assert!(screen.contains("total 900"), "{screen}");
+            assert!(screen.contains("limit 1000"), "{screen}");
+            assert!(screen.contains("completeness complete"), "{screen}");
+            assert!(screen.contains("per-agent limit 300"), "{screen}");
+            if selected.is_some() {
+                assert!(
+                    screen.contains("Usage (child child-thread) source: server confirmed"),
+                    "{screen}"
+                );
+                assert!(screen.contains("total 12 | input 7"), "{screen}");
+                assert!(screen.contains("Compaction #1"), "{screen}");
+                assert!(screen.contains("status Unknown"), "{screen}");
+                assert!(screen.contains("cached input unavailable"), "{screen}");
+                assert!(screen.contains("Selected child · thread child-thread · current turn child-turn · generation 1"), "{screen}");
+                assert!(
+                    screen.contains("most recent server-confirmed value retained by Core"),
+                    "{screen}"
+                );
+                assert!(!screen.contains("root-compaction"), "{screen}");
+                assert!(!screen.contains("total 900 | input 800"), "{screen}");
+            } else {
+                assert!(
+                    screen.contains("Usage (root) source: server confirmed"),
+                    "{screen}"
+                );
+                assert!(screen.contains("Selected root · thread root-thread · current turn turn · generation unavailable"), "{screen}");
+                assert!(
+                    screen.contains("most recent server-confirmed value retained by Core"),
+                    "{screen}"
+                );
+                assert!(screen.contains("total 900 | input 800"), "{screen}");
+                assert!(screen.contains("root-compaction"), "{screen}");
+                assert!(!screen.contains("child-compaction"), "{screen}");
+            }
+        }
+
+        let unknown = CoreSnapshot::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 16)).unwrap();
+        let mut context_panel = context::ContextPanel::default();
+        context_panel.visible = true;
+        terminal
+            .draw(|frame| context_panel.draw(frame, frame.area(), &unknown, None))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("source: unknown"), "{screen}");
+        assert!(screen.contains("Selected root · thread unavailable · current turn unavailable · generation unavailable"), "{screen}");
+        assert!(
+            screen.contains("latest retained value is not server-confirmed"),
+            "{screen}"
+        );
+        assert!(screen.contains("total unavailable"), "{screen}");
+        assert!(screen.contains("limit unavailable"), "{screen}");
+        assert!(screen.contains("completeness unavailable"), "{screen}");
+        assert!(screen.contains("Compaction facts: unavailable"), "{screen}");
+
+        let mut narrow = Terminal::new(TestBackend::new(32, 8)).unwrap();
+        context_panel.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 8);
+        narrow
+            .draw(|frame| context_panel.draw(frame, frame.area(), &unknown, None))
+            .unwrap();
+    }
+
+    #[test]
+    fn help_view_lists_the_context_panel_shortcut() {
+        let snapshot = observed_snapshot();
+        let local = LocalState {
+            help: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Ctrl+G context"), "{screen}");
     }
 
     #[test]
