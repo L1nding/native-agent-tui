@@ -21,34 +21,43 @@ use crate::agents::AgentSnapshot;
 use crate::client::{ClientHandle, Command};
 use crate::history::HistoryHandle;
 use crate::interactions::{ApprovalDecision, RequestKind, RequestRef, RequestView};
-use crate::observation::{
-    ActivityScope, ActivitySnapshot, AttentionClass, AttentionLevel, CompactionFact,
-    CompactionFactStatus, ExecutionState,
-};
+use crate::observation::{AttentionClass, AttentionLevel};
 use crate::scheduler::{
     RootTaskSpec, SchedulerCommand, TaskAttempt, TaskSnapshot, ROOT_QUEUE_LIMIT,
 };
 use crate::state::{display_text, CoreSnapshot, FactSource, MESSAGE_BYTES};
 
+mod activity;
 mod history;
 mod input;
 mod reminders;
 mod requests;
 mod scope;
 mod search;
+mod skills;
 mod timeline;
 mod tool_detail;
 mod tool_search;
 mod workflow;
 
+use activity::compaction_fact_rows;
+use activity::{
+    age, agent_usage_brief, draw_evidence, evidence_brief, focus_activity, reminder_brief,
+    truncate_display_label, usage_status,
+};
 use input::{InputEvent, TerminalInput};
+use skills::{draw_skills, skills_panel_entries_capacity};
 use workflow::{
     navigate_workflow_link, project_workflow, selected_task, stale_gate_link, task_reference,
     workflow_conversation, ConversationTarget, WorkflowLinkKind, WorkflowLinkNavigation,
 };
 
 #[cfg(test)]
+use crate::observation::{ActivityScope, ExecutionState};
+#[cfg(test)]
 use crate::scheduler::TaskId;
+#[cfg(test)]
+use activity::{activity_brief, format_token_budget_evidence, token_budget_brief};
 #[cfg(test)]
 use workflow::WorkflowLinkCursor;
 
@@ -1314,8 +1323,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     let selected_activity = focus_activity(snapshot, agent_id);
     let mut header = vec![Line::from(status)];
     if let Some(activity) = selected_activity {
-        header.push(Line::from(display_text(&reminder_brief(activity, local))));
-        header.push(Line::from(display_text(&evidence_brief(activity, local))));
+        header.push(Line::from(display_text(&reminder_brief(
+            activity,
+            &local.reminders,
+        ))));
+        header.push(Line::from(display_text(&evidence_brief(
+            activity,
+            &local.reminders,
+        ))));
     }
     header.push(Line::from(display_text(&settings)));
     if area.height <= 16 && selected_activity.is_some() {
@@ -1367,7 +1382,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     }
 
     if local.skills {
-        draw_skills(frame, area, snapshot, local);
+        draw_skills(frame, area, snapshot, local.skills_scroll);
         return;
     }
 
@@ -1616,7 +1631,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         draw_tasks(frame, chunks[1], snapshot, local);
     }
     if local.evidence {
-        draw_evidence(frame, chunks[1], snapshot, local, agent_id);
+        draw_evidence(
+            frame,
+            chunks[1],
+            snapshot,
+            &local.reminders,
+            local.evidence_scroll,
+            agent_id,
+        );
     }
 
     let notice = local
@@ -1756,541 +1778,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     }
     if local.request_panel && local.attention_editor.is_none() {
         requests::draw(frame, snapshot, local);
-    }
-}
-
-const SKILLS_PANEL_FULL_HEADER_LINES: u16 = 7;
-const SKILLS_PANEL_COMPACT_HEADER_LINES: u16 = 5;
-
-fn skill_refresh_source_label(source: Option<crate::skills::SkillRefreshSource>) -> &'static str {
-    match source {
-        Some(crate::skills::SkillRefreshSource::Initial) => "Initial",
-        Some(crate::skills::SkillRefreshSource::Changed) => "Changed",
-        Some(crate::skills::SkillRefreshSource::Manual) => "Manual",
-        None => "unavailable",
-    }
-}
-
-fn skills_panel_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let width = area.width.saturating_sub(4).clamp(1, 100);
-    let height = area.height.saturating_sub(2).max(1);
-    ratatui::layout::Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
-}
-
-fn skills_panel_entries_capacity(area: ratatui::layout::Rect) -> usize {
-    let inner = Block::default()
-        .borders(Borders::ALL)
-        .inner(skills_panel_rect(area));
-    let header = if inner.height < 10 {
-        SKILLS_PANEL_COMPACT_HEADER_LINES
-    } else {
-        SKILLS_PANEL_FULL_HEADER_LINES
-    };
-    inner.height.saturating_sub(header) as usize
-}
-
-fn draw_skills(
-    frame: &mut ratatui::Frame<'_>,
-    area: ratatui::layout::Rect,
-    snapshot: &CoreSnapshot,
-    local: &LocalState,
-) {
-    let rect = skills_panel_rect(area);
-    let inner = Block::default().borders(Borders::ALL).inner(rect);
-    let compact = inner.height < 10;
-    frame.render_widget(Clear, rect);
-    let skills = &snapshot.skills;
-    let directory = Line::from(format!("Directory: {}", display_text(&snapshot.cwd)));
-    let status = Line::from(
-        if matches!(
-            skills.availability,
-            crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
-        ) {
-            format!(
-                "Status: {:?} / {:?} | {} skills observed, {} enabled | scan errors: {}{}",
-                skills.availability,
-                skills.freshness,
-                skills.skill_count,
-                skills.enabled_count,
-                skills.scan_error_count,
-                if skills.truncated { " | truncated" } else { "" },
-            )
-        } else {
-            format!(
-                "Status: {:?} / {:?} | skill counts unavailable",
-                skills.availability, skills.freshness
-            )
-        },
-    );
-    let session = Line::from(format!(
-        "Session: {:?} · pending requests: {}",
-        snapshot.phase,
-        snapshot.requests.len()
-    ));
-    let refresh_source = if compact {
-        Line::from(format!(
-            "Refresh: {}",
-            skill_refresh_source_label(skills.refresh_source)
-        ))
-    } else {
-        Line::from(format!(
-            "Refresh source: {}",
-            skill_refresh_source_label(skills.refresh_source)
-        ))
-    };
-    let source = if matches!(
-        skills.availability,
-        crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
-    ) {
-        Line::from("Source: server-confirmed skills/list directory scan")
-    } else {
-        Line::from(format!(
-            "Inventory source unavailable: {:?}",
-            skills.availability
-        ))
-    };
-    let mut lines = if compact {
-        let compact_status = Line::from(format!(
-            "{:?} / {:?}",
-            skills.availability, skills.freshness
-        ));
-        let compact_source = if matches!(
-            skills.availability,
-            crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
-        ) {
-            Line::from("Source: AppServer")
-        } else {
-            Line::from(format!("Unavailable: {:?}", skills.availability))
-        };
-        vec![
-            directory,
-            compact_status,
-            compact_source,
-            refresh_source,
-            Line::from(format!(
-                "{:?} req {} · Enter/F2",
-                snapshot.phase,
-                snapshot.requests.len()
-            )),
-        ]
-    } else {
-        vec![
-            directory,
-            status,
-            session,
-            source,
-            refresh_source,
-            Line::from("Listed entries do not confirm loaded, invoked, completed, or failed."),
-            Line::from("Enter refresh · Esc/Ctrl+K close · ↑/↓ scroll · F2 requests"),
-        ]
-    };
-    let visible = inner.height.saturating_sub(lines.len() as u16) as usize;
-    let start = local
-        .skills_scroll
-        .min(skills.entries.len().saturating_sub(visible));
-    lines.extend(
-        skills
-            .entries
-            .iter()
-            .skip(start)
-            .take(visible)
-            .map(|entry| {
-                Line::from(display_text(&format!(
-                    "{} [{}] {} · {}",
-                    if entry.enabled { "on" } else { "off" },
-                    entry.scope,
-                    entry.name,
-                    entry.path,
-                )))
-            }),
-    );
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Skills inventory · Ctrl+K "),
-        ),
-        rect,
-    );
-}
-
-fn age(ms: Option<u64>) -> String {
-    ms.map_or_else(|| "unknown".into(), |ms| format!("{}s", ms / 1000))
-}
-
-fn focus_activity<'a>(snapshot: &'a CoreSnapshot, agent_id: &str) -> Option<&'a ActivitySnapshot> {
-    snapshot
-        .observation
-        .activities
-        .iter()
-        .filter(|activity| activity.identity.agent_id == agent_id)
-        .max_by_key(|activity| {
-            let rank = if activity.attention.requires_action {
-                5
-            } else if activity.attention.level == AttentionLevel::AttentionNeeded {
-                4
-            } else if matches!(
-                activity.execution_state,
-                ExecutionState::Starting | ExecutionState::Running | ExecutionState::Waiting
-            ) {
-                3
-            } else if activity.scope == ActivityScope::Turn {
-                2
-            } else {
-                1
-            };
-            (
-                rank,
-                activity.scope == ActivityScope::Tool,
-                activity.silence_ms.unwrap_or(0),
-            )
-        })
-}
-
-fn activity_brief(activity: &ActivitySnapshot) -> String {
-    format!(
-        "{:?} {} | quiet {} | {:?}",
-        activity.execution_state,
-        activity.tool_category.map_or_else(
-            || format!("{:?}", activity.kind),
-            |category| format!("{category:?}")
-        ),
-        age(activity.silence_ms),
-        activity.attention.level
-    )
-}
-
-fn reminder_brief(activity: &ActivitySnapshot, local: &LocalState) -> String {
-    let mut text = activity_brief(activity);
-    if local.reminders.is_acknowledged(activity) {
-        text.push_str(" | reminder off locally");
-    }
-    text
-}
-
-fn next_action(activity: &ActivitySnapshot, local: &LocalState) -> &'static str {
-    if activity.attention.requires_action {
-        "F2 answer request"
-    } else if activity.execution_state == ExecutionState::Unknown {
-        "inspect unknown outcome"
-    } else if local.reminders.is_acknowledged(activity) {
-        "continuing to wait; Ctrl+W restore"
-    } else if matches!(
-        activity.attention.level,
-        AttentionLevel::Quiet | AttentionLevel::AttentionNeeded
-    ) {
-        "F11 inspect; Ctrl+W wait or Ctrl+C"
-    } else if activity.attention.level == AttentionLevel::Ended {
-        "review result"
-    } else {
-        "wait; F11 evidence"
-    }
-}
-
-fn evidence_brief(activity: &ActivitySnapshot, local: &LocalState) -> String {
-    format!(
-        "Next: {} | Last: {}",
-        next_action(activity, local),
-        activity.last_evidence.as_ref().map_or_else(
-            || "unknown".into(),
-            |evidence| format!("{:?} {:?} #{}", evidence.kind, evidence.source, evidence.id)
-        )
-    )
-}
-
-fn draw_evidence(
-    frame: &mut ratatui::Frame<'_>,
-    area: ratatui::layout::Rect,
-    snapshot: &CoreSnapshot,
-    local: &LocalState,
-    agent_id: &str,
-) {
-    let mut rows = Vec::new();
-    let diagnostics = &snapshot.diagnostics;
-    rows.push(format!(
-        "Transport bytes in/out {} / {} | control events {} | telemetry events {}",
-        diagnostics.transport_bytes_in,
-        diagnostics.transport_bytes_out,
-        diagnostics.control_events,
-        diagnostics.telemetry_events
-    ));
-    rows.push(format_usage_evidence(snapshot));
-    rows.push(format_token_budget_evidence(snapshot));
-    if let Some(journal) = &snapshot.journal {
-        rows.push(format!(
-            "Session {} / committed {} / submitted {} / persistence {:?}",
-            journal.session_id, journal.committed_seq, journal.submitted_seq, snapshot.persistence
-        ));
-    }
-    let compactions = snapshot
-        .observation
-        .activities
-        .iter()
-        .filter(|activity| {
-            activity.identity.agent_id == agent_id
-                && activity.tool_category == Some(crate::protocol::ToolCategory::Compaction)
-        })
-        .count();
-    rows.push(format!(
-        "Compactions retained: {compactions} | lifetime total unavailable"
-    ));
-    for activity in snapshot
-        .observation
-        .activities
-        .iter()
-        .filter(|activity| activity.identity.agent_id == agent_id)
-    {
-        rows.push(format!(
-            "{:?} {} | {:?}",
-            activity.scope,
-            activity.item_id.as_deref().unwrap_or("turn"),
-            activity.attention.level
-        ));
-        if activity.tool_category == Some(crate::protocol::ToolCategory::Compaction) {
-            rows.push(format!(
-                "Compaction source {:?}",
-                activity
-                    .last_evidence
-                    .as_ref()
-                    .map(|evidence| evidence.source)
-            ));
-            rows.extend(compaction_fact_rows(compaction_fact_for_activity(
-                snapshot, activity,
-            )));
-        }
-        rows.push(activity_brief(activity));
-        if local.reminders.is_acknowledged(activity) {
-            rows.push("Silence reminder: off locally until new evidence; Ctrl+W restore".into());
-        }
-        rows.push(format!(
-            "Last: {}",
-            activity.last_evidence.as_ref().map_or_else(
-                || "unknown".into(),
-                |evidence| format!(
-                    "{:?} / {:?} #{}",
-                    evidence.kind, evidence.source, evidence.id
-                )
-            )
-        ));
-        rows.push(format!("Next: {}", next_action(activity, local)));
-        rows.push(format!(
-            "Elapsed {} / progress {} / bytes {}",
-            age(activity.elapsed_ms),
-            activity.progress_seq,
-            activity.output_bytes
-        ));
-        rows.push(format!(
-            "Thread {:?} turn {:?} gen {:?} attempt {:?}",
-            activity.identity.thread_id,
-            activity.identity.turn_id,
-            activity.identity.generation,
-            activity.identity.attempt_id
-        ));
-        rows.push(format!(
-            "Quiet {:?}ms / attention {:?}ms / source {:?}",
-            activity.attention.quiet_after_ms,
-            activity.attention.attention_after_ms,
-            activity.attention.config_source
-        ));
-        rows.push("Provider execution: unavailable".into());
-        if let Some(reason) = activity.wait_reason {
-            rows.push(format!(
-                "Wait: {reason:?} / resume: {:?}",
-                activity.resume_condition
-            ));
-        }
-        for target in &activity.wait_targets {
-            rows.push(format!(
-                "Target {} / turn {:?} gen {} / {:?} / quiet {} / {:?}",
-                target.thread_id,
-                target.turn_id,
-                target.generation,
-                target.outcome,
-                age(target.silence_ms),
-                target.attention.as_ref().map(|attention| attention.level)
-            ));
-        }
-        rows.push(String::new());
-    }
-    if rows.is_empty() {
-        rows.push("Activity evidence unavailable.".into());
-    }
-    let lines: Vec<_> = rows
-        .iter()
-        .flat_map(|row| wrap(&display_text(row), area.width.saturating_sub(2) as usize))
-        .map(Line::from)
-        .collect();
-    let height = area.height.saturating_sub(2) as usize;
-    let start = local
-        .evidence_scroll
-        .min(lines.len().saturating_sub(height));
-    frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(start)
-                .take(height)
-                .collect::<Vec<_>>(),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Evidence · F11 · PgUp/PgDn "),
-        ),
-        area,
-    );
-}
-
-fn compaction_fact_for_activity<'a>(
-    snapshot: &'a CoreSnapshot,
-    activity: &ActivitySnapshot,
-) -> Option<&'a CompactionFact> {
-    let thread_id = activity.identity.thread_id.as_ref()?;
-    let turn_id = activity.identity.turn_id.as_ref()?;
-    let item_id = activity.item_id.as_ref()?;
-    snapshot.observation.compactions.iter().find(|fact| {
-        fact.thread_id == *thread_id && fact.turn_id == *turn_id && fact.item_id == *item_id
-    })
-}
-
-pub(super) fn compaction_fact_rows(fact: Option<&CompactionFact>) -> Vec<String> {
-    let status = fact.map_or("unavailable", |fact| match fact.status {
-        CompactionFactStatus::Started => "Started",
-        CompactionFactStatus::Completed => "Completed",
-        CompactionFactStatus::Unknown => "Unknown",
-    });
-    vec![
-        format!("Compaction status: {status}"),
-        format!(
-            "Compaction usage: input {} | cached input {} | output {} | total {} | context window {}",
-            usage_value(fact.and_then(|fact| fact.input_tokens)),
-            usage_value(fact.and_then(|fact| fact.cached_input_tokens)),
-            usage_value(fact.and_then(|fact| fact.output_tokens)),
-            usage_value(fact.and_then(|fact| fact.total_tokens)),
-            usage_value(fact.and_then(|fact| fact.context_window)),
-        ),
-    ]
-}
-
-fn usage_status(snapshot: &CoreSnapshot) -> String {
-    let usage = snapshot.usage;
-    let base = token_budget_brief(snapshot);
-    if usage.input_tokens.is_none()
-        && usage.cached_input_tokens.is_none()
-        && usage.output_tokens.is_none()
-        && usage.reasoning_tokens.is_none()
-    {
-        return base;
-    }
-    format!(
-        "{base} in:{} cached:{} out:{} reasoning:{}",
-        usage_value(usage.input_tokens),
-        usage_value(usage.cached_input_tokens),
-        usage_value(usage.output_tokens),
-        usage_value(usage.reasoning_tokens)
-    )
-}
-
-fn token_budget_brief(snapshot: &CoreSnapshot) -> String {
-    let total = snapshot.token_budget.confirmed_total_tokens.map_or_else(
-        || "unavailable".to_owned(),
-        |total| {
-            if snapshot.token_budget.confirmed_complete {
-                total.to_string()
-            } else {
-                format!("partial {total}")
-            }
-        },
-    );
-    format!(
-        "tokens:{}/{}",
-        total,
-        usage_value(snapshot.token_budget.limit)
-    )
-}
-
-fn format_token_budget_evidence(snapshot: &CoreSnapshot) -> String {
-    let budget = snapshot.token_budget;
-    format!(
-        "Session token budget: {} | stop triggered: {} | Per-agent token budget: {}",
-        token_budget_brief(snapshot),
-        if budget.stop_triggered { "yes" } else { "no" },
-        per_agent_budget_brief(budget)
-    )
-}
-
-fn per_agent_budget_brief(budget: crate::state::TokenBudgetSnapshot) -> String {
-    let Some(limit) = budget.per_agent_limit else {
-        return "not set".to_owned();
-    };
-    format!(
-        "limit {limit} | stop triggered: {}",
-        if budget.per_agent_stop_triggered {
-            "yes"
-        } else {
-            "no"
-        }
-    )
-}
-
-fn agent_usage_brief(agent: &crate::agents::AgentSnapshot) -> String {
-    match (agent.usage.source, agent.usage.total_tokens) {
-        (FactSource::ServerConfirmed, Some(tokens)) => format!("tokens:{tokens}"),
-        _ => "tokens: unavailable".to_owned(),
-    }
-}
-
-fn truncate_display_label(text: &str, max_width: usize) -> String {
-    let text = display_text(text);
-    if UnicodeWidthStr::width(text.as_str()) <= max_width {
-        return text;
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut output = String::new();
-    let mut width = 0;
-    for grapheme in text.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if width + grapheme_width + 1 > max_width {
-            break;
-        }
-        output.push_str(grapheme);
-        width += grapheme_width;
-    }
-    output.push('…');
-    output
-}
-
-fn format_usage_evidence(snapshot: &CoreSnapshot) -> String {
-    let usage = snapshot.usage;
-    let total = usage.total_tokens;
-    format!(
-        "Usage source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {}",
-        source_label(usage.source),
-        usage_value(total),
-        usage_value(usage.input_tokens),
-        usage_value(usage.cached_input_tokens),
-        usage_value(usage.output_tokens),
-        usage_value(usage.reasoning_tokens),
-        usage_value(usage.context_window),
-    )
-}
-
-fn usage_value(value: Option<u64>) -> String {
-    value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
-}
-
-fn source_label(source: FactSource) -> &'static str {
-    match source {
-        FactSource::ServerConfirmed => "server confirmed",
-        FactSource::LocalEstimate => "local estimate",
-        FactSource::Unknown => "unknown",
     }
 }
 
@@ -3707,11 +3194,11 @@ mod tests {
             .reminders
             .is_acknowledged(&snapshot.observation.activities[2]));
         assert_eq!(
-            next_action(&snapshot.observation.activities[1], &local),
+            activity::next_action(&snapshot.observation.activities[1], &local.reminders),
             "F2 answer request"
         );
         assert_eq!(
-            next_action(&snapshot.observation.activities[2], &local),
+            activity::next_action(&snapshot.observation.activities[2], &local.reminders),
             "inspect unknown outcome"
         );
         assert_eq!(snapshot.observation, before);
