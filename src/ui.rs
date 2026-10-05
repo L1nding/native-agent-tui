@@ -26,7 +26,7 @@ use crate::observation::{
     CompactionFactStatus, ExecutionState,
 };
 use crate::scheduler::{
-    RootTaskSpec, SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, ROOT_QUEUE_LIMIT,
+    RootTaskSpec, SchedulerCommand, TaskAttempt, TaskSnapshot, ROOT_QUEUE_LIMIT,
 };
 use crate::state::{display_text, CoreSnapshot, FactSource, MESSAGE_BYTES};
 
@@ -44,9 +44,13 @@ mod workflow;
 use input::{InputEvent, TerminalInput};
 use workflow::{
     navigate_workflow_link, project_workflow, selected_task, stale_gate_link, task_reference,
-    workflow_conversation, ConversationTarget, WorkflowLinkCursor, WorkflowLinkKind,
-    WorkflowLinkNavigation,
+    workflow_conversation, ConversationTarget, WorkflowLinkKind, WorkflowLinkNavigation,
 };
+
+#[cfg(test)]
+use crate::scheduler::TaskId;
+#[cfg(test)]
+use workflow::WorkflowLinkCursor;
 
 const PASTE_REJECTED: &str = "Paste exceeds 32 KiB; the entire paste was discarded.";
 
@@ -120,12 +124,7 @@ struct LocalState {
     scroll_from_bottom: usize,
     notice: Option<String>,
     help: bool,
-    tasks: bool,
-    task_id: Option<TaskId>,
-    task_scroll: usize,
-    task_manual_scroll: bool,
-    task_link_cursor: Option<WorkflowLinkCursor>,
-    confirm_stop: bool,
+    workflow: workflow::WorkflowPanel,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -349,7 +348,7 @@ pub async fn run_history(
 }
 
 fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
-    if local.tasks {
+    if local.workflow.visible {
         return;
     }
     sync_local_requests(local, snapshot);
@@ -503,7 +502,7 @@ fn handle_key(
                     local.request_selection = Some(request.reference());
                     local.request_panel = true;
                     local.request_scroll = 0;
-                    local.tasks = false;
+                    local.workflow.visible = false;
                     local.evidence = false;
                     sync_local_requests(local, snapshot);
                     local.notice = None;
@@ -556,7 +555,7 @@ fn handle_key(
                     Some(focus.thread().into())
                 };
                 local.conversation_focus = Some(focus);
-                local.tasks = false;
+                local.workflow.visible = false;
                 local.evidence = false;
                 local.request_panel = false;
                 local.notice = None;
@@ -586,7 +585,7 @@ fn handle_key(
                         Some(focus.thread().into())
                     };
                     local.conversation_focus = Some(focus);
-                    local.tasks = false;
+                    local.workflow.visible = false;
                     local.evidence = false;
                     local.request_panel = false;
                     local.notice = None;
@@ -595,7 +594,7 @@ fn handle_key(
                     local.request_selection = Some(reference);
                     local.request_panel = true;
                     local.request_scroll = 0;
-                    local.tasks = false;
+                    local.workflow.visible = false;
                     local.evidence = false;
                     sync_local_requests(local, snapshot);
                     local.notice = None;
@@ -603,7 +602,7 @@ fn handle_key(
                 Some(timeline::Locate::ToolSearch(thread)) => {
                     local.timeline.close();
                     local.search.open_tools(thread);
-                    local.tasks = false;
+                    local.workflow.visible = false;
                     local.evidence = false;
                     local.request_panel = false;
                     local.notice = None;
@@ -719,7 +718,7 @@ fn handle_key(
         }
         return false;
     }
-    if local.tasks {
+    if local.workflow.visible {
         let plain = key.modifiers.is_empty();
         let allowed = control && matches!(key.code, KeyCode::Char('q' | 'd' | 'c'))
             || plain
@@ -747,7 +746,7 @@ fn handle_key(
         }
     }
     if key.code != KeyCode::F(9) {
-        local.confirm_stop = false;
+        local.workflow.confirm_stop = false;
     }
     // These control letters remain distinct when a host drops Enter modifiers.
     let key = if control && key.code == KeyCode::Char('s') {
@@ -841,52 +840,52 @@ fn handle_key(
         }
         KeyCode::F(4) => {
             local.request_panel = false;
-            local.tasks = !local.tasks;
-            local.task_scroll = 0;
-            local.task_manual_scroll = false;
-            local.task_link_cursor = None;
+            local.workflow.visible = !local.workflow.visible;
+            local.workflow.scroll = 0;
+            local.workflow.manual_scroll = false;
+            local.workflow.link_cursor = None;
         }
-        KeyCode::PageUp if local.tasks => {
-            local.task_manual_scroll = true;
-            local.task_scroll = local.task_scroll.saturating_sub(8);
+        KeyCode::PageUp if local.workflow.visible => {
+            local.workflow.manual_scroll = true;
+            local.workflow.scroll = local.workflow.scroll.saturating_sub(8);
         }
-        KeyCode::PageDown if local.tasks => {
-            local.task_manual_scroll = true;
-            local.task_scroll = local.task_scroll.saturating_add(8);
+        KeyCode::PageDown if local.workflow.visible => {
+            local.workflow.manual_scroll = true;
+            local.workflow.scroll = local.workflow.scroll.saturating_add(8);
         }
-        KeyCode::Home if local.tasks => {
-            local.task_manual_scroll = true;
-            local.task_scroll = 0;
+        KeyCode::Home if local.workflow.visible => {
+            local.workflow.manual_scroll = true;
+            local.workflow.scroll = 0;
         }
-        KeyCode::End if local.tasks => {
-            local.task_manual_scroll = true;
-            local.task_scroll = usize::MAX;
+        KeyCode::End if local.workflow.visible => {
+            local.workflow.manual_scroll = true;
+            local.workflow.scroll = usize::MAX;
         }
-        KeyCode::Char('d') if local.tasks && key.modifiers.is_empty() => {
+        KeyCode::Char('d') if local.workflow.visible && key.modifiers.is_empty() => {
             apply_workflow_navigation(
                 navigate_workflow_link(
                     snapshot,
-                    local.task_id,
-                    local.task_link_cursor,
+                    local.workflow.selected_id,
+                    local.workflow.link_cursor,
                     WorkflowLinkKind::Dependency,
                 ),
                 local,
             );
         }
-        KeyCode::Char('g') if local.tasks && key.modifiers.is_empty() => {
+        KeyCode::Char('g') if local.workflow.visible && key.modifiers.is_empty() => {
             apply_workflow_navigation(
                 navigate_workflow_link(
                     snapshot,
-                    local.task_id,
-                    local.task_link_cursor,
+                    local.workflow.selected_id,
+                    local.workflow.link_cursor,
                     WorkflowLinkKind::Gate,
                 ),
                 local,
             );
         }
-        KeyCode::Enter if local.tasks && !control => {
-            if let Some(task) = selected_task(snapshot, local.task_id) {
-                if stale_gate_link(snapshot, local.task_link_cursor, task) {
+        KeyCode::Enter if local.workflow.visible && !control => {
+            if let Some(task) = selected_task(snapshot, local.workflow.selected_id) {
+                if stale_gate_link(snapshot, local.workflow.link_cursor, task) {
                     local.notice = Some(
                         "The captured Gate attempt is no longer current; use Up/Down to reselect the task before opening it.".into(),
                     );
@@ -897,14 +896,14 @@ fn handle_key(
                             local.agent_id = None;
                             local.conversation_focus = None;
                             local.scroll_from_bottom = 0;
-                            local.tasks = false;
+                            local.workflow.visible = false;
                         }
                         ConversationTarget::Child(agent) => {
                             local.notice = None;
                             local.agent_id = Some(agent.info.id.clone());
                             local.conversation_focus = None;
                             local.scroll_from_bottom = 0;
-                            local.tasks = false;
+                            local.workflow.visible = false;
                         }
                         ConversationTarget::Unavailable(message) => {
                             local.notice = Some(message.into());
@@ -924,9 +923,9 @@ fn handle_key(
                 local,
             );
         }
-        KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) if local.tasks => {
-            if let Some(task) = selected_task(snapshot, local.task_id) {
-                if stale_gate_link(snapshot, local.task_link_cursor, task) {
+        KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) if local.workflow.visible => {
+            if let Some(task) = selected_task(snapshot, local.workflow.selected_id) {
+                if stale_gate_link(snapshot, local.workflow.link_cursor, task) {
                     local.notice = Some(
                         "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
                     );
@@ -945,19 +944,19 @@ fn handle_key(
                 }
             }
         }
-        KeyCode::F(9) if local.tasks => {
-            if local.confirm_stop {
+        KeyCode::F(9) if local.workflow.visible => {
+            if local.workflow.confirm_stop {
                 send(Command::Schedule(SchedulerCommand::StopWorkflow), tx, local);
-                local.confirm_stop = false;
+                local.workflow.confirm_stop = false;
             } else {
-                local.confirm_stop = true;
+                local.workflow.confirm_stop = true;
                 local.notice = Some("Press F9 again to cancel all workflow tasks. Any other key cancels this action.".into());
             }
         }
-        KeyCode::Up | KeyCode::Down if local.tasks => {
+        KeyCode::Up | KeyCode::Down if local.workflow.visible => {
             let tasks = project_workflow(snapshot);
             if !tasks.is_empty() {
-                let index = selected_task(snapshot, local.task_id)
+                let index = selected_task(snapshot, local.workflow.selected_id)
                     .and_then(|task| tasks.iter().position(|id| *id == task.id))
                     .unwrap_or(0);
                 let next = if key.code == KeyCode::Up {
@@ -965,15 +964,17 @@ fn handle_key(
                 } else {
                     (index + 1).min(tasks.len() - 1)
                 };
-                local.task_id = Some(tasks[next]);
-                local.task_scroll = 0;
-                local.task_manual_scroll = false;
-                local.task_link_cursor = None;
+                local.workflow.selected_id = Some(tasks[next]);
+                local.workflow.scroll = 0;
+                local.workflow.manual_scroll = false;
+                local.workflow.link_cursor = None;
             }
         }
-        KeyCode::Char('+') | KeyCode::Char('-') if local.tasks && key.modifiers.is_empty() => {
-            if let Some(task) = selected_task(snapshot, local.task_id) {
-                if stale_gate_link(snapshot, local.task_link_cursor, task) {
+        KeyCode::Char('+') | KeyCode::Char('-')
+            if local.workflow.visible && key.modifiers.is_empty() =>
+        {
+            if let Some(task) = selected_task(snapshot, local.workflow.selected_id) {
+                if stale_gate_link(snapshot, local.workflow.link_cursor, task) {
                     local.notice = Some(
                         "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
                     );
@@ -1017,7 +1018,7 @@ fn handle_key(
             local.request_panel = true;
             local.request_scroll = 0;
             local.notice = None;
-            local.tasks = false;
+            local.workflow.visible = false;
             local.evidence = false;
             sync_local_requests(local, snapshot);
         }
@@ -1042,15 +1043,15 @@ fn handle_key(
                 local.request_panel = false;
                 return false;
             }
-            if local.tasks {
-                local.tasks = false;
-                local.task_link_cursor = None;
-                local.task_scroll = 0;
-                local.task_manual_scroll = false;
+            if local.workflow.visible {
+                local.workflow.visible = false;
+                local.workflow.link_cursor = None;
+                local.workflow.scroll = 0;
+                local.workflow.manual_scroll = false;
                 return false;
             }
             local.help = false;
-            local.tasks = false;
+            local.workflow.visible = false;
             local.evidence = false;
             local.editor.clear();
         }
@@ -1169,11 +1170,11 @@ fn selected_agent_id<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> &'a 
 
 fn apply_workflow_navigation(result: WorkflowLinkNavigation, local: &mut LocalState) {
     if let Some(task_id) = result.task_id {
-        local.task_id = Some(task_id);
-        local.task_scroll = 0;
-        local.task_manual_scroll = false;
+        local.workflow.selected_id = Some(task_id);
+        local.workflow.scroll = 0;
+        local.workflow.manual_scroll = false;
     }
-    local.task_link_cursor = result.cursor;
+    local.workflow.link_cursor = result.cursor;
     local.notice = result.notice;
 }
 
@@ -1611,7 +1612,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         }),
         conversation_area,
     );
-    if local.tasks {
+    if local.workflow.visible {
         draw_tasks(frame, chunks[1], snapshot, local);
     }
     if local.evidence {
@@ -1741,7 +1742,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     );
     frame.set_cursor_position((chunks[3].x + 1 + cursor as u16, chunks[3].y + 1));
     frame.render_widget(
-        Paragraph::new(if local.tasks {
+        Paragraph::new(if local.workflow.visible {
             "Up/Down select  F5 workflow  F6 pause  F7 cancel  F8 retry  +/- priority  F9 stop"
         } else if local.evidence {
             "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
@@ -2349,7 +2350,7 @@ fn draw_tasks(
     local: &LocalState,
 ) {
     let scheduler = &snapshot.scheduler;
-    let selected = selected_task(snapshot, local.task_id);
+    let selected = selected_task(snapshot, local.workflow.selected_id);
     let workflow_order = project_workflow(snapshot);
     let agent_rows = project_agent_tree(&snapshot.agents, snapshot.thread_id.as_deref())
         .into_iter()
@@ -2532,7 +2533,8 @@ fn draw_tasks(
             workflow_agent_label(snapshot, task, &agent_rows)
         ));
         if let Some(cursor) = local
-            .task_link_cursor
+            .workflow
+            .link_cursor
             .filter(|cursor| cursor.target == task.id)
         {
             if let Some(captured) = cursor.captured_attempt {
@@ -2550,8 +2552,8 @@ fn draw_tasks(
         .flat_map(|text| wrap(text, width).into_iter().map(Line::from))
         .collect::<Vec<_>>();
     let max_scroll = lines.len().saturating_sub(viewport);
-    let mut scroll = local.task_scroll.min(max_scroll);
-    if !local.task_manual_scroll {
+    let mut scroll = local.workflow.scroll.min(max_scroll);
+    if !local.workflow.manual_scroll {
         if let Some(selected_row) = selected_visual {
             if selected_row < scroll {
                 scroll = selected_row;
@@ -3899,7 +3901,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert!(local.tasks);
+        assert!(local.workflow.visible);
         assert!(rx.try_recv().is_err());
         for (width, height) in [(40, 12), (80, 24), (160, 45)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -3925,7 +3927,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        let selected = selected_task(&snapshot, local.task_id).unwrap();
+        let selected = selected_task(&snapshot, local.workflow.selected_id).unwrap();
         assert_eq!(selected.state, TaskState::Ready);
         let attempt = TaskAttempt {
             task: selected.id,
@@ -3951,7 +3953,22 @@ mod tests {
             &mut local,
             &tx,
         );
+        assert!(local.workflow.confirm_stop);
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.workflow.confirm_stop);
+        handle_key(
+            KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
         assert!(rx.try_recv().is_err());
+        assert!(local.workflow.confirm_stop);
         handle_key(
             KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
             &snapshot,
@@ -4086,7 +4103,10 @@ mod tests {
             ..Default::default()
         };
         let local = LocalState {
-            tasks: true,
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let render = |width, height| {
@@ -4207,21 +4227,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut local = LocalState::default();
         local.editor.insert("unsent draft");
-        local.tasks = true;
+        local.workflow.visible = true;
         handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &snapshot,
             &mut local,
             &tx,
         );
-        assert!(!local.tasks);
+        assert!(!local.workflow.visible);
         assert_eq!(local.agent_id.as_deref(), Some("child-thread"));
         assert_eq!(local.editor.text, "unsent draft");
         assert!(rx.try_recv().is_err());
 
         let mut stale = snapshot.clone();
         stale.agents[0].turn_id = Some("newer-turn".into());
-        local.tasks = true;
+        local.workflow.visible = true;
         local.agent_id = None;
         local.notice = None;
         handle_key(
@@ -4230,7 +4250,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert!(local.tasks);
+        assert!(local.workflow.visible);
         assert!(local.agent_id.is_none());
         assert!(local.notice.as_deref().unwrap().contains("stale"));
 
@@ -4243,7 +4263,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert!(local.tasks);
+        assert!(local.workflow.visible);
         assert!(local.agent_id.is_none());
         assert!(local.notice.as_deref().unwrap().contains("inconsistent"));
 
@@ -4257,7 +4277,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert!(local.tasks);
+        assert!(local.workflow.visible);
         assert!(local.agent_id.is_none());
         assert!(local
             .notice
@@ -4283,7 +4303,10 @@ mod tests {
         let snapshot = observed_snapshot_with_requests(&[approval]);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut local = LocalState {
-            tasks: true,
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                ..Default::default()
+            },
             answers: BTreeMap::from([("secret-question".into(), vec!["SECRET_DRAFT".into()])]),
             ..Default::default()
         };
@@ -4318,7 +4341,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert!(!local.tasks);
+        assert!(!local.workflow.visible);
         assert_eq!(local.editor.text, "TASK_DRAFT");
         assert_eq!(
             local.answers.get("secret-question").unwrap(),
@@ -4333,7 +4356,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert!(!local.tasks);
+        assert!(!local.workflow.visible);
         assert!(local.request_panel);
         handle_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -4349,7 +4372,7 @@ mod tests {
             }
         );
 
-        local.tasks = true;
+        local.workflow.visible = true;
         local.request_panel = false;
         handle_key(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -4464,14 +4487,21 @@ mod tests {
             KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
         ] {
             let mut local = LocalState {
-                tasks: true,
-                task_id: Some(TaskId(2)),
-                task_link_cursor: Some(stale_cursor),
+                workflow: workflow::WorkflowPanel {
+                    visible: true,
+                    selected_id: Some(TaskId(2)),
+                    link_cursor: Some(stale_cursor),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             handle_key(key, &snapshot, &mut local, &tx);
-            assert!(local.tasks, "stale Gate action {:?} left F4", key.code);
-            assert_eq!(local.task_id, Some(TaskId(2)));
+            assert!(
+                local.workflow.visible,
+                "stale Gate action {:?} left F4",
+                key.code
+            );
+            assert_eq!(local.workflow.selected_id, Some(TaskId(2)));
             assert!(local
                 .notice
                 .as_deref()
@@ -4485,9 +4515,12 @@ mod tests {
         }
 
         let mut local = LocalState {
-            tasks: true,
-            task_id: Some(TaskId(2)),
-            task_link_cursor: Some(stale_cursor),
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                selected_id: Some(TaskId(2)),
+                link_cursor: Some(stale_cursor),
+                ..Default::default()
+            },
             ..Default::default()
         };
         handle_key(
@@ -4496,36 +4529,39 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert_eq!(local.task_id, Some(TaskId(1)));
-        assert!(local.task_link_cursor.is_none());
+        assert_eq!(local.workflow.selected_id, Some(TaskId(1)));
+        assert!(local.workflow.link_cursor.is_none());
         handle_key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &snapshot,
             &mut local,
             &tx,
         );
-        assert_eq!(local.task_id, Some(TaskId(2)));
-        assert!(local.task_link_cursor.is_none());
+        assert_eq!(local.workflow.selected_id, Some(TaskId(2)));
+        assert!(local.workflow.link_cursor.is_none());
         handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &snapshot,
             &mut local,
             &tx,
         );
-        assert!(!local.tasks);
+        assert!(!local.workflow.visible);
         assert_eq!(local.agent_id.as_deref(), Some("child-thread"));
         assert!(rx.try_recv().is_err());
 
         // A cursor from an earlier source attempt is also invalid even if its
         // captured target attempt happens to match the current task attempt.
         let mut source_stale = LocalState {
-            tasks: true,
-            task_id: Some(TaskId(2)),
-            task_link_cursor: Some(WorkflowLinkCursor {
-                origin_attempt: 1,
-                captured_attempt: Some(2),
-                ..stale_cursor
-            }),
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                selected_id: Some(TaskId(2)),
+                link_cursor: Some(WorkflowLinkCursor {
+                    origin_attempt: 1,
+                    captured_attempt: Some(2),
+                    ..stale_cursor
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         handle_key(
@@ -4552,8 +4588,8 @@ mod tests {
             &mut source_stale,
             &tx,
         );
-        assert_eq!(source_stale.task_id, Some(TaskId(2)));
-        assert!(source_stale.task_link_cursor.is_none());
+        assert_eq!(source_stale.workflow.selected_id, Some(TaskId(2)));
+        assert!(source_stale.workflow.link_cursor.is_none());
         handle_key(
             KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
             &snapshot,
@@ -4690,8 +4726,11 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut local = LocalState {
-            tasks: true,
-            task_id: Some(TaskId(3)),
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                selected_id: Some(TaskId(3)),
+                ..Default::default()
+            },
             ..Default::default()
         };
         handle_key(
@@ -4700,25 +4739,28 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert_eq!(local.task_id, Some(TaskId(1)));
+        assert_eq!(local.workflow.selected_id, Some(TaskId(1)));
         handle_key(
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
             &snapshot,
             &mut local,
             &tx,
         );
-        assert_eq!(local.task_id, Some(TaskId(2)));
+        assert_eq!(local.workflow.selected_id, Some(TaskId(2)));
 
-        local.task_id = Some(TaskId(3));
-        local.task_link_cursor = None;
+        local.workflow.selected_id = Some(TaskId(3));
+        local.workflow.link_cursor = None;
         handle_key(
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
             &snapshot,
             &mut local,
             &tx,
         );
-        assert_eq!(local.task_id, Some(TaskId(2)));
-        assert_eq!(local.task_link_cursor.unwrap().captured_attempt, Some(1));
+        assert_eq!(local.workflow.selected_id, Some(TaskId(2)));
+        assert_eq!(
+            local.workflow.link_cursor.unwrap().captured_attempt,
+            Some(1)
+        );
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|frame| draw_tasks(frame, frame.area(), &snapshot, &local))
@@ -4734,8 +4776,8 @@ mod tests {
         assert!(rendered.contains("current task attempt is 2"), "{rendered}");
         assert!(rx.try_recv().is_err());
 
-        local.task_id = Some(TaskId(1));
-        local.task_link_cursor = None;
+        local.workflow.selected_id = Some(TaskId(1));
+        local.workflow.link_cursor = None;
         handle_key(
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
             &snapshot,
@@ -4782,9 +4824,12 @@ mod tests {
             ..Default::default()
         };
         let mut local = LocalState {
-            tasks: true,
-            task_manual_scroll: true,
-            task_scroll: usize::MAX,
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                manual_scroll: true,
+                scroll: usize::MAX,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(48, 8)).unwrap();
@@ -4801,10 +4846,13 @@ mod tests {
         assert!(rendered.contains("Conversation:"), "{rendered}");
 
         let parent_local = LocalState {
-            tasks: true,
-            task_id: Some(TaskId(1)),
-            task_manual_scroll: true,
-            task_scroll: 0,
+            workflow: workflow::WorkflowPanel {
+                visible: true,
+                selected_id: Some(TaskId(1)),
+                manual_scroll: true,
+                scroll: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut parent_terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
@@ -4842,15 +4890,15 @@ mod tests {
         );
         assert!(!child_rendered.contains("Parent: none"), "{child_rendered}");
 
-        local.task_scroll = 0;
-        local.task_manual_scroll = true;
+        local.workflow.scroll = 0;
+        local.workflow.manual_scroll = true;
         handle_key(
             KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
             &snapshot,
             &mut local,
             &tokio::sync::mpsc::channel(1).0,
         );
-        assert_eq!(local.task_scroll, usize::MAX);
+        assert_eq!(local.workflow.scroll, usize::MAX);
     }
 
     #[test]

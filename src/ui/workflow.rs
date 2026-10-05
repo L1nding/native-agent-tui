@@ -5,6 +5,16 @@ use crate::observation::ActivityScope;
 use crate::scheduler::{TaskAttempt, TaskId, TaskSnapshot};
 use crate::state::CoreSnapshot;
 
+#[derive(Debug, Default)]
+pub(super) struct WorkflowPanel {
+    pub(super) visible: bool,
+    pub(super) selected_id: Option<TaskId>,
+    pub(super) scroll: usize,
+    pub(super) manual_scroll: bool,
+    pub(super) link_cursor: Option<WorkflowLinkCursor>,
+    pub(super) confirm_stop: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkflowLinkKind {
     Dependency,
