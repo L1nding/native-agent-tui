@@ -1,6 +1,8 @@
 use super::*;
 use crate::agents::AgentInfo;
-use crate::protocol::{ObservedCompaction, ObservedTool, ObservedToolOutcome};
+use crate::protocol::{
+    decode_file_change_snapshot, ObservedCompaction, ObservedTool, ObservedToolOutcome,
+};
 use crate::scheduler::{ExternalTurn, RootTaskSpec, Scheduler};
 use serde_json::json;
 use std::time::Duration;
@@ -794,6 +796,132 @@ fn configuration_ticks_empty_and_stale_output_do_not_advance_progress() {
     assert_eq!(main(&rollback, "root").freshness, Freshness::Unknown);
     assert_eq!(main(&rollback, "root").silence_ms, None);
     assert_eq!(main(&rollback, "root").elapsed_ms, None);
+}
+
+#[test]
+fn file_patch_progress_uses_full_snapshots_and_refreshes_tool_attention() {
+    let now = Instant::now();
+    let root = root_task();
+    let mut observer = observer(now);
+    observer
+        .reconcile(facts(&root, &[], &[], None), now)
+        .unwrap();
+    let file_tool = ObservedTool {
+        category: ToolCategory::File,
+        ..tool("file-1", None)
+    };
+    observer.tool(&file_tool, now).unwrap();
+
+    let started_params = json!({"threadId":"parent","turnId":"turn-1","item":{"id":"file-1","type":"fileChange","changes":[{"path":"a.rs","kind":{"type":"update"},"diff":"old"}]}});
+    let started = decode_file_change_snapshot("item/started", &started_params)
+        .unwrap()
+        .unwrap();
+    assert!(observer.file_change_snapshot(&started, now));
+    let baseline = observer.snapshot_at(1, now);
+    let tool_baseline = baseline
+        .activities
+        .iter()
+        .find(|activity| activity.scope == ActivityScope::Tool)
+        .unwrap();
+
+    let quiet = observer.snapshot_at(2, now + Duration::from_secs(30));
+    assert_eq!(
+        quiet
+            .activities
+            .iter()
+            .find(|activity| activity.scope == ActivityScope::Tool)
+            .unwrap()
+            .attention
+            .level,
+        AttentionLevel::Quiet
+    );
+
+    let attention = observer.snapshot_at(3, now + Duration::from_secs(60));
+    assert_eq!(
+        attention
+            .activities
+            .iter()
+            .find(|activity| activity.scope == ActivityScope::Tool)
+            .unwrap()
+            .attention
+            .level,
+        AttentionLevel::AttentionNeeded
+    );
+
+    let patch_params = json!({"threadId":"parent","turnId":"turn-1","itemId":"file-1","changes":[{"path":"a.rs","kind":{"type":"update"},"diff":"old"},{"path":"b.rs","kind":{"type":"add"},"diff":"new"}]});
+    let patch = decode_file_change_snapshot("item/fileChange/patchUpdated", &patch_params)
+        .unwrap()
+        .unwrap();
+    assert!(observer.file_change_snapshot(&patch, now + Duration::from_secs(61)));
+    let active = observer.snapshot_at(4, now + Duration::from_secs(61));
+    let tool_active = active
+        .activities
+        .iter()
+        .find(|activity| activity.scope == ActivityScope::Tool)
+        .unwrap();
+    assert_eq!(tool_active.attention.level, AttentionLevel::Active);
+    assert_eq!(tool_active.progress_seq, tool_baseline.progress_seq + 1);
+    assert_eq!(tool_active.output_bytes, tool_baseline.output_bytes);
+    assert_eq!(tool_active.last_evidence.as_ref().unwrap().output_bytes, 0);
+
+    assert!(!observer.file_change_snapshot(&patch, now + Duration::from_secs(62)));
+    let removed_params = json!({"threadId":"parent","turnId":"turn-1","itemId":"file-1","changes":[{"path":"a.rs","kind":{"type":"update"},"diff":"old"}]});
+    let removed = decode_file_change_snapshot("item/fileChange/patchUpdated", &removed_params)
+        .unwrap()
+        .unwrap();
+    assert!(observer.file_change_snapshot(&removed, now + Duration::from_secs(63)));
+
+    let completed = ObservedTool {
+        outcome: Some(ObservedToolOutcome::Completed),
+        ..file_tool.clone()
+    };
+    observer
+        .tool(&completed, now + Duration::from_secs(64))
+        .unwrap();
+    let late_params = json!({"threadId":"parent","turnId":"turn-1","itemId":"file-1","changes":[]});
+    let late = decode_file_change_snapshot("item/fileChange/patchUpdated", &late_params)
+        .unwrap()
+        .unwrap();
+    assert!(!observer.file_change_snapshot(&late, now + Duration::from_secs(65)));
+
+    let missing_tool = ObservedTool {
+        item_id: "missing-file".into(),
+        ..file_tool
+    };
+    observer.tool(&missing_tool, now).unwrap();
+    let missing_start_params = json!({"threadId":"parent","turnId":"turn-1","item":{"id":"missing-file","type":"fileChange"}});
+    let missing_start = decode_file_change_snapshot("item/started", &missing_start_params)
+        .unwrap()
+        .unwrap();
+    assert!(observer.file_change_snapshot(&missing_start, now));
+    let missing_attention = observer.snapshot_at(5, now + Duration::from_secs(60));
+    assert_eq!(
+        missing_attention
+            .activities
+            .iter()
+            .find(|activity| activity.item_id.as_deref() == Some("missing-file"))
+            .unwrap()
+            .attention
+            .level,
+        AttentionLevel::AttentionNeeded
+    );
+    let first_patch_params = json!({"threadId":"parent","turnId":"turn-1","itemId":"missing-file","changes":[{"path":"new.rs","kind":{"type":"add"},"diff":"+new"}]});
+    let first_patch =
+        decode_file_change_snapshot("item/fileChange/patchUpdated", &first_patch_params)
+            .unwrap()
+            .unwrap();
+    assert!(observer.file_change_snapshot(&first_patch, now + Duration::from_secs(61)));
+    let recovered = observer.snapshot_at(6, now + Duration::from_secs(61));
+    assert_eq!(
+        recovered
+            .activities
+            .iter()
+            .find(|activity| activity.item_id.as_deref() == Some("missing-file"))
+            .unwrap()
+            .attention
+            .level,
+        AttentionLevel::Active
+    );
 }
 
 #[test]

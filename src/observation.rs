@@ -10,7 +10,10 @@ use tokio::time::Instant;
 use crate::agents::AgentSnapshot;
 use crate::gate::{ChildOutcome, WaitTarget};
 use crate::interactions::{RequestKind, RequestRef, RequestView};
-use crate::protocol::{ObservedCompaction, RpcId, ToolCategory};
+use crate::protocol::{
+    FileChangeFingerprint, FileChangeSnapshotSource, ObservedCompaction,
+    ObservedFileChangeSnapshot, RpcId, ToolCategory,
+};
 use crate::scheduler::{TaskId, TaskSnapshot, TaskState};
 use crate::state::{GateSnapshot, SessionPhase};
 use crate::timeline::{Timeline, TimelineEntry, TimelineSnapshot};
@@ -509,6 +512,8 @@ struct Activity {
     seen_children: BTreeMap<String, u64>,
     start_known: bool,
     tool_category: Option<ToolCategory>,
+    file_change_fingerprint: Option<FileChangeFingerprint>,
+    file_change_started: bool,
 }
 
 pub struct Observer {
@@ -624,6 +629,8 @@ impl Observer {
                 seen_children: BTreeMap::new(),
                 start_known: true,
                 tool_category: None,
+                file_change_fingerprint: None,
+                file_change_started: false,
             },
         );
         Ok(())
@@ -969,6 +976,86 @@ impl Observer {
             );
         }
         Ok(true)
+    }
+
+    /// 保存定长快照指纹；仅运行中的文件工具完整快照变化时记录进展。
+    pub(crate) fn file_change_snapshot(
+        &mut self,
+        snapshot: &ObservedFileChangeSnapshot<'_>,
+        now: Instant,
+    ) -> bool {
+        let Some(agent) = self.agent_for_turn(snapshot.thread_id, snapshot.turn_id) else {
+            return false;
+        };
+        if snapshot.source == FileChangeSnapshotSource::ItemCompleted {
+            return false;
+        }
+        let main = (agent.clone(), Slot::Main);
+        if !self
+            .activities
+            .get(&main)
+            .is_some_and(|activity| activity.execution.active())
+        {
+            return false;
+        }
+        let key = (agent, Slot::Tool(snapshot.item_id.to_owned()));
+        let Some(activity) = self.activities.get_mut(&key) else {
+            return false;
+        };
+        if activity.scope != ActivityScope::Tool
+            || activity.tool_category != Some(ToolCategory::File)
+            || activity.execution != ExecutionState::Running
+            || activity.identity.thread_id.as_deref() != Some(snapshot.thread_id)
+            || activity.identity.turn_id.as_deref() != Some(snapshot.turn_id)
+        {
+            return false;
+        }
+        if snapshot.source == FileChangeSnapshotSource::ItemStarted {
+            if activity.file_change_started {
+                return false;
+            }
+            activity.file_change_started = true;
+            if activity.file_change_fingerprint.is_some() {
+                return false;
+            }
+            if let Some(fingerprint) = snapshot.fingerprint {
+                activity.file_change_fingerprint.get_or_insert(fingerprint);
+            }
+            return true;
+        }
+        let Some(fingerprint) = snapshot.fingerprint else {
+            return false;
+        };
+        if activity.file_change_fingerprint == Some(fingerprint) {
+            return false;
+        }
+        let had_baseline = activity.file_change_fingerprint.is_some();
+        let is_first_nonempty_patch = activity.file_change_fingerprint.is_none()
+            && snapshot
+                .changes
+                .as_ref()
+                .is_some_and(|changes| !changes.is_empty());
+        activity.file_change_fingerprint = Some(fingerprint);
+        if !had_baseline && !is_first_nonempty_patch {
+            return false;
+        }
+        self.evidence(
+            &key,
+            EvidenceKind::Output,
+            EvidenceSource::AppServer,
+            now,
+            Some(snapshot.item_id.to_owned()),
+            0,
+        );
+        self.evidence(
+            &main,
+            EvidenceKind::Output,
+            EvidenceSource::AppServer,
+            now,
+            Some(snapshot.item_id.to_owned()),
+            0,
+        );
+        true
     }
 
     /// 子代理换轮时，将旧代活动工具明确结束为未知。

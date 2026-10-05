@@ -2493,20 +2493,6 @@ impl Core {
                 ))
                 || self.state.agents.active_turn(thread, turn);
             if owned {
-                if method == "item/fileChange/patchUpdated" {
-                    self.file_previews.observe_patch_updated(
-                        &params,
-                        self.ingress_seq,
-                        &mut self.state.view.requests,
-                    );
-                }
-                if matches!(method, "item/started" | "item/completed") {
-                    self.file_previews.observe(
-                        &params,
-                        self.ingress_seq,
-                        &mut self.state.view.requests,
-                    );
-                }
                 if let Some(notice) = protocol::decode_observed_tool(method, &params) {
                     match notice {
                         Ok(notice) => match self.observer.tool(&notice, Instant::now()) {
@@ -2517,6 +2503,20 @@ impl Core {
                             }
                         },
                         Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
+                    }
+                }
+                if let Some(Ok(snapshot)) = protocol::decode_file_change_snapshot(method, &params) {
+                    let accepted = self
+                        .observer
+                        .file_change_snapshot(&snapshot, Instant::now());
+                    if snapshot.source != protocol::FileChangeSnapshotSource::ItemStarted
+                        || accepted
+                    {
+                        self.file_previews.observe(
+                            &snapshot,
+                            self.ingress_seq,
+                            &mut self.state.view.requests,
+                        );
                     }
                 }
                 if let Some(output) = protocol::decode_observed_output(method, &params) {
@@ -2899,6 +2899,7 @@ fn preserve_cumulative_total(previous: UsageSummary, mut current: UsageSummary) 
 
 #[cfg(test)]
 mod tests {
+    mod file_progress;
     mod tool_details;
 
     use super::*;
@@ -3936,6 +3937,28 @@ mod tests {
             .is_none());
         observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":item}})).await;
         observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":null},"diff":"PRIVATE_PATCH_UPDATED"}]}})).await;
+        let latest_preview = client.snapshots.borrow().requests[0]
+            .details
+            .file_preview
+            .clone();
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"file-1","type":"fileChange","status":"inProgress","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":null},"diff":"PRIVATE_DIFF"}]}}})).await;
+        assert_eq!(
+            client.snapshots.borrow().requests[0].details.file_preview,
+            latest_preview,
+            "a repeated start snapshot must not replace the newer approval preview"
+        );
+        observation_event(&mut client, &mut server, json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"file-1","type":"fileChange","status":"inProgress"}}})).await;
+        assert_eq!(
+            client.snapshots.borrow().requests[0].details.file_preview,
+            latest_preview,
+            "a repeated start without changes must preserve an available preview"
+        );
+        observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1"}})).await;
+        assert_eq!(
+            client.snapshots.borrow().requests[0].details.file_preview,
+            latest_preview,
+            "a patch update without changes must preserve the cached preview"
+        );
         observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"root-turn","itemId":"file-1","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":42},"diff":"PRIVATE_MALFORMED_PATCH"}]}})).await;
         observation_event(&mut client, &mut server, json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"root","turnId":"old-turn","itemId":"file-1","changes":[{"path":"PRIVATE_FILE.rs","kind":{"type":"update","move_path":null},"diff":"PRIVATE_STALE_PATCH"}]}})).await;
         assert!(client.snapshots.borrow().requests[0]
@@ -3964,7 +3987,10 @@ mod tests {
             .details
             .file_preview
             .is_some());
-        let stored =
+        let current = client.snapshots.borrow().clone();
+        let observation = serde_json::to_string(&current.observation).unwrap();
+        let timeline = format!("{:?}", current.timeline);
+        let journal =
             serde_json::to_string(&StoredSnapshot::capture(&client.snapshots.borrow())).unwrap();
         for private in [
             "PRIVATE_FILE",
@@ -3975,7 +4001,15 @@ mod tests {
             "PRIVATE_REASON",
             "PRIVATE_ROOT",
         ] {
-            assert!(!stored.contains(private));
+            assert!(
+                !observation.contains(private),
+                "observation leaked {private}"
+            );
+            assert!(!timeline.contains(private), "timeline leaked {private}");
+            assert!(
+                !journal.contains(private),
+                "journal snapshot leaked {private}"
+            );
         }
         observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
         assert!(client.snapshots.borrow().requests.is_empty());

@@ -1,7 +1,7 @@
 //! Bounded, live file-change context owned by Core. No filesystem reads.
 use std::collections::VecDeque;
 
-use serde_json::Value;
+use crate::protocol::{ObservedFileChangeKind, ObservedFileChangeSnapshot};
 
 use super::{FilePreview, RequestKind, RequestView};
 
@@ -28,27 +28,21 @@ pub(crate) struct FilePreviews {
 }
 
 impl FilePreviews {
-    /// Only called after Core has validated ownership and current turn identity.
-    pub fn observe(&mut self, params: &Value, seq: u64, requests: &mut [RequestView]) {
-        let item = &params["item"];
-        if item["type"] != "fileChange" {
-            return;
-        }
-        let (Some(thread), Some(turn), Some(id)) = (
-            params["threadId"].as_str(),
-            params["turnId"].as_str(),
-            item["id"].as_str(),
-        ) else {
-            return;
-        };
-        if [thread, turn, id]
-            .iter()
-            .any(|id| id.is_empty() || id.len() > 1024)
-        {
-            return;
-        }
-        let preview = decode(item.get("changes"), seq);
-        self.store(thread, turn, id, preview, requests);
+    /// 仅接收协议层完整校验后的类型化快照。
+    pub fn observe(
+        &mut self,
+        snapshot: &ObservedFileChangeSnapshot<'_>,
+        seq: u64,
+        requests: &mut [RequestView],
+    ) {
+        let preview = decode(snapshot, seq);
+        self.store(
+            snapshot.thread_id,
+            snapshot.turn_id,
+            snapshot.item_id,
+            preview,
+            requests,
+        );
     }
 
     pub fn attach(&self, request: &mut RequestView) {
@@ -64,35 +58,6 @@ impl FilePreviews {
                     && Some(entry.item.as_str()) == request.details.item_id.as_deref()
             })
             .map(|entry| entry.preview.clone());
-    }
-
-    pub fn observe_patch_updated(
-        &mut self,
-        params: &Value,
-        seq: u64,
-        requests: &mut [RequestView],
-    ) {
-        let (Some(thread), Some(turn), Some(item)) = (
-            params.get("threadId").and_then(Value::as_str),
-            params.get("turnId").and_then(Value::as_str),
-            params.get("itemId").and_then(Value::as_str),
-        ) else {
-            return;
-        };
-        let Some(changes) = params.get("changes") else {
-            return;
-        };
-        if [thread, turn, item]
-            .iter()
-            .any(|id| id.is_empty() || id.len() > 1024)
-            || !changes
-                .as_array()
-                .is_some_and(|changes| changes.iter().all(valid_change))
-        {
-            return;
-        }
-        let preview = decode(Some(changes), seq);
-        self.store(thread, turn, item, preview, requests);
     }
 
     fn store(
@@ -134,29 +99,6 @@ impl FilePreviews {
     }
 }
 
-fn valid_change(change: &Value) -> bool {
-    let valid_shape = change
-        .get("path")
-        .and_then(Value::as_str)
-        .is_some_and(|path| !path.is_empty() && path.len() <= 4096)
-        && change.get("diff").and_then(Value::as_str).is_some()
-        && matches!(
-            change.pointer("/kind/type").and_then(Value::as_str),
-            Some("add" | "delete" | "update")
-        );
-    if !valid_shape {
-        return false;
-    }
-    let kind = change.pointer("/kind/type").and_then(Value::as_str);
-    kind != Some("update")
-        || change.pointer("/kind/move_path").is_none_or(|move_path| {
-            move_path.is_null()
-                || move_path
-                    .as_str()
-                    .is_some_and(|path| !path.is_empty() && path.len() <= 4096)
-        })
-}
-
 fn append(text: &mut String, value: &str, truncated: &mut bool) {
     let room = PREVIEW_BYTES.saturating_sub(text.len());
     let mut end = value.len().min(room);
@@ -167,43 +109,33 @@ fn append(text: &mut String, value: &str, truncated: &mut bool) {
     *truncated |= end < value.len();
 }
 
-fn decode(changes_value: Option<&Value>, seq: u64) -> FilePreview {
+fn decode(snapshot: &ObservedFileChangeSnapshot<'_>, seq: u64) -> FilePreview {
     let mut preview = FilePreview {
         text: String::new(),
         source_seq: seq,
         truncated: false,
         unavailable: false,
     };
-    let Some(changes) = changes_value.and_then(Value::as_array) else {
+    let Some(changes) = snapshot.changes.as_ref() else {
         preview.unavailable = true;
         return preview;
     };
     for change in changes {
-        let (Some(path), Some(diff), Some(kind)) = (
-            change["path"].as_str(),
-            change["diff"].as_str(),
-            change.pointer("/kind/type").and_then(Value::as_str),
-        ) else {
-            preview.unavailable = true;
-            break;
+        let kind = match change.kind {
+            ObservedFileChangeKind::Add => "add",
+            ObservedFileChangeKind::Delete => "delete",
+            ObservedFileChangeKind::Update => "update",
         };
-        if !matches!(kind, "add" | "delete" | "update") {
-            preview.unavailable = true;
-            break;
-        }
-        for part in [kind, " ", path, "\n"] {
+        for part in [kind, " ", change.path, "\n"] {
             append(&mut preview.text, part, &mut preview.truncated);
         }
-        if let Some(path) = change.pointer("/kind/move_path").and_then(Value::as_str) {
+        if let Some(path) = change.move_path {
             append(&mut preview.text, "Move to: ", &mut preview.truncated);
             append(&mut preview.text, path, &mut preview.truncated);
             append(&mut preview.text, "\n", &mut preview.truncated);
         }
-        append(&mut preview.text, diff, &mut preview.truncated);
+        append(&mut preview.text, change.diff, &mut preview.truncated);
         append(&mut preview.text, "\n", &mut preview.truncated);
-    }
-    if preview.unavailable {
-        preview.text.clear(); // Do not present a partial malformed event as a complete diff.
     }
     preview
 }
@@ -218,7 +150,11 @@ mod tests {
     fn previews_are_bounded_and_bound_to_thread_turn_and_item() {
         let mut cache = FilePreviews::default();
         for n in 0..90 {
-            cache.observe(&json!({"threadId":"root","turnId":"one","item":{"id":n.to_string(),"type":"fileChange","changes":[{"path":"中文.rs","kind":{"type":"update","move_path":"new.rs"},"diff":"变更".repeat(20000)}]}}), n, &mut []);
+            let event = json!({"threadId":"root","turnId":"one","item":{"id":n.to_string(),"type":"fileChange","changes":[{"path":"中文.rs","kind":{"type":"update","move_path":"new.rs"},"diff":"变更".repeat(20000)}]}});
+            let snapshot = crate::protocol::decode_file_change_snapshot("item/started", &event)
+                .unwrap()
+                .unwrap();
+            cache.observe(&snapshot, n, &mut []);
         }
         assert!(cache.entries.len() <= CACHE_ITEMS);
         assert!(cache.entries.iter().map(Entry::bytes).sum::<usize>() <= CACHE_BYTES);
@@ -249,28 +185,31 @@ mod tests {
             &json!({"threadId":"root","turnId":"one","itemId":"file-1"}),
         )
         .unwrap()];
-        cache.observe(
-            &json!({"threadId":"root","turnId":"one","item":{"id":"file-1","type":"fileChange","changes":[{"path":"old.rs","kind":{"type":"update"},"diff":"old"}]}}),
-            1,
-            &mut requests,
-        );
+        let started = json!({"threadId":"root","turnId":"one","item":{"id":"file-1","type":"fileChange","changes":[{"path":"old.rs","kind":{"type":"update"},"diff":"old"}]}});
+        let snapshot = crate::protocol::decode_file_change_snapshot("item/started", &started)
+            .unwrap()
+            .unwrap();
+        cache.observe(&snapshot, 1, &mut requests);
         cache.attach(&mut requests[0]);
         let old_preview = requests[0].details.file_preview.clone().unwrap();
 
-        cache.observe_patch_updated(
-            &json!({"threadId":"root","turnId":"one","itemId":"file-1","changes":[{"path":"new.rs","kind":{"type":"update","move_path":42},"diff":"new"}]}),
-            2,
-            &mut requests,
-        );
+        let malformed = json!({"threadId":"root","turnId":"one","itemId":"file-1","changes":[{"path":"new.rs","kind":{"type":"update","move_path":42},"diff":"new"}]});
+        assert!(crate::protocol::decode_file_change_snapshot(
+            "item/fileChange/patchUpdated",
+            &malformed
+        )
+        .unwrap()
+        .is_err());
         cache.attach(&mut requests[0]);
         assert_eq!(requests[0].details.file_preview, Some(old_preview.clone()));
         assert_eq!(cache.entries[0].preview, old_preview);
 
-        cache.observe_patch_updated(
-            &json!({"threadId":"root","turnId":"one","itemId":"file-1","changes":[{"path":"new.rs","kind":{"type":"update","move_path":null},"diff":"new"}]}),
-            3,
-            &mut requests,
-        );
+        let updated = json!({"threadId":"root","turnId":"one","itemId":"file-1","changes":[{"path":"new.rs","kind":{"type":"update","move_path":null},"diff":"new"}]});
+        let snapshot =
+            crate::protocol::decode_file_change_snapshot("item/fileChange/patchUpdated", &updated)
+                .unwrap()
+                .unwrap();
+        cache.observe(&snapshot, 3, &mut requests);
         cache.attach(&mut requests[0]);
         let updated = requests[0].details.file_preview.as_ref().unwrap();
         assert_eq!(updated.source_seq, 3);

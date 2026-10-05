@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod file_changes;
+pub(crate) use file_changes::{
+    decode_file_change_snapshot, FileChangeFingerprint, FileChangeSnapshotSource,
+    ObservedFileChangeKind, ObservedFileChangeSnapshot,
+};
+
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const WAIT_TOOL: &str = "wait_for_subagent_completion";
 

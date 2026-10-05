@@ -25,7 +25,7 @@
 
 固定版本 schema 中，`webSearch`、`imageView`、`sleep` 和 review item 没有 status 字段。合法 `item/completed` 确认生命周期结束，结果显示未报告，不据此推断工具成功。`imageGeneration` 要求 status，缺失时保持 Unknown。
 
-`contextCompaction` 沿用压缩完成事实。矛盾状态、错误类型的结果字段和明确失败不能被视为成功。文件 `patchUpdated` 只刷新同一线程、轮次和 item 的有效审批预览。
+`contextCompaction` 沿用压缩完成事实。矛盾状态、错误类型的结果字段和明确失败不能被视为成功。文件 `patchUpdated` 刷新同一线程、轮次和 item 的有效审批预览；运行中文件工具的完整快照发生变化时，也刷新对应活动证据。去重、静默恢复与父子隔离见[文件补丁活动证据](file-patch-progress.md)。
 
 ### 文件预览更新的版本依据
 
