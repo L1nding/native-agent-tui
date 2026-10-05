@@ -39,6 +39,7 @@ mod skills;
 mod timeline;
 mod tool_detail;
 mod tool_search;
+mod tool_trace;
 mod workflow;
 
 use activity::compaction_fact_rows;

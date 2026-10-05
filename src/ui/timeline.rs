@@ -13,7 +13,7 @@ use super::scope::Scope;
 use super::tool_detail;
 use super::{search, wrap, Editor};
 use crate::interactions::RequestRef;
-use crate::observation::{EvidenceKind, ExecutionState};
+use crate::observation::{ActivityScope, EvidenceKind, ExecutionState};
 use crate::state::{display_text, CoreSnapshot};
 use crate::timeline::{TimelineEntry, BYTE_LIMIT, ENTRY_LIMIT};
 use crate::tool_details::ToolDetailLocator;
@@ -442,10 +442,15 @@ impl TimelinePanel {
                     }
                     self.notice =
                         Some("This request delivery has ended; no current request matches.".into());
-                } else if matches!(
-                    entry.evidence.kind,
-                    EvidenceKind::ToolStarted | EvidenceKind::ToolCompleted
-                ) {
+                } else if entry.scope == ActivityScope::Tool
+                    && matches!(
+                        entry.evidence.kind,
+                        EvidenceKind::ToolStarted
+                            | EvidenceKind::Output
+                            | EvidenceKind::ToolCompleted
+                            | EvidenceKind::ExecutionUnknown
+                    )
+                {
                     let Some(item_id) = entry.item_id.clone() else {
                         self.notice =
                             Some("Tool detail unavailable: item identity is missing.".into());
@@ -456,7 +461,9 @@ impl TimelinePanel {
                         identity: entry.identity.clone(),
                         item_id,
                     };
-                    if current.tool_details.get(&locator).is_some() {
+                    if current.tool_details.get(&locator).is_some()
+                        || super::tool_trace::has_matching_metadata(&locator, current)
+                    {
                         self.tool_detail = Some(locator);
                         self.scroll.set(0);
                         self.tool_detail_max_scroll.set(0);

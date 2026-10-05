@@ -262,7 +262,7 @@ fn enter_opens_only_the_exact_tool_locator_and_escape_returns_without_commands()
 }
 
 #[test]
-fn attempt_generation_mismatch_and_evicted_tool_details_show_unavailable() {
+fn stale_exact_tool_details_fall_back_to_retained_metadata_trace() {
     let entry = tool_event(1);
     let mut current = source(vec![entry.clone()]);
     let locator = ToolDetailLocator {
@@ -286,15 +286,63 @@ fn attempt_generation_mismatch_and_evicted_tool_details_show_unavailable() {
         let mut panel = TimelinePanel::default();
         panel.open("root".into(), &current);
         assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
-        assert!(
-            panel.tool_detail.is_none(),
-            "{mismatch} must not open stale details"
-        );
-        assert!(panel
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("unavailable")));
+        assert_eq!(panel.tool_detail, Some(locator.clone()), "{mismatch}");
+        assert!(panel.notice.is_none(), "{mismatch}");
     }
+}
+
+#[test]
+fn enter_opens_metadata_only_tool_trace_when_exact_detail_is_missing() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut completed = (*tool_event(1)).clone();
+    completed.evidence.item_id = None;
+    completed.execution_state = ExecutionState::Unknown;
+    completed.activity_kind = ActivityKind::Unknown;
+    let current = source(vec![Arc::new(completed.clone())]);
+    let locator = ToolDetailLocator {
+        session_id: current.timeline.session_id.clone(),
+        identity: completed.identity,
+        item_id: completed.item_id.unwrap(),
+    };
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+
+    assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+    assert_eq!(panel.tool_detail, Some(locator));
+    let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+    terminal
+        .draw(|frame| panel.draw(frame, frame.area(), &current))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("Tool detail unavailable"), "{text}");
+    assert!(text.contains("ToolCompleted"), "{text}");
+    assert!(text.contains("state=Unknown"), "{text}");
+}
+
+#[test]
+fn tool_output_timeline_event_can_open_metadata_only_trace() {
+    let mut output = (*tool_event(1)).clone();
+    output.evidence.kind = EvidenceKind::Output;
+    output.evidence.item_id = None;
+    output.execution_state = ExecutionState::Running;
+    output.activity_kind = ActivityKind::ToolRunning;
+    let current = source(vec![Arc::new(output)]);
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+
+    assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+    assert_eq!(
+        panel.tool_detail.as_ref().map(|item| item.item_id.as_str()),
+        Some("tool-1")
+    );
 }
 
 #[test]

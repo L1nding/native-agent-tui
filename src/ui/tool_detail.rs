@@ -2,6 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::tool_trace;
 use super::wrap;
 use crate::state::CoreSnapshot;
 use crate::tool_details::ToolDetailLocator;
@@ -69,9 +70,10 @@ pub(super) fn draw(
             format!("Combined output: {}", detail.output)
         });
     } else {
-        lines
-            .push("Tool detail unavailable: exact item identity was evicted or mismatched.".into());
+        lines.push("Tool detail unavailable: exact detail was not retained.".into());
     }
+    lines.push("Live tool trace · metadata only".into());
+    lines.extend(tool_trace::lines(locator, current));
     let width = area.width.saturating_sub(2) as usize;
     let wrapped: Vec<_> = lines
         .iter()
