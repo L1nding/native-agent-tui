@@ -186,20 +186,12 @@ impl AttentionEditor {
 }
 
 pub async fn run_tasks_with_history(
-    client: ClientHandle,
-    tasks: Vec<RootTaskSpec>,
-    history: HistoryHandle,
-) -> Result<(), UiError> {
-    run_tasks_inner(client, tasks, Some(history)).await
-}
-
-async fn run_tasks_inner(
     mut client: ClientHandle,
     tasks: Vec<RootTaskSpec>,
-    mut history: Option<HistoryHandle>,
+    mut history: HistoryHandle,
 ) -> Result<(), UiError> {
     let mut history_panel = history::HistoryPanel::default();
-    let mut history_open = history.is_some();
+    let mut history_open = true;
     let mut search = search::SearchHandle::spawn();
     let mut search_open = true;
     let result = async {
@@ -235,21 +227,16 @@ async fn run_tasks_inner(
                     dirty = true;
                 }
                 change = async {
-                    match &mut history {
-                        Some(history) => {
-                            tokio::select! {
-                                result = history.status.changed() => (false, result),
-                                result = history.search.status.changed() => (true, result),
-                            }
-                        }
-                        None => std::future::pending().await,
+                    tokio::select! {
+                        result = history.status.changed() => (false, result),
+                        result = history.search.status.changed() => (true, result),
                     }
                 }, if history_open => {
                     if let (is_search, Ok(())) = change {
                         if is_search {
-                            history_panel.search_updated(history.as_ref().unwrap());
+                            history_panel.search_updated(&history);
                         } else {
-                            history_panel.updated(history.as_mut().unwrap());
+                            history_panel.updated(&mut history);
                         }
                     } else {
                         history_open = false;
@@ -269,12 +256,11 @@ async fn run_tasks_inner(
                             InputEvent::Key(key) if key.kind != KeyEventKind::Release => {
                                 let snapshot = client.snapshots.borrow().clone();
                                 if history_panel.visible {
-                                    if history_panel.key(key, history.as_mut().unwrap(), false) { return Ok(()); }
+                                    if history_panel.key(key, &mut history, false) { return Ok(()); }
                                 } else if key.code == KeyCode::F(12) {
                                     local.search.close();
                                     local.timeline.close();
-                                    if let Some(history) = &mut history { history_panel.open(history, None); }
-                                    else { local.notice = Some("History browsing is unavailable for this client.".into()); }
+                                    history_panel.open(&mut history, None);
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 dirty = true;
                             }
@@ -303,11 +289,7 @@ async fn run_tasks_inner(
         .join
         .await
         .map_err(|error| UiError::Shutdown(error.to_string()))?;
-    let history_result = if let Some(history) = &mut history {
-        history.shutdown().await.map_err(UiError::from)
-    } else {
-        Ok(())
-    };
+    let history_result = history.shutdown().await.map_err(UiError::from);
     if let Some(error) = report.cleanup_error {
         return Err(UiError::Shutdown(error));
     }
