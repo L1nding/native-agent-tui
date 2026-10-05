@@ -1638,6 +1638,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
             &local.reminders,
             local.evidence_scroll,
             agent_id,
+            selected_agent,
         );
     }
 
@@ -3024,6 +3025,129 @@ mod tests {
         interrupted.observation.activities[0].execution_state = ExecutionState::Interrupted;
         interrupted.observation.activities[0].kind = crate::observation::ActivityKind::Completed;
         assert!(activity_brief(&interrupted.observation.activities[0]).starts_with("Interrupted"));
+    }
+
+    #[test]
+    fn f11_evidence_uses_selected_child_usage_and_keeps_budget_session_wide() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+
+        let mut snapshot = observed_snapshot();
+        snapshot.usage = crate::state::UsageSummary {
+            total_tokens: Some(900),
+            input_tokens: Some(901),
+            source: FactSource::ServerConfirmed,
+            ..Default::default()
+        };
+        snapshot.token_budget.confirmed_total_tokens = Some(900);
+        snapshot.token_budget.confirmed_complete = true;
+        snapshot.token_budget.limit = Some(1_000);
+        snapshot.agents.push(AgentSnapshot {
+            info: AgentInfo {
+                id: "child-thread".into(),
+                parent_id: "root-thread".into(),
+                path: Some("/root/worker".into()),
+                nickname: None,
+                role: None,
+                model: None,
+                confirmed: true,
+            },
+            generation: 1,
+            turn_id: Some("child-turn".into()),
+            outcome: None,
+            awaiting_turn: false,
+            usage: crate::state::UsageSummary {
+                total_tokens: Some(12),
+                input_tokens: Some(7),
+                cached_input_tokens: Some(3),
+                output_tokens: Some(4),
+                reasoning_tokens: Some(2),
+                context_window: Some(80),
+                source: FactSource::ServerConfirmed,
+            },
+        });
+
+        let mut local = LocalState {
+            agent_id: Some("child-thread".into()),
+            ..LocalState::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        ));
+        assert!(local.evidence);
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 45)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("Usage (child child-thread) source: server confirmed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "total 12 | input 7 | cached 3 | output 4 | reasoning 2 | context window 80"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("total 900 | input 901"), "{rendered}");
+        assert!(
+            rendered.contains("Session token budget: tokens:900/1000"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn usage_evidence_preserves_unknown_source_and_missing_fields() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+
+        let snapshot = CoreSnapshot::default();
+        let root = activity::format_usage_evidence(&snapshot, None);
+        assert_eq!(
+            root,
+            "Usage (root) source: unknown | total unavailable | input unavailable | cached unavailable | output unavailable | reasoning unavailable | context window unavailable"
+        );
+        let estimated_snapshot = CoreSnapshot {
+            usage: crate::state::UsageSummary {
+                source: FactSource::LocalEstimate,
+                ..Default::default()
+            },
+            ..snapshot.clone()
+        };
+        assert!(activity::format_usage_evidence(&estimated_snapshot, None)
+            .contains("Usage (root) source: local estimate"));
+
+        let agent = AgentSnapshot {
+            info: AgentInfo {
+                id: "child-thread".into(),
+                parent_id: "root-thread".into(),
+                path: None,
+                nickname: None,
+                role: None,
+                model: None,
+                confirmed: true,
+            },
+            generation: 1,
+            turn_id: None,
+            outcome: None,
+            awaiting_turn: false,
+            usage: Default::default(),
+        };
+        let child = activity::format_usage_evidence(&snapshot, Some(&agent));
+        assert_eq!(
+            child,
+            "Usage (child child-thread) source: unknown | total unavailable | input unavailable | cached unavailable | output unavailable | reasoning unavailable | context window unavailable"
+        );
     }
 
     #[test]

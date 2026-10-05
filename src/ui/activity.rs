@@ -105,6 +105,7 @@ pub(super) fn draw_evidence(
     reminders: &Reminders,
     evidence_scroll: usize,
     agent_id: &str,
+    selected_agent: Option<&crate::agents::AgentSnapshot>,
 ) {
     let mut rows = Vec::new();
     let diagnostics = &snapshot.diagnostics;
@@ -115,7 +116,7 @@ pub(super) fn draw_evidence(
         diagnostics.control_events,
         diagnostics.telemetry_events
     ));
-    rows.push(format_usage_evidence(snapshot));
+    rows.push(format_usage_evidence(snapshot, selected_agent));
     rows.push(format_token_budget_evidence(snapshot));
     if let Some(journal) = &snapshot.journal {
         rows.push(format!(
@@ -361,11 +362,17 @@ pub(super) fn truncate_display_label(text: &str, max_width: usize) -> String {
     output
 }
 
-pub(super) fn format_usage_evidence(snapshot: &CoreSnapshot) -> String {
-    let usage = snapshot.usage;
+pub(super) fn format_usage_evidence(
+    snapshot: &CoreSnapshot,
+    selected_agent: Option<&crate::agents::AgentSnapshot>,
+) -> String {
+    let (owner, usage) = selected_agent.map_or_else(
+        || ("root".to_owned(), snapshot.usage),
+        |agent| (format!("child {}", agent.info.id), agent.usage),
+    );
     let total = usage.total_tokens;
     format!(
-        "Usage source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {}",
+        "Usage ({owner}) source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {}",
         source_label(usage.source),
         usage_value(total),
         usage_value(usage.input_tokens),
