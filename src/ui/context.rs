@@ -76,29 +76,34 @@ impl ContextPanel {
             snapshot,
             selected_agent,
         )];
-        let selected_thread = selected_agent
+        let usage_fact = crate::ui::activity::usage_fact_for(snapshot, selected_agent);
+        let owner_thread = selected_agent
             .map(|agent| agent.info.id.as_str())
             .or(snapshot.thread_id.as_deref());
-        let selected_turn = match selected_agent {
-            Some(agent) => agent.turn_id.as_deref(),
-            None => snapshot.turn_id.as_deref(),
-        };
+        let identity = usage_fact.map(|fact| &fact.identity);
+        let selected_thread = identity.and_then(|identity| identity.thread_id.as_deref());
+        let selected_turn = identity.and_then(|identity| identity.turn_id.as_deref());
+        let generation = identity
+            .and_then(|identity| identity.generation)
+            .map_or_else(
+                || "unavailable".to_owned(),
+                |generation| generation.to_string(),
+            );
+        let usage_source = usage_fact.map_or(FactSource::Unknown, |fact| fact.summary.source);
         let identity_label = selected_agent.map_or("root", |_| "child");
-        let generation = selected_agent.map_or_else(
-            || "unavailable".to_owned(),
-            |agent| agent.generation.to_string(),
-        );
-        let usage_source = selected_agent.map_or(snapshot.usage.source, |agent| agent.usage.source);
         rows.push(format!(
-            "Selected {identity_label} · thread {} · current turn {} · generation {generation}",
+            "Usage identity {identity_label} · thread {} · turn {} · generation {generation}",
             selected_thread.unwrap_or("unavailable"),
             selected_turn.unwrap_or("unavailable"),
         ));
-        rows.push(if usage_source == FactSource::ServerConfirmed {
-            "Usage recency: most recent server-confirmed value retained by Core; current-turn association unavailable".to_owned()
-        } else {
-            "Usage recency: latest retained value is not server-confirmed; current-turn usage unavailable".to_owned()
-        });
+        rows.push(
+            if usage_fact.is_some() && usage_source == FactSource::ServerConfirmed {
+                "Usage recency: most recent server-confirmed value for this thread/turn/generation"
+                    .to_owned()
+            } else {
+                "Usage recency: current thread/turn/generation usage unavailable".to_owned()
+            },
+        );
 
         let budget = snapshot.token_budget;
         let completeness = if budget.confirmed_total_tokens.is_none() {
@@ -124,7 +129,7 @@ impl ContextPanel {
             yes_no(budget.per_agent_stop_triggered)
         ));
 
-        let compactions: Vec<_> = selected_thread.map_or_else(Vec::new, |thread_id| {
+        let compactions: Vec<_> = owner_thread.map_or_else(Vec::new, |thread_id| {
             snapshot
                 .observation
                 .compactions
@@ -207,5 +212,60 @@ fn compaction_status(fact: &CompactionFact) -> &'static str {
         crate::observation::CompactionFactStatus::Started => "Started",
         crate::observation::CompactionFactStatus::Completed => "Completed",
         crate::observation::CompactionFactStatus::Unknown => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn narrow_context_shows_unavailable_usage_and_keeps_compaction_by_owner_thread() {
+        let snapshot = CoreSnapshot {
+            thread_id: Some("root-thread".into()),
+            turn_id: Some("new-turn".into()),
+            usage: crate::state::UsageSummary {
+                total_tokens: Some(9),
+                source: FactSource::ServerConfirmed,
+                ..Default::default()
+            },
+            observation: crate::observation::ObservationSnapshot {
+                compactions: vec![crate::observation::CompactionFact {
+                    thread_id: "root-thread".into(),
+                    turn_id: "old-turn".into(),
+                    item_id: "old-compaction".into(),
+                    status: crate::observation::CompactionFactStatus::Completed,
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    input_tokens: Some(8),
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: Some(9),
+                    context_window: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let panel = ContextPanel {
+            visible: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
+        terminal
+            .draw(|frame| panel.draw(frame, frame.area(), &snapshot, None))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("total unavailable"), "{screen}");
+        assert!(screen.contains("thread unavailable"), "{screen}");
+        assert!(screen.contains("generation unavailable"), "{screen}");
+        assert!(screen.contains("old-compaction"), "{screen}");
     }
 }

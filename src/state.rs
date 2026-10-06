@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::agents::{AgentRegistry, AgentSnapshot};
 use crate::gate::WaitTarget;
@@ -104,6 +104,20 @@ pub struct UsageSummary {
     pub source: FactSource,
 }
 
+/// 服务端 usage 的归属身份；UI 不得从 agent id 或当前选中项推断这些字段。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageIdentity {
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageFact {
+    pub summary: UsageSummary,
+    pub identity: UsageIdentity,
+}
+
 /// 会话级预算投影；数字只来自服务端确认的 usage。
 ///
 /// `per_agent_*` 是当前会话配置的单 agent/turn 预算及其触发摘要，
@@ -158,6 +172,7 @@ pub struct CoreSnapshot {
     pub last_error: Option<String>,
     pub tool_activity: Option<String>,
     pub usage: UsageSummary,
+    pub usage_facts: Vec<UsageFact>,
     pub token_budget: TokenBudgetSnapshot,
     pub skills: crate::skills::SkillsSnapshot,
     pub history_truncated: bool,
@@ -201,6 +216,7 @@ impl Default for CoreSnapshot {
             last_error: None,
             tool_activity: None,
             usage: UsageSummary::default(),
+            usage_facts: Vec::new(),
             token_budget: TokenBudgetSnapshot::default(),
             skills: crate::skills::SkillsSnapshot::default(),
             history_truncated: false,
@@ -213,13 +229,35 @@ impl Default for CoreSnapshot {
 pub(crate) struct SessionState {
     pub view: CoreSnapshot,
     pub agents: AgentRegistry,
+    pub(crate) usage_facts: BTreeMap<String, UsageFact>,
 }
 
 impl SessionState {
     pub fn snapshot(&mut self) -> Arc<CoreSnapshot> {
         self.view.agents = self.agents.snapshots();
+        self.view.usage_facts = self.usage_facts.values().cloned().collect();
         self.view.version += 1;
         Arc::new(self.view.clone())
+    }
+
+    pub fn clear_usage_fact(&mut self, thread_id: &str) {
+        // 用明确的 unavailable 占位遮住旧 turn，直到服务端确认新事实。
+        self.usage_facts.insert(
+            thread_id.to_owned(),
+            UsageFact {
+                summary: UsageSummary::default(),
+                identity: UsageIdentity {
+                    thread_id: Some(thread_id.to_owned()),
+                    ..Default::default()
+                },
+            },
+        );
+    }
+
+    pub fn set_usage_fact(&mut self, fact: UsageFact) {
+        if let Some(thread_id) = fact.identity.thread_id.clone() {
+            self.usage_facts.insert(thread_id, fact);
+        }
     }
 
     pub fn submission(&mut self, text: &str) {

@@ -9,8 +9,8 @@
 - `ui/search`：统一搜索面板、异步查询任务和消息/工具结果导航。
 - `ui/tool_search`：工具详情字段扫描、类别/生命周期过滤、UTF-8 范围和 revision 校验。
 - `ui/skills`：技能清单面板的布局、状态摘要和滚动内容；只接收快照与滚动位置。
-- `ui/activity`：活动摘要、证据面板、用量/预算格式化和 compaction 证据行；F11 按选中 agent 显示 root 或 child 的完整 usage，并始终把 token budget 标成会话级；不持有 UI 本地状态。
-- `ui/context`：Context 面板本地可见/滚动状态与只读渲染；按当前 root/child 展示 usage 来源、该 agent 的 compaction 事实，以及独立的会话级 token budget。面板不发送 Core 命令。
+- `ui/activity`：活动摘要、证据面板、用量/预算格式化和 compaction 证据行；F11 按选中 agent 显示 Core 提供的 `UsageFact`（含 thread/turn/generation/source），缺少精确身份时显示 unavailable，并始终把 token budget 标成会话级；不持有 UI 本地状态。
+- `ui/context`：Context 面板本地可见/滚动状态与只读渲染；按 Core usage fact 的精确 root/child 身份展示 usage 来源、累计值和最近确认语义，以及该 agent 的 compaction 事实和独立的会话级 token budget。面板不从 agent id 推断 usage 归属，也不发送 Core 命令。
 - `ui/timeline`：证据时间线选择与工具详情定位。
 - `ui/tool_detail`：工具摘要和搜索命中详情的只读渲染；`ui/tool_trace` 从快照保留窗口按完整 locator 投影生命周期元数据，不读取正文、参数或命令，也不维护额外缓存。
 - `ui/workflow`：任务选择顺序、依赖/Gate 链接导航、过期链接检查和 root/child 精确会话定位。

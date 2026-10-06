@@ -23,7 +23,7 @@ use crate::scheduler::{
 use crate::skills::SkillRefreshSource;
 use crate::state::{
     CoreSnapshot, FactSource, GateSnapshot, PersistenceState, SessionPhase, SessionState,
-    TokenBudgetSnapshot, UsageSummary, MESSAGE_BYTES,
+    TokenBudgetSnapshot, UsageFact, UsageIdentity, UsageSummary, MESSAGE_BYTES,
 };
 use crate::tool_details::{ToolDetailLocator, ToolDetails, ToolLifecycle};
 use crate::transport::{PipeTransport, TransportError};
@@ -238,6 +238,7 @@ impl ClientHandle {
                 state: SessionState {
                     view: initial,
                     agents: AgentRegistry::with_limits(agent_limits),
+                    usage_facts: Default::default(),
                 },
                 pending: HashMap::new(),
                 next_id: 1,
@@ -1488,8 +1489,10 @@ impl Core {
         }
         let id = RpcId::Number(self.next_id);
         self.next_id += 1;
-        let thread = self.state.view.thread_id.as_deref().unwrap();
-        let request = app_server::turn_start(id.clone(), thread, text);
+        let thread = self.state.view.thread_id.clone().unwrap();
+        // 新 root turn 尚未收到 usage；旧 turn 事实不能重新绑定到这一代。
+        self.state.clear_usage_fact(&thread);
+        let request = app_server::turn_start(id.clone(), &thread, text);
         let outbox_id = match self.send_effect(request, self.root_attempt) {
             Ok(outbox_id) => outbox_id,
             Err(error) => {
@@ -2452,7 +2455,16 @@ impl Core {
                 if self.state.view.turn_id.as_deref() != Some(turn) {
                     return;
                 }
-                self.state.view.usage = preserve_cumulative_total(self.state.view.usage, usage);
+                let usage = preserve_cumulative_total(self.state.view.usage, usage);
+                self.state.view.usage = usage;
+                self.state.set_usage_fact(UsageFact {
+                    summary: usage,
+                    identity: UsageIdentity {
+                        thread_id: Some(thread.to_owned()),
+                        turn_id: Some(turn.to_owned()),
+                        generation: Some(self.generation),
+                    },
+                });
                 true
             } else {
                 if !self.state.agents.current_turn(thread, turn) {
@@ -2465,11 +2477,26 @@ impl Core {
                     .into_iter()
                     .find(|agent| agent.info.id == thread)
                     .map_or_else(UsageSummary::default, |agent| agent.usage);
-                self.state.agents.update_usage(
-                    thread,
-                    turn,
-                    preserve_cumulative_total(previous, usage),
-                )
+                let usage = preserve_cumulative_total(previous, usage);
+                let accepted = self.state.agents.update_usage(thread, turn, usage);
+                if accepted {
+                    let generation = self
+                        .state
+                        .agents
+                        .snapshots()
+                        .into_iter()
+                        .find(|agent| agent.info.id == thread)
+                        .map(|agent| agent.generation);
+                    self.state.set_usage_fact(UsageFact {
+                        summary: usage,
+                        identity: UsageIdentity {
+                            thread_id: Some(thread.to_owned()),
+                            turn_id: Some(turn.to_owned()),
+                            generation,
+                        },
+                    });
+                }
+                accepted
             };
             if accepted {
                 if let Some(limit) = self.token_budget_exhausted() {
@@ -2613,6 +2640,9 @@ impl Core {
                             match self.state.agents.started(thread, turn, self.ingress_seq) {
                                 Ok(event) => {
                                     if event.is_some() {
+                                        // 子代理进入新 generation 后，旧 usage 只保留在历史累计中，
+                                        // 当前 turn 必须等服务端再次确认。
+                                        self.state.clear_usage_fact(thread);
                                         if let Some((old_turn, generation)) =
                                             previous_turn.filter(|(old_turn, _)| old_turn != turn)
                                         {
@@ -7459,6 +7489,14 @@ mod tests {
             client.snapshots.borrow().usage.source,
             FactSource::ServerConfirmed
         );
+        let snapshot = client.snapshots.borrow().clone();
+        let usage_fact = snapshot
+            .usage_facts
+            .iter()
+            .find(|fact| fact.identity.thread_id.as_deref() == Some("root"))
+            .expect("accepted root usage keeps typed identity");
+        assert_eq!(usage_fact.identity.turn_id.as_deref(), Some("current"));
+        assert_eq!(usage_fact.identity.generation, Some(1));
         send(&mut server, json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"child-current","tokenUsage":{"total":{"totalTokens":999}}}})).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(client.snapshots.borrow().usage.total_tokens, Some(83));
@@ -7652,6 +7690,15 @@ mod tests {
             .wait_for(|snapshot| snapshot.usage.total_tokens == Some(9))
             .await
             .unwrap();
+        let first_fact = client
+            .snapshots
+            .borrow()
+            .usage_facts
+            .iter()
+            .find(|fact| fact.identity.thread_id.as_deref() == Some("root"))
+            .cloned()
+            .expect("first turn usage fact");
+        assert_eq!(first_fact.identity.turn_id.as_deref(), Some("one"));
         assert_eq!(
             client
                 .snapshots
@@ -7695,10 +7742,22 @@ mod tests {
         client
             .snapshots
             .wait_for(|snapshot| {
-                snapshot.turn_id.as_deref() == Some("two") && snapshot.usage.total_tokens == Some(9)
+                snapshot.turn_id.as_deref() == Some("two")
+                    && snapshot.usage_facts.iter().any(|fact| {
+                        fact.identity.thread_id.as_deref() == Some("root")
+                            && fact.identity.turn_id.as_deref() == Some("two")
+                    })
             })
             .await
             .unwrap();
+        let snapshot = client.snapshots.borrow().clone();
+        let second_fact = snapshot
+            .usage_facts
+            .iter()
+            .find(|fact| fact.identity.thread_id.as_deref() == Some("root"))
+            .expect("second turn usage fact");
+        assert_eq!(second_fact.identity.turn_id.as_deref(), Some("two"));
+        assert_eq!(second_fact.identity.generation, Some(2));
         let mut version = client.snapshots.borrow().version;
         send(
             &mut server,
@@ -7816,6 +7875,14 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        let snapshot = client.snapshots.borrow().clone();
+        let child_fact = snapshot
+            .usage_facts
+            .iter()
+            .find(|fact| fact.identity.thread_id.as_deref() == Some("child"))
+            .expect("child usage carries its server identity");
+        assert_eq!(child_fact.identity.turn_id.as_deref(), Some("child-turn"));
+        assert_eq!(child_fact.identity.generation, Some(1));
 
         let mut interrupted_threads = BTreeSet::new();
         for _ in 0..2 {
@@ -7860,6 +7927,58 @@ mod tests {
                 .await
                 .is_err()
         );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_new_generation_keeps_usage_unavailable_until_confirmed() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "child", "child-turn").await;
+        send(
+            &mut server,
+            json!({"method":"thread/tokenUsage/updated","params":{"threadId":"child","turnId":"child-turn","tokenUsage":{"total":{"totalTokens":7}}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.usage_facts.iter().any(|fact| {
+                    fact.identity.thread_id.as_deref() == Some("child")
+                        && fact.identity.turn_id.as_deref() == Some("child-turn")
+                })
+            })
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-next"}}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot.agents.iter().any(|agent| {
+                    agent.info.id == "child" && agent.turn_id.as_deref() == Some("child-next")
+                })
+            })
+            .await
+            .unwrap();
+        let snapshot = client.snapshots.borrow().clone();
+        let fact = snapshot
+            .usage_facts
+            .iter()
+            .find(|fact| fact.identity.thread_id.as_deref() == Some("child"))
+            .expect("new generation keeps an explicit unavailable fact");
+        assert_eq!(fact.summary.source, FactSource::Unknown);
+        assert_eq!(fact.identity.turn_id, None);
+        assert_eq!(fact.identity.generation, None);
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

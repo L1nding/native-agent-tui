@@ -10,7 +10,9 @@ use crate::observation::{
     ActivityScope, ActivitySnapshot, AttentionLevel, CompactionFact, CompactionFactStatus,
     ExecutionState,
 };
-use crate::state::{display_text, CoreSnapshot, FactSource};
+use crate::state::{
+    display_text, CoreSnapshot, FactSource, UsageFact, UsageIdentity, UsageSummary,
+};
 pub(super) fn age(ms: Option<u64>) -> String {
     ms.map_or_else(|| "unknown".into(), |ms| format!("{}s", ms / 1000))
 }
@@ -273,7 +275,8 @@ pub(super) fn compaction_fact_rows(fact: Option<&CompactionFact>) -> Vec<String>
 }
 
 pub(super) fn usage_status(snapshot: &CoreSnapshot) -> String {
-    let usage = snapshot.usage;
+    let usage =
+        usage_fact_for(snapshot, None).map_or_else(UsageSummary::default, |fact| fact.summary);
     let base = token_budget_brief(snapshot);
     if usage.input_tokens.is_none()
         && usage.cached_input_tokens.is_none()
@@ -333,11 +336,17 @@ pub(super) fn per_agent_budget_brief(budget: crate::state::TokenBudgetSnapshot) 
     )
 }
 
-pub(super) fn agent_usage_brief(agent: &crate::agents::AgentSnapshot) -> String {
-    match (agent.usage.source, agent.usage.total_tokens) {
-        (FactSource::ServerConfirmed, Some(tokens)) => format!("tokens:{tokens}"),
-        _ => "tokens: unavailable".to_owned(),
-    }
+pub(super) fn agent_usage_brief(
+    snapshot: &CoreSnapshot,
+    agent: &crate::agents::AgentSnapshot,
+) -> String {
+    usage_fact_for(snapshot, Some(agent)).map_or_else(
+        || "tokens: unavailable".to_owned(),
+        |fact| match fact.summary.total_tokens {
+            Some(tokens) => format!("tokens:{tokens}"),
+            None => "tokens: unavailable".to_owned(),
+        },
+    )
 }
 
 pub(super) fn truncate_display_label(text: &str, max_width: usize) -> String {
@@ -366,13 +375,14 @@ pub(super) fn format_usage_evidence(
     snapshot: &CoreSnapshot,
     selected_agent: Option<&crate::agents::AgentSnapshot>,
 ) -> String {
-    let (owner, usage) = selected_agent.map_or_else(
-        || ("root".to_owned(), snapshot.usage),
-        |agent| (format!("child {}", agent.info.id), agent.usage),
+    let owner = selected_agent.map_or_else(
+        || "root".to_owned(),
+        |agent| format!("child {}", agent.info.id),
     );
+    let (usage, identity) = usage_display_fact(snapshot, selected_agent);
     let total = usage.total_tokens;
     format!(
-        "Usage ({owner}) source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {}",
+        "Usage ({owner}) source: {} | total {} | input {} | cached {} | output {} | reasoning {} | context window {} | identity thread {} turn {} generation {}",
         source_label(usage.source),
         usage_value(total),
         usage_value(usage.input_tokens),
@@ -380,7 +390,70 @@ pub(super) fn format_usage_evidence(
         usage_value(usage.output_tokens),
         usage_value(usage.reasoning_tokens),
         usage_value(usage.context_window),
+        identity_value(identity.thread_id.as_deref()),
+        identity_value(identity.turn_id.as_deref()),
+        identity.generation.map_or_else(|| "unavailable".to_owned(), |generation| generation.to_string()),
     )
+}
+
+pub(super) fn usage_fact_for<'a>(
+    snapshot: &'a CoreSnapshot,
+    selected_agent: Option<&crate::agents::AgentSnapshot>,
+) -> Option<&'a UsageFact> {
+    let (thread_id, turn_id, generation) = selected_agent.map_or_else(
+        || {
+            let thread_id = snapshot.thread_id.as_deref();
+            let turn_id = snapshot.turn_id.as_deref();
+            let generation = thread_id.and_then(|thread_id| {
+                turn_id.and_then(|turn_id| {
+                    snapshot
+                        .observation
+                        .activities
+                        .iter()
+                        .filter(|activity| {
+                            activity.scope == ActivityScope::Turn
+                                && activity.identity.thread_id.as_deref() == Some(thread_id)
+                                && activity.identity.turn_id.as_deref() == Some(turn_id)
+                        })
+                        .filter_map(|activity| activity.identity.generation)
+                        .max()
+                })
+            });
+            (thread_id, turn_id, generation)
+        },
+        |agent| {
+            if agent.awaiting_turn {
+                return (None, None, None);
+            }
+            (
+                Some(agent.info.id.as_str()),
+                agent.turn_id.as_deref(),
+                Some(agent.generation),
+            )
+        },
+    );
+    let thread_id = thread_id?;
+    let generation = generation?;
+    snapshot.usage_facts.iter().find(|fact| {
+        fact.summary.has_value()
+            && fact.identity.thread_id.as_deref() == Some(thread_id)
+            && fact.identity.turn_id.as_deref() == turn_id
+            && fact.identity.generation == Some(generation)
+    })
+}
+
+fn usage_display_fact(
+    snapshot: &CoreSnapshot,
+    selected_agent: Option<&crate::agents::AgentSnapshot>,
+) -> (UsageSummary, UsageIdentity) {
+    usage_fact_for(snapshot, selected_agent).map_or_else(
+        || (UsageSummary::default(), UsageIdentity::default()),
+        |fact| (fact.summary, fact.identity.clone()),
+    )
+}
+
+fn identity_value(value: Option<&str>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), str::to_owned)
 }
 
 pub(super) fn usage_value(value: Option<u64>) -> String {
@@ -392,5 +465,115 @@ pub(super) fn source_label(source: FactSource) -> &'static str {
         FactSource::ServerConfirmed => "server confirmed",
         FactSource::LocalEstimate => "local estimate",
         FactSource::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observation::{
+        ActivityIdentity, ActivityKind, Attention, AttentionReason, ExecutionState, Freshness,
+    };
+    use crate::state::{CoreSnapshot, UsageFact, UsageIdentity};
+
+    fn root_turn(generation: u64) -> ActivitySnapshot {
+        ActivitySnapshot {
+            session_id: "session".into(),
+            clock_epoch: "session:clock".into(),
+            activity_id: "root-turn".into(),
+            identity: ActivityIdentity {
+                agent_id: "root".into(),
+                task_id: None,
+                attempt_id: None,
+                thread_id: Some("root-thread".into()),
+                turn_id: Some("root-turn".into()),
+                generation: Some(generation),
+            },
+            scope: ActivityScope::Turn,
+            kind: ActivityKind::ModelStreaming,
+            execution_state: ExecutionState::Running,
+            item_id: None,
+            request_id: None,
+            interaction_state: None,
+            tool_category: None,
+            started_at_ms: None,
+            last_evidence_at_ms: None,
+            elapsed_ms: None,
+            silence_ms: None,
+            freshness: Freshness::Current,
+            last_evidence: None,
+            recent_evidence: Vec::new(),
+            progress_seq: 0,
+            output_bytes: 0,
+            transition_count: 0,
+            child_terminal_count: 0,
+            wait_reason: None,
+            resume_condition: None,
+            wait_targets: Vec::new(),
+            attention: Attention {
+                level: AttentionLevel::Active,
+                reason: AttentionReason::RecentEvidence,
+                requires_action: false,
+                quiet_after_ms: None,
+                attention_after_ms: None,
+                config_source: None,
+            },
+            provider_state: None,
+        }
+    }
+
+    fn confirmed_fact(thread: &str, turn: &str, generation: u64) -> UsageFact {
+        UsageFact {
+            summary: UsageSummary {
+                total_tokens: Some(12),
+                source: FactSource::ServerConfirmed,
+                ..Default::default()
+            },
+            identity: UsageIdentity {
+                thread_id: Some(thread.into()),
+                turn_id: Some(turn.into()),
+                generation: Some(generation),
+            },
+        }
+    }
+
+    #[test]
+    fn root_usage_requires_current_turn_activity_generation() {
+        let mut snapshot = CoreSnapshot {
+            thread_id: Some("root-thread".into()),
+            turn_id: Some("root-turn".into()),
+            usage_facts: vec![confirmed_fact("root-thread", "root-turn", 3)],
+            ..Default::default()
+        };
+        assert!(usage_fact_for(&snapshot, None).is_none());
+        snapshot.observation.activities.push(root_turn(3));
+        assert!(usage_fact_for(&snapshot, None).is_some());
+        snapshot.observation.activities[0].identity.generation = Some(4);
+        assert!(usage_fact_for(&snapshot, None).is_none());
+    }
+
+    #[test]
+    fn child_awaiting_turn_cannot_display_previous_usage_fact() {
+        let snapshot = CoreSnapshot {
+            usage_facts: vec![confirmed_fact("child-thread", "old-turn", 1)],
+            ..Default::default()
+        };
+        let child = crate::agents::AgentSnapshot {
+            info: crate::agents::AgentInfo {
+                id: "child-thread".into(),
+                parent_id: "root-thread".into(),
+                path: None,
+                nickname: None,
+                role: None,
+                model: None,
+                confirmed: true,
+            },
+            generation: 2,
+            turn_id: Some("old-turn".into()),
+            outcome: None,
+            awaiting_turn: true,
+            usage: UsageSummary::default(),
+        };
+        assert!(usage_fact_for(&snapshot, Some(&child)).is_none());
     }
 }

@@ -2227,6 +2227,24 @@ mod tests {
             },
         };
         snapshot.agents.push(child.clone());
+        snapshot.usage_facts = vec![
+            crate::state::UsageFact {
+                summary: snapshot.usage,
+                identity: crate::state::UsageIdentity {
+                    thread_id: Some("root-thread".into()),
+                    turn_id: Some("turn".into()),
+                    generation: Some(1),
+                },
+            },
+            crate::state::UsageFact {
+                summary: child.usage,
+                identity: crate::state::UsageIdentity {
+                    thread_id: Some("child-thread".into()),
+                    turn_id: Some("child-turn".into()),
+                    generation: Some(1),
+                },
+            },
+        ];
         snapshot.observation.compactions.push(CompactionFact {
             thread_id: "root-thread".into(),
             turn_id: "root-turn".into(),
@@ -2287,9 +2305,11 @@ mod tests {
                 assert!(screen.contains("Compaction #1"), "{screen}");
                 assert!(screen.contains("status Unknown"), "{screen}");
                 assert!(screen.contains("cached input unavailable"), "{screen}");
-                assert!(screen.contains("Selected child · thread child-thread · current turn child-turn · generation 1"), "{screen}");
+                assert!(screen.contains("Usage identity child · thread child-thread · turn child-turn · generation 1"), "{screen}");
                 assert!(
-                    screen.contains("most recent server-confirmed value retained by Core"),
+                    screen.contains(
+                        "most recent server-confirmed value for this thread/turn/generation"
+                    ),
                     "{screen}"
                 );
                 assert!(!screen.contains("root-compaction"), "{screen}");
@@ -2299,9 +2319,16 @@ mod tests {
                     screen.contains("Usage (root) source: server confirmed"),
                     "{screen}"
                 );
-                assert!(screen.contains("Selected root · thread root-thread · current turn turn · generation unavailable"), "{screen}");
                 assert!(
-                    screen.contains("most recent server-confirmed value retained by Core"),
+                    screen.contains(
+                        "Usage identity root · thread root-thread · turn turn · generation 1"
+                    ),
+                    "{screen}"
+                );
+                assert!(
+                    screen.contains(
+                        "most recent server-confirmed value for this thread/turn/generation"
+                    ),
                     "{screen}"
                 );
                 assert!(screen.contains("total 900 | input 800"), "{screen}");
@@ -2325,9 +2352,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("source: unknown"), "{screen}");
-        assert!(screen.contains("Selected root · thread unavailable · current turn unavailable · generation unavailable"), "{screen}");
+        assert!(screen.contains("Usage identity root · thread unavailable · turn unavailable · generation unavailable"), "{screen}");
         assert!(
-            screen.contains("latest retained value is not server-confirmed"),
+            screen.contains("current thread/turn/generation usage unavailable"),
             "{screen}"
         );
         assert!(screen.contains("total unavailable"), "{screen}");
@@ -3108,7 +3135,7 @@ mod tests {
         snapshot.token_budget.confirmed_total_tokens = Some(900);
         snapshot.token_budget.confirmed_complete = true;
         snapshot.token_budget.limit = Some(1_000);
-        snapshot.agents.push(AgentSnapshot {
+        let child = AgentSnapshot {
             info: AgentInfo {
                 id: "child-thread".into(),
                 parent_id: "root-thread".into(),
@@ -3131,7 +3158,16 @@ mod tests {
                 context_window: Some(80),
                 source: FactSource::ServerConfirmed,
             },
-        });
+        };
+        snapshot.agents.push(child.clone());
+        snapshot.usage_facts = vec![crate::state::UsageFact {
+            summary: child.usage,
+            identity: crate::state::UsageIdentity {
+                thread_id: Some("child-thread".into()),
+                turn_id: Some("child-turn".into()),
+                generation: Some(1),
+            },
+        }];
 
         let mut local = LocalState {
             agent_id: Some("child-thread".into()),
@@ -3178,17 +3214,31 @@ mod tests {
     fn usage_evidence_preserves_unknown_source_and_missing_fields() {
         use crate::agents::{AgentInfo, AgentSnapshot};
 
-        let snapshot = CoreSnapshot::default();
+        let snapshot = observed_snapshot();
         let root = activity::format_usage_evidence(&snapshot, None);
         assert_eq!(
             root,
-            "Usage (root) source: unknown | total unavailable | input unavailable | cached unavailable | output unavailable | reasoning unavailable | context window unavailable"
+            "Usage (root) source: unknown | total unavailable | input unavailable | cached unavailable | output unavailable | reasoning unavailable | context window unavailable | identity thread unavailable turn unavailable generation unavailable"
         );
         let estimated_snapshot = CoreSnapshot {
             usage: crate::state::UsageSummary {
                 source: FactSource::LocalEstimate,
                 ..Default::default()
             },
+            usage_facts: vec![crate::state::UsageFact {
+                summary: crate::state::UsageSummary {
+                    source: FactSource::LocalEstimate,
+                    total_tokens: Some(1),
+                    ..Default::default()
+                },
+                identity: crate::state::UsageIdentity {
+                    thread_id: Some("root-thread".into()),
+                    turn_id: Some("turn".into()),
+                    generation: Some(1),
+                },
+            }],
+            thread_id: Some("root-thread".into()),
+            turn_id: Some("turn".into()),
             ..snapshot.clone()
         };
         assert!(activity::format_usage_evidence(&estimated_snapshot, None)
@@ -3213,7 +3263,7 @@ mod tests {
         let child = activity::format_usage_evidence(&snapshot, Some(&agent));
         assert_eq!(
             child,
-            "Usage (child child-thread) source: unknown | total unavailable | input unavailable | cached unavailable | output unavailable | reasoning unavailable | context window unavailable"
+            "Usage (child child-thread) source: unknown | total unavailable | input unavailable | cached unavailable | output unavailable | reasoning unavailable | context window unavailable | identity thread unavailable turn unavailable generation unavailable"
         );
     }
 
@@ -4700,6 +4750,14 @@ mod tests {
             }),
             ..Default::default()
         };
+        snapshot.usage_facts.push(crate::state::UsageFact {
+            summary: snapshot.agents[0].usage,
+            identity: crate::state::UsageIdentity {
+                thread_id: Some("a".into()),
+                turn_id: Some("a-1".into()),
+                generation: Some(1),
+            },
+        });
         for (thread, text) in [("root", "ROOT_OUTPUT"), ("a", "CHILD_OUTPUT 中文")] {
             snapshot.messages.push(ConversationItem {
                 id: "shared".into(),

@@ -4,7 +4,9 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use super::activity::{age, agent_usage_brief, focus_activity, truncate_display_label};
+use super::activity::{
+    age, agent_usage_brief, focus_activity, truncate_display_label, usage_fact_for,
+};
 use super::workflow::{
     self, project_workflow, selected_task, task_reference, workflow_conversation,
     ConversationTarget,
@@ -28,15 +30,12 @@ pub(super) fn draw_agents(
             .find(|agent| Some(agent.info.id.as_str()) == selected_id)
             .map_or_else(
                 || {
-                    let usage =
-                        if snapshot.usage.source == crate::state::FactSource::ServerConfirmed {
-                            snapshot.usage.total_tokens.map_or_else(
-                                || "tokens: unavailable".into(),
-                                |tokens| format!("tokens:{tokens}"),
-                            )
-                        } else {
-                            "tokens: unavailable".into()
-                        };
+                    let usage = usage_fact_for(snapshot, None)
+                        .and_then(|fact| fact.summary.total_tokens)
+                        .map_or_else(
+                            || "tokens: unavailable".into(),
+                            |tokens| format!("tokens:{tokens}"),
+                        );
                     (
                         "root",
                         format!("{:?}", snapshot.phase),
@@ -63,7 +62,7 @@ pub(super) fn draw_agents(
                         name,
                         status,
                         agent.generation.to_string(),
-                        agent_usage_brief(agent),
+                        agent_usage_brief(snapshot, agent),
                     )
                 },
             );
@@ -133,7 +132,7 @@ pub(super) fn draw_agents(
         agents.push(Line::from(format!(
             "    {}{}",
             "  ".repeat(row.depth.saturating_sub(1)),
-            agent_usage_brief(agent)
+            agent_usage_brief(snapshot, agent)
         )));
         if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
             agents.push(Line::from(format!(
