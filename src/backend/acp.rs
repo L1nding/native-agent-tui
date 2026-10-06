@@ -89,6 +89,8 @@ struct AcpBridge {
     turn_started: bool,
     pending: HashMap<RpcId, Pending>,
     permissions: HashMap<RpcId, Permission>,
+    message_text: HashMap<String, String>,
+    last_message_id: Option<String>,
 }
 
 impl AcpBridge {
@@ -105,6 +107,8 @@ impl AcpBridge {
             turn_started: false,
             pending: HashMap::new(),
             permissions: HashMap::new(),
+            message_text: HashMap::new(),
+            last_message_id: None,
         }
     }
 
@@ -174,6 +178,8 @@ impl AcpBridge {
                     .and_then(|params| params.pointer("/input/0/text"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                self.message_text.clear();
+                self.last_message_id = None;
                 self.turn_id = Some(format!("acp-turn-{}", id_text(&id)));
                 self.turn_started = true;
                 self.core.send(Envelope::notification(
@@ -321,6 +327,18 @@ impl AcpBridge {
                     id.clone(),
                     Some(json!({"turn":{"id":turn}})),
                 ))?;
+                if let Some(item_id) = self.last_message_id.take() {
+                    if let Some(text) = self.message_text.remove(&item_id) {
+                        self.core.send(Envelope::notification(
+                            "item/completed",
+                            Some(json!({
+                                "threadId": self.session_id,
+                                "turnId": turn,
+                                "item": {"id": item_id, "type": "agentMessage", "text": text}
+                            })),
+                        ))?;
+                    }
+                }
                 let status = match acp_protocol::stop_reason(&result) {
                     Some("end_turn" | "completed") => "completed",
                     Some("cancelled" | "canceled") => "interrupted",
@@ -374,7 +392,22 @@ impl AcpBridge {
             self.turn_started = true;
         }
         match update {
-            Update::AgentMessage { item_id, text } => self.core.send(Envelope::notification("item/agentMessage/delta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?,
+            Update::AgentMessage { item_id, text } => {
+                self.last_message_id = Some(item_id.clone());
+                if !self.message_text.contains_key(&item_id) && self.message_text.len() >= 64 {
+                    self.message_text.clear();
+                }
+                let entry = self.message_text.entry(item_id.clone()).or_default();
+                entry.push_str(&text);
+                if entry.len() > crate::state::MESSAGE_BYTES {
+                    let mut end = crate::state::MESSAGE_BYTES;
+                    while end > 0 && !entry.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    entry.truncate(end);
+                }
+                self.core.send(Envelope::notification("item/agentMessage/delta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?
+            }
             Update::AgentThought { item_id, text } => self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?,
             Update::ToolCall { item_id, title, kind } => self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","command":title,"kind":kind}}))))?,
             Update::ToolCallUpdate { item_id, status, output } => {
