@@ -11,6 +11,7 @@ use super::activity::{
     draw_evidence, evidence_brief, focus_activity, reminder_brief, usage_status,
 };
 use super::attention::draw_attention_editor;
+use super::help::draw_help;
 use super::layout::{conversation_content_size, main_layout, wrap};
 use super::requests;
 use super::skills::draw_skills;
@@ -305,9 +306,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .as_ref()
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
-    let activity = if local.help {
-        "Ctrl+P command palette | Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+G context | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
-    } else if let Some(notice) = &local.notice {
+    let activity = if let Some(notice) = &local.notice {
         match &snapshot.last_error {
             Some(error) => format!("{error}\n{notice}"),
             None => notice.clone(),
@@ -431,7 +430,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         } else if local.evidence {
             "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
         } else {
-            "Enter send | Ctrl+P commands | Ctrl+T timeline | Ctrl+F search | Ctrl+Q quit | F1 help"
+            "F1 keys | Enter send | Ctrl+P commands | Ctrl+F search | Ctrl+T timeline | Ctrl+Q quit"
         }),
         chunks[4],
     );
@@ -440,5 +439,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     }
     if local.request_panel && local.attention_editor.is_none() {
         requests::draw(frame, snapshot, local);
+    }
+    if local.help {
+        draw_help(frame, area);
     }
 }

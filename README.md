@@ -48,7 +48,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | Ctrl+T | Browse live evidence; F1 lists filters, navigation and local bookmarks |
 | PageUp / PageDown, Ctrl+Home / Ctrl+End | Scroll conversation |
 | Ctrl+Y / Ctrl+N / Ctrl+B | Accept / decline / cancel the selected approval when allowed |
-| F1 / F2 | Show help / select next pending request |
+| F1 / F2 | Show the grouped key overlay / select next pending request |
 | F3 | Cycle root and child conversations; input still submits a root task |
 | F4 / Up, Down | Open tasks / select a task |
 | F5 / F6 | Pause workflow dispatch / pause the selected root task |

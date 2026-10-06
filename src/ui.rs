@@ -16,6 +16,7 @@ mod attention;
 mod commands;
 mod context;
 mod editor;
+mod help;
 mod history;
 mod input;
 mod layout;
@@ -1286,18 +1287,34 @@ mod tests {
             help: true,
             ..Default::default()
         };
-        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
-        terminal
-            .draw(|frame| draw(frame, &snapshot, &local))
-            .unwrap();
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("Ctrl+G context"), "{screen}");
+        // 80 列也要完整显示两栏帮助，不能被状态栏截断。
+        for (width, height) in [(160, 30), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..height)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let screen = rows.join(
+                "
+",
+            );
+            for (key, action) in [
+                ("Ctrl+G", "context"),
+                ("Ctrl+Y", "accept approval"),
+                ("Ctrl+W", "silence reminder"),
+                ("F12", "history and export"),
+            ] {
+                assert!(
+                    rows.iter()
+                        .any(|row| row.contains(key) && row.contains(action)),
+                    "{key} {action} missing at {width}x{height}:
+{screen}"
+                );
+            }
+        }
     }
 
     #[test]
