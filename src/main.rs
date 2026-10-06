@@ -27,6 +27,12 @@ fn print_help() {
     );
     println!(
         r#"
+Quick start:
+  native-agent-tui                     Open the TUI in the current directory; F1 lists keys
+  native-agent-tui --check-shell       Check Codex and the sandbox without a model turn
+  native-agent-tui --run "TASK"        Run one task and print the answer
+  If the shell check times out on Windows, add --windows-sandbox unelevated.
+
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]
   native-agent-tui --run TASK [--json-events] [OPTIONS]
