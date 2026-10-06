@@ -832,6 +832,14 @@ impl Core {
         if let Some(view) = &mut self.state.view.journal {
             view.error = self.journal_error.clone().or(view.error.take());
         }
+        self.state.view.startup_blocked = !self.preflight_passed
+            && !matches!(
+                self.state.view.phase,
+                SessionPhase::Created
+                    | SessionPhase::Launching
+                    | SessionPhase::Initializing
+                    | SessionPhase::CheckingShell
+            );
         self.project_persistence_state();
         self.snapshot_tx.send_replace(self.state.snapshot());
     }
@@ -7457,6 +7465,7 @@ mod tests {
         )
         .await;
         phase(&mut client, SessionPhase::Failed).await;
+        assert!(client.snapshots.borrow().startup_blocked);
         client
             .commands
             .send(Command::SubmitRootInput {

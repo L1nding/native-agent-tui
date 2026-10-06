@@ -370,12 +370,11 @@ fn handle_key(
         || control && matches!(key.code, KeyCode::Home | KeyCode::End)
     {
         if let Some(focus) = &local.conversation_focus {
+            let status = render::status_text(snapshot, local);
             let chunks = main_layout(
                 local.viewport,
-                !snapshot.observation.activities.is_empty(),
-                selected_request(snapshot, local).is_some()
-                    || snapshot.last_error.is_some()
-                    || snapshot.gate.as_ref().is_some_and(|gate| gate.pending),
+                render::header_activity(snapshot, local).is_some(),
+                render::status_rows(snapshot, local, &status),
             );
             let mut area = chunks[1];
             if local.viewport.width >= 100 && !snapshot.agents.is_empty() {
@@ -685,10 +684,14 @@ fn handle_key(
                 || snapshot.phase == crate::state::SessionPhase::GatePending
                 || explicit_queue)
                 || snapshot.thread_id.is_none()
+                || snapshot.startup_blocked
             {
                 use crate::state::SessionPhase::*;
                 local.notice = Some(
                     match snapshot.phase {
+                        _ if snapshot.startup_blocked => {
+                            "This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history."
+                        }
                         Created | Launching | Initializing | CheckingShell | Ready => {
                             "Still starting; your draft is kept. Press Enter again once Ready."
                         }
@@ -2519,6 +2522,49 @@ mod tests {
     }
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn startup_blocked_session_keeps_draft_and_shows_error_with_notice() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Failed,
+            thread_id: Some("root".into()),
+            startup_blocked: true,
+            last_error: Some("shell preflight failed with exit code 1".into()),
+            notice: Some("Shell preflight has not passed".into()),
+            ..CoreSnapshot::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, local: &LocalState| {
+            terminal
+                .draw(|frame| draw(frame, &snapshot, local))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let mut local = LocalState::default();
+        let rendered = render(&mut terminal, &local);
+        assert!(rendered.contains("exit code 1"), "{rendered}");
+        assert!(rendered.contains("has not passed"), "{rendered}");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        local.editor.insert("保留的任务");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "保留的任务");
+        let rendered = render(&mut terminal, &local);
+        assert!(rendered.contains("exit code 1"), "{rendered}");
+        assert!(rendered.contains("cannot run tasks"), "{rendered}");
+    }
 
     #[test]
     fn idle_header_omits_zero_counters_and_missing_tokens() {

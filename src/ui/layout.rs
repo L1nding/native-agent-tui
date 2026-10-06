@@ -27,7 +27,14 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     output
 }
 
-pub(super) fn main_layout(area: Rect, has_activity: bool, expanded_status: bool) -> Rc<[Rect]> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatusRows {
+    Hidden,
+    Compact,
+    Expanded,
+}
+
+pub(super) fn main_layout(area: Rect, has_activity: bool, status: StatusRows) -> Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -41,10 +48,10 @@ pub(super) fn main_layout(area: Rect, has_activity: bool, expanded_status: bool)
                 3
             }),
             Constraint::Min(1),
-            Constraint::Length(if area.height > 16 && expanded_status {
-                6
-            } else {
-                2
+            Constraint::Length(match status {
+                StatusRows::Hidden => 0,
+                StatusRows::Expanded if area.height > 16 => 6,
+                _ => 2,
             }),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -62,7 +69,7 @@ pub(super) fn conversation_content_size(area: Rect) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{conversation_content_size, main_layout, wrap};
+    use super::{conversation_content_size, main_layout, wrap, StatusRows};
     use ratatui::layout::Rect;
 
     #[test]
@@ -80,11 +87,14 @@ mod tests {
 
     #[test]
     fn main_layout_expands_header_and_status_only_when_requested() {
-        let compact = main_layout(Rect::new(0, 0, 80, 20), false, false);
+        let hidden = main_layout(Rect::new(0, 0, 80, 20), false, StatusRows::Hidden);
+        assert_eq!(hidden[2].height, 0);
+
+        let compact = main_layout(Rect::new(0, 0, 80, 20), false, StatusRows::Compact);
         assert_eq!(compact[0].height, 4);
         assert_eq!(compact[2].height, 2);
 
-        let expanded = main_layout(Rect::new(0, 0, 80, 20), true, true);
+        let expanded = main_layout(Rect::new(0, 0, 80, 20), true, StatusRows::Expanded);
         assert_eq!(expanded[0].height, 6);
         assert_eq!(expanded[2].height, 6);
     }

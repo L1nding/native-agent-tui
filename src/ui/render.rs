@@ -12,7 +12,7 @@ use super::activity::{
 };
 use super::attention::draw_attention_editor;
 use super::help::draw_help;
-use super::layout::{conversation_content_size, main_layout, wrap};
+use super::layout::{conversation_content_size, main_layout, wrap, StatusRows};
 use super::requests;
 use super::skills::draw_skills;
 use super::workflow_view;
@@ -46,10 +46,11 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .map(|agent| agent.info.id.as_str())
         .or(snapshot.thread_id.as_deref())
         .unwrap_or("");
+    let activity = status_text(snapshot, local);
     let chunks = main_layout(
         area,
-        !snapshot.observation.activities.is_empty(),
-        request.is_some() || snapshot.last_error.is_some() || waiting.is_some(),
+        header_activity(snapshot, local).is_some(),
+        status_rows(snapshot, local, &activity),
     );
     let actions = snapshot
         .observation
@@ -106,12 +107,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         snapshot.approval_policy
     );
     let agent_id = selected_agent.map_or("root", |agent| agent.info.id.as_str());
-    // 已结束的活动只会显示“Completed/review result”，在空闲时误导用户，留给 F11 查看。
-    let selected_activity = focus_activity(snapshot, agent_id).filter(|activity| {
-        activity.attention.requires_action
-            || activity.execution_state == ExecutionState::Unknown
-            || activity.attention.level != AttentionLevel::Ended
-    });
+    let selected_activity = header_activity(snapshot, local);
     let mut header = vec![Line::from(status)];
     if let Some(activity) = selected_activity {
         header.push(Line::from(display_text(&reminder_brief(
@@ -311,65 +307,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         );
     }
 
-    let notice = local
-        .notice
-        .as_ref()
-        .or(snapshot.notice.as_ref())
-        .or(snapshot.last_error.as_ref());
-    let activity = if let Some(notice) = &local.notice {
-        match &snapshot.last_error {
-            Some(error) => format!("{error}\n{notice}"),
-            None => notice.clone(),
-        }
-    } else if let Some(request) = request {
-        match &request.kind {
-            RequestKind::UserInput { questions } => {
-                let question = &questions[local.question_index.min(questions.len() - 1)];
-                let options = question
-                    .options
-                    .as_ref()
-                    .map(|values| {
-                        values
-                            .iter()
-                            .map(|v| format!("{}: {}", v.label, v.description))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                format!(
-                    "{} · {} ({}/{})\n{}\n{}",
-                    request.thread_id,
-                    question.header,
-                    local.question_index + 1,
-                    questions.len(),
-                    question.question,
-                    options
-                )
-            }
-            _ => format!(
-                "{} · {}\n{}",
-                request.thread_id,
-                request.summary,
-                requests::actions(snapshot, local, request)
-            ),
-        }
-    } else if let Some(notice) = notice {
-        if let Some(gate) = waiting {
-            format!("{}\n{notice}", workflow_view::gate_status(snapshot, gate))
-        } else {
-            notice.clone()
-        }
-    } else if let Some(gate) = waiting {
-        workflow_view::gate_status(snapshot, gate)
-    } else if snapshot.queued_inputs > 0 {
-        format!(
-            "{} root tasks pending; see dependencies and controls in F4.",
-            snapshot.queued_inputs
-        )
-    } else {
-        snapshot.tool_activity.clone().unwrap_or_default()
-    };
-    let lines: Vec<_> = wrap(&activity, chunks[2].width.saturating_sub(2) as usize)
+    let lines: Vec<_> = wrap(&activity, chunks[2].width as usize)
         .into_iter()
         .map(Line::from)
         .collect();
@@ -382,7 +320,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             }))
             .block(
                 Block::default()
-                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .borders(Borders::TOP)
                     .title(if request.is_some() {
                         " Pending request "
                     } else {
@@ -453,4 +391,104 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     if local.help {
         draw_help(frame, area);
     }
+}
+
+/// Status panel text shared by rendering and scroll geometry; empty hides the panel.
+pub(super) fn status_text(snapshot: &CoreSnapshot, local: &LocalState) -> String {
+    let request = selected_request(snapshot, local);
+    let waiting = snapshot.gate.as_ref().filter(|gate| gate.pending);
+    // 错误原因始终保留在提示前面，后续提示不能把它遮住。
+    let notice = match (snapshot.notice.as_ref(), snapshot.last_error.as_ref()) {
+        (Some(notice), Some(error)) if notice != error => Some(format!(
+            "{error}
+{notice}"
+        )),
+        (notice, error) => notice.or(error).cloned(),
+    };
+    let notice = local.notice.as_ref().or(notice.as_ref());
+    if let Some(notice) = &local.notice {
+        match &snapshot.last_error {
+            Some(error) => format!("{error}\n{notice}"),
+            None => notice.clone(),
+        }
+    } else if let Some(request) = request {
+        match &request.kind {
+            RequestKind::UserInput { questions } => {
+                let question = &questions[local.question_index.min(questions.len() - 1)];
+                let options = question
+                    .options
+                    .as_ref()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|v| format!("{}: {}", v.label, v.description))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{} · {} ({}/{})\n{}\n{}",
+                    request.thread_id,
+                    question.header,
+                    local.question_index + 1,
+                    questions.len(),
+                    question.question,
+                    options
+                )
+            }
+            _ => format!(
+                "{} · {}\n{}",
+                request.thread_id,
+                request.summary,
+                requests::actions(snapshot, local, request)
+            ),
+        }
+    } else if let Some(notice) = notice {
+        if let Some(gate) = waiting {
+            format!("{}\n{notice}", workflow_view::gate_status(snapshot, gate))
+        } else {
+            notice.clone()
+        }
+    } else if let Some(gate) = waiting {
+        workflow_view::gate_status(snapshot, gate)
+    } else if snapshot.queued_inputs > 0 {
+        format!(
+            "{} root tasks pending; see dependencies and controls in F4.",
+            snapshot.queued_inputs
+        )
+    } else {
+        snapshot.tool_activity.clone().unwrap_or_default()
+    }
+}
+
+/// 状态区行数：无内容时隐藏；请求、错误和等待需要更多行。
+pub(super) fn status_rows(snapshot: &CoreSnapshot, local: &LocalState, text: &str) -> StatusRows {
+    if text.is_empty() {
+        StatusRows::Hidden
+    } else if selected_request(snapshot, local).is_some()
+        || snapshot.last_error.is_some()
+        || snapshot.gate.as_ref().is_some_and(|gate| gate.pending)
+    {
+        StatusRows::Expanded
+    } else {
+        StatusRows::Compact
+    }
+}
+
+/// 头部展示的活动；渲染和滚动几何共用，保证头部高度一致。
+pub(super) fn header_activity<'a>(
+    snapshot: &'a CoreSnapshot,
+    local: &LocalState,
+) -> Option<&'a crate::observation::ActivitySnapshot> {
+    let agent_id = local
+        .agent_id
+        .as_deref()
+        .filter(|id| snapshot.agents.iter().any(|agent| agent.info.id == *id))
+        .unwrap_or("root");
+    // 已结束的活动只会显示“Completed/review result”，在空闲时误导用户，留给 F11 查看。
+    focus_activity(snapshot, agent_id).filter(|activity| {
+        activity.attention.requires_action
+            || activity.execution_state == ExecutionState::Unknown
+            || activity.attention.level != AttentionLevel::Ended
+    })
 }

@@ -176,6 +176,8 @@ pub struct CoreSnapshot {
     pub token_budget: TokenBudgetSnapshot,
     pub skills: crate::skills::SkillsSnapshot,
     pub history_truncated: bool,
+    /// 启动预检未通过且已不在启动阶段：本会话不能再提交任务。
+    pub startup_blocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +222,7 @@ impl Default for CoreSnapshot {
             token_budget: TokenBudgetSnapshot::default(),
             skills: crate::skills::SkillsSnapshot::default(),
             history_truncated: false,
+            startup_blocked: false,
         }
     }
 }
