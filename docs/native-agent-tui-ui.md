@@ -1,8 +1,20 @@
 # Rust Agent TUI UI 详细设计
 
-日期：2026-10-02。本文是 [V1 总方案](C:/Users/Admin/orca/workspaces/uni-app-test/optimize/docs/design/native-agent-tui-v1.md) 的 UI 设计，依赖 [Core 设计](native-agent-tui-core.md) 提供的 `ClientHandle`、事实快照和分页日志，并使用 [工作流调度设计](native-agent-tui-workflow.md) 的任务状态与资源信息。
+更新：2026-10-03。依赖 [Core 设计](native-agent-tui-core.md)、[产品计划](native-agent-tui-plan.md)和[可观测性契约](native-agent-tui-observability.md)。调度扩展见[工作流设计](native-agent-tui-workflow.md)。
 
 目标是把 TUI 做成可观察、可交互、可调度的 Agent 工作台：用户能够看到每个 thread/turn/item 的对话轨迹、工具与审批、父子关系、上下文和压缩、skill 状态、任务依赖与调度原因；用户能够在合法范围内回答请求、暂停/恢复/取消/重排任务和导出脱敏记录。UI 不解析 JSON-RPC、不猜测完成状态，也不以刷新或轮询推动模型。
+
+## 0. Alpha 与 V2 交付边界
+
+Alpha：状态与最近证据、时间线、审批/输入、搜索、等待列表、脱敏导出与观察恢复。已有 child/Gate 可显示，不以完整多 agent scheduler、DAG overlay、全部 context/skill 面板作为 Alpha 前置。V2 完成 1–3 个直属 child 的调度视图。文中扩展字段仅在有 Core 证据时显示。
+
+顶部始终显示 execution、activity、最后可靠证据、静默时长、attention、来源和下一步动作；不能只用 spinner、颜色或进程存活表示正常。等待详情优先列表：等待方 → 对象/turn/generation → 恢复条件 → 最近证据。DAG 是 V2 详情。
+
+UI 只显示 Core 计算的 Active/Quiet/AttentionNeeded。临时阈值通过 typed command 更新 Core，显示当前值及来源；关闭提醒/继续等待只更新 UI 本地状态，不重置证据或发请求。审批/输入立即显示 requires_action，虽然不按静默升级。新证据只清除对应活动的静默提示，不隐藏独立错误或待审批。
+
+交付报告显示结论、文件、验证、未完成项和逐字段 reported/verified/unknown。没有结构化数据时显示 unknown。支持查看详情、复制 ID、继续等待和明确中断；通知默认关闭。
+
+键盘优先，UI 英文默认；中文与 emoji 输入显示属于 Alpha，中文文案后续完善。
 
 ## 1. UI 的执行边界
 
@@ -37,6 +49,7 @@ pub struct UiSnapshot {
     pub usage: UsageSummary,
     pub skills: SkillSummary,
     pub diagnostics: DiagnosticSummary,
+    pub activities: std::sync::Arc<[ActivityView]>, // 含证据、等待和 Core attention
 }
 ```
 
@@ -100,7 +113,7 @@ struct UiLocalState {
 
 窗口变化只改变投影，不销毁 app-server、任务或 Gate。顶部状态始终显示最终 sandbox、approval policy、根状态、Gate 目标、队列和资源槽。
 
-## 4. Agent 树与工作流视图
+## 4. Agent 树与工作流视图（现有视图回归、完整调度归 V2）
 
 Agent 树只使用 Core 的 `threadId`、`parentThreadId`、`agentPath` 和真实 subAgentActivity。示例：
 
@@ -116,7 +129,7 @@ Agent 树只使用 Core 的 `threadId`、`parentThreadId`、`agentPath` 和真�
 
 - `workflowId/taskId/attemptId/epoch`。
 - 父任务和依赖边，未满足依赖计数。
-- `Draft/Queued/Ready/Running/WaitingChildren/WaitingApproval/Blocked/RetryBackoff/Succeeded/Failed/Cancelled`。
+- `Draft/Queued/Ready/Running/WaitingChildren/WaitingApproval/Blocked/Succeeded/Failed/Cancelled/Unknown`；服务端退避提示单独显示，客户端不自动重试。
 - ready queue 顺序、优先级、aging 等待时间。
 - 模型、工具、shell、CPU/RSS、token 资源槽使用量。
 - 阻塞原因：无槽位、依赖失败、等待审批、预算耗尽、暂停、退避、重启后未知。
@@ -213,7 +226,7 @@ permission=allowed
 
 `F2` 打开请求队列。每个请求保留 requestId、threadId、turnId、kind、创建序列、允许决策和状态。command approval、file approval、user input 使用不同表单；不能全部套 Yes/No。
 
-审批显示 agent、命令/文件、cwd、diff 摘要、风险、有效 sandbox/approval policy 和允许选项。`approval-policy never` 固定显示，UI 不自动改策略。`Esc` 只关闭弹窗，不取消请求；`Ctrl+Enter` 提交；提交后禁用重复回答，直到 resolved、turn 终止或断连。过期 request 由 Core 拒绝。
+审批显示 agent、命令/文件、cwd、diff 摘要、风险、有效 sandbox/approval policy 和允许选项。`approval-policy never` 固定显示，UI 不自动改策略。`Esc` 只关闭弹窗，不取消请求；明确的提交动作按表单允许选项执行；提交后禁用重复回答，直到 resolved、turn 终止或断连。过期 request 由 Core 拒绝。
 
 GatePending 时子代理请求仍可回答；处理请求不释放 Gate、不启动根 turn、不修改等待目标。根输入进入队列并显示排队原因。未知请求显示方法名和 ID，Core 按协议拒绝或停在错误状态，不猜 schema。
 
@@ -223,7 +236,7 @@ GatePending 时子代理请求仍可回答；处理请求不释放 Gate、不启
 
 优先使用 Crossterm `Event::Paste`：多行一次插入、不触发快捷键、限制大小、内容不写诊断。没有 Paste event 时通过 ClipboardAdapter，不拼 shell 命令。
 
-建议快捷键：
+目标快捷键（已实现按键以 README 为准；输入焦点中的普通字符不触发全局命令）：
 
 ```text
 Tab/Shift+Tab 面板     ↑↓/j/k 选择      PgUp/PgDn 翻页
@@ -232,7 +245,8 @@ f 过滤                 n/N 搜索结果      b/B 书签
 t 轨迹范围             c 上下文/压缩      F2 请求
 F6 skill               w 调度             r 原始/摘要
 y 脱敏复制             e 导出             Ctrl+C 停止
-q 空闲退出             Ctrl+Q 强制退出
+Ctrl+P 命令面板        Ctrl+Q 请求退出并清理
+Esc 关闭 overlay       F3 当前已有的根/child 会话切换
 ```
 
 输入文本时普通字符不触发全局快捷键。根输入在 Ready 或允许 follow-up 时提交，GatePending 时排队，Stopping/Disconnected 时禁止执行。UI 不提供任意 child `turn/start`；子代理交互必须通过 Core 的合法请求或明确命令。
@@ -253,7 +267,7 @@ Core facts → Arc<UiSnapshot> → local projection → visible rows → Termina
 
 ## 11. 复制、导出与脱敏
 
-`y` 复制当前可见脱敏文本；`Ctrl+Shift+Y` 复制原始文本前确认可能包含参数和路径。导出 `e` 支持当前 agent、子树、根到当前、全部；Markdown 或 JSONL；过滤结果或全部事件；可选 reasoning、tool arguments、usage/context。
+`y` 复制当前可见脱敏文本；导出 `e` 支持已保留的观察摘要，提供范围选择和脱敏预览。Alpha 不将 secret 或原始工具参数写入 journal，也不承诺重建完整对话。V2 可扩展子树/关联路径选择；缺失内容显示未保留。扩展正文导出必须是用户显式选择的现存内容，并保持脱敏。
 
 默认脱敏 API key、Bearer token、cookie、环境变量疑似凭据、路径中的敏感值，并保留 thread/turn/item、父子轨迹、压缩范围和淘汰说明。导出先固定 sequence 和页范围，写临时文件后原子重命名；失败不停止 agent、不阻塞 Gate。
 
@@ -277,4 +291,4 @@ Core facts → Arc<UiSnapshot> → local projection → visible rows → Termina
 
 UI 要完整实现，Core 至少提供：稳定的 thread/turn/item/ingressSeq；父子 thread 关系和 agent path；request 所属 thread/turn 与合法选项；delta/final 去重；tool call/result 关联；subAgentActivity；compaction 前后统计/摘要（如 schema 提供）；usage 与上下文 source；skill inventory/call 状态（如 schema 提供）；可分页 timeline/log reader；单调 snapshot version；历史加载状态；停止/断连后的 pending 状态；以及 command accepted/rejected 结果。
 
-如果当前 app-server 没有某项事实，UI 显示 unknown/unavailable，并保留证据来源，不扫描日志或本地文件补齐。
+如果当前 app-server 没有某项事实，UI 显示 unknown/unavailable，并保留证据来源，不扫描日志或本地文件补齐。Alpha 还必须覆盖可控时钟的静默/恢复、审批 requires_action、关闭提醒不影响 Core、宽窄终端无颜色显示，以及与 Python 消费者相同的 attention 和 progress_seq。

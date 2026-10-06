@@ -38,6 +38,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | Ctrl+C | Request interruption; wait for the server's terminal event |
 | Ctrl+Q / Ctrl+D | Quit and clean up owned processes |
 | Ctrl+F | Search retained conversation text; Enter searches/opens, Esc closes |
+| Ctrl+T | Browse live evidence; F1 lists filters, navigation and local bookmarks |
 | PageUp / PageDown, Ctrl+Home / Ctrl+End | Scroll conversation |
 | Ctrl+Y / Ctrl+N / Ctrl+B | Accept / decline / cancel the selected approval when allowed |
 | F1 / F2 | Show help / select next pending request |
@@ -66,7 +67,13 @@ The root can call `wait_for_subagent_completion` with `{"targets":[]}` to captur
 
 Startup obtains the effective catalog with `codex debug models`, writes a private temporary copy with `tool_mode: direct`, and removes it when the app-server owner exits. User configuration stays intact. This requires a Codex version supporting that command and the pinned protocol.
 
-Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Enforced native capacity, execution recovery, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
+Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. Native child count, depth, and active turn limits are configurable with `--max-native-children`, `--max-native-depth`, and `--max-native-turns`. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Fine-grained resource budgets, execution recovery, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
+
+## Roadmap
+
+The planned V1 / `0.1.0-alpha` focuses on reliable single-agent work, activity evidence, attention hints, and journal-based observation recovery. Existing child/Gate behavior remains covered by regression tests; V2 targets scheduling for 1–3 direct children.
+
+See the [product plan](docs/native-agent-tui-plan.md), [observability contract](docs/native-agent-tui-observability.md), and [GitHub roadmap](https://github.com/L1nding/native-agent-tui/issues/1). The JSONL/replay CLI shown in the design is planned, not an available command.
 
 ## Activity observation
 
@@ -90,7 +97,7 @@ cargo run --locked -- --export SESSION_ID --since 0 --output diagnostic.jsonl
 
 Exports preserve recorded states and relationships, replace string identities with stable aliases, and exclude prompts, answers, and full text. Historical ages stay frozen; uncertain outcomes require review before starting a new task. See [history and export](docs/history-export.md) and [validation](docs/history-validation.md).
 
-After opening a retained session, press `/` or `Ctrl+F` to search its committed evidence metadata. `F6` changes the lifecycle/output/tool/request/waiting category; Up/Down selects a hit and Enter opens its recorded event. Search results are bounded and redacted, and never include prompts, answers, secrets, commands, paths, or raw tool output. See [historical evidence search](docs/history-evidence-search.md).
+From the retained-session list or an opened session, press `/` or `Ctrl+F` to search committed evidence metadata. The search scans the selected retained sessions, `F6` changes the lifecycle/output/tool/request/waiting category, and Up/Down plus Enter opens the selected session/event hit. Search results are bounded and redacted, and never include prompts, answers, secrets, commands, paths, or raw tool output. See [historical evidence search](docs/history-evidence-search.md).
 
 ## Live JSONL
 

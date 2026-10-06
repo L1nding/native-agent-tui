@@ -2,6 +2,8 @@
 
 调研日期：2026-10-02
 
+历史说明（2026-10-03）：下文“尚无 Cargo package”是调研时的背景，现已过时；现状以 Cargo.toml、README 和[实施状态](implementation-status.md)为准。本文保留历史研究理由，不作为当前完成度清单。
+
 ## 结论
 
 本项目适合建立一个窄范围的项目级 Rust 开发 skill：指导实现阶段如何遵守既有 Core、Transport、Scheduler 与 UI 边界，并使用 Cargo、rustfmt、Clippy 和 Tokio/Ratatui 的官方工作方式。它应补充仓库 `AGENTS.md` 中的 Rust 通用约定，具体步骤应由未来实际加入的 `Cargo.toml`、工具链配置和 CI 决定。

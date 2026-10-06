@@ -1,8 +1,16 @@
 # Rust Agent TUI Core 详细设计
 
-日期：2026-10-02。本文是 [V1 总方案](C:/Users/Admin/orca/workspaces/uni-app-test/optimize/docs/design/native-agent-tui-v1.md) 的 Core 设计，和 [UI 设计](native-agent-tui-ui.md)、[工作流调度设计](native-agent-tui-workflow.md) 共享身份字段与状态语义。
+更新：2026-10-03。本文与 [UI 设计](native-agent-tui-ui.md)、[工作流调度设计](native-agent-tui-workflow.md) 共享身份和状态边界。发布范围以[产品计划](native-agent-tui-plan.md)为准，活动、Attention、JSONL 和恢复以[可观测性契约](native-agent-tui-observability.md)为准。
 
 Core 是执行事实的唯一所有者。它启动并持有 Codex app-server，解析 stdio JSONL，维护线程与轮次，处理审批和用户输入，决定等待 Gate 是否释放，并向 UI 发布只读快照。UI 不直接碰 JSON-RPC、子进程或 Gate。
+
+## 0. 发布范围与观察所有权
+
+V1/Alpha 优先交付可靠单 agent、活动证据、审批/输入、journal 观察恢复和 JSONL 状态流。Gate/child 已有实现继续回归；完整调度与 1–3 直属 child 的产品支持归入 V2。本文类型示例为目标设计，当前事实见[实施状态](implementation-status.md)。
+
+Core 保存 execution state、ActivitySnapshot 和独立 attention 投影；UI、Python 均消费此投影。计时可以更新 attention 与 snapshot_version，不能更新 progress_seq、启动模型或触发 Gate。不同 agent 的证据分别计时；未知 provider 阶段显示 unknown。
+
+状态流 S2.5a 在状态 seam 后实现；S2.5b 的持久 JSONL 依赖 S9a journal 基础。恢复只读脱敏投影，重新执行必须由用户创建新 attempt。
 
 ## 1. 外部 Interface 与 Module
 
@@ -96,7 +104,7 @@ features.multi_agent_v2.expose_spawn_agent_model_overrides = true
 allowProviderModelFallback = false
 ```
 
-升级 Codex 必须重新生成 schema、运行兼容测试和真实事件回放。模型请求配置与服务端返回的实际模型/effort 分开存储。
+首个受支持版本固定并写入兼容表；本段 0.159.2 是历史验证基线，不代表最新版本。能力探测仅允许已验证版本缺少可选能力时降级，必需能力缺失则禁止执行。升级 Codex 必须重新生成 schema、运行兼容测试和真实事件回放。模型请求配置与服务端返回的实际模型/effort 分开存储。
 
 ## 3. reader、writer 与事件归并
 
@@ -110,7 +118,7 @@ control: response, server request, thread/started, turn/started/completed,
 telemetry: agentMessage/delta, 普通 item 增量和诊断
 ```
 
-Core 总是先消费 control。telemetry 按 `(threadId, turnId, itemId)` 合并；生命周期事实不可丢失。writer 失败后，所有 pending 操作进入失败/断连路径，不自动重放 `turn/start`、文件或 shell 操作。
+Core 优先处理 control，同时保留 ingressSeq 因果关系；不能让终态越过必要前序 delta 后丢掉最终输出。telemetry 按 `(threadId, turnId, itemId)` 合并并记录覆盖范围；生命周期事实必须持久保留或显式报告过载失败，不承诺无限缓存。writer 失败后，所有 pending 操作进入失败/断连路径，不自动重放 `turn/start`、文件或 shell 操作。
 
 统一处理顺序：
 
@@ -168,7 +176,7 @@ pub struct AgentState {
 
 Core 应记录上下文和 skill 的事实，但明确来源：服务端确认、客户端估算、未知。上下文压缩至少保存触发原因、前后 usage、摘要/保留范围（如果 schema 提供）；skill 至少保存名称、来源、版本/hash（如提供）、loaded/invoked/completed/failed 状态。扫描本地 skill 文件不能证明服务端已经加载。
 
-## 5. CompletionGate
+## 5. CompletionGate（现有能力回归与 V2 支持）
 
 Gate 是深 Module，外部接口只暴露接受等待、应用事件、取消、断连和取结果：
 
@@ -246,7 +254,7 @@ enum RearmState {
 
 ## 6. 审批、输入、目标和调度
 
-所有服务端请求统一进入 `PendingServerRequest`，但每个方法使用自己的 schema。V1 支持 command approval、file change approval、tool user input 和 wait tool。Core 拥有 request，UI 只显示并提交带 requestId 的回答。
+所有服务端请求统一进入 `PendingServerRequest`，但每个方法使用自己的 schema。V1 必须支持 command approval、file change approval、tool user input；已有 wait tool 保持回归，完整多 agent 等待/调度归入 V2。Core 拥有 request，UI 只显示并提交带 requestId 的回答。
 
 根 GatePending 时，子代理审批/输入仍可即时处理；根普通输入只进入队列，不启动根新轮。`serverRequest/resolved` 会关闭对应请求，过期回答返回 `AlreadyResolved`。未知请求、未知 dynamic tool 或未实现的权限请求要拒绝并停止不安全的 goal continuation，不无限重试。
 
@@ -260,7 +268,8 @@ enum RearmState {
 Created → Launching → Initializing → Ready → Running
         → GatePending → GoalChecking → Completed
 任何状态 → Stopping → ClosingTransport → Stopped
-任何状态 → Disconnected → Failed
+连接断开 → Disconnected；未确认的外部执行结果 → Unknown
+明确 turn failed → Failed（断连本身不证明任务失败）
 ```
 
 Stop 是幂等的：禁止新根轮，发送已验证的 interrupt，继续消费终态和 resolved，关闭 stdin，等待 app-server，必要时显式 terminate/kill，再清理临时目录和终端。不能伪造 completed 唤醒父模型，也不能重放未知副作用。
@@ -290,7 +299,7 @@ Tokio `Child` drop 不保证 app-server、shell 和孙进程退出。Windows 必
 - 真实锁定 app-server + 本地计数 mock provider 验证 dynamic tool 与请求计数。
 - Windows app-server 与 shell 进程树清理有证据。
 
-Core 进入 UI 开发的条件是：reader 不被 Gate 阻塞；Gate 不含 timeout/sleep/polling；旧轮事件不会释放新等待；交互请求在等待期间可路由；断连和停止不会伪造完成；所有验收通过同一外部 Interface。
+Alpha 按产品计划验收单 agent、S2.5、journal、Python 消费者和真实 smoke test；UI 可先通过 typed snapshot 和 fake replay 开发，不等待完整 scheduler。已有 Gate 路径仍须证明 reader 不阻塞、无等待 deadline、旧轮不能释放新等待、审批可路由、断连/停止不伪造完成。V2 增加 1–3 child 的真实并发与调度验收。
 
 ## 10. 必须验证的兼容假设
 

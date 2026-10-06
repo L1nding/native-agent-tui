@@ -1,6 +1,6 @@
 # 实施状态与验证
 
-更新日期：2026-10-02。
+实现验证记录日期：2026-10-02；计划索引更新：2026-10-03。本次文档同步没有重新运行这些测试，不将历史通过数作为当前复验结论。
 
 ## 当前可用范围
 
@@ -79,14 +79,20 @@ Windows ConPTY 交互验证已收到 `TUI_READY`，同一线程第二轮输入�
 
 ## 尚未完成的设计要求
 
-1. 在已接入的 DAG、根槽位、Gate 和任务控制之上，实现完整资源预算、原生并发/深度限制及持久调度恢复。当前能力和验收见[调度接入验证](scheduler-validation.md)。
+1. 在已接入的 DAG、根槽位、Gate 和任务控制之上，实现细粒度资源预算及持久调度恢复；直属 child 数量、观察深度和活动 turn 数已支持启动配置。当前能力和验收见[调度接入验证](scheduler-validation.md)。
 2. 在已接入的脱敏 journal、实时 JSONL、只读历史和手动导出上，继续补齐上下文压缩及 skill 的服务端事实记录；执行恢复与完整 transcript 重建没有实现。
 3. 扩展协议兼容快照，验证一层子代理限制、整棵代理树停止，以及正在运行的子代理收到普通消息时的轮次语义。
-4. 提供代理/任务树、搜索、详细工具轨迹、usage/context 面板和诊断指标。
+4. 提供完整代理/任务树、详细工具轨迹、compaction/skill 事实和 usage/context 面板；当前只显示服务端确认的 token 汇总，缺失字段明确为 unavailable。
 
 `scheduler.rs` 已接入真实 Core 和 UI，具体证据见[调度接入验证](scheduler-validation.md)。`rpc.rs` 和 `diagnostics.rs` 的独立接口仍不能作为完整诊断已接入的证据。本地 provider 验证同一直属子代理的两轮；8 子代理场景通过内存 transport 验证，尚未扩展到真实 provider 并行计数。
 
 Windows 已通过创建时的 Job 属性建立进程所有权，消除先创建、后附加之间的窗口；原生 suspended/硬终止与关闭确认见[进程所有权](windows-process-ownership.md)。Shell 预检仍存在间歇超时，启动可靠性门禁尚未通过。
+
+## 2026-10-03 计划同步（尚未实现的契约）
+
+产品支持范围见[产品计划](native-agent-tui-plan.md)，活动证据、Attention、JSONL/Python、journal 只读回放见[可观测性契约](native-agent-tui-observability.md)。现有 Gate/child 能力继续保留；V1/Alpha 优先可靠单 agent 与观察恢复，V2 验收 1–3 个直属 child 的完整调度。
+
+新增契约不代表 `--json-events`、`--replay`、`--since`、持久 journal 或 Attention 已可使用。S0 必须对当前实现重新核对，Issue 关闭需对应测试证据。
 
 ## S2.5a 活动观察接入
 
@@ -152,6 +158,10 @@ Ctrl+W 关闭/恢复所选代理当前的静默提醒；记录仅在 UI 内绑�
 
 使用与范围见[活动观察](activity-observation.md)和[本地提醒验证](attention-reminders-validation.md)。本次终端检查没有调用真实模型，前一项启动修复的五项真实 Codex 验证保持独立记录。搜索、完整请求详情、更广终端和试用验收，以及 Alpha/V2 仍待完成。
 
+## Usage 身份事实（2026-10-06）
+
+Core 快照新增 typed `UsageFact`，携带 server/local/unknown 来源和 thread/turn/generation 身份。新 root 或 child generation 先发布 unavailable 占位；只有精确匹配当前 thread/turn 的更新才能填充事实，累计 total 仍保持单调。Context/F11 只消费该事实，缺少身份或当前 turn usage 时显示 unavailable，不从 agent id 推断归属。回归覆盖 root/child 精确接受、旧 turn 忽略、新 generation 未确认、旧快照身份默认值和宽窄 UI 渲染。
+
 ## S4 请求身份与 UI 详情
 
 审批、输入和 headless 动作改为携带 RPC ID、线程、轮次与接收序号；Core 校验完整身份、当前轮次和 responding。同轮次复用 ID 产生新身份，重复投递仍保留原身份。UI 固定选择，过期后需明确选择当前请求；每个提交立即锁定，输入草稿分别绑定完整身份。
@@ -183,3 +193,19 @@ Windows 终端输入改为有界 VT/Win32 记录适配，完整标记的多行�
 本轮 `python scripts/verify.py --live` 全部通过：182 项默认 Rust 测试、八项真实 Codex 检查和全部原生夹具，含 12 项 ConPTY 输入检查；fmt/check/clippy/doctest/release 通过。真实 TUI 夹具另行验证三行秘密答案精确提交一次、粘贴和搜索零额外 RPC、进程清理及脱敏回放。
 
 本机 ConPTY 跨写入拆分粘贴标记会丢失前缀，物理 Shift/Ctrl+Enter 可能变为普通 Enter；这两项宿主能力探针当前失败并保留复现命令。Windows Terminal、Orca 剪贴板及 IME 仍待验收，Alpha/V2 未完成。详见[终端输入验证与限制](windows-terminal-input.md)。
+
+## S8b 有界实时证据时间线
+
+`Ctrl+T` 已接入 Core 拥有的有界证据归档。时间线记录活动身份、状态、工具 item、请求完整投递引用和等待目标；按 Core 接受证据的顺序展示，并明确不等于原始 ingress 或 journal 游标。归档最多 512 条、256 KiB 元数据，整条淘汰并显示高水位和缺口；快照共享不可变条目，tick、配置或 UI 浏览不会生成新证据。
+
+时间线支持线程/已确认子树/关联路径/全部范围、事件类别、执行状态、当前待请求、元数据和精确 turn 过滤；Enter 只定位仍保留的消息或完整身份匹配的当前请求。b/B 书签最多 64 条/64 KiB，仅保存在本次 TUI。淘汰、旧 session、复用 RPC ID、陈旧请求或缺少正文都会明确提示，不会自动操作其他请求。原始输出、reasoning、compaction 和历史跨 session 搜索仍显示 unavailable；F11 证据视图现在显示服务端确认的 input/cached/output/reasoning/total token 字段及 context window，缺失值保持 unavailable。
+
+新增回归覆盖证据预算、冻结等待目标、重试身份、过滤/定位、淘汰书签、同批按键、秘密草稿、窄宽屏帮助和持久化故障 Unknown。Windows ConPTY 假 app-server 夹具验证过滤、书签、resize、两次同 ID 审批、历史切换后的秘密答案和零额外观察 RPC，并已接入 `scripts/verify.py`。
+
+当前 `python scripts/verify.py --live` 通过：196 项默认 Rust 测试、8 项真实 Codex 检查、全部原生夹具及时间线 TUI 夹具；fmt/check/clippy/doctest/release 通过。Windows Terminal、Orca 剪贴板/IME、完整事件轨迹、原始工具结果搜索、试用任务集和 Alpha/V2 发布门禁仍待完成。详见[实时证据时间线](evidence-timeline.md)。
+
+## S9c 历史证据搜索
+
+历史会话列表和详情都支持 `/`、`Ctrl+F` 输入脱敏证据元数据，F6 在生命周期、输出、工具、请求和等待类别间切换；Up/Down 选择命中，Enter 重新打开对应 session/event。列表搜索分别固定所有当前保留 session 的已提交前缀，详情搜索固定当前 session；搜索在线程中取消旧查询，排除未提交尾部，并限制查询、命中和元数据内存。结果可以用内部身份字段匹配，但界面只显示脱敏摘要；提示、答案、秘密、命令、路径和原始工具输出不会进入结果。
+
+新增回归覆盖真实历史搜索、取消旧查询、脱敏结果、事件定位和 Ratatui 渲染。2026-10-03 的 `python scripts/verify.py --live` 通过 200 项默认 Rust 测试、8 项真实 Codex 检查、全部原生 fixture、fmt/check/clippy/doctest/release；历史搜索使用与实时执行隔离的只读线程。跨 session 全局搜索、原始工具结果搜索和 Alpha/V2 发布验收仍未完成。详见[历史证据搜索](history-evidence-search.md)。
