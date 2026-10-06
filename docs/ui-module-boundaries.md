@@ -5,6 +5,7 @@
 ## 当前子模块
 
 - `ui/input`：VT/Windows 输入记录、粘贴和有界编辑事件。
+- `ui/layout`：纯终端几何、会话布局约束和按 grapheme 的文本换行；不读取或修改 Core/UI 状态。
 - `ui/editor`：有界、按 Unicode grapheme 操作的文本编辑器状态与光标操作；不发送 Core 命令。
 - `ui/attention`：注意力阈值编辑器状态与弹窗渲染；只通过根模块路由提交类型化命令。
 - `ui/requests`：审批和用户输入请求的详情、草稿和身份校验。

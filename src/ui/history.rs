@@ -6,7 +6,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{age, wrap, Editor};
+use super::layout::wrap;
+use super::{age, Editor};
 use crate::history::search::{Category, Query, Results, FIELD_BYTES};
 use crate::history::{ExportPreview, HistoricalView, HistoryHandle, HistoryRequest, HistoryResult};
 use crate::journal::SessionInfo;

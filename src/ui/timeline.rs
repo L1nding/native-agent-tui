@@ -9,9 +9,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::layout::wrap;
 use super::scope::Scope;
 use super::tool_detail;
-use super::{search, wrap, Editor};
+use super::{search, Editor};
 use crate::interactions::RequestRef;
 use crate::observation::{ActivityScope, EvidenceKind, ExecutionState};
 use crate::state::{display_text, CoreSnapshot};

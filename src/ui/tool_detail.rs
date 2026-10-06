@@ -2,8 +2,8 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::layout::wrap;
 use super::tool_trace;
-use super::wrap;
 use crate::state::CoreSnapshot;
 use crate::tool_details::ToolDetailLocator;
 

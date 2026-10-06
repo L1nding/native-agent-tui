@@ -7,6 +7,8 @@ use crate::agents::AgentSnapshot;
 use crate::observation::CompactionFact;
 use crate::state::{CoreSnapshot, FactSource};
 
+use super::layout::wrap;
+
 #[derive(Debug, Default)]
 pub(super) struct ContextPanel {
     pub visible: bool,
@@ -169,10 +171,7 @@ impl ContextPanel {
 
         let inner_width = area.width.saturating_sub(2) as usize;
         let inner_height = area.height.saturating_sub(2) as usize;
-        let wrapped_rows: Vec<_> = rows
-            .iter()
-            .flat_map(|row| super::wrap(row, inner_width))
-            .collect();
+        let wrapped_rows: Vec<_> = rows.iter().flat_map(|row| wrap(row, inner_width)).collect();
         let max_scroll = wrapped_rows.len().saturating_sub(inner_height);
         let scroll = self.scroll.min(max_scroll);
         let scroll = if self.from_end {

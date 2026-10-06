@@ -31,6 +31,7 @@ mod context;
 mod editor;
 mod history;
 mod input;
+mod layout;
 mod reminders;
 mod requests;
 mod scope;
@@ -49,6 +50,7 @@ use attention::{draw_attention_editor, AttentionEditor};
 use commands::{PaletteAction, PaletteEvent};
 use editor::Editor;
 use input::{InputEvent, TerminalInput};
+use layout::{conversation_content_size, main_layout, wrap};
 use skills::{draw_skills, skills_panel_entries_capacity};
 use workflow::{
     navigate_workflow_link, project_workflow, selected_task, stale_gate_link,
@@ -718,7 +720,13 @@ fn handle_key(
         || control && matches!(key.code, KeyCode::Home | KeyCode::End)
     {
         if let Some(focus) = &local.conversation_focus {
-            let chunks = main_layout(local.viewport, snapshot, local);
+            let chunks = main_layout(
+                local.viewport,
+                !snapshot.observation.activities.is_empty(),
+                selected_request(snapshot, local).is_some()
+                    || snapshot.last_error.is_some()
+                    || snapshot.gate.as_ref().is_some_and(|gate| gate.pending),
+            );
             let mut area = chunks[1];
             if local.viewport.width >= 100 && !snapshot.agents.is_empty() {
                 area = Layout::default()
@@ -1251,66 +1259,6 @@ fn apply_workflow_navigation(result: WorkflowLinkNavigation, local: &mut LocalSt
     local.notice = result.notice;
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut output = Vec::new();
-    for source in display_text(text).split('\n') {
-        let mut line = String::new();
-        let mut cells = 0;
-        for grapheme in source.graphemes(true) {
-            let count = grapheme.width();
-            if cells + count > width.max(1) && !line.is_empty() {
-                output.push(std::mem::take(&mut line));
-                cells = 0;
-            }
-            line.push_str(grapheme);
-            cells += count;
-        }
-        output.push(line);
-    }
-    output
-}
-
-fn main_layout(
-    area: ratatui::layout::Rect,
-    snapshot: &CoreSnapshot,
-    local: &LocalState,
-) -> std::rc::Rc<[ratatui::layout::Rect]> {
-    let request = selected_request(snapshot, local).is_some();
-    let waiting = snapshot.gate.as_ref().is_some_and(|gate| gate.pending);
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(if area.height > 16 {
-                if snapshot.observation.activities.is_empty() {
-                    4
-                } else {
-                    6
-                }
-            } else {
-                3
-            }),
-            Constraint::Min(1),
-            Constraint::Length(
-                if area.height > 16 && (request || snapshot.last_error.is_some() || waiting) {
-                    6
-                } else {
-                    2
-                },
-            ),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(area)
-}
-
-fn conversation_content_size(area: ratatui::layout::Rect) -> (usize, usize) {
-    let border = if area.height < 3 { 0 } else { 2 };
-    (
-        area.width.saturating_sub(border) as usize,
-        area.height.saturating_sub(border) as usize,
-    )
-}
-
 fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
     let area = frame.area();
     if local.palette.visible {
@@ -1337,7 +1285,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .map(|agent| agent.info.id.as_str())
         .or(snapshot.thread_id.as_deref())
         .unwrap_or("");
-    let chunks = main_layout(area, snapshot, local);
+    let chunks = main_layout(
+        area,
+        !snapshot.observation.activities.is_empty(),
+        request.is_some() || snapshot.last_error.is_some() || waiting.is_some(),
+    );
     let actions = snapshot
         .observation
         .activities

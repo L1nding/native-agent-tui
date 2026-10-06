@@ -4,6 +4,8 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use crate::observation::AttentionClass;
 use crate::state::CoreSnapshot;
 
+use super::layout::wrap;
+
 pub(super) struct AttentionEditor {
     pub(super) class_index: usize,
     pub(super) field: usize,
@@ -70,7 +72,7 @@ pub(super) fn draw_attention_editor(
     ];
     let lines: Vec<_> = rows
         .iter()
-        .flat_map(|row| super::wrap(row, width.saturating_sub(2) as usize))
+        .flat_map(|row| wrap(row, width.saturating_sub(2) as usize))
         .map(Line::from)
         .collect();
     frame.render_widget(Clear, area);

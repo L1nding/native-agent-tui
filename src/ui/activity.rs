@@ -4,8 +4,8 @@ use unicode_width::UnicodeWidthStr;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use super::layout::wrap;
 use super::reminders::Reminders;
-use super::wrap;
 use crate::observation::{
     ActivityScope, ActivitySnapshot, AttentionLevel, CompactionFact, CompactionFactStatus,
     ExecutionState,

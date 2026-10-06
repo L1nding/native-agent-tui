@@ -12,9 +12,10 @@ use tokio::sync::watch;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::layout::wrap;
 use super::scope::Scope;
 use super::tool_search::{self, CategoryFilter, LifecycleFilter};
-use super::{wrap, Editor};
+use super::Editor;
 use crate::state::{display_text, ConversationItem, CoreSnapshot};
 
 const QUERY_BYTES: usize = 1024;

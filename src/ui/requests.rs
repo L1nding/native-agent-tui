@@ -3,7 +3,8 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::{request_locked, selected_request, wrap, LocalState};
+use super::layout::wrap;
+use super::{request_locked, selected_request, LocalState};
 use crate::interactions::{RequestKind, RequestView};
 use crate::state::{display_text, CoreSnapshot};
 

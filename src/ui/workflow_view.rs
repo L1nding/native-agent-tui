@@ -7,11 +7,11 @@ use unicode_width::UnicodeWidthStr;
 use super::activity::{
     age, agent_usage_brief, focus_activity, truncate_display_label, usage_fact_for,
 };
+use super::layout::wrap;
 use super::workflow::{
     self, project_workflow, selected_task, task_reference, workflow_conversation,
     ConversationTarget,
 };
-use super::wrap;
 use crate::agents::AgentSnapshot;
 use crate::scheduler::TaskSnapshot;
 use crate::state::{display_text, CoreSnapshot};
