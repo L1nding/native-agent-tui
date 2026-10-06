@@ -18,7 +18,7 @@ use super::skills::draw_skills;
 use super::workflow_view;
 use super::{selected_request, LocalState};
 use crate::interactions::RequestKind;
-use crate::observation::AttentionLevel;
+use crate::observation::{AttentionLevel, ExecutionState};
 use crate::state::{display_text, CoreSnapshot};
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
     let area = frame.area();
@@ -74,25 +74,30 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     } else {
         String::new()
     };
+    // 只显示有信息量的计数；缺失的 token 事实在 F11 中仍明确显示 unavailable。
+    let mut status = vec![
+        format!("{:?}", snapshot.phase),
+        format!("action:{actions} attention:{attention}{reminders_status}"),
+    ];
+    for (label, count) in [
+        ("turns", snapshot.root_turn_count as usize),
+        ("children", snapshot.agents.len()),
+        ("queued", snapshot.queued_inputs),
+    ] {
+        if count > 0 {
+            status.push(format!("{label}: {count}"));
+        }
+    }
     let usage = usage_status(snapshot);
-    let status = format!(
-        "{:?} | action:{} attention:{}{} | turns: {} | children: {} | queued: {} | {}{}",
-        snapshot.phase,
-        actions,
-        attention,
-        reminders_status,
-        snapshot.root_turn_count,
-        snapshot.agents.len(),
-        snapshot.queued_inputs,
-        usage,
-        if snapshot.scheduler.stopping {
-            " | stopping"
-        } else if snapshot.scheduler.paused {
-            " | dispatch paused"
-        } else {
-            ""
-        },
-    );
+    if usage != "tokens:unavailable/unavailable" {
+        status.push(usage);
+    }
+    if snapshot.scheduler.stopping {
+        status.push("stopping".into());
+    } else if snapshot.scheduler.paused {
+        status.push("dispatch paused".into());
+    }
+    let status = status.join(" | ");
     let settings = format!(
         "{} | {} | {} | {}",
         snapshot.model.as_deref().unwrap_or("model pending"),
@@ -101,7 +106,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         snapshot.approval_policy
     );
     let agent_id = selected_agent.map_or("root", |agent| agent.info.id.as_str());
-    let selected_activity = focus_activity(snapshot, agent_id);
+    // 已结束的活动只会显示“Completed/review result”，在空闲时误导用户，留给 F11 查看。
+    let selected_activity = focus_activity(snapshot, agent_id).filter(|activity| {
+        activity.attention.requires_action
+            || activity.execution_state == ExecutionState::Unknown
+            || activity.attention.level != AttentionLevel::Ended
+    });
     let mut header = vec![Line::from(status)];
     if let Some(activity) = selected_activity {
         header.push(Line::from(display_text(&reminder_brief(

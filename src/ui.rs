@@ -2521,6 +2521,32 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn idle_header_omits_zero_counters_and_missing_tokens() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            ..CoreSnapshot::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &LocalState::default()))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("Ready | action:0 attention:0"),
+            "{rendered}"
+        );
+        for noise in ["children: 0", "queued: 0", "turns: 0", "tokens:unavailable"] {
+            assert!(!rendered.contains(noise), "{noise}: {rendered}");
+        }
+    }
+
+    #[test]
     fn escape_closes_help_without_discarding_draft() {
         let snapshot = CoreSnapshot::default();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
