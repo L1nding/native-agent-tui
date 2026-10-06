@@ -256,16 +256,41 @@ fn content_text(value: &Value) -> Result<Option<String>, AcpProtocolError> {
     let Some(content) = value.get("content") else {
         return Ok(None);
     };
-    let Some(text) = content
-        .as_str()
-        .or_else(|| content.get("text").and_then(Value::as_str))
-    else {
+    text_from_value(content)
+}
+
+fn text_from_value(value: &Value) -> Result<Option<String>, AcpProtocolError> {
+    if let Some(text) = value.as_str() {
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(AcpProtocolError::TextTooLarge);
+        }
+        return Ok(Some(text.to_owned()));
+    }
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(AcpProtocolError::TextTooLarge);
+        }
+        return Ok(Some(text.to_owned()));
+    }
+    if let Some(content) = value.get("content") {
+        return text_from_value(content);
+    }
+    let Some(items) = value.as_array() else {
         return Ok(None);
     };
-    if text.len() > MAX_TEXT_BYTES {
-        return Err(AcpProtocolError::TextTooLarge);
+    let mut combined = String::new();
+    for item in items {
+        if let Some(text) = text_from_value(item)? {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&text);
+            if combined.len() > MAX_TEXT_BYTES {
+                return Err(AcpProtocolError::TextTooLarge);
+            }
+        }
     }
-    Ok(Some(text.to_owned()))
+    Ok((!combined.is_empty()).then_some(combined))
 }
 
 fn number(value: &Value, keys: &[&str]) -> Option<u64> {
@@ -336,5 +361,22 @@ mod tests {
         assert_eq!(value[0]["env"][0]["name"], "MODE");
         assert_eq!(value[1]["type"], "http");
         assert_eq!(value[1]["headers"][0]["name"], "X-Test");
+    }
+
+    #[test]
+    fn decodes_tool_content_arrays_without_retaining_raw_blocks() {
+        let (_, Update::ToolCallUpdate { output, .. }) = update(&json!({
+            "sessionId":"s",
+            "update": {
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":"tool",
+                "status":"completed",
+                "content":[{"type":"content","content":{"type":"text","text":"result"}}]
+            }
+        }))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(output.as_deref(), Some("result"));
     }
 }
