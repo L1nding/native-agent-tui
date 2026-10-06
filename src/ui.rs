@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
@@ -22,11 +22,13 @@ use crate::history::HistoryHandle;
 use crate::interactions::{ApprovalDecision, RequestKind, RequestRef, RequestView};
 use crate::observation::{AttentionClass, AttentionLevel};
 use crate::scheduler::{RootTaskSpec, SchedulerCommand, TaskAttempt, ROOT_QUEUE_LIMIT};
-use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
+use crate::state::{display_text, CoreSnapshot};
 
 mod activity;
+mod attention;
 mod commands;
 mod context;
+mod editor;
 mod history;
 mod input;
 mod reminders;
@@ -43,7 +45,9 @@ mod workflow_view;
 
 use activity::compaction_fact_rows;
 use activity::{age, draw_evidence, evidence_brief, focus_activity, reminder_brief, usage_status};
+use attention::{draw_attention_editor, AttentionEditor};
 use commands::{PaletteAction, PaletteEvent};
+use editor::Editor;
 use input::{InputEvent, TerminalInput};
 use skills::{draw_skills, skills_panel_entries_capacity};
 use workflow::{
@@ -74,49 +78,6 @@ pub enum UiError {
     Io(#[from] io::Error),
     #[error("Core shutdown failed: {0}")]
     Shutdown(String),
-}
-
-#[derive(Default)]
-struct Editor {
-    text: String,
-    cursor: usize,
-}
-
-impl Editor {
-    fn insert(&mut self, text: &str) {
-        let text = display_text(text);
-        if self.text.len() + text.len() > MESSAGE_BYTES {
-            return;
-        }
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
-    }
-    fn left(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(index, _)| index);
-    }
-    fn right(&mut self) {
-        if let Some(grapheme) = self.text[self.cursor..].graphemes(true).next() {
-            self.cursor += grapheme.len();
-        }
-    }
-    fn backspace(&mut self) {
-        let end = self.cursor;
-        self.left();
-        self.text.drain(self.cursor..end);
-    }
-    fn delete(&mut self) {
-        let start = self.cursor;
-        self.right();
-        self.text.drain(start..self.cursor);
-        self.cursor = start;
-    }
-    fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
 }
 
 #[derive(Default)]
@@ -155,37 +116,6 @@ struct InputDraft {
     editor: Editor,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
-}
-
-struct AttentionEditor {
-    class_index: usize,
-    field: usize,
-    quiet: String,
-    attention: String,
-    notice: Option<String>,
-}
-
-impl AttentionEditor {
-    fn new(snapshot: &CoreSnapshot, class_index: usize) -> Self {
-        let pair = snapshot
-            .observation
-            .settings
-            .get(AttentionClass::ALL[class_index]);
-        Self {
-            class_index,
-            field: 0,
-            quiet: pair.quiet_ms.to_string(),
-            attention: pair.attention_ms.to_string(),
-            notice: None,
-        }
-    }
-    fn input(&mut self) -> &mut String {
-        if self.field == 0 {
-            &mut self.quiet
-        } else {
-            &mut self.attention
-        }
-    }
 }
 
 pub async fn run_tasks_with_history(
@@ -1796,55 +1726,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     if local.request_panel && local.attention_editor.is_none() {
         requests::draw(frame, snapshot, local);
     }
-}
-
-fn draw_attention_editor(
-    frame: &mut ratatui::Frame<'_>,
-    snapshot: &CoreSnapshot,
-    editor: &AttentionEditor,
-) {
-    let screen = frame.area();
-    let width = screen.width.min(68);
-    let height = screen.height.min(12);
-    let area = ratatui::layout::Rect::new(
-        screen.x + (screen.width - width) / 2,
-        screen.y + (screen.height - height) / 2,
-        width,
-        height,
-    );
-    let class = AttentionClass::ALL[editor.class_index];
-    let effective = snapshot.observation.settings.get(class);
-    let rows = [
-        format!("{class:?} / effective source {:?}", effective.source),
-        format!(
-            "{} Quiet ms: {}",
-            if editor.field == 0 { ">" } else { " " },
-            editor.quiet
-        ),
-        format!(
-            "{} Attention ms: {}",
-            if editor.field == 1 { ">" } else { " " },
-            editor.attention
-        ),
-        "Up/Down class · Tab field · Ctrl+U clear".into(),
-        "Enter apply · Esc close · session only".into(),
-        editor.notice.clone().unwrap_or_default(),
-    ];
-    let lines: Vec<_> = rows
-        .iter()
-        .flat_map(|row| wrap(row, width.saturating_sub(2) as usize))
-        .map(Line::from)
-        .collect();
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Attention · F10 "),
-        ),
-        area,
-    );
-    frame.set_cursor_position((area.x + 1, area.y + 2 + editor.field as u16));
 }
 
 struct TerminalGuard {
