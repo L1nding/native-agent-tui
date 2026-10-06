@@ -21,12 +21,12 @@
 - `ui/context`：Context 面板本地可见/滚动状态与只读渲染；按 Core usage fact 的精确 root/child 身份展示 usage 来源、累计值和最近确认语义，以及该 agent 的 compaction 事实和独立的会话级 token budget。面板不从 agent id 推断 usage 归属，也不发送 Core 命令。
 - `ui/timeline`：证据时间线选择与工具详情定位。
 - `ui/tool_detail`：工具摘要和搜索命中详情的只读渲染；`ui/tool_trace` 从快照保留窗口按完整 locator 投影生命周期元数据，不读取正文、参数或命令，也不维护额外缓存。
-- `ui/workflow`：任务选择顺序、依赖/Gate 链接导航、过期链接检查和 root/child 精确会话定位。
+- `ui/workflow`：工作流面板允许按键、任务选择顺序、依赖/Gate 链接导航、过期 attempt 检查、root/child 精确会话定位、二次确认和调度意图；输入只读快照与面板状态，返回类型化动作/通知/导航/调度请求，不访问 `LocalState`、不发送 Core 命令。
 - `ui/workflow_view`：Agent 树投影与渲染、工作流/Gate 视图和状态文案；紧凑布局由终端高度决定，视图只读快照。
 - `ui/history`：持久会话列表、历史搜索、只读详情和导出预览。
 - `ui/commands`：本地命令面板的静态导航项、过滤/选择/滚动、粘贴编辑和无副作用 `PaletteAction`。
 
-工作流模块只接收 `CoreSnapshot`、选中的 `TaskId` 和链接游标，返回导航结果；它不依赖根 UI 的 `LocalState`，也不发送 Core 命令。根模块负责把结果应用到本地滚动/选择状态，并决定是否提交调度或打开对话。
+工作流模块接收按键、`CoreSnapshot` 和只读面板状态，负责面板内允许键判定及调度/导航决策，再返回类型化结果；它不依赖根 UI 的 `LocalState`，也不发送 Core 命令。根模块保留全局路由、跨面板开关、面板状态应用和 typed `Command` 发送，并根据会话导航结果打开对话。
 
 Context 模块只消费 Core 快照和当前选中的 agent。根模块处理全局 `Ctrl+G` 路由并打开或关闭面板；面板拥有自己的 `Esc` 关闭和 PgUp/PgDn、Home/End 滚动行为。普通编辑文本中的 `c` 仍由输入编辑器处理。
 

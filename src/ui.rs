@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::client::Command;
 use crate::interactions::{ApprovalDecision, RequestKind, RequestRef, RequestView};
 use crate::observation::AttentionClass;
-use crate::scheduler::{RootTaskSpec, SchedulerCommand, TaskAttempt, ROOT_QUEUE_LIMIT};
+use crate::scheduler::{RootTaskSpec, ROOT_QUEUE_LIMIT};
 use crate::state::CoreSnapshot;
 
 mod activity;
@@ -45,17 +45,14 @@ use overlays::open_palette_action;
 use render::draw;
 use request_state::{request_locked, selected_request, sync_local_requests};
 use skills::skills_panel_entries_capacity;
-use workflow::{
-    navigate_workflow_link, project_workflow, selected_task, stale_gate_link,
-    workflow_conversation, ConversationTarget, WorkflowLinkKind, WorkflowLinkNavigation,
-};
+use workflow::{WorkflowAction, WorkflowConversation, WorkflowKeyResult, WorkflowScheduleRequest};
 
 pub use runtime::{run_history, run_tasks_with_history};
 
 #[cfg(test)]
 use crate::observation::{ActivityScope, AttentionLevel, ExecutionState};
 #[cfg(test)]
-use crate::scheduler::{TaskId, TaskSnapshot};
+use crate::scheduler::{SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot};
 #[cfg(test)]
 use crate::state::FactSource;
 #[cfg(test)]
@@ -74,6 +71,8 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
 use workflow::WorkflowLinkCursor;
+#[cfg(test)]
+use workflow::{selected_task, workflow_conversation, ConversationTarget, WorkflowLinkKind};
 
 const PASTE_REJECTED: &str = "Paste exceeds 32 KiB; the entire paste was discarded.";
 
@@ -460,32 +459,8 @@ fn handle_key(
         }
         return false;
     }
-    if local.workflow.visible {
-        let plain = key.modifiers.is_empty();
-        let allowed = control && matches!(key.code, KeyCode::Char('q' | 'd' | 'c'))
-            || plain
-                && matches!(
-                    key.code,
-                    KeyCode::F(2)
-                        | KeyCode::F(4)
-                        | KeyCode::F(5)
-                        | KeyCode::F(6)
-                        | KeyCode::F(7)
-                        | KeyCode::F(8)
-                        | KeyCode::F(9)
-                        | KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                        | KeyCode::Home
-                        | KeyCode::End
-                        | KeyCode::Enter
-                        | KeyCode::Esc
-                        | KeyCode::Char('d' | 'g' | '+' | '-')
-                );
-        if !allowed {
-            return false;
-        }
+    if local.workflow.visible && !workflow::allows_key(key) {
+        return false;
     }
     if key.code != KeyCode::F(9) {
         local.workflow.confirm_stop = false;
@@ -555,6 +530,12 @@ fn handle_key(
             _ => {}
         }
     }
+    if key.code == KeyCode::F(5) || local.workflow.visible {
+        if let Some(result) = workflow::handle_key(key, snapshot, &local.workflow) {
+            apply_workflow_key_result(result, local, tx);
+            return false;
+        }
+    }
     match key.code {
         KeyCode::Char('k') if control => {
             local.skills = !local.skills;
@@ -586,163 +567,6 @@ fn handle_key(
             local.workflow.scroll = 0;
             local.workflow.manual_scroll = false;
             local.workflow.link_cursor = None;
-        }
-        KeyCode::PageUp if local.workflow.visible => {
-            local.workflow.manual_scroll = true;
-            local.workflow.scroll = local.workflow.scroll.saturating_sub(8);
-        }
-        KeyCode::PageDown if local.workflow.visible => {
-            local.workflow.manual_scroll = true;
-            local.workflow.scroll = local.workflow.scroll.saturating_add(8);
-        }
-        KeyCode::Home if local.workflow.visible => {
-            local.workflow.manual_scroll = true;
-            local.workflow.scroll = 0;
-        }
-        KeyCode::End if local.workflow.visible => {
-            local.workflow.manual_scroll = true;
-            local.workflow.scroll = usize::MAX;
-        }
-        KeyCode::Char('d') if local.workflow.visible && key.modifiers.is_empty() => {
-            apply_workflow_navigation(
-                navigate_workflow_link(
-                    snapshot,
-                    local.workflow.selected_id,
-                    local.workflow.link_cursor,
-                    WorkflowLinkKind::Dependency,
-                ),
-                local,
-            );
-        }
-        KeyCode::Char('g') if local.workflow.visible && key.modifiers.is_empty() => {
-            apply_workflow_navigation(
-                navigate_workflow_link(
-                    snapshot,
-                    local.workflow.selected_id,
-                    local.workflow.link_cursor,
-                    WorkflowLinkKind::Gate,
-                ),
-                local,
-            );
-        }
-        KeyCode::Enter if local.workflow.visible && !control => {
-            if let Some(task) = selected_task(snapshot, local.workflow.selected_id) {
-                if stale_gate_link(snapshot, local.workflow.link_cursor, task) {
-                    local.notice = Some(
-                        "The captured Gate attempt is no longer current; use Up/Down to reselect the task before opening it.".into(),
-                    );
-                } else {
-                    match workflow_conversation(snapshot, task) {
-                        ConversationTarget::Root => {
-                            local.notice = None;
-                            local.agent_id = None;
-                            local.conversation_focus = None;
-                            local.scroll_from_bottom = 0;
-                            local.workflow.visible = false;
-                        }
-                        ConversationTarget::Child(agent) => {
-                            local.notice = None;
-                            local.agent_id = Some(agent.info.id.clone());
-                            local.conversation_focus = None;
-                            local.scroll_from_bottom = 0;
-                            local.workflow.visible = false;
-                        }
-                        ConversationTarget::Unavailable(message) => {
-                            local.notice = Some(message.into());
-                        }
-                    }
-                }
-            }
-        }
-        KeyCode::F(5) => {
-            send(
-                Command::Schedule(if snapshot.scheduler.paused {
-                    SchedulerCommand::ResumeWorkflow
-                } else {
-                    SchedulerCommand::PauseWorkflow
-                }),
-                tx,
-                local,
-            );
-        }
-        KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) if local.workflow.visible => {
-            if let Some(task) = selected_task(snapshot, local.workflow.selected_id) {
-                if stale_gate_link(snapshot, local.workflow.link_cursor, task) {
-                    local.notice = Some(
-                        "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
-                    );
-                } else {
-                    let command = match key.code {
-                        KeyCode::F(6) if task.pause_requested => SchedulerCommand::Resume(task.id),
-                        KeyCode::F(6) => SchedulerCommand::Pause(task.id),
-                        KeyCode::F(7) => SchedulerCommand::Cancel(task.id),
-                        _ => SchedulerCommand::Retry(task.id),
-                    };
-                    let attempt = TaskAttempt {
-                        task: task.id,
-                        attempt: task.attempt,
-                    };
-                    send(Command::ScheduleTask { attempt, command }, tx, local);
-                }
-            }
-        }
-        KeyCode::F(9) if local.workflow.visible => {
-            if local.workflow.confirm_stop {
-                send(Command::Schedule(SchedulerCommand::StopWorkflow), tx, local);
-                local.workflow.confirm_stop = false;
-            } else {
-                local.workflow.confirm_stop = true;
-                local.notice = Some("Press F9 again to cancel all workflow tasks. Any other key cancels this action.".into());
-            }
-        }
-        KeyCode::Up | KeyCode::Down if local.workflow.visible => {
-            let tasks = project_workflow(snapshot);
-            if !tasks.is_empty() {
-                let index = selected_task(snapshot, local.workflow.selected_id)
-                    .and_then(|task| tasks.iter().position(|id| *id == task.id))
-                    .unwrap_or(0);
-                let next = if key.code == KeyCode::Up {
-                    index.saturating_sub(1)
-                } else {
-                    (index + 1).min(tasks.len() - 1)
-                };
-                local.workflow.selected_id = Some(tasks[next]);
-                local.workflow.scroll = 0;
-                local.workflow.manual_scroll = false;
-                local.workflow.link_cursor = None;
-            }
-        }
-        KeyCode::Char('+') | KeyCode::Char('-')
-            if local.workflow.visible && key.modifiers.is_empty() =>
-        {
-            if let Some(task) = selected_task(snapshot, local.workflow.selected_id) {
-                if stale_gate_link(snapshot, local.workflow.link_cursor, task) {
-                    local.notice = Some(
-                        "The captured Gate attempt is no longer current; use Up/Down to reselect the task before changing it.".into(),
-                    );
-                } else {
-                    let priority = task.priority
-                        + if key.code == KeyCode::Char('+') {
-                            1
-                        } else {
-                            -1
-                        };
-                    send(
-                        Command::ScheduleTask {
-                            attempt: TaskAttempt {
-                                task: task.id,
-                                attempt: task.attempt,
-                            },
-                            command: SchedulerCommand::Reprioritize {
-                                task_id: task.id,
-                                priority,
-                            },
-                        },
-                        tx,
-                        local,
-                    );
-                }
-            }
         }
         KeyCode::F(1) => local.help = !local.help,
         KeyCode::F(2) => {
@@ -899,14 +723,74 @@ fn selected_agent_id<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> &'a 
         .map_or("root", |agent| agent.info.id.as_str())
 }
 
-fn apply_workflow_navigation(result: WorkflowLinkNavigation, local: &mut LocalState) {
-    if let Some(task_id) = result.task_id {
-        local.workflow.selected_id = Some(task_id);
-        local.workflow.scroll = 0;
-        local.workflow.manual_scroll = false;
+fn apply_workflow_key_result(
+    result: WorkflowKeyResult,
+    local: &mut LocalState,
+    tx: &tokio::sync::mpsc::Sender<Command>,
+) {
+    if let Some(action) = result.action {
+        let opened_conversation = matches!(
+            &action,
+            WorkflowAction::OpenConversation(
+                WorkflowConversation::Root | WorkflowConversation::Child(_)
+            )
+        );
+        match action {
+            WorkflowAction::Select(task_id) => {
+                local.workflow.selected_id = Some(task_id);
+                local.workflow.scroll = 0;
+                local.workflow.manual_scroll = false;
+                local.workflow.link_cursor = None;
+            }
+            WorkflowAction::Scroll { position, manual } => {
+                local.workflow.scroll = position;
+                local.workflow.manual_scroll = manual;
+            }
+            WorkflowAction::OpenConversation(target) => match target {
+                WorkflowConversation::Root => {
+                    local.notice = None;
+                    local.agent_id = None;
+                    local.workflow.visible = false;
+                }
+                WorkflowConversation::Child(agent_id) => {
+                    local.notice = None;
+                    local.agent_id = Some(agent_id);
+                    local.workflow.visible = false;
+                }
+                WorkflowConversation::Unavailable(message) => {
+                    local.notice = Some(message.into());
+                }
+            },
+            WorkflowAction::ConfirmStop(confirm) => {
+                local.workflow.confirm_stop = confirm;
+            }
+        }
+        if opened_conversation {
+            local.conversation_focus = None;
+            local.scroll_from_bottom = 0;
+        }
     }
-    local.workflow.link_cursor = result.cursor;
-    local.notice = result.notice;
+    if let Some(navigation) = result.navigation {
+        if let Some(task_id) = navigation.task_id {
+            local.workflow.selected_id = Some(task_id);
+            local.workflow.scroll = 0;
+            local.workflow.manual_scroll = false;
+        }
+        local.workflow.link_cursor = navigation.cursor;
+        local.notice = navigation.notice;
+    }
+    if let Some(notice) = result.notice {
+        local.notice = Some(notice);
+    }
+    if let Some(schedule) = result.schedule {
+        let command = match schedule {
+            WorkflowScheduleRequest::Workflow(command) => Command::Schedule(command),
+            WorkflowScheduleRequest::Task { attempt, command } => {
+                Command::ScheduleTask { attempt, command }
+            }
+        };
+        send(command, tx, local);
+    }
 }
 
 #[cfg(test)]
@@ -2609,7 +2493,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn task_controls_use_captured_attempts_and_render_without_mutating_core_facts() {
+    fn workflow_panel_binds_task_actions_and_requires_f9_confirmation() {
         use crate::scheduler::{Scheduler, TaskState};
         let mut scheduler = Scheduler::default();
         scheduler

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 use crate::agents::AgentSnapshot;
 use crate::observation::ActivityScope;
-use crate::scheduler::{TaskAttempt, TaskId, TaskSnapshot};
+use crate::scheduler::{SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot};
 use crate::state::CoreSnapshot;
 
 #[derive(Debug, Default)]
@@ -35,6 +37,270 @@ pub(super) struct WorkflowLinkNavigation {
     pub(super) task_id: Option<TaskId>,
     pub(super) cursor: Option<WorkflowLinkCursor>,
     pub(super) notice: Option<String>,
+}
+
+pub(super) enum WorkflowConversation {
+    Root,
+    Child(String),
+    Unavailable(&'static str),
+}
+
+pub(super) enum WorkflowAction {
+    Select(TaskId),
+    Scroll { position: usize, manual: bool },
+    OpenConversation(WorkflowConversation),
+    ConfirmStop(bool),
+}
+
+pub(super) enum WorkflowScheduleRequest {
+    Workflow(SchedulerCommand),
+    Task {
+        attempt: TaskAttempt,
+        command: SchedulerCommand,
+    },
+}
+
+pub(super) struct WorkflowKeyResult {
+    pub(super) action: Option<WorkflowAction>,
+    pub(super) navigation: Option<WorkflowLinkNavigation>,
+    pub(super) notice: Option<String>,
+    pub(super) schedule: Option<WorkflowScheduleRequest>,
+}
+
+impl WorkflowKeyResult {
+    fn handled() -> Self {
+        Self {
+            action: None,
+            navigation: None,
+            notice: None,
+            schedule: None,
+        }
+    }
+}
+
+pub(super) fn allows_key(key: KeyEvent) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = key.modifiers.is_empty();
+    control && matches!(key.code, KeyCode::Char('q' | 'd' | 'c'))
+        || plain
+            && matches!(
+                key.code,
+                KeyCode::F(2)
+                    | KeyCode::F(4)
+                    | KeyCode::F(5)
+                    | KeyCode::F(6)
+                    | KeyCode::F(7)
+                    | KeyCode::F(8)
+                    | KeyCode::F(9)
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Char('d' | 'g' | '+' | '-')
+            )
+}
+
+/// 工作流面板只解析本面板按键并返回意图；状态应用和 Core 命令发送由根路由负责。
+pub(super) fn handle_key(
+    key: KeyEvent,
+    snapshot: &CoreSnapshot,
+    panel: &WorkflowPanel,
+) -> Option<WorkflowKeyResult> {
+    if key.code == KeyCode::F(5) {
+        return Some(toggle_workflow(snapshot));
+    }
+    if !panel.visible {
+        return None;
+    }
+    let plain = key.modifiers.is_empty();
+    match key.code {
+        KeyCode::PageUp => Some(scroll(panel.scroll.saturating_sub(8))),
+        KeyCode::PageDown => Some(scroll(panel.scroll.saturating_add(8))),
+        KeyCode::Home => Some(scroll(0)),
+        KeyCode::End => Some(scroll(usize::MAX)),
+        KeyCode::Char('d') if plain => {
+            Some(navigate(snapshot, panel, WorkflowLinkKind::Dependency))
+        }
+        KeyCode::Char('g') if plain => Some(navigate(snapshot, panel, WorkflowLinkKind::Gate)),
+        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(open_conversation(snapshot, panel))
+        }
+        KeyCode::F(6) | KeyCode::F(7) | KeyCode::F(8) => {
+            Some(task_command(key.code, snapshot, panel))
+        }
+        KeyCode::F(9) => Some(stop_confirmation(panel.confirm_stop)),
+        KeyCode::Up | KeyCode::Down => Some(select_task(key.code, snapshot, panel)),
+        KeyCode::Char('+') | KeyCode::Char('-') if plain => {
+            Some(change_priority(key.code, snapshot, panel))
+        }
+        _ => None,
+    }
+}
+
+fn toggle_workflow(snapshot: &CoreSnapshot) -> WorkflowKeyResult {
+    WorkflowKeyResult {
+        schedule: Some(WorkflowScheduleRequest::Workflow(
+            if snapshot.scheduler.paused {
+                SchedulerCommand::ResumeWorkflow
+            } else {
+                SchedulerCommand::PauseWorkflow
+            },
+        )),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn scroll(position: usize) -> WorkflowKeyResult {
+    WorkflowKeyResult {
+        action: Some(WorkflowAction::Scroll {
+            position,
+            manual: true,
+        }),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn navigate(
+    snapshot: &CoreSnapshot,
+    panel: &WorkflowPanel,
+    kind: WorkflowLinkKind,
+) -> WorkflowKeyResult {
+    WorkflowKeyResult {
+        navigation: Some(navigate_workflow_link(
+            snapshot,
+            panel.selected_id,
+            panel.link_cursor,
+            kind,
+        )),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn open_conversation(snapshot: &CoreSnapshot, panel: &WorkflowPanel) -> WorkflowKeyResult {
+    let Some(task) = selected_task(snapshot, panel.selected_id) else {
+        return WorkflowKeyResult::handled();
+    };
+    if stale_gate_link(snapshot, panel.link_cursor, task) {
+        return stale_gate_notice("before opening it");
+    }
+    let target = match workflow_conversation(snapshot, task) {
+        ConversationTarget::Root => WorkflowConversation::Root,
+        ConversationTarget::Child(agent) => WorkflowConversation::Child(agent.info.id.clone()),
+        ConversationTarget::Unavailable(message) => WorkflowConversation::Unavailable(message),
+    };
+    WorkflowKeyResult {
+        action: Some(WorkflowAction::OpenConversation(target)),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn task_command(key: KeyCode, snapshot: &CoreSnapshot, panel: &WorkflowPanel) -> WorkflowKeyResult {
+    let Some(task) = selected_task(snapshot, panel.selected_id) else {
+        return WorkflowKeyResult::handled();
+    };
+    if stale_gate_link(snapshot, panel.link_cursor, task) {
+        return stale_gate_notice("before changing it");
+    }
+    let command = match key {
+        KeyCode::F(6) if task.pause_requested => SchedulerCommand::Resume(task.id),
+        KeyCode::F(6) => SchedulerCommand::Pause(task.id),
+        KeyCode::F(7) => SchedulerCommand::Cancel(task.id),
+        _ => SchedulerCommand::Retry(task.id),
+    };
+    WorkflowKeyResult {
+        schedule: Some(WorkflowScheduleRequest::Task {
+            attempt: TaskAttempt {
+                task: task.id,
+                attempt: task.attempt,
+            },
+            command,
+        }),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn stop_confirmation(confirmed: bool) -> WorkflowKeyResult {
+    if confirmed {
+        WorkflowKeyResult {
+            action: Some(WorkflowAction::ConfirmStop(false)),
+            schedule: Some(WorkflowScheduleRequest::Workflow(
+                SchedulerCommand::StopWorkflow,
+            )),
+            ..WorkflowKeyResult::handled()
+        }
+    } else {
+        WorkflowKeyResult {
+            action: Some(WorkflowAction::ConfirmStop(true)),
+            notice: Some(
+                "Press F9 again to cancel all workflow tasks. Any other key cancels this action."
+                    .into(),
+            ),
+            ..WorkflowKeyResult::handled()
+        }
+    }
+}
+
+fn select_task(key: KeyCode, snapshot: &CoreSnapshot, panel: &WorkflowPanel) -> WorkflowKeyResult {
+    let tasks = project_workflow(snapshot);
+    if tasks.is_empty() {
+        return WorkflowKeyResult::handled();
+    }
+    let index = selected_task(snapshot, panel.selected_id)
+        .and_then(|task| tasks.iter().position(|id| *id == task.id))
+        .unwrap_or(0);
+    let next = if key == KeyCode::Up {
+        index.saturating_sub(1)
+    } else {
+        (index + 1).min(tasks.len() - 1)
+    };
+    WorkflowKeyResult {
+        action: Some(WorkflowAction::Select(tasks[next])),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn change_priority(
+    key: KeyCode,
+    snapshot: &CoreSnapshot,
+    panel: &WorkflowPanel,
+) -> WorkflowKeyResult {
+    let Some(task) = selected_task(snapshot, panel.selected_id) else {
+        return WorkflowKeyResult::handled();
+    };
+    if stale_gate_link(snapshot, panel.link_cursor, task) {
+        return stale_gate_notice("before changing it");
+    }
+    let priority = if key == KeyCode::Char('+') {
+        task.priority.saturating_add(1)
+    } else {
+        task.priority.saturating_sub(1)
+    };
+    WorkflowKeyResult {
+        schedule: Some(WorkflowScheduleRequest::Task {
+            attempt: TaskAttempt {
+                task: task.id,
+                attempt: task.attempt,
+            },
+            command: SchedulerCommand::Reprioritize {
+                task_id: task.id,
+                priority,
+            },
+        }),
+        ..WorkflowKeyResult::handled()
+    }
+}
+
+fn stale_gate_notice(action: &str) -> WorkflowKeyResult {
+    WorkflowKeyResult {
+        notice: Some(format!(
+            "The captured Gate attempt is no longer current; use Up/Down to reselect the task {action}."
+        )),
+        ..WorkflowKeyResult::handled()
+    }
 }
 
 pub(super) enum ConversationTarget<'a> {
