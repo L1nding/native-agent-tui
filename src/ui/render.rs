@@ -308,7 +308,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     let activity = if local.help {
         "Ctrl+P command palette | Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+G context | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
-        notice.clone()
+        match &snapshot.last_error {
+            Some(error) => format!("{error}\n{notice}"),
+            None => notice.clone(),
+        }
     } else if let Some(request) = request {
         match &request.kind {
             RequestKind::UserInput { questions } => {

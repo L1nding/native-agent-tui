@@ -685,8 +685,19 @@ fn handle_key(
                 || explicit_queue)
                 || snapshot.thread_id.is_none()
             {
-                local.notice =
-                    Some("Wait for the current turn, or use Ctrl+C to interrupt.".into());
+                use crate::state::SessionPhase::*;
+                local.notice = Some(
+                    match snapshot.phase {
+                        Created | Launching | Initializing | CheckingShell | Ready => {
+                            "Still starting; your draft is kept. Press Enter again once Ready."
+                        }
+                        Stopping | ClosingTransport | Stopped | Disconnected | Unknown => {
+                            "This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history."
+                        }
+                        _ => "Wait for the current turn, or use Ctrl+C to interrupt.",
+                    }
+                    .into(),
+                );
             } else if snapshot.queued_inputs >= ROOT_QUEUE_LIMIT {
                 local.notice =
                     Some("The task queue is full (8 tasks); your draft is retained.".into());
@@ -2491,6 +2502,44 @@ mod tests {
     }
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn unusable_session_keeps_draft_and_shows_failure_reason() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Unknown,
+            last_error: Some("Shell preflight timed out; no model turn was started.".into()),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        local.editor.insert("中文任务");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "中文任务");
+        assert!(local
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("cannot run tasks"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Shell preflight timed out"), "{rendered}");
+        assert!(rendered.contains("Ctrl+Q"), "{rendered}");
+    }
 
     #[test]
     fn workflow_panel_binds_task_actions_and_requires_f9_confirmation() {

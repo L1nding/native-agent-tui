@@ -394,6 +394,8 @@ impl SessionState {
     pub fn error(&mut self, phase: SessionPhase, error: impl Into<String>) {
         self.view.phase = phase;
         self.view.last_error = Some(error.into());
+        // 进行中的提示（如“正在检查 shell”）在出错后已过期，留着会遮住错误原因。
+        self.view.notice = None;
         self.view.tool_activity = None;
     }
 }
@@ -431,6 +433,18 @@ mod tests {
         state.message("turn-2", "item", "late", false);
         assert_eq!(state.view.messages.len(), 1);
         assert_eq!(state.view.messages[0].text, "hello!");
+    }
+
+    #[test]
+    fn error_replaces_stale_progress_notice() {
+        let mut state = SessionState::default();
+        state.view.notice = Some("Checking the sandbox shell".into());
+        state.error(SessionPhase::Unknown, "Shell preflight timed out");
+        assert_eq!(state.view.notice, None);
+        assert_eq!(
+            state.view.last_error.as_deref(),
+            Some("Shell preflight timed out")
+        );
     }
 
     #[test]
