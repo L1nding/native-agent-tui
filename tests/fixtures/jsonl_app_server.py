@@ -6,6 +6,8 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
+# JSONL 协议固定 UTF-8；Windows 管道默认使用系统代码页，会破坏中文/emoji 回答。
+sys.stdin.reconfigure(encoding="utf-8")
 from windows_process_identity import record as record_processes
 
 root = Path(os.environ["NATIVE_JSONL_FIXTURE_ROOT"])

@@ -4,7 +4,7 @@ import sys
 
 
 def main():
-    fixture = json.load(sys.stdin)
+    fixture = json.loads(sys.stdin.buffer.read())
     assert fixture["fixture_version"] == 1
     initial, silence, resumed = fixture["snapshots"]
 

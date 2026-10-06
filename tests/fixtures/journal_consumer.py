@@ -4,7 +4,7 @@ import sys
 
 
 def main():
-    text = sys.stdin.read()
+    text = sys.stdin.buffer.read().decode("utf-8")
     records = [json.loads(line) for line in text.splitlines()]
     assert "PRIVATE_" not in text
     assert all(r["schema_version"] == 2 and r["historical"] for r in records)
