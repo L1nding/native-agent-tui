@@ -1789,9 +1789,11 @@ impl Core {
     fn response(&mut self, kind: RpcKind, result: Value) {
         let action = match kind {
             RpcKind::Initialize => {
-                if let Err(error) = crate::compatibility::verify_initialize(&result) {
-                    self.state.error(SessionPhase::Failed, error.to_string());
-                    return;
+                if !self.config.backend.is_acp() {
+                    if let Err(error) = crate::compatibility::verify_initialize(&result) {
+                        self.state.error(SessionPhase::Failed, error.to_string());
+                        return;
+                    }
                 }
                 if let Err(error) =
                     self.send_effect(Envelope::notification("initialized", None), None)
@@ -1799,16 +1801,18 @@ impl Core {
                     self.state.error(SessionPhase::Failed, error.to_string());
                     return;
                 }
-                Some(if self.check_only {
+                Some(if self.check_only && !self.config.backend.is_acp() {
                     RpcKind::Preflight
                 } else {
                     RpcKind::ThreadStart
                 })
             }
             RpcKind::ThreadStart => {
-                if let Err(error) = crate::compatibility::verify_thread_start(&result) {
-                    self.state.error(SessionPhase::Failed, error.to_string());
-                    return;
+                if !self.config.backend.is_acp() {
+                    if let Err(error) = crate::compatibility::verify_thread_start(&result) {
+                        self.state.error(SessionPhase::Failed, error.to_string());
+                        return;
+                    }
                 }
                 let Some(id) = result.pointer("/thread/id").and_then(Value::as_str) else {
                     self.state.error(
@@ -1828,7 +1832,16 @@ impl Core {
                 if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
                     self.state.view.cwd = cwd.into();
                 }
-                Some(RpcKind::Preflight)
+                if self.config.backend.is_acp() {
+                    // ACP has no Codex command/exec preflight. The session/new
+                    // response is the explicit backend readiness fact.
+                    self.state.view.phase = SessionPhase::Ready;
+                    self.state.view.notice = None;
+                    self.preflight_passed = true;
+                    None
+                } else {
+                    Some(RpcKind::Preflight)
+                }
             }
             RpcKind::Preflight => {
                 if result.get("exitCode").and_then(Value::as_i64) != Some(0)

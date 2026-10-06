@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::agents::{
     DEFAULT_MAX_NATIVE_CHILDREN, DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_NATIVE_TURNS,
 };
+use crate::backend::BackendKind;
 use crate::history::search::Category;
 use crate::journal::JournalSettings;
 use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
@@ -11,8 +12,11 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    pub backend: BackendKind,
     pub cwd: PathBuf,
     pub executable: PathBuf,
+    pub dsh_executable: PathBuf,
+    pub acp_profile: String,
     pub model: Option<String>,
     pub sandbox: String,
     pub approval_policy: String,
@@ -29,12 +33,17 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            backend: BackendKind::Codex,
             cwd: PathBuf::from("."),
             executable: std::env::var_os("CODEX_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
                     PathBuf::from(if cfg!(windows) { "codex.cmd" } else { "codex" })
                 }),
+            dsh_executable: std::env::var_os("DSH_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "dsh.cmd" } else { "dsh" })),
+            acp_profile: "acp".into(),
             model: None,
             sandbox: "workspace-write".into(),
             approval_policy: "on-request".into(),
@@ -169,6 +178,17 @@ where
             "--headless" if !headless => headless = true,
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
             "--codex" => config.executable = value(&args, &mut index, option)?.into(),
+            "--backend" => {
+                let raw = value(&args, &mut index, option)?;
+                config.backend =
+                    raw.parse::<BackendKind>()
+                        .map_err(|expected| CliError::InvalidValue {
+                            option: option.clone(),
+                            value: expected.into(),
+                        })?;
+            }
+            "--dsh" => config.dsh_executable = value(&args, &mut index, option)?.into(),
+            "--profile" => config.acp_profile = value(&args, &mut index, option)?,
             "--model" => config.model = Some(value(&args, &mut index, option)?),
             "--journal-dir" => config.journal.root = Some(value(&args, &mut index, option)?.into()),
             "--max-native-children" => {
@@ -724,6 +744,27 @@ mod tests {
             parse_args(Vec::<String>::new()).unwrap(),
             CliCommand::Tui { goal: None, .. }
         ));
+    }
+
+    #[test]
+    fn selects_deepseek_acp_without_changing_codex_defaults() {
+        let CliCommand::Run { config, .. } = parse_args([
+            "--backend",
+            "deepseek-acp",
+            "--dsh",
+            "custom-dsh",
+            "--profile",
+            "acp-test",
+            "--run",
+            "hello",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(config.backend, BackendKind::DeepSeekAcp);
+        assert_eq!(config.dsh_executable, PathBuf::from("custom-dsh"));
+        assert_eq!(config.acp_profile, "acp-test");
+        assert_eq!(Config::default().backend, BackendKind::Codex);
     }
 
     #[test]

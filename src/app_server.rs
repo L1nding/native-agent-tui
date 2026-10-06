@@ -8,6 +8,8 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 
+use crate::backend::acp::{self, AcpError};
+use crate::backend::BackendKind;
 use crate::compatibility::{self, CompatibilityError};
 use crate::config::Config;
 use crate::owned_process::{self, Child, Command, Input};
@@ -24,6 +26,8 @@ pub enum AppServerError {
     InvalidDirectory(String),
     #[error(transparent)]
     Compatibility(#[from] CompatibilityError),
+    #[error(transparent)]
+    Acp(#[from] AcpError),
     #[error(
         "startup query process cleanup could not be confirmed; inspect retained session evidence"
     )]
@@ -35,11 +39,22 @@ pub(crate) struct AppServer {
     pub pipe: Option<PipeTransport>,
     child: Child,
     stderr: JoinHandle<()>,
+    bridge: Option<JoinHandle<()>>,
     _catalog: Option<Arc<DirectCatalog>>,
 }
 
 impl AppServer {
     pub(crate) async fn spawn(config: &Config) -> Result<Self, AppServerError> {
+        if config.backend == BackendKind::DeepSeekAcp {
+            let process = acp::spawn(config)?;
+            return Ok(Self {
+                pipe: Some(process.core_pipe),
+                child: process.child,
+                stderr: process.stderr,
+                bridge: Some(process.bridge),
+                _catalog: None,
+            });
+        }
         let version = query_output(
             config,
             &["--version"],
@@ -97,6 +112,7 @@ impl AppServer {
             pipe: Some(PipeTransport::new(stdout, stdin)),
             child,
             stderr,
+            bridge: None,
             _catalog: None,
         })
     }
@@ -104,6 +120,14 @@ impl AppServer {
     pub(crate) async fn shutdown(&mut self) -> Result<(), AppServerError> {
         if let Some(pipe) = &mut self.pipe {
             pipe.close_writer().await;
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            if tokio::time::timeout(Duration::from_secs(1), &mut bridge)
+                .await
+                .is_err()
+            {
+                bridge.abort();
+            }
         }
         let exited = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         #[cfg(windows)]
@@ -289,6 +313,9 @@ impl Drop for AppServer {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         self.stderr.abort();
+        if let Some(bridge) = &self.bridge {
+            bridge.abort();
+        }
     }
 }
 

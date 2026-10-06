@@ -22,7 +22,7 @@ fn print_help() {
     };
     println!("Native Agent TUI {}", env!("CARGO_PKG_VERSION"));
     println!(
-        "Execution requires codex-cli {}.",
+        "Default execution requires codex-cli {}; --backend deepseek-acp uses dsh --profile <name>.",
         native_agent_tui::compatibility::SUPPORTED_CODEX_VERSION
     );
     println!(
@@ -42,6 +42,9 @@ Usage:
 Options:
   --cwd PATH       Working directory (default: current directory)
   --codex PATH     Codex executable (or CODEX_BIN)
+  --backend NAME    codex (default) | deepseek-acp
+  --dsh PATH        DeepSeek Harness executable (or DSH_BIN)
+  --profile NAME    DeepSeek ACP profile (default: acp)
   --model NAME     Requested model; uses Codex configuration when omitted
   --sandbox MODE   read-only | workspace-write | danger-full-access
   --approval MODE  untrusted | on-request | never (default: on-request)

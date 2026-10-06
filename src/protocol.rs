@@ -431,6 +431,8 @@ pub enum RpcId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jsonrpc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RpcId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -455,6 +457,7 @@ fn present_value<'de, D: serde::Deserializer<'de>>(
 impl Envelope {
     pub fn request(id: RpcId, method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
+            jsonrpc: None,
             id: Some(id),
             method: Some(method.into()),
             params,
@@ -465,6 +468,7 @@ impl Envelope {
 
     pub fn notification(method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
+            jsonrpc: None,
             id: None,
             method: Some(method.into()),
             params,
@@ -475,6 +479,7 @@ impl Envelope {
 
     pub fn response(id: RpcId, result: Option<Value>) -> Self {
         Self {
+            jsonrpc: None,
             id: Some(id),
             method: None,
             params: None,
@@ -485,6 +490,7 @@ impl Envelope {
 
     pub fn error_response(id: RpcId, code: i64, message: impl Into<String>) -> Self {
         Self {
+            jsonrpc: None,
             id: Some(id),
             method: None,
             params: None,
