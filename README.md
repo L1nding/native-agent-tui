@@ -60,7 +60,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F12 | Browse retained sessions and export redacted historical evidence |
 | Ctrl+P | Open the local command palette; type to filter, Enter to open a panel, Esc to close |
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
-| Escape | Close help/tasks and clear input |
+| Escape | Close help, panels, and notices; the draft is kept (Ctrl+U clears it) |
 
 Chinese, combining characters, and emoji are edited as whole graphemes. Secret answers are masked and kept outside conversation history. A task draft is saved while answering questions. Messages and queues have byte limits; history truncation is visible.
 

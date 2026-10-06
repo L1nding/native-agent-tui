@@ -605,10 +605,10 @@ fn handle_key(
                 local.workflow.manual_scroll = false;
                 return false;
             }
+            // Esc 只关闭浮层和提示；误按不能丢掉草稿，清空输入用 Ctrl+U。
             local.help = false;
-            local.workflow.visible = false;
             local.evidence = false;
-            local.editor.clear();
+            local.notice = None;
         }
         KeyCode::PageUp => {
             local.conversation_focus = None;
@@ -2502,6 +2502,26 @@ mod tests {
     }
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn escape_closes_help_without_discarding_draft() {
+        let snapshot = CoreSnapshot::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        local.editor.insert("草稿 draft");
+        local.help = true;
+        for _ in 0..2 {
+            handle_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+        }
+        assert!(!local.help);
+        assert_eq!(local.editor.text, "草稿 draft");
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn unusable_session_keeps_draft_and_shows_failure_reason() {
