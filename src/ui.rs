@@ -2524,6 +2524,64 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn scrolled_conversation_says_how_to_return_and_styles_roles() {
+        let messages = (0..30)
+            .map(|index| ConversationItem {
+                id: format!("m{index}"),
+                thread_id: "root".into(),
+                turn_id: "turn".into(),
+                role: if index % 2 == 0 { "You" } else { "Agent" }.into(),
+                text: format!("line {index}"),
+                complete: true,
+                truncated: false,
+            })
+            .collect();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Completed,
+            thread_id: Some("root".into()),
+            messages,
+            ..CoreSnapshot::default()
+        };
+        let mut local = LocalState::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let screen = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        assert!(!screen(&terminal).contains("more rows below"));
+        let buffer = terminal.backend().buffer();
+        // 对话区正文从第 1 列开始；标题栏里的 "Agent" 不算。
+        let role_cell = (0..24)
+            .map(|y| (1, y))
+            .find(|&(x, y)| {
+                (0..5).all(|offset| {
+                    buffer[(x + offset, y)].symbol()
+                        == &"Agent"[offset as usize..offset as usize + 1]
+                })
+            })
+            .unwrap();
+        assert!(buffer[role_cell]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD));
+
+        local.scroll_from_bottom = 8;
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("8 more rows below"), "{rendered}");
+        assert!(rendered.contains("Ctrl+End latest"), "{rendered}");
+    }
+
+    #[test]
     fn running_and_failed_turns_explain_the_next_step() {
         let render = |snapshot: &CoreSnapshot, local: &LocalState| {
             let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();

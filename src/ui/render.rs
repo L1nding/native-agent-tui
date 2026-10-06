@@ -1,7 +1,7 @@
 //! Read-only terminal rendering composed from a Core snapshot and local UI state.
 
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
@@ -196,12 +196,21 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     };
     let (width, height) = conversation_content_size(conversation_area);
     let mut transcript = Vec::new();
+    let mut role_rows = std::collections::HashMap::new();
     let mut focused_row = None;
     for message in snapshot
         .messages
         .iter()
         .filter(|message| message.thread_id == selected_thread)
     {
+        role_rows.insert(
+            transcript.len(),
+            if message.role == "You" {
+                Color::Cyan
+            } else {
+                Color::Green
+            },
+        );
         transcript.push(format!(
             "{}{}",
             message.role,
@@ -250,8 +259,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 .unwrap_or(&agent.info.id)
         })
         .unwrap_or("root");
+    let below = max_scroll.saturating_sub(start);
     let title = display_text(&format!(
-        " {name} · F3 switch{}{} ",
+        " {name} · F3 switch{}{}{} ",
         if snapshot.history_truncated {
             " [older content truncated]"
         } else {
@@ -261,6 +271,11 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             " [search content changed/evicted]"
         } else {
             ""
+        },
+        if below > 0 {
+            format!(" · {below} more rows below, Ctrl+End latest")
+        } else {
+            String::new()
         }
     ));
     let visible: Vec<_> = transcript
@@ -271,6 +286,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .map(|(row, text)| {
             if Some(row) == focused_row {
                 Line::from(text).style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
+            } else if let Some(color) = role_rows.get(&row) {
+                Line::from(text).style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
             } else {
                 Line::from(text)
             }
