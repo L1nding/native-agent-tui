@@ -247,11 +247,13 @@ impl AcpBridge {
                         .and_then(|value| value.get("decision"))
                         .and_then(Value::as_str)
                         .unwrap_or("decline");
-                    let option = choose_permission_option(decision, &permission.options);
-                    Envelope::response(
-                        id,
-                        Some(json!({"outcome":{"outcome":"selected","optionId":option}})),
-                    )
+                    let outcome = if decision == "cancel" {
+                        json!({"outcome":"cancelled"})
+                    } else {
+                        let option = choose_permission_option(decision, &permission.options);
+                        json!({"outcome":"selected","optionId":option})
+                    };
+                    Envelope::response(id, Some(json!({"outcome": outcome})))
                 };
                 self.acp.send(with_jsonrpc(response))?;
             }
