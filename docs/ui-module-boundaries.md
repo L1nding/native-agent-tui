@@ -16,6 +16,7 @@
 - `ui/workflow`：任务选择顺序、依赖/Gate 链接导航、过期链接检查和 root/child 精确会话定位。
 - `ui/workflow_view`：Agent 树投影与渲染、工作流/Gate 视图和状态文案；紧凑布局由终端高度决定，视图只读快照。
 - `ui/history`：持久会话列表、历史搜索、只读详情和导出预览。
+- `ui/commands`：本地命令面板的静态导航项、过滤/选择/滚动、粘贴编辑和无副作用 `PaletteAction`。
 
 工作流模块只接收 `CoreSnapshot`、选中的 `TaskId` 和链接游标，返回导航结果；它不依赖根 UI 的 `LocalState`，也不发送 Core 命令。根模块负责把结果应用到本地滚动/选择状态，并决定是否提交调度或打开对话。
 

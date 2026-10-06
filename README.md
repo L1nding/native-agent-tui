@@ -50,6 +50,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F10 | Edit temporary attention thresholds; Up/Down class, Tab field, Enter apply |
 | F11 / PageUp, PageDown | Open activity evidence / scroll its details |
 | F12 | Browse retained sessions and export redacted historical evidence |
+| Ctrl+P | Open the local command palette; type to filter, Enter to open a panel, Esc to close |
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
 | Escape | Close help/tasks and clear input |
 

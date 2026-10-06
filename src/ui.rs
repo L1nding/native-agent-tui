@@ -25,6 +25,7 @@ use crate::scheduler::{RootTaskSpec, SchedulerCommand, TaskAttempt, ROOT_QUEUE_L
 use crate::state::{display_text, CoreSnapshot, MESSAGE_BYTES};
 
 mod activity;
+mod commands;
 mod context;
 mod history;
 mod input;
@@ -42,6 +43,7 @@ mod workflow_view;
 
 use activity::compaction_fact_rows;
 use activity::{age, draw_evidence, evidence_brief, focus_activity, reminder_brief, usage_status};
+use commands::{PaletteAction, PaletteEvent};
 use input::{InputEvent, TerminalInput};
 use skills::{draw_skills, skills_panel_entries_capacity};
 use workflow::{
@@ -136,6 +138,7 @@ struct LocalState {
     help: bool,
     workflow: workflow::WorkflowPanel,
     context: context::ContextPanel,
+    palette: commands::PaletteState,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -214,7 +217,8 @@ pub async fn run_tasks_with_history(
                 local.search.dispatch(snapshot.clone(), &mut search);
                 local.timeline.sync(&snapshot);
                 terminal.terminal.draw(|frame| {
-                    if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
+                    if local.palette.visible { draw(frame, &snapshot, &local); }
+                    else if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
                 })?;
                 dirty = false;
@@ -255,7 +259,9 @@ pub async fn run_tasks_with_history(
                         match event {
                             InputEvent::Key(key) if key.kind != KeyEventKind::Release => {
                                 let snapshot = client.snapshots.borrow().clone();
-                                if history_panel.visible {
+                                if local.palette.visible {
+                                    if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
+                                } else if history_panel.visible {
                                     if history_panel.key(key, &mut history, false) { return Ok(()); }
                                 } else if key.code == KeyCode::F(12) {
                                     local.search.close();
@@ -265,14 +271,24 @@ pub async fn run_tasks_with_history(
                                 dirty = true;
                             }
                             InputEvent::Paste(text) => {
+                                if local.palette.visible {
+                                    local.palette.paste(&text);
+                                    dirty = true;
+                                    continue;
+                                }
                                 if history_panel.visible { history_panel.paste(&text); dirty = true; continue; }
                                 let snapshot = client.snapshots.borrow().clone();
                                 handle_paste(&text, &snapshot, &mut local);
                                 dirty = true;
                             }
                             InputEvent::PasteRejected => {
-                                if history_panel.visible { history_panel.notice = Some(PASTE_REJECTED.into()); }
-                                else { reject_paste(&mut local); }
+                                if local.palette.visible {
+                                    local.palette.reject_paste();
+                                } else if history_panel.visible {
+                                    history_panel.notice = Some(PASTE_REJECTED.into());
+                                } else {
+                                    reject_paste(&mut local);
+                                }
                                 dirty = true;
                             }
                             InputEvent::Resize(_, _) => dirty = true,
@@ -359,6 +375,10 @@ pub async fn run_history(
 }
 
 fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
+    if local.palette.visible {
+        local.palette.paste(text);
+        return;
+    }
     if local.workflow.visible {
         return;
     }
@@ -486,6 +506,96 @@ fn send(command: Command, tx: &tokio::sync::mpsc::Sender<Command>, local: &mut L
     }
 }
 
+fn close_mutual_overlays(local: &mut LocalState) {
+    local.search.close();
+    local.timeline.close();
+    local.skills = false;
+    local.context.visible = false;
+    local.context.scroll = 0;
+    local.request_panel = false;
+    local.evidence = false;
+    local.workflow.visible = false;
+    local.workflow.link_cursor = None;
+    local.workflow.scroll = 0;
+    local.workflow.manual_scroll = false;
+    local.attention_editor = None;
+    local.help = false;
+}
+
+fn open_palette_action(action: PaletteAction, snapshot: &CoreSnapshot, local: &mut LocalState) {
+    let already_visible = match action {
+        PaletteAction::Search => local.search.visible,
+        PaletteAction::Timeline => local.timeline.visible,
+        PaletteAction::Context => local.context.visible,
+        PaletteAction::Skills => local.skills,
+        PaletteAction::Requests => local.request_panel,
+        PaletteAction::Workflow => local.workflow.visible,
+        PaletteAction::Evidence => local.evidence,
+        PaletteAction::Attention => local.attention_editor.is_some(),
+        PaletteAction::Help => local.help,
+        PaletteAction::NextAgent => false,
+    };
+    close_mutual_overlays(local);
+    if already_visible {
+        return;
+    }
+    match action {
+        PaletteAction::Search => {
+            let thread = local
+                .agent_id
+                .clone()
+                .or_else(|| snapshot.thread_id.clone())
+                .unwrap_or_default();
+            local.search.open(thread);
+        }
+        PaletteAction::Timeline => {
+            let thread = local
+                .agent_id
+                .clone()
+                .or_else(|| snapshot.thread_id.clone())
+                .unwrap_or_default();
+            local.timeline.open(thread, snapshot);
+        }
+        PaletteAction::Context => local.context.toggle(),
+        PaletteAction::Skills => {
+            local.skills = true;
+            local.skills_scroll = 0;
+        }
+        PaletteAction::Requests => {
+            let current = selected_request(snapshot, local)
+                .filter(|request| !request.responding)
+                .or_else(|| snapshot.requests.iter().find(|request| !request.responding));
+            if let Some(request) = current {
+                local.request_selection = Some(request.reference());
+                local.request_panel = true;
+                local.request_scroll = 0;
+                sync_local_requests(local, snapshot);
+                local.notice = None;
+            } else {
+                local.notice = Some("No pending requests.".into());
+            }
+        }
+        PaletteAction::Workflow => {
+            local.workflow.visible = true;
+        }
+        PaletteAction::Evidence => {
+            local.evidence = true;
+            local.evidence_scroll = 0;
+        }
+        PaletteAction::Attention => {
+            local.attention_editor = Some(AttentionEditor::new(snapshot, 0));
+        }
+        PaletteAction::Help => {
+            local.help = true;
+        }
+        PaletteAction::NextAgent => {
+            local.conversation_focus = None;
+            local.agent_id = workflow_view::next_agent_id(snapshot, local.agent_id.as_deref());
+            local.scroll_from_bottom = 0;
+        }
+    }
+}
+
 fn handle_key(
     key: KeyEvent,
     snapshot: &CoreSnapshot,
@@ -495,6 +605,17 @@ fn handle_key(
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if control && key.code == KeyCode::Char('p') {
+        local.palette.toggle();
+        return false;
+    }
+    if local.palette.visible {
+        match local.palette.key(key) {
+            PaletteEvent::Action(action) => open_palette_action(action, snapshot, local),
+            PaletteEvent::Close | PaletteEvent::Consumed => {}
+        }
+        return false;
+    }
     if local.context.visible {
         if control && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d')) {
             return true;
@@ -1262,6 +1383,10 @@ fn conversation_content_size(area: ratatui::layout::Rect) -> (usize, usize) {
 
 fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
     let area = frame.area();
+    if local.palette.visible {
+        local.palette.draw(frame, area);
+        return;
+    }
     if area.width < 24 || area.height < 8 {
         frame.render_widget(
             Paragraph::new(format!(
@@ -1539,7 +1664,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         .or(snapshot.notice.as_ref())
         .or(snapshot.last_error.as_ref());
     let activity = if local.help {
-        "Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+G context | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
+        "Ctrl+P command palette | Ctrl+T evidence timeline | Ctrl+F retained conversation search | Ctrl+G context | Ctrl+K skills inventory | Enter task/answer | Ctrl+S queue/answer (Ctrl+Enter) | Ctrl+O newline (Shift+Enter) | Ctrl+C interrupt root | Ctrl+Q quit | Ctrl+W acknowledge/restore silence reminders for selected agent | F2 request | F3 agent | F4 tasks | F5 pause dispatch | F6 pause task | F7 cancel | F8 retry (may repeat effects) | +/- priority | F9 twice stop workflow | F10 thresholds | F11 evidence | F12 history/export".to_owned()
     } else if let Some(notice) = &local.notice {
         notice.clone()
     } else if let Some(request) = request {
@@ -1661,7 +1786,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
         } else if local.evidence {
             "Ctrl+W wait/restore  PgUp/PgDn scroll  F11 close  F3 agent"
         } else {
-            "Enter send | Ctrl+T timeline | Ctrl+F search | Ctrl+Q quit | F1 help"
+            "Enter send | Ctrl+P commands | Ctrl+T timeline | Ctrl+F search | Ctrl+Q quit | F1 help"
         }),
         chunks[4],
     );
@@ -1776,6 +1901,151 @@ mod tests {
 
     fn observed_snapshot() -> CoreSnapshot {
         observed_snapshot_with_requests(&[])
+    }
+
+    #[test]
+    fn command_palette_is_modal_and_opens_search_without_commands() {
+        let snapshot = observed_snapshot();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        local.editor.insert("TASK_DRAFT");
+        local.task_draft = Some(Editor {
+            text: "SECRET_TASK_DRAFT".into(),
+            cursor: "SECRET_TASK_DRAFT".len(),
+        });
+        local
+            .answers
+            .insert("secret".into(), vec!["SECRET_ANSWER".into()]);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.palette.visible);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        handle_paste("中文🙂\n", &snapshot, &mut local);
+        assert!(local.palette.visible);
+        assert!(!local.context.visible);
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.palette.visible);
+        assert!(!local.search.visible);
+        assert!(!local.timeline.visible);
+        assert!(rx.try_recv().is_err());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.palette.visible);
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        local.palette.paste("search");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.palette.visible);
+        assert!(local.search.visible);
+        assert_eq!(local.editor.text, "TASK_DRAFT");
+        assert_eq!(
+            local.task_draft.as_ref().map(|draft| draft.text.as_str()),
+            Some("SECRET_TASK_DRAFT")
+        );
+        assert_eq!(
+            local.answers.get("secret"),
+            Some(&vec!["SECRET_ANSWER".to_string()])
+        );
+        assert!(rx.try_recv().is_err());
+
+        handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.palette.visible);
+        assert!(local.search.visible);
+        handle_key(
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.palette.visible);
+        assert!(local.search.visible);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn command_palette_action_closes_mutual_overlay_and_renders_no_results() {
+        use ratatui::backend::TestBackend;
+
+        let snapshot = observed_snapshot();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        local.timeline.open("root-thread".into(), &snapshot);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.palette.visible);
+        local.palette.paste("zzzz");
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("No matching commands."), "{screen}");
+        local.palette.close();
+        handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        local.palette.paste("context");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.search.visible);
+        assert!(!local.timeline.visible);
+        assert!(local.context.visible);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
