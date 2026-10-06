@@ -1,18 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{self, stdout, Stdout};
+use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use ratatui::backend::CrosstermBackend;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Terminal;
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -37,6 +31,7 @@ mod requests;
 mod scope;
 mod search;
 mod skills;
+mod terminal;
 mod timeline;
 mod tool_detail;
 mod tool_search;
@@ -49,9 +44,10 @@ use activity::{age, draw_evidence, evidence_brief, focus_activity, reminder_brie
 use attention::{draw_attention_editor, AttentionEditor};
 use commands::{PaletteAction, PaletteEvent};
 use editor::Editor;
-use input::{InputEvent, TerminalInput};
+use input::InputEvent;
 use layout::{conversation_content_size, main_layout, wrap};
 use skills::{draw_skills, skills_panel_entries_capacity};
+use terminal::TerminalGuard;
 use workflow::{
     navigate_workflow_link, project_workflow, selected_task, stale_gate_link,
     workflow_conversation, ConversationTarget, WorkflowLinkKind, WorkflowLinkNavigation,
@@ -67,6 +63,8 @@ use crate::state::FactSource;
 use activity::truncate_display_label;
 #[cfg(test)]
 use activity::{activity_brief, format_token_budget_evidence, token_budget_brief};
+#[cfg(test)]
+use ratatui::Terminal;
 #[cfg(test)]
 use workflow::WorkflowLinkCursor;
 
@@ -1677,53 +1675,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalSt
     }
     if local.request_panel && local.attention_editor.is_none() {
         requests::draw(frame, snapshot, local);
-    }
-}
-
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    input: TerminalInput,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<Self, UiError> {
-        enable_raw_mode()?;
-        let mut input = match TerminalInput::enter() {
-            Ok(input) => input,
-            Err(error) => {
-                let _ = disable_raw_mode();
-                return Err(error.into());
-            }
-        };
-        let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, event::EnableBracketedPaste) {
-            let _ = input.restore();
-            let _ = disable_raw_mode();
-            let _ = execute!(output, LeaveAlternateScreen, event::DisableBracketedPaste);
-            return Err(error.into());
-        }
-        match Terminal::new(CrosstermBackend::new(output)) {
-            Ok(terminal) => Ok(Self { terminal, input }),
-            Err(error) => {
-                let _ = input.restore();
-                let _ = disable_raw_mode();
-                let _ = execute!(stdout(), LeaveAlternateScreen, event::DisableBracketedPaste);
-                Err(error.into())
-            }
-        }
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = self.input.restore();
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            event::DisableBracketedPaste
-        );
-        let _ = self.terminal.show_cursor();
     }
 }
 
