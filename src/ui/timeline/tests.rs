@@ -262,6 +262,54 @@ fn enter_opens_only_the_exact_tool_locator_and_escape_returns_without_commands()
 }
 
 #[test]
+fn enter_opens_exact_tool_details_from_the_latest_turn_mirror() {
+    let tool = tool_event(1);
+    let locator = ToolDetailLocator {
+        session_id: "live-session".into(),
+        identity: tool.identity.clone(),
+        item_id: tool.item_id.clone().unwrap(),
+    };
+
+    for kind in [EvidenceKind::Output, EvidenceKind::ToolCompleted] {
+        let mut mirror = (*tool).clone();
+        mirror.scope = ActivityScope::Turn;
+        mirror.activity_kind = ActivityKind::ModelStreaming;
+        mirror.execution_state = ExecutionState::Running;
+        mirror.tool_category = None;
+        mirror.evidence.id = 2;
+        mirror.evidence.kind = kind;
+        let mut current = source(vec![tool.clone(), Arc::new(mirror)]);
+        current.tool_details = tool_details(locator.clone());
+
+        let mut panel = TimelinePanel::default();
+        panel.open("root".into(), &current);
+        assert_eq!(panel.selected, Some(2), "latest mirror: {kind:?}");
+        assert!(key(&mut panel, KeyCode::Enter, &current).is_none());
+        assert_eq!(panel.tool_detail, Some(locator.clone()), "{kind:?}");
+    }
+
+    let mut mirror = (*tool).clone();
+    mirror.scope = ActivityScope::Turn;
+    mirror.activity_kind = ActivityKind::ModelStreaming;
+    mirror.execution_state = ExecutionState::Running;
+    mirror.tool_category = None;
+    mirror.evidence.id = 2;
+    mirror.evidence.kind = EvidenceKind::ToolCompleted;
+    let mut stale = locator.clone();
+    stale.identity.generation = Some(2);
+    let mut current = source(vec![tool, Arc::new(mirror)]);
+    current.tool_details = tool_details(stale);
+
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+    key(&mut panel, KeyCode::Enter, &current);
+    assert!(
+        panel.tool_detail.is_none(),
+        "stale generation must not open"
+    );
+}
+
+#[test]
 fn stale_exact_tool_details_fall_back_to_retained_metadata_trace() {
     let entry = tool_event(1);
     let mut current = source(vec![entry.clone()]);

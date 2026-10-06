@@ -443,7 +443,8 @@ impl TimelinePanel {
                     }
                     self.notice =
                         Some("This request delivery has ended; no current request matches.".into());
-                } else if entry.scope == ActivityScope::Tool
+                } else if (entry.scope == ActivityScope::Tool
+                    || has_exact_tool_detail(&entry, current))
                     && matches!(
                         entry.evidence.kind,
                         EvidenceKind::ToolStarted
@@ -738,6 +739,18 @@ fn active(state: ExecutionState) -> bool {
         state,
         ExecutionState::Starting | ExecutionState::Running | ExecutionState::Waiting
     )
+}
+
+fn has_exact_tool_detail(entry: &TimelineEntry, current: &CoreSnapshot) -> bool {
+    let Some(item_id) = entry.item_id.clone() else {
+        return false;
+    };
+    let locator = ToolDetailLocator {
+        session_id: current.timeline.session_id.clone(),
+        identity: entry.identity.clone(),
+        item_id,
+    };
+    current.tool_details.get(&locator).is_some()
 }
 
 fn metadata(entry: &TimelineEntry) -> Vec<String> {
