@@ -19,7 +19,7 @@ use super::workflow_view;
 use super::{selected_request, LocalState};
 use crate::interactions::RequestKind;
 use crate::observation::{AttentionLevel, ExecutionState};
-use crate::state::{display_text, CoreSnapshot};
+use crate::state::{display_text, CoreSnapshot, SessionPhase};
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
     let area = frame.area();
     if local.palette.visible {
@@ -398,7 +398,17 @@ pub(super) fn status_text(snapshot: &CoreSnapshot, local: &LocalState) -> String
     let request = selected_request(snapshot, local);
     let waiting = snapshot.gate.as_ref().filter(|gate| gate.pending);
     // 错误原因始终保留在提示前面，后续提示不能把它遮住。
-    let notice = match (snapshot.notice.as_ref(), snapshot.last_error.as_ref()) {
+    let error = snapshot.last_error.as_ref().map(|error| {
+        if snapshot.phase == SessionPhase::Failed && !snapshot.startup_blocked {
+            format!(
+                "Turn failed: {error}
+Enter a new task to continue; F8 retries a failed workflow task."
+            )
+        } else {
+            error.clone()
+        }
+    });
+    let notice = match (snapshot.notice.as_ref(), error.as_ref()) {
         (Some(notice), Some(error)) if notice != error => Some(format!(
             "{error}
 {notice}"
@@ -407,8 +417,11 @@ pub(super) fn status_text(snapshot: &CoreSnapshot, local: &LocalState) -> String
     };
     let notice = local.notice.as_ref().or(notice.as_ref());
     if let Some(notice) = &local.notice {
-        match &snapshot.last_error {
-            Some(error) => format!("{error}\n{notice}"),
+        match &error {
+            Some(error) => format!(
+                "{error}
+{notice}"
+            ),
             None => notice.clone(),
         }
     } else if let Some(request) = request {

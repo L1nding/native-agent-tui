@@ -698,7 +698,7 @@ fn handle_key(
                         Stopping | ClosingTransport | Stopped | Disconnected | Unknown => {
                             "This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history."
                         }
-                        _ => "Wait for the current turn, or use Ctrl+C to interrupt.",
+                        _ => "A turn is running: Ctrl+S queues this task to run next, Ctrl+C interrupts.",
                     }
                     .into(),
                 );
@@ -2522,6 +2522,51 @@ mod tests {
     }
     use crate::state::{ConversationItem, SessionPhase};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn running_and_failed_turns_explain_the_next_step() {
+        let render = |snapshot: &CoreSnapshot, local: &LocalState| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, snapshot, local)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let running = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        local.editor.insert("next task");
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &running,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "next task");
+        assert!(render(&running, &local).contains("Ctrl+S queues"));
+
+        let failed = CoreSnapshot {
+            phase: SessionPhase::Failed,
+            thread_id: Some("root".into()),
+            last_error: Some("model overloaded".into()),
+            ..CoreSnapshot::default()
+        };
+        let rendered = render(&failed, &LocalState::default());
+        assert!(
+            rendered.contains("Turn failed: model overloaded"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Enter a new task"), "{rendered}");
+    }
 
     #[test]
     fn request_details_show_the_command_first_and_a_clean_hint_row() {
