@@ -2524,6 +2524,42 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn request_details_show_the_command_first_and_a_clean_hint_row() {
+        let request = RequestView::decode(
+            RpcId::Number(7),
+            "item/commandExecution/requestApproval",
+            &serde_json::json!({"threadId":"root","turnId":"one","itemId":"shell",
+                "command":"cargo test 中文","cwd":"COMMAND_DIRECTORY",
+                "availableDecisions":["accept","decline"]}),
+        )
+        .unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            requests: vec![request],
+            ..CoreSnapshot::default()
+        };
+        let mut local = LocalState {
+            request_panel: true,
+            ..Default::default()
+        };
+        sync_local_requests(&mut local, &snapshot);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("Command approval"), "{screen}");
+        assert!(screen.contains("cargo test"), "{screen}");
+        assert!(!screen.contains("Cancel rejects"), "{screen}");
+        assert_eq!(rows[23].trim_end(), "F2 next  PgUp/Dn  Esc close");
+    }
+
+    #[test]
     fn startup_blocked_session_keeps_draft_and_shows_error_with_notice() {
         let snapshot = CoreSnapshot {
             phase: SessionPhase::Failed,

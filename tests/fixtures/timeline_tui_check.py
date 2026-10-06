@@ -254,7 +254,7 @@ def main():
             time.sleep(.1)
             assert answers() == before
             console.write('\r')
-            console.wait(lambda screen: 'Context source: server request' in screen, 'current request was not located')
+            console.wait(lambda screen: '── Details ──' in screen, 'current request was not located')
             console.write('\x0e')  # Explicitly decline in the request panel.
             console.wait(lambda _: answers() == expected, 'explicit approval answer missing')
             # Force synchronization with the resulting new delivery / input form.

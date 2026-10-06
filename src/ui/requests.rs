@@ -36,77 +36,27 @@ pub(super) fn actions(
 }
 
 fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -> Vec<String> {
-    let mut lines = vec![
-        format!(
-            "Request: {:?} | received sequence {}",
-            request.id, request.received_seq
-        ),
-        format!("Agent/thread: {}", request.thread_id),
-        format!("Turn: {}", request.turn_id),
-        format!(
-            "Item: {}",
-            request.details.item_id.as_deref().unwrap_or("unavailable")
-        ),
-        format!(
-            "Server start ms: {}",
-            request
-                .details
-                .started_at_ms
-                .map_or_else(|| "unavailable".into(), |ms| ms.to_string())
-        ),
-        format!(
-            "Kind: {}",
-            match request.kind {
-                RequestKind::CommandApproval => "command approval",
-                RequestKind::FileApproval => "file approval",
-                RequestKind::UserInput { .. } => "user input",
-            }
-        ),
-        format!(
-            "State: {}",
-            if request_locked(snapshot, local, request) {
-                "submitted or unavailable"
-            } else {
-                "awaiting your answer"
-            }
-        ),
-    ];
-    let root = snapshot.thread_id.as_deref() == Some(&request.thread_id);
-    if root {
-        lines.push(format!("Effective sandbox:\n{}", snapshot.sandbox));
-        lines.push(format!(
-            "Effective approval policy:\n{}",
-            snapshot.approval_policy
-        ));
-    } else {
-        lines.push("Child effective sandbox / approval policy: unavailable".into());
-        lines.push(format!(
-            "Root sandbox: {} | approval policy: {}",
-            snapshot.sandbox, snapshot.approval_policy
-        ));
-    }
-    lines.push(format!("Session cwd: {}", snapshot.cwd));
-    lines.push("Context source: server request".into());
-    lines.push("Proposals: not applied".into());
+    // 先显示要决定的内容（命令、文件、问题），身份和策略元数据放在后面。
+    let mut lines = vec![format!(
+        "{} · {}",
+        match request.kind {
+            RequestKind::CommandApproval => "Command approval",
+            RequestKind::FileApproval => "File approval",
+            RequestKind::UserInput { .. } => "User input",
+        },
+        if request_locked(snapshot, local, request) {
+            "submitted or unavailable"
+        } else {
+            "awaiting your answer"
+        }
+    )];
+    let mut meta = Vec::new();
     match &request.kind {
         RequestKind::UserInput { questions } => {
-            lines.push(format!(
-                "Server blocking hint: {}",
-                request
-                    .details
-                    .is_blocking
-                    .map_or_else(|| "unavailable".into(), |blocking| blocking.to_string())
-            ));
-            lines.push(format!(
-                "Legacy auto-resolution hint: {}",
-                request.details.auto_resolution_ms.map_or_else(
-                    || "unavailable".into(),
-                    |ms| format!("{ms} ms (informational)")
-                )
-            ));
             for (index, question) in questions.iter().enumerate() {
                 lines.push(format!(
-                    "\nQuestion {}/{} · {} · id={}{}{}",
+                    "
+Question {}/{} · {} · id={}{}{}",
                     index + 1,
                     questions.len(),
                     question.header,
@@ -131,22 +81,22 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                     lines.push("Options: free text".into());
                 }
             }
-        }
-        _ => {
-            lines.push(format!(
-                "Server decisions:\n{}",
-                request.details.available_decisions.as_ref().map_or_else(
-                    || "unavailable; client choices: accept / decline / cancel".into(),
-                    |decisions| if decisions.is_empty() {
-                        "none".into()
-                    } else {
-                        decisions.join("\n")
-                    }
+            meta.push(format!(
+                "Server blocking hint: {}",
+                request
+                    .details
+                    .is_blocking
+                    .map_or_else(|| "unavailable".into(), |blocking| blocking.to_string())
+            ));
+            meta.push(format!(
+                "Legacy auto-resolution hint: {}",
+                request.details.auto_resolution_ms.map_or_else(
+                    || "unavailable".into(),
+                    |ms| format!("{ms} ms (informational)")
                 )
             ));
-            lines.push("Cancel rejects this approval and interrupts its owning turn. Decline rejects it and lets the agent continue.".into());
-            lines.push("UI supports accept / decline / cancel. Session grants and policy amendments require a supported decision form.".into());
-            lines.push("Risk assessment: unavailable (review the request context)".into());
+        }
+        _ => {
             if matches!(request.kind, RequestKind::CommandApproval) {
                 for label in ["Command", "Command cwd"] {
                     if !request
@@ -160,13 +110,19 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                 }
             }
             for field in &request.details.fields {
-                lines.push(format!("\n{}:\n{}", field.label, field.text));
+                lines.push(format!(
+                    "
+{}:
+{}",
+                    field.label, field.text
+                ));
             }
             if matches!(request.kind, RequestKind::FileApproval) {
                 match &request.details.file_preview {
                     Some(preview) if !preview.unavailable => {
                         lines.push(format!(
-                            "\nFile preview: server fileChange item, sequence {}{}",
+                            "
+File preview: server fileChange item, sequence {}{}",
                             preview.source_seq,
                             if preview.truncated {
                                 " [truncated at 32 KiB]"
@@ -184,8 +140,73 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                     ),
                 }
             }
+            if request.allow_cancel {
+                lines.push("
+Cancel rejects this approval and interrupts its owning turn. Decline rejects it and lets the agent continue.".into());
+            }
+            meta.push(format!(
+                "Server decisions:
+{}",
+                request.details.available_decisions.as_ref().map_or_else(
+                    || "unavailable; client choices: accept / decline / cancel".into(),
+                    |decisions| if decisions.is_empty() {
+                        "none".into()
+                    } else {
+                        decisions.join(
+                            "
+",
+                        )
+                    }
+                )
+            ));
+            meta.push("UI supports accept / decline / cancel. Session grants and policy amendments require a supported decision form.".into());
+            meta.push("Risk assessment: unavailable (review the request context)".into());
         }
     }
+    lines.push(
+        "
+── Details ──"
+            .into(),
+    );
+    lines.push(format!(
+        "Request: {:?} | received sequence {}",
+        request.id, request.received_seq
+    ));
+    lines.push(format!("Agent/thread: {}", request.thread_id));
+    lines.push(format!("Turn: {}", request.turn_id));
+    lines.push(format!(
+        "Item: {}",
+        request.details.item_id.as_deref().unwrap_or("unavailable")
+    ));
+    lines.push(format!(
+        "Server start ms: {}",
+        request
+            .details
+            .started_at_ms
+            .map_or_else(|| "unavailable".into(), |ms| ms.to_string())
+    ));
+    if snapshot.thread_id.as_deref() == Some(&request.thread_id) {
+        lines.push(format!(
+            "Effective sandbox:
+{}",
+            snapshot.sandbox
+        ));
+        lines.push(format!(
+            "Effective approval policy:
+{}",
+            snapshot.approval_policy
+        ));
+    } else {
+        lines.push("Child effective sandbox / approval policy: unavailable".into());
+        lines.push(format!(
+            "Root sandbox: {} | approval policy: {}",
+            snapshot.sandbox, snapshot.approval_policy
+        ));
+    }
+    lines.push(format!("Session cwd: {}", snapshot.cwd));
+    lines.push("Context source: server request".into());
+    lines.push("Proposals: not applied".into());
+    lines.extend(meta);
     lines
 }
 
@@ -251,12 +272,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             ..area
         },
     );
-    frame.render_widget(
-        Paragraph::new("F2 next  PgUp/Dn  Esc close"),
-        Rect {
-            y: area.y + area.height.saturating_sub(1),
-            height: 1,
-            ..area
-        },
-    );
+    let hint = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    // 主界面提示更长，先清空这一行，避免残留字符。
+    frame.render_widget(Clear, hint);
+    frame.render_widget(Paragraph::new("F2 next  PgUp/Dn  Esc close"), hint);
 }
