@@ -7,6 +7,7 @@
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use crate::config::McpServerConfig;
 use crate::protocol::{Envelope, RpcId};
 
 pub const INITIALIZE: &str = "initialize";
@@ -93,6 +94,37 @@ pub fn session_new_request(id: RpcId, cwd: &str, mcp_servers: Value) -> Envelope
         SESSION_NEW,
         Some(json!({"cwd": cwd, "mcpServers": mcp_servers})),
     ))
+}
+
+pub fn encode_mcp_servers(servers: &[McpServerConfig]) -> Value {
+    Value::Array(
+        servers
+            .iter()
+            .map(|server| match server {
+                McpServerConfig::Stdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                } => json!({
+                    "name": name,
+                    "command": command,
+                    "args": args,
+                    "env": env.iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+                }),
+                McpServerConfig::Http {
+                    name,
+                    url,
+                    headers,
+                } => json!({
+                    "type": "http",
+                    "name": name,
+                    "url": url,
+                    "headers": headers.iter().map(|(name, value)| json!({"name": name, "value": value})).collect::<Vec<_>>(),
+                }),
+            })
+            .collect(),
+    )
 }
 
 pub fn session_prompt_request(id: RpcId, session_id: &str, text: &str) -> Envelope {
@@ -243,7 +275,7 @@ fn number(value: &Value, keys: &[&str]) -> Option<u64> {
 
 fn tool_status(value: Option<&str>) -> ToolStatus {
     match value {
-        Some("in_progress" | "running") => ToolStatus::InProgress,
+        Some("pending" | "in_progress" | "running") => ToolStatus::InProgress,
         Some("completed" | "success" | "succeeded") => ToolStatus::Completed,
         Some("failed" | "error") => ToolStatus::Failed,
         Some("cancelled" | "canceled") => ToolStatus::Cancelled,
@@ -254,6 +286,7 @@ fn tool_status(value: Option<&str>) -> ToolStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::McpServerConfig;
 
     #[test]
     fn builds_acp_lifecycle_requests_with_bounded_content() {
@@ -282,5 +315,26 @@ mod tests {
             ),
             Err(AcpProtocolError::TextTooLarge)
         ));
+    }
+
+    #[test]
+    fn encodes_typed_stdio_and_http_mcp_servers() {
+        let value = encode_mcp_servers(&[
+            McpServerConfig::Stdio {
+                name: "local".into(),
+                command: "mcp-server".into(),
+                args: vec!["--stdio".into()],
+                env: vec![("MODE".into(), "test".into())],
+            },
+            McpServerConfig::Http {
+                name: "remote".into(),
+                url: "https://mcp.invalid".into(),
+                headers: vec![("X-Test".into(), "value".into())],
+            },
+        ]);
+        assert_eq!(value[0]["command"], "mcp-server");
+        assert_eq!(value[0]["env"][0]["name"], "MODE");
+        assert_eq!(value[1]["type"], "http");
+        assert_eq!(value[1]["headers"][0]["name"], "X-Test");
     }
 }

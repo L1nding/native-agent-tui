@@ -102,7 +102,7 @@ impl AcpBridge {
             cwd: config.cwd.display().to_string(),
             // MCP remains a typed seam even before CLI configuration exposes
             // individual servers. An empty list is valid ACP input.
-            mcp_servers: json!([]),
+            mcp_servers: acp_protocol::encode_mcp_servers(&config.mcp_servers),
             session_id: None,
             turn_id: None,
             turn_started: false,
@@ -421,8 +421,20 @@ impl AcpBridge {
             Update::AgentThought { item_id, text } => self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?,
             Update::ToolCall { item_id, title, kind } => self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","command":title,"kind":kind}}))))?,
             Update::ToolCallUpdate { item_id, status, output } => {
-                let status = match status { ToolStatus::Completed => "completed", ToolStatus::Failed => "failed", ToolStatus::Cancelled => "cancelled", ToolStatus::InProgress => "in_progress", ToolStatus::Unknown => "unknown" };
-                self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output}}))))?;
+                match status {
+                    ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
+                        let status = match status {
+                            ToolStatus::Completed => "completed",
+                            ToolStatus::Failed => "failed",
+                            ToolStatus::Cancelled => "cancelled",
+                            _ => unreachable!(),
+                        };
+                        self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output}}))))?;
+                    }
+                    ToolStatus::InProgress | ToolStatus::Unknown => {
+                        self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","status":"inProgress","aggregatedOutput":output}}))))?;
+                    }
+                }
             }
             Update::Usage { input_tokens, output_tokens, total_tokens, context_window } => self.core.send(Envelope::notification("thread/tokenUsage/updated", Some(json!({"threadId":session,"turnId":turn,"usage":{"inputTokens":input_tokens,"outputTokens":output_tokens,"totalTokens":total_tokens,"contextWindow":context_window}}))))?,
             Update::Unknown { .. } => {}
@@ -436,6 +448,11 @@ impl AcpBridge {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if self.session_id.as_deref() != Some(session) {
+            self.acp.send(with_jsonrpc(Envelope::error_response(
+                id,
+                -32602,
+                "ACP permission request does not belong to the active session",
+            )))?;
             return Ok(());
         }
         let turn = self
@@ -462,6 +479,14 @@ impl AcpBridge {
                     .collect()
             })
             .unwrap_or_default();
+        if self.permissions.len() >= 64 {
+            self.acp.send(with_jsonrpc(Envelope::error_response(
+                id,
+                -32000,
+                "too many pending ACP permission requests",
+            )))?;
+            return Ok(());
+        }
         self.permissions.insert(id.clone(), Permission { options });
         self.core.send(Envelope::request(id, "item/commandExecution/requestApproval", Some(json!({"threadId":session,"turnId":turn,"command":title,"reason":"DeepSeek ACP permission request","kind":"command","availableDecisions":["accept","decline","cancel"]}))))?;
         Ok(())
@@ -500,7 +525,20 @@ fn choose_permission_option(decision: &str, options: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::choose_permission_option;
+    use super::{choose_permission_option, AcpBridge};
+    use crate::app_server;
+    use crate::config::Config;
+    use crate::protocol::{Envelope, RpcId};
+    use crate::transport::PipeTransport;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn pair() -> (PipeTransport, PipeTransport) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        (PipeTransport::new(ar, aw), PipeTransport::new(br, bw))
+    }
 
     #[test]
     fn permission_decisions_prefer_matching_acp_option_ids() {
@@ -512,5 +550,125 @@ mod tests {
             choose_permission_option("decline", &["allow_once".into(), "deny".into()]),
             "deny"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_maps_acp_lifecycle_and_permission_without_model_calls() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let bridge =
+            tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &Config::default()).run());
+
+        core_client
+            .send(Envelope::request(
+                RpcId::Number(1),
+                "initialize",
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        let initialize = tokio::time::timeout(Duration::from_secs(2), acp_server.recv())
+            .await
+            .expect("bridge did not forward initialize")
+            .unwrap();
+        assert_eq!(initialize.jsonrpc.as_deref(), Some("2.0"));
+        assert_eq!(initialize.method.as_deref(), Some("initialize"));
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(1),
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        assert_eq!(core_client.recv().await.unwrap().id, Some(RpcId::Number(1)));
+
+        core_client
+            .send(app_server::thread_start(
+                RpcId::Number(2),
+                &Config::default(),
+            ))
+            .unwrap();
+        assert_eq!(
+            acp_server.recv().await.unwrap().method.as_deref(),
+            Some("session/new")
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId": "session-1"})),
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().result.unwrap()["thread"]["id"],
+            "session-1"
+        );
+
+        core_client
+            .send(app_server::turn_start(
+                RpcId::Number(3),
+                "session-1",
+                "hello",
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("turn/started")
+        );
+        assert_eq!(
+            acp_server.recv().await.unwrap().method.as_deref(),
+            Some("session/prompt")
+        );
+        acp_server
+            .send(Envelope::notification(
+                "session/update",
+                Some(json!({
+                    "sessionId":"session-1",
+                    "update":{"sessionUpdate":"agent_message_chunk","messageId":"m","content":{"type":"text","text":"hello"}}
+                })),
+            ))
+            .unwrap();
+        acp_server
+            .send(Envelope::request(
+                RpcId::String("permission".into()),
+                "session/request_permission",
+                Some(json!({
+                    "sessionId":"session-1",
+                    "toolCall":{"title":"run tests"},
+                    "options":[{"optionId":"allow_once"},{"optionId":"reject_once"}]
+                })),
+            ))
+            .unwrap();
+        let delta = core_client.recv().await.unwrap();
+        assert_eq!(delta.method.as_deref(), Some("item/agentMessage/delta"));
+        let permission = core_client.recv().await.unwrap();
+        assert_eq!(permission.id, Some(RpcId::String("permission".into())));
+        core_client
+            .send(Envelope::response(
+                RpcId::String("permission".into()),
+                Some(json!({"decision":"accept"})),
+            ))
+            .unwrap();
+        let permission_response = acp_server.recv().await.unwrap();
+        assert_eq!(permission_response.jsonrpc.as_deref(), Some("2.0"));
+        assert_eq!(
+            permission_response.result.unwrap()["outcome"]["optionId"],
+            "allow_once"
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(3),
+                Some(json!({"stopReason":"end_turn"})),
+            ))
+            .unwrap();
+        assert_eq!(core_client.recv().await.unwrap().id, Some(RpcId::Number(3)));
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("item/completed")
+        );
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("turn/completed")
+        );
+
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
 }

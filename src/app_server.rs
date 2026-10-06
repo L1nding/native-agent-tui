@@ -24,6 +24,8 @@ pub enum AppServerError {
     Transport(#[from] TransportError),
     #[error("invalid working directory: {0}")]
     InvalidDirectory(String),
+    #[error("invalid backend configuration: {0}")]
+    InvalidConfiguration(String),
     #[error(transparent)]
     Compatibility(#[from] CompatibilityError),
     #[error(transparent)]
@@ -327,6 +329,18 @@ pub fn normalize_config(mut config: Config) -> Result<Config, AppServerError> {
     if !config.cwd.is_dir() {
         return Err(AppServerError::InvalidDirectory(
             config.cwd.display().to_string(),
+        ));
+    }
+    if config.backend.is_acp()
+        && (config.acp_profile.trim().is_empty() || config.acp_profile.len() > 128)
+    {
+        return Err(AppServerError::InvalidConfiguration(
+            "ACP profile must contain 1-128 non-whitespace bytes".into(),
+        ));
+    }
+    if config.backend.is_acp() && config.dsh_executable.as_os_str().is_empty() {
+        return Err(AppServerError::InvalidConfiguration(
+            "ACP executable path cannot be empty".into(),
         ));
     }
     // Strip the Win32 verbatim prefix for shell/server compatibility.

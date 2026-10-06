@@ -11,12 +11,28 @@ use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerConfig {
+    Stdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Http {
+        name: String,
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub backend: BackendKind,
     pub cwd: PathBuf,
     pub executable: PathBuf,
     pub dsh_executable: PathBuf,
     pub acp_profile: String,
+    pub mcp_servers: Vec<McpServerConfig>,
     pub model: Option<String>,
     pub sandbox: String,
     pub approval_policy: String,
@@ -44,6 +60,7 @@ impl Default for Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "dsh.cmd" } else { "dsh" })),
             acp_profile: "acp".into(),
+            mcp_servers: Vec::new(),
             model: None,
             sandbox: "workspace-write".into(),
             approval_policy: "on-request".into(),
