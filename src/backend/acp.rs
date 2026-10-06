@@ -315,7 +315,7 @@ impl AcpBridge {
                 self.session_id = Some(session.clone());
                 self.core.send(Envelope::response(
                     id,
-                    Some(json!({"thread":{"id":session,"cliVersion":"deepseek-acp"},"model":null})),
+                    Some(json!({"thread":{"id":session},"model":null})),
                 ))?;
             }
             Pending::Prompt => {
