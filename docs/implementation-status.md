@@ -209,3 +209,16 @@ Windows 终端输入改为有界 VT/Win32 记录适配，完整标记的多行�
 历史会话列表和详情都支持 `/`、`Ctrl+F` 输入脱敏证据元数据，F6 在生命周期、输出、工具、请求和等待类别间切换；Up/Down 选择命中，Enter 重新打开对应 session/event。列表搜索分别固定所有当前保留 session 的已提交前缀，详情搜索固定当前 session；搜索在线程中取消旧查询，排除未提交尾部，并限制查询、命中和元数据内存。结果可以用内部身份字段匹配，但界面只显示脱敏摘要；提示、答案、秘密、命令、路径和原始工具输出不会进入结果。
 
 新增回归覆盖真实历史搜索、取消旧查询、脱敏结果、事件定位和 Ratatui 渲染。2026-10-03 的 `python scripts/verify.py --live` 通过 200 项默认 Rust 测试、8 项真实 Codex 检查、全部原生 fixture、fmt/check/clippy/doctest/release；历史搜索使用与实时执行隔离的只读线程。跨 session 全局搜索、原始工具结果搜索和 Alpha/V2 发布验收仍未完成。详见[历史证据搜索](history-evidence-search.md)。
+
+## 易用性迭代（2026-10-06）
+
+用 ConPTY 驱动 release 版 TUI（真实 Codex 仅用于预检复现，其余场景使用 `jsonl_app_server.py` 假服务端，不发起模型请求）逐项试用并修复：
+
+- 启动失败可见：预检超时后原先只显示 `Unknown`，进行中提示遮住错误；现在 Core 出错时清除过期提示，状态区始终先显示错误原因。Windows 预检超时提示 `--windows-sandbox unelevated` 或在 Codex `config.toml` 持久设置 `[windows] sandbox = "unelevated"`。
+- 不可用会话：Core 快照新增 `startup_blocked`；预检失败、Unknown、断连后按 Enter 不再提交，说明原因并保留草稿。运行中按 Enter 提示 Ctrl+S 排队；轮次失败显示 `Turn failed` 及继续方式，Core 原始错误不变。
+- 交互：Esc 不再清空草稿；F1 改为分组按键浮层（80 列两栏完整显示）；底栏把 F1 放在最前；顶部隐藏为零的计数、缺失 token 汇总和已结束活动行；状态区无内容时收起。
+- 请求详情首屏先显示命令、文件预览或问题，元数据移到分隔线后；仅允许取消时说明取消语义；修复提示行残留文字。
+- 对话：You/Agent 标题加粗着色；向上滚动时标题显示剩余行数和 Ctrl+End。每轮工具调用以灰色摘要行保留在对话中（命令首行、状态、退出码、耗时，最多 40 行），轮次结束后仍可见；`ConversationItem` 的 Debug 只输出正文长度。
+- 夹具：Python 夹具按 UTF-8 读取标准输入，修复中文 Windows 下秘密回答被 GBK 解码导致的误报。
+
+验证：`python scripts/verify.py` 通过（376 项默认 Rust 测试、全部原生夹具含 ConPTY TUI 场景，fmt/check/clippy/doctest/release）。本轮未运行 `--live` 真实模型测试；本机 elevated 沙箱预检超时仍存在，需按提示使用 unelevated。
