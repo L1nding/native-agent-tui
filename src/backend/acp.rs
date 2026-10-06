@@ -73,6 +73,7 @@ enum Pending {
     Initialize,
     SessionNew,
     Prompt,
+    Passthrough,
 }
 
 struct Permission {
@@ -218,8 +219,12 @@ impl AcpBridge {
                 ))?;
             }
             (Some(acp_protocol::SESSION_CLOSE), Some(id)) => {
-                self.acp.send(message)?;
-                self.pending.insert(id, Pending::SessionNew);
+                self.acp.send(with_jsonrpc(message))?;
+                self.pending.insert(id, Pending::Passthrough);
+            }
+            (Some(acp_protocol::SESSION_SET_CONFIG_OPTION), Some(id)) => {
+                self.pending.insert(id, Pending::Passthrough);
+                self.acp.send(with_jsonrpc(message))?;
             }
             (Some("thread/read"), Some(id)) => {
                 self.core.send(Envelope::error_response(
@@ -356,6 +361,9 @@ impl AcpBridge {
                 ))?;
                 self.turn_started = false;
                 self.turn_id = None;
+            }
+            Pending::Passthrough => {
+                self.core.send(Envelope::response(id, Some(result)))?;
             }
         }
         Ok(())
