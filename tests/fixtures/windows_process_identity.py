@@ -23,7 +23,10 @@ def creation_time(kernel, handle):
 def record(root, pids):
     path = root / "pids.json"
     previous = json.loads(path.read_text()) if path.exists() else []
-    path.write_text(json.dumps(previous + pids))
+    # 原子替换：检查方一看到文件存在就会读取，不能让它读到空文件。
+    temporary = path.with_name(f"pids.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(previous + pids))
+    os.replace(temporary, path)
     if os.name != "nt":
         return
     kernel = kernel_api()
