@@ -19,7 +19,7 @@ use super::workflow_view;
 use super::{selected_request, LocalState};
 use crate::interactions::RequestKind;
 use crate::observation::{AttentionLevel, ExecutionState};
-use crate::state::{display_text, CoreSnapshot, SessionPhase};
+use crate::state::{display_text, ConversationItem, CoreSnapshot, SessionPhase};
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
     let area = frame.area();
     if local.palette.visible {
@@ -203,32 +203,29 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .iter()
         .filter(|message| message.thread_id == selected_thread)
     {
-        role_rows.insert(
-            transcript.len(),
-            if message.role == "You" {
-                Color::Cyan
-            } else {
-                Color::Green
-            },
-        );
-        transcript.push(format!(
-            "{}{}",
-            message.role,
-            if message.truncated {
-                " [truncated]"
-            } else {
-                ""
+        let (rows, header) = message_rows(message, width);
+        if header > 0 {
+            role_rows.insert(
+                transcript.len(),
+                if message.role == "You" {
+                    Color::Cyan
+                } else {
+                    Color::Green
+                },
+            );
+        } else {
+            for row in transcript.len()..transcript.len() + rows.len() {
+                role_rows.insert(row, Color::DarkGray);
             }
-        ));
+        }
         if let Some(focus) = local
             .conversation_focus
             .as_ref()
             .filter(|focus| focus.matches(message))
         {
-            focused_row = Some(transcript.len() + focus.row(width));
+            focused_row = Some(transcript.len() + header + focus.row(width));
         }
-        transcript.extend(wrap(&message.text, width));
-        transcript.push(String::new());
+        transcript.extend(rows);
     }
     if transcript.is_empty() {
         transcript.push(
@@ -286,8 +283,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .map(|(row, text)| {
             if Some(row) == focused_row {
                 Line::from(text).style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
-            } else if let Some(color) = role_rows.get(&row) {
-                Line::from(text).style(Style::default().fg(*color).add_modifier(Modifier::BOLD))
+            } else if let Some(&color) = role_rows.get(&row) {
+                Line::from(text).style(if color == Color::DarkGray {
+                    Style::default().fg(color)
+                } else {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                })
             } else {
                 Line::from(text)
             }
@@ -521,4 +522,25 @@ pub(super) fn header_activity<'a>(
             || activity.execution_state == ExecutionState::Unknown
             || activity.attention.level != AttentionLevel::Ended
     })
+}
+
+/// 一条消息在对话区占用的行（含末尾空行）以及标题行数；渲染和滚动定位共用。
+/// 工具摘要没有角色标题，避免每个轮次多出噪音行。
+pub(super) fn message_rows(message: &ConversationItem, width: usize) -> (Vec<String>, usize) {
+    let mut rows = Vec::new();
+    let header = usize::from(message.role != "Tool");
+    if header > 0 {
+        rows.push(format!(
+            "{}{}",
+            message.role,
+            if message.truncated {
+                " [truncated]"
+            } else {
+                ""
+            }
+        ));
+    }
+    rows.extend(wrap(&message.text, width));
+    rows.push(String::new());
+    (rows, header)
 }

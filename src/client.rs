@@ -239,6 +239,7 @@ impl ClientHandle {
                     view: initial,
                     agents: AgentRegistry::with_limits(agent_limits),
                     usage_facts: Default::default(),
+                    tool_lines: Default::default(),
                 },
                 pending: HashMap::new(),
                 next_id: 1,
@@ -2170,7 +2171,7 @@ impl Core {
         let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
         if notice.outcome.is_none() {
             self.tool_details
-                .observe_started(locator, notice.category, fields);
+                .observe_started(locator.clone(), notice.category, fields);
         } else {
             let lifecycle = match notice.outcome {
                 Some(protocol::ObservedToolOutcome::Completed) => ToolLifecycle::Completed,
@@ -2188,6 +2189,11 @@ impl Core {
                 fields,
                 notice.outcome != Some(protocol::ObservedToolOutcome::Unknown),
             );
+        }
+        if let Some(detail) = self.tool_details.get(&locator) {
+            let line = crate::tool_details::summary_line(&detail);
+            self.state
+                .tool_line(&notice.thread_id, &notice.turn_id, &notice.item_id, line);
         }
     }
 

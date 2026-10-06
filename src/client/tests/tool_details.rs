@@ -447,3 +447,52 @@ async fn disconnect_marks_running_details_unknown_and_keeps_partial_output() {
     drop(snapshot);
     client.join.await.unwrap();
 }
+
+#[tokio::test]
+async fn tool_calls_leave_one_summary_line_per_item_after_the_turn_retires() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"shell-1","type":"commandExecution","status":"inProgress","command":"cargo test\nsecond line","cwd":"PRIVATE_CWD"}}}),
+    )
+    .await;
+    let running = client.snapshots.borrow().clone();
+    let tools: Vec<_> = running
+        .messages
+        .iter()
+        .filter(|message| message.role == "Tool")
+        .collect();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].text, "▸ cargo test · running");
+
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"shell-1","type":"commandExecution","status":"completed","exitCode":3,"durationMs":1500,"aggregatedOutput":"PRIVATE_AGGREGATE"}}}),
+    )
+    .await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}),
+    )
+    .await;
+    let done = client.snapshots.borrow().clone();
+    assert!(done.tool_details.entries.is_empty());
+    let tools: Vec<_> = done
+        .messages
+        .iter()
+        .filter(|message| message.role == "Tool")
+        .collect();
+    assert_eq!(tools.len(), 1);
+    assert!(
+        tools[0].text == "▸ cargo test · failed · exit 3 · 1.5s",
+        "{}",
+        tools[0].text
+    );
+    assert!(!tools[0].text.contains("PRIVATE_"));
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}

@@ -41,7 +41,7 @@ use activity::compaction_fact_rows;
 use attention::AttentionEditor;
 use commands::PaletteEvent;
 use editor::Editor;
-use layout::{conversation_content_size, main_layout, wrap};
+use layout::{conversation_content_size, main_layout};
 use overlays::open_palette_action;
 use render::draw;
 use request_state::{request_locked, selected_request, sync_local_requests};
@@ -391,11 +391,11 @@ fn handle_key(
                 .iter()
                 .filter(|m| m.thread_id == focus.thread())
             {
-                rows += 1;
+                let (lines, header) = render::message_rows(message, width);
                 if focus.matches(message) {
-                    target = Some(rows + focus.row(width));
+                    target = Some(rows + header + focus.row(width));
                 }
-                rows += wrap(&message.text, width).len() + 1;
+                rows += lines.len();
             }
             let max_scroll = rows.saturating_sub(1).saturating_sub(height);
             if let Some(row) = target {

@@ -82,6 +82,38 @@ impl ToolDetail {
     }
 }
 
+/// 对话中显示的一行工具摘要：命令首行（最多 96 字符）、状态、退出码和耗时。
+pub fn summary_line(detail: &ToolDetail) -> String {
+    let what = detail
+        .command
+        .as_deref()
+        .and_then(|command| command.lines().find(|line| !line.trim().is_empty()))
+        .map(|line| {
+            let line = line.trim();
+            match line.char_indices().nth(96) {
+                Some((end, _)) => format!("{}…", &line[..end]),
+                None => line.to_owned(),
+            }
+        })
+        .unwrap_or_else(|| format!("{:?}", detail.category));
+    let state = match detail.lifecycle {
+        ToolLifecycle::Running => "running",
+        ToolLifecycle::Completed => "done",
+        ToolLifecycle::Failed => "failed",
+        ToolLifecycle::Interrupted => "interrupted",
+        ToolLifecycle::EndedUnknown => "ended, outcome unknown",
+        ToolLifecycle::Unknown => "unknown",
+    };
+    let mut line = format!("▸ {what} · {state}");
+    if let Some(code) = detail.exit_code {
+        line.push_str(&format!(" · exit {code}"));
+    }
+    if let Some(ms) = detail.duration_ms {
+        line.push_str(&format!(" · {:.1}s", ms as f64 / 1000.0));
+    }
+    crate::state::display_text(&line)
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ToolDetailsSnapshot {
     pub entries: Arc<VecDeque<Arc<ToolDetail>>>,
@@ -119,6 +151,13 @@ pub(crate) struct ToolDetails {
 }
 
 impl ToolDetails {
+    pub fn get(&self, locator: &ToolDetailLocator) -> Option<Arc<ToolDetail>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.locator == *locator)
+            .cloned()
+    }
+
     pub fn snapshot(&self) -> ToolDetailsSnapshot {
         ToolDetailsSnapshot {
             entries: Arc::new(self.entries.clone()),

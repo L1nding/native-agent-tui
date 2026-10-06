@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use crate::agents::{AgentRegistry, AgentSnapshot};
 use crate::gate::WaitTarget;
@@ -74,7 +77,7 @@ pub(crate) fn workflow_outcome(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConversationItem {
     pub id: String,
     pub thread_id: String,
@@ -83,6 +86,21 @@ pub struct ConversationItem {
     pub text: String,
     pub complete: bool,
     pub truncated: bool,
+}
+
+impl std::fmt::Debug for ConversationItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 快照可能被调试打印；提示、回答和工具命令只输出长度，不输出正文。
+        f.debug_struct("ConversationItem")
+            .field("id", &self.id)
+            .field("thread_id", &self.thread_id)
+            .field("turn_id", &self.turn_id)
+            .field("role", &self.role)
+            .field("text_bytes", &self.text.len())
+            .field("complete", &self.complete)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -233,7 +251,20 @@ pub(crate) struct SessionState {
     pub view: CoreSnapshot,
     pub agents: AgentRegistry,
     pub(crate) usage_facts: BTreeMap<String, UsageFact>,
+    /// 每个 (thread, turn) 的工具摘要行，按 item 原位更新；只存在内存中。
+    pub(crate) tool_lines: VecDeque<ToolLines>,
 }
+
+#[derive(Debug, Default)]
+pub(crate) struct ToolLines {
+    thread_id: String,
+    turn_id: String,
+    lines: VecDeque<(String, String)>,
+    dropped: usize,
+}
+
+const TOOL_LINES_PER_TURN: usize = 40;
+const TOOL_LINE_TURNS: usize = 16;
 
 impl SessionState {
     pub fn snapshot(&mut self) -> Arc<CoreSnapshot> {
@@ -261,6 +292,78 @@ impl SessionState {
         if let Some(thread_id) = fact.identity.thread_id.clone() {
             self.usage_facts.insert(thread_id, fact);
         }
+    }
+
+    /// 用一条 "Tool" 消息汇总一个轮次内的工具调用，避免每次调用占用一条历史。
+    pub fn tool_line(&mut self, thread: &str, turn: &str, item: &str, line: String) {
+        let index = match self
+            .tool_lines
+            .iter()
+            .position(|group| group.thread_id == thread && group.turn_id == turn)
+        {
+            Some(index) => index,
+            None => {
+                if self.tool_lines.len() >= TOOL_LINE_TURNS {
+                    self.tool_lines.pop_front();
+                }
+                self.tool_lines.push_back(ToolLines {
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    ..Default::default()
+                });
+                self.tool_lines.len() - 1
+            }
+        };
+        let group = &mut self.tool_lines[index];
+        match group.lines.iter_mut().find(|(id, _)| id == item) {
+            Some((_, existing)) => *existing = line,
+            None => {
+                group.lines.push_back((item.into(), line));
+                if group.lines.len() > TOOL_LINES_PER_TURN {
+                    group.lines.pop_front();
+                    group.dropped += 1;
+                }
+            }
+        }
+        let mut text = if group.dropped > 0 {
+            format!(
+                "… {} earlier tool calls (Ctrl+T)
+",
+                group.dropped
+            )
+        } else {
+            String::new()
+        };
+        text.push_str(
+            &group
+                .lines
+                .iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                ),
+        );
+        let id = format!("tools:{turn}");
+        match self
+            .view
+            .messages
+            .iter_mut()
+            .find(|m| m.thread_id == thread && m.turn_id == turn && m.id == id)
+        {
+            Some(message) => message.text = text,
+            None => self.view.messages.push(ConversationItem {
+                id,
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                role: "Tool".into(),
+                text,
+                complete: true,
+                truncated: false,
+            }),
+        }
+        self.bound_history();
     }
 
     pub fn submission(&mut self, text: &str) {
@@ -436,6 +539,41 @@ mod tests {
         state.message("turn-2", "item", "late", false);
         assert_eq!(state.view.messages.len(), 1);
         assert_eq!(state.view.messages[0].text, "hello!");
+    }
+
+    #[test]
+    fn tool_lines_share_one_message_per_turn_and_stay_bounded() {
+        let mut state = SessionState::default();
+        for index in 0..45 {
+            state.tool_line(
+                "root",
+                "turn",
+                &format!("item-{index}"),
+                format!("▸ step {index}"),
+            );
+        }
+        state.tool_line("root", "turn", "item-44", "▸ step 44 · done".into());
+        let tools: Vec<_> = state
+            .view
+            .messages
+            .iter()
+            .filter(|message| message.role == "Tool")
+            .collect();
+        assert_eq!(tools.len(), 1);
+        let lines: Vec<_> = tools[0].text.lines().collect();
+        assert_eq!(lines[0], "… 5 earlier tool calls (Ctrl+T)");
+        assert_eq!(lines.len(), 41);
+        assert_eq!(lines[40], "▸ step 44 · done");
+        state.tool_line("root", "next", "item-0", "▸ next".into());
+        assert_eq!(
+            state
+                .view
+                .messages
+                .iter()
+                .filter(|m| m.role == "Tool")
+                .count(),
+            2
+        );
     }
 
     #[test]
