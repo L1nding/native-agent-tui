@@ -26,6 +26,13 @@ cargo run --locked -- --check-shell --windows-sandbox unelevated
 cargo run --locked -- --sandbox read-only --windows-sandbox unelevated
 ```
 
+To keep this choice without passing the flag, add the following to the Codex `config.toml`; the client never edits that file for you:
+
+```toml
+[windows]
+sandbox = "unelevated"
+```
+
 This flag leaves the selected `--sandbox` policy in place. Preflight uses that policy, runs before any model turn, and stops execution if it fails.
 
 ## Controls

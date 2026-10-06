@@ -439,10 +439,20 @@ impl Core {
     }
 
     fn shell_timeout(&mut self) {
-        self.state.error(
-            SessionPhase::Unknown,
-            "Shell preflight timed out; no model turn was started. Automatic retry is disabled.",
-        );
+        let message = self.shell_timeout_message();
+        self.state.error(SessionPhase::Unknown, message);
+    }
+
+    /// 超时后只给出可操作的建议，不自动放宽沙箱或重试。
+    fn shell_timeout_message(&self) -> String {
+        let advice = if !cfg!(windows) {
+            "Check the configured shell and sandbox."
+        } else if self.config.windows_sandbox.as_deref() == Some("unelevated") {
+            "Check the Codex Windows sandbox setup."
+        } else {
+            "Restart with --windows-sandbox unelevated, or set `[windows] sandbox = \"unelevated\"` in the Codex config.toml to keep it."
+        };
+        format!("Shell preflight timed out; no model turn was started. {advice} Automatic retry is disabled.")
     }
 
     fn token_budget_exhausted(&self) -> Option<u64> {
@@ -676,8 +686,7 @@ impl Core {
                             }
                         } else {
                             let message = if matches!(kind, RpcKind::Preflight) {
-                            let advice = if cfg!(windows) { " Check Codex Windows sandbox setup, or explicitly select --windows-sandbox unelevated." } else { " Check the configured shell and sandbox." };
-                            format!("Shell preflight timed out; no model turn was started.{advice} Automatic retry is disabled.")
+                            self.shell_timeout_message()
                         } else {
                             format!("app-server {kind:?} response timed out; automatic retry is disabled")
                         };
@@ -6560,6 +6569,15 @@ mod tests {
         initialize_peer(&mut peer).await;
         tokio::time::advance(crate::shell_check::DEADLINE + Duration::from_secs(1)).await;
         phase(&mut client, SessionPhase::Unknown).await;
+        {
+            let snapshot = client.snapshots.borrow();
+            let error = snapshot.last_error.as_deref().unwrap();
+            assert!(error.contains("Shell preflight timed out"), "{error}");
+            if cfg!(windows) {
+                assert!(error.contains("--windows-sandbox unelevated"), "{error}");
+            }
+            assert_eq!(snapshot.notice, None);
+        }
         let report = client.join.await.unwrap();
         assert!(report.cleanup_error.is_none());
         assert_eq!(client.snapshots.borrow().root_start_requests, 0);
