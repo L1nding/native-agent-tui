@@ -8,6 +8,7 @@
 - `ui/layout`：纯终端几何、会话布局约束和按 grapheme 的文本换行；不读取或修改 Core/UI 状态。
 - `ui/terminal`：交互终端进入、退出和资源恢复；只封装 `Terminal`/`TerminalInput` 生命周期，不参与路由或渲染。
 - `ui/render`：从只读 `CoreSnapshot` 与 `LocalState` 组合终端视图；不处理按键、发送命令或修改状态。
+- `ui/overlays`：命令面板触发的互斥面板切换与关闭；接收快照和本地 UI 状态，调用父模块的请求同步 seam，不发送 Core 命令。
 - `ui/editor`：有界、按 Unicode grapheme 操作的文本编辑器状态与光标操作；不发送 Core 命令。
 - `ui/attention`：注意力阈值编辑器状态与弹窗渲染；只通过根模块路由提交类型化命令。
 - `ui/requests`：审批和用户输入请求的详情、草稿和身份校验。
