@@ -24,10 +24,15 @@ bounded duplex bridge. Core continues to receive the existing typed
 
 The bridge maps `initialize`, `session/new`, `session/prompt`,
 `session/update`, `session/request_permission`, `session/cancel`, and
-`session/close`. ACP updates become existing assistant, reasoning, tool,
-usage, approval, and terminal facts. ACP-only fields that do not have a Core
-equivalent stay unavailable; the bridge never fabricates Codex child or model
-metadata.
+`session/close` and `session/set_config_option`. ACP updates become existing
+assistant, reasoning, tool, usage, approval, and terminal facts. In-progress
+tool updates stay open; only ACP terminal tool statuses become completed,
+failed, or cancelled facts. ACP-only fields that do not have a Core equivalent
+stay unavailable; the bridge never fabricates Codex child or model metadata.
+
+`Config::mcp_servers` is a typed seam for ACP stdio and HTTP MCP definitions.
+It is encoded at the protocol edge, so future configuration loading does not
+expose raw ACP JSON to Core or UI.
 
 ACP prompt turns are single-flight. Core request deadlines still apply to
 startup, prompt, and interruption acknowledgements. A cancel notification is
@@ -42,4 +47,11 @@ Use the normal Rust checks:
 cargo fmt --all -- --check
 cargo check --all-targets
 cargo test --all-targets
+```
+
+The bridge lifecycle and permission mapping are covered by a duplex fake ACP
+server test. A Windows smoke check with the installed Harness is:
+
+```text
+cargo run -- --backend deepseek-acp --check-shell
 ```
