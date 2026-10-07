@@ -87,6 +87,7 @@ pub fn summary_line(detail: &ToolDetail) -> String {
     let what = detail
         .command
         .as_deref()
+        .map(crate::protocol::shell_script)
         .and_then(|command| command.lines().find(|line| !line.trim().is_empty()))
         .map(|line| {
             let line = line.trim();

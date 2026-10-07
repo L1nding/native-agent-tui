@@ -2587,6 +2587,48 @@ mod tests {
     }
 
     #[test]
+    fn pending_approval_names_root_and_shows_the_script_inside_the_shell_wrapper() {
+        let thread = "01a11532-77be-7ae3-962b-af39798883e3";
+        let request = RequestView::decode(
+            RpcId::Number(3),
+            "item/commandExecution/requestApproval",
+            &serde_json::json!({"threadId":thread,"turnId":"turn","itemId":"call",
+                "command":r#""C:\Users\Admin\pwsh.exe" -Command "Set-Content -LiteralPath .\probe.txt -Value 'hi'""#,
+                "reason":"写入文件？","availableDecisions":["accept","cancel"]}),
+        )
+        .unwrap();
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some(thread.into()),
+            requests: vec![request],
+            ..CoreSnapshot::default()
+        };
+        snapshot.token_budget.confirmed_total_tokens = Some(20095);
+        snapshot.token_budget.confirmed_complete = true;
+        let mut local = LocalState::default();
+        sync_local_requests(&mut local, &snapshot);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("root · Set-Content -LiteralPath"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(thread), "{rendered}");
+        assert!(!rendered.contains("pwsh.exe"), "{rendered}");
+        assert!(rendered.contains("tokens:20095 "), "{rendered}");
+        assert!(!rendered.contains("tokens:20095/"), "{rendered}");
+    }
+
+    #[test]
     fn running_and_failed_turns_explain_the_next_step() {
         let render = |snapshot: &CoreSnapshot, local: &LocalState| {
             let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();

@@ -608,8 +608,66 @@ pub fn encode_line(envelope: &Envelope) -> Result<String, ProtocolError> {
     Ok(line)
 }
 
+/// 摘要行只显示 shell 包装内的脚本，例如 `pwsh.exe -Command "x"` 显示为 `x`；
+/// 无法确定包装格式时原样返回。审批详情仍显示完整命令。
+pub fn shell_script(command: &str) -> &str {
+    let command = command.trim();
+    let (program, rest) = match command.strip_prefix('"') {
+        Some(quoted) => match quoted.find('"') {
+            Some(end) => (&quoted[..end], &quoted[end + 1..]),
+            None => return command,
+        },
+        None => command
+            .split_once(char::is_whitespace)
+            .unwrap_or((command, "")),
+    };
+    let name = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    if !matches!(name, "pwsh" | "powershell" | "cmd" | "bash" | "sh" | "zsh") {
+        return command;
+    }
+    let mut rest = rest.trim_start();
+    loop {
+        let Some((flag, tail)) = rest.split_once(char::is_whitespace) else {
+            return command;
+        };
+        let flag = flag.to_ascii_lowercase();
+        if matches!(flag.as_str(), "-command" | "-c" | "/c" | "-lc") {
+            rest = tail.trim();
+            break;
+        }
+        if !flag.starts_with('-') && !flag.starts_with('/') {
+            return command;
+        }
+        rest = tail.trim_start();
+    }
+    rest.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty())
+        .unwrap_or(rest)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_script_unwraps_common_shell_wrappers_only() {
+        assert_eq!(
+            super::shell_script(
+                r#""C:\Program Files\PowerShell\pwsh.exe" -NoProfile -Command "Set-Content x 'hi'""#
+            ),
+            "Set-Content x 'hi'"
+        );
+        assert_eq!(super::shell_script("bash -lc 'cargo test'"), "'cargo test'");
+        assert_eq!(super::shell_script("cmd.exe /c dir"), "dir");
+        assert_eq!(super::shell_script("cargo test --all"), "cargo test --all");
+        assert_eq!(super::shell_script("pwsh"), "pwsh");
+        assert_eq!(super::shell_script(r#""unterminated"#), r#""unterminated"#);
+    }
+
     use super::{decode_line, encode_line, Envelope, ProtocolError, RpcId};
 
     #[test]

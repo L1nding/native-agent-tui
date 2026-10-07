@@ -89,8 +89,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             status.push(format!("{label}: {count}"));
         }
     }
-    let usage = usage_status(snapshot);
-    if usage != "tokens:unavailable/unavailable" {
+    // 没有设置预算时省略 "/unavailable" 上限；F11 仍显示完整字段。
+    let usage = usage_status(snapshot).replacen("/unavailable", "", 1);
+    if usage != "tokens:unavailable" {
         status.push(usage);
     }
     if snapshot.scheduler.stopping {
@@ -459,7 +460,7 @@ Enter a new task to continue; F8 retries a failed workflow task."
                     .unwrap_or_default();
                 format!(
                     "{} · {} ({}/{})\n{}\n{}",
-                    request.thread_id,
+                    agent_label(snapshot, &request.thread_id),
                     question.header,
                     local.question_index + 1,
                     questions.len(),
@@ -469,7 +470,7 @@ Enter a new task to continue; F8 retries a failed workflow task."
             }
             _ => format!(
                 "{} · {}\n{}",
-                request.thread_id,
+                agent_label(snapshot, &request.thread_id),
                 request.summary,
                 requests::actions(snapshot, local, request)
             ),
@@ -543,4 +544,23 @@ pub(super) fn message_rows(message: &ConversationItem, width: usize) -> (Vec<Str
     rows.extend(wrap(&message.text, width));
     rows.push(String::new());
     (rows, header)
+}
+
+/// 请求所属代理的可读名称：根线程显示 root，子代理优先路径或昵称。
+fn agent_label<'a>(snapshot: &'a CoreSnapshot, thread_id: &'a str) -> &'a str {
+    if snapshot.thread_id.as_deref() == Some(thread_id) {
+        return "root";
+    }
+    snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.info.id == thread_id)
+        .and_then(|agent| {
+            agent
+                .info
+                .path
+                .as_deref()
+                .or(agent.info.nickname.as_deref())
+        })
+        .unwrap_or(thread_id)
 }

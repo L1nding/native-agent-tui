@@ -192,7 +192,9 @@ impl RequestView {
         let summary = match &kind {
             RequestKind::CommandApproval => format!(
                 "{}\n{}",
-                params["command"].as_str().unwrap_or("Command approval"),
+                params["command"]
+                    .as_str()
+                    .map_or("Command approval", crate::protocol::shell_script),
                 params["reason"].as_str().unwrap_or("")
             ),
             RequestKind::FileApproval => params["reason"]
