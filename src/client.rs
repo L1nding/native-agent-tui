@@ -321,6 +321,17 @@ struct PendingRpc {
     skills_cwd: Option<String>,
 }
 
+impl PendingRpc {
+    fn new(kind: RpcKind) -> Self {
+        Self {
+            kind,
+            deadline: Instant::now() + Duration::from_secs(30),
+            identity_thread: None,
+            skills_cwd: None,
+        }
+    }
+}
+
 struct Core {
     observer: Observer,
     journal: Option<Journal>,
@@ -1029,10 +1040,18 @@ impl Core {
         Ok(outbox_id)
     }
 
-    fn track_outbox(&mut self, request_id: &RpcId, outbox_id: Option<u64>) {
+    fn next_rpc_id(&mut self) -> RpcId {
+        let id = RpcId::Number(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// 已写出的请求等待响应；响应确认 outbox，超时或断连则标记为 unknown。
+    fn expect_response(&mut self, id: RpcId, outbox_id: Option<u64>, rpc: PendingRpc) {
         if let Some(outbox_id) = outbox_id {
-            self.outbox_pending.insert(request_id.clone(), outbox_id);
+            self.outbox_pending.insert(id.clone(), outbox_id);
         }
+        self.pending.insert(id, rpc);
     }
 
     fn confirm_outbox(&mut self, request_id: &RpcId) {
@@ -1081,8 +1100,7 @@ impl Core {
                 return Ok(());
             }
         }
-        let id = RpcId::Number(self.next_id);
-        self.next_id += 1;
+        let id = self.next_rpc_id();
         let envelope = match kind {
             RpcKind::Initialize => app_server::initialize(id.clone()),
             RpcKind::ThreadStart => app_server::thread_start(id.clone(), &self.config),
@@ -1102,20 +1120,19 @@ impl Core {
             }
         };
         let outbox_id = self.send_effect(envelope, None)?;
-        self.track_outbox(&id, outbox_id);
         if matches!(kind, RpcKind::Preflight) {
             self.state.view.phase = SessionPhase::CheckingShell;
             self.state.view.notice =
                 Some("Checking the sandbox shell; no model turn has started.".into());
         }
-        self.pending.insert(
+        let skills_cwd = matches!(kind, RpcKind::SkillsList { .. })
+            .then(|| self.config.cwd.display().to_string());
+        self.expect_response(
             id,
+            outbox_id,
             PendingRpc {
-                kind,
-                deadline: Instant::now() + Duration::from_secs(30),
-                identity_thread: None,
-                skills_cwd: matches!(kind, RpcKind::SkillsList { .. })
-                    .then(|| self.config.cwd.display().to_string()),
+                skills_cwd,
+                ..PendingRpc::new(kind)
             },
         );
         Ok(())
@@ -1441,23 +1458,14 @@ impl Core {
         if task.external.as_ref() != Some(&external) {
             return;
         }
-        let id = RpcId::Number(self.next_id);
-        self.next_id += 1;
+        let id = self.next_rpc_id();
         let request = app_server::interrupt(id.clone(), &external.thread_id, &external.turn_id);
         match self.send_effect(request, Some(effect.attempt)) {
             Ok(outbox_id) => {
-                self.track_outbox(&id, outbox_id);
-                self.pending.insert(
-                    id,
-                    PendingRpc {
-                        kind: RpcKind::ChildInterrupt {
-                            attempt: effect.attempt,
-                        },
-                        deadline: Instant::now() + Duration::from_secs(30),
-                        identity_thread: None,
-                        skills_cwd: None,
-                    },
-                );
+                let kind = RpcKind::ChildInterrupt {
+                    attempt: effect.attempt,
+                };
+                self.expect_response(id, outbox_id, PendingRpc::new(kind));
             }
             Err(error) => self.state.error(SessionPhase::Unknown, error.to_string()),
         }
@@ -1496,8 +1504,7 @@ impl Core {
             );
             return;
         }
-        let id = RpcId::Number(self.next_id);
-        self.next_id += 1;
+        let id = self.next_rpc_id();
         let thread = self.state.view.thread_id.clone().unwrap();
         // 新 root turn 尚未收到 usage；旧 turn 事实不能重新绑定到这一代。
         self.state.clear_usage_fact(&thread);
@@ -1509,7 +1516,6 @@ impl Core {
                 return;
             }
         };
-        self.track_outbox(&id, outbox_id);
         self.state.view.root_start_requests += 1;
         self.generation += 1;
         self.state.view.turn_id = None;
@@ -1520,17 +1526,10 @@ impl Core {
         self.completed_collab.clear();
         self.pending
             .retain(|_, rpc| rpc.kind.generation().is_none());
-        self.pending.insert(
-            id,
-            PendingRpc {
-                kind: RpcKind::StartTurn {
-                    generation: self.generation,
-                },
-                deadline: Instant::now() + Duration::from_secs(30),
-                identity_thread: None,
-                skills_cwd: None,
-            },
-        );
+        let kind = RpcKind::StartTurn {
+            generation: self.generation,
+        };
+        self.expect_response(id, outbox_id, PendingRpc::new(kind));
     }
 
     fn issue_interrupt(&mut self) {
@@ -2342,8 +2341,7 @@ impl Core {
             return;
         }
         self.identity_requested.insert(id.into());
-        let request_id = RpcId::Number(self.next_id);
-        self.next_id += 1;
+        let request_id = self.next_rpc_id();
         let request = Envelope::request(
             request_id.clone(),
             "thread/read",
@@ -2356,14 +2354,12 @@ impl Core {
                 return;
             }
         };
-        self.track_outbox(&request_id, outbox_id);
-        self.pending.insert(
+        self.expect_response(
             request_id,
+            outbox_id,
             PendingRpc {
-                kind: RpcKind::AgentRead,
-                deadline: Instant::now() + Duration::from_secs(30),
                 identity_thread: Some(id.into()),
-                skills_cwd: None,
+                ..PendingRpc::new(RpcKind::AgentRead)
             },
         );
     }
