@@ -465,7 +465,7 @@ async fn tool_calls_leave_one_summary_line_per_item_after_the_turn_retires() {
         .filter(|message| message.role == "Tool")
         .collect();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].text, "▸ cargo test · running");
+    assert_eq!(tools[0].text, "▸ running · cargo test");
 
     observation_event(
         &mut client,
@@ -488,7 +488,7 @@ async fn tool_calls_leave_one_summary_line_per_item_after_the_turn_retires() {
         .collect();
     assert_eq!(tools.len(), 1);
     assert!(
-        tools[0].text == "▸ cargo test · failed · exit 3 · 1.5s",
+        tools[0].text == "▸ failed · exit 3 · 1.5s · cargo test",
         "{}",
         tools[0].text
     );

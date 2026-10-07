@@ -68,7 +68,7 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
 | Escape | Close help, panels, and notices; the draft is kept (Ctrl+U clears it) |
 
-Each turn shows its tool calls as compact gray lines in the conversation (command, state, exit code, duration); Ctrl+T opens full details.
+Each turn shows its tool calls as compact gray lines in the conversation (state, exit code, duration, command); Ctrl+T opens full details.
 
 Chinese, combining characters, and emoji are edited as whole graphemes. Secret answers are masked and kept outside conversation history. A task draft is saved while answering questions. Messages and queues have byte limits; history truncation is visible.
 

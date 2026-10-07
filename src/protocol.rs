@@ -645,9 +645,13 @@ pub fn shell_script(command: &str) -> &str {
         }
         rest = tail.trim_start();
     }
-    rest.strip_prefix('"')
-        .and_then(|inner| inner.strip_suffix('"'))
-        .filter(|inner| !inner.is_empty())
+    ['"', '\'']
+        .into_iter()
+        .find_map(|quote| {
+            rest.strip_prefix(quote)
+                .and_then(|inner| inner.strip_suffix(quote))
+                .filter(|inner| !inner.is_empty() && !inner.contains(quote))
+        })
         .unwrap_or(rest)
 }
 
@@ -661,7 +665,12 @@ mod tests {
             ),
             "Set-Content x 'hi'"
         );
-        assert_eq!(super::shell_script("bash -lc 'cargo test'"), "'cargo test'");
+        assert_eq!(super::shell_script("bash -lc 'cargo test'"), "cargo test");
+        // 内部还有同种引号时无法安全去壳，保留原样。
+        assert_eq!(
+            super::shell_script("bash -lc 'echo '\"'x'\"''"),
+            "'echo '\"'x'\"''"
+        );
         assert_eq!(super::shell_script("cmd.exe /c dir"), "dir");
         assert_eq!(super::shell_script("cargo test --all"), "cargo test --all");
         assert_eq!(super::shell_script("pwsh"), "pwsh");

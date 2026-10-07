@@ -82,7 +82,7 @@ impl ToolDetail {
     }
 }
 
-/// 对话中显示的一行工具摘要：命令首行（最多 96 字符）、状态、退出码和耗时。
+/// 对话中显示的一行工具摘要：状态、退出码、耗时和命令首行（最多 96 字符）。
 pub fn summary_line(detail: &ToolDetail) -> String {
     let what = detail
         .command
@@ -105,13 +105,15 @@ pub fn summary_line(detail: &ToolDetail) -> String {
         ToolLifecycle::EndedUnknown => "ended, outcome unknown",
         ToolLifecycle::Unknown => "unknown",
     };
-    let mut line = format!("▸ {what} · {state}");
+    // 状态在前：命令很长而换行时，状态和退出码仍在第一行可见。
+    let mut line = format!("▸ {state}");
     if let Some(code) = detail.exit_code {
         line.push_str(&format!(" · exit {code}"));
     }
     if let Some(ms) = detail.duration_ms {
         line.push_str(&format!(" · {:.1}s", ms as f64 / 1000.0));
     }
+    line.push_str(&format!(" · {what}"));
     crate::state::display_text(&line)
 }
 
