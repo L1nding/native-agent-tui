@@ -204,6 +204,27 @@ impl TimelinePanel {
                 .collect()
         };
         rows.sort_by_key(|entry| entry.evidence.id);
+        if self.category == Category::All && !self.bookmarks_only {
+            // 流式输出每个片段都是一条证据，会淹没生命周期和工具事件；全部视图里
+            // 同一 item 连续的 Output 只保留最新一条（已选中的保留），Output 分类可看全部。
+            let same_stream = |a: &TimelineEntry, b: &TimelineEntry| {
+                a.evidence.kind == EvidenceKind::Output
+                    && b.evidence.kind == EvidenceKind::Output
+                    && a.identity.thread_id == b.identity.thread_id
+                    && a.identity.turn_id == b.identity.turn_id
+                    && a.item_id == b.item_id
+            };
+            let keep: Vec<bool> = (0..rows.len())
+                .map(|index| {
+                    Some(rows[index].evidence.id) == self.selected
+                        || rows
+                            .get(index + 1)
+                            .is_none_or(|next| !same_stream(&rows[index], next))
+                })
+                .collect();
+            let mut keep = keep.into_iter();
+            rows.retain(|_| keep.next().unwrap_or(true));
+        }
         rows
     }
 

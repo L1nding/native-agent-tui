@@ -709,3 +709,26 @@ fn empty_timeline_has_no_locatable_selection() {
         .is_none());
     assert!(panel.visible);
 }
+
+#[test]
+fn all_view_collapses_streamed_output_but_output_category_keeps_every_chunk() {
+    let mut entries: Vec<_> = (1..=5)
+        .map(|id| event(id, "root", "turn-1", "msg"))
+        .collect();
+    entries.push(tool_event(6));
+    entries.extend((7..=8).map(|id| event(id, "root", "turn-1", "msg-2")));
+    let current = source(entries);
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+    let ids = |panel: &TimelinePanel| {
+        panel
+            .rows(&current)
+            .iter()
+            .map(|entry| entry.evidence.id)
+            .collect::<Vec<_>>()
+    };
+    // open() 选中最新一条（#8），连续片段只保留每段最后一条。
+    assert_eq!(ids(&panel), vec![5, 6, 8]);
+    panel.category = Category::Output;
+    assert_eq!(ids(&panel), vec![1, 2, 3, 4, 5, 7, 8]);
+}

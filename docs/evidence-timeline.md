@@ -52,3 +52,5 @@ python scripts/verify.py --live
 Windows 原生 ConPTY 使用假 app-server 验证书签、过滤、帮助、缩放、两次同 ID 审批定位、秘密答案经历史切换后精确提交一次，以及零额外根请求/中断、进程清理和脱敏回放。该夹具已接入 `scripts/verify.py`，截图仅保留没有正文和秘密的证据面板。
 
 当前入口是实时证据视图。完整 ingress 事件轨迹、原始工具结果/参数搜索、reasoning/usage/compaction 专项视图及跨 session 历史搜索仍待实现；没有的数据显示 unavailable。Windows Terminal、Orca 剪贴板/IME、固定开发任务集及 Alpha/V2 发布门禁仍未完成。
+
+全部分类视图会把同一 thread/turn/item 连续的 Output 证据折叠为最新一条（当前选中的条目保留）；切到 Output 分类可查看每个流式片段。头部计数显示折叠后的可见条数与保留总数。
