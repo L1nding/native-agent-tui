@@ -19,7 +19,13 @@ The TUI requires an interactive terminal. `--run` prints streamed agent text and
 
 ### Windows sandbox setup
 
-The client inherits Codex's Windows sandbox implementation. If shell preflight times out with an elevated sandbox, check that sandbox's setup. An explicit unelevated override is also available:
+The client inherits Codex's Windows sandbox implementation. The elevated sandbox needs a one-time administrator setup (repeated after some Codex upgrades). Started from app-server, that setup cannot show its UAC prompt, so shell preflight times out. Run it once in an interactive terminal and approve the prompt:
+
+```text
+codex sandbox -- cmd /c echo ok
+```
+
+Preflight runs `powershell.exe` because the elevated Codex 0.159.2 runner does not resolve a bare `pwsh` installed under the user profile. An explicit unelevated override is also available:
 
 ```text
 cargo run --locked -- --check-shell --windows-sandbox unelevated

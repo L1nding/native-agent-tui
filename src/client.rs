@@ -451,7 +451,7 @@ impl Core {
         } else if self.config.windows_sandbox.as_deref() == Some("unelevated") {
             "Check the Codex Windows sandbox setup."
         } else {
-            "Restart with --windows-sandbox unelevated, or set `[windows] sandbox = \"unelevated\"` in the Codex config.toml to keep it."
+            "The elevated Codex sandbox may need one-time admin setup: run `codex sandbox -- cmd /c echo ok` in a terminal and approve the UAC prompt. Or restart with --windows-sandbox unelevated (keep it with `[windows] sandbox = \"unelevated\"` in the Codex config.toml)."
         };
         format!("Shell preflight timed out; no model turn was started. {advice} Automatic retry is disabled.")
     }

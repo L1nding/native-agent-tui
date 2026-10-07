@@ -412,8 +412,10 @@ pub(crate) fn interrupt(id: RpcId, thread: &str, turn: &str) -> Envelope {
 }
 
 pub(crate) fn preflight(id: RpcId, config: &Config) -> Envelope {
+    // Windows 用系统自带的 powershell.exe：Codex 0.159.2 的 elevated 运行器
+    // 不按 PATH 解析用户目录下的裸名 pwsh，会让预检误报失败。
     let command: Vec<&str> = if cfg!(windows) {
-        vec!["pwsh", "-NoProfile", "-NonInteractive", "-Command", "if (-not (Test-Path -LiteralPath . -PathType Container)) { exit 1 }; Write-Output native-agent-tui-shell-ok"]
+        vec!["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "if (-not (Test-Path -LiteralPath . -PathType Container)) { exit 1 }; Write-Output native-agent-tui-shell-ok"]
     } else {
         vec!["sh", "-c", "test -d . && printf native-agent-tui-shell-ok"]
     };
