@@ -2406,6 +2406,17 @@ impl Core {
         self.flush_gate();
     }
 
+    /// 轮次终结后清理其工具详情、文件预览和未决请求。
+    fn retire_turn_evidence(&mut self, thread: &str, turn: &str) {
+        let session = &self.state.view.observation.session_id;
+        self.tool_details.retire(session, thread, turn);
+        self.file_previews.retire(thread, turn);
+        self.state
+            .view
+            .requests
+            .retain(|request| request.thread_id != thread || request.turn_id != turn);
+    }
+
     fn observe_output(
         &mut self,
         thread: &str,
@@ -2674,13 +2685,7 @@ impl Core {
                                                 generation,
                                                 Instant::now(),
                                             );
-                                            let session = &self.state.view.observation.session_id;
-                                            self.tool_details.retire(session, thread, &old_turn);
-                                            self.file_previews.retire(thread, &old_turn);
-                                            self.state.view.requests.retain(|request| {
-                                                request.thread_id != thread
-                                                    || request.turn_id != old_turn
-                                            });
+                                            self.retire_turn_evidence(thread, &old_turn);
                                         }
                                         self.read_agent_identity(thread);
                                     }
@@ -2711,15 +2716,7 @@ impl Core {
                                 };
                             let event = self.state.agents.completed(thread, turn, outcome);
                             if event.is_some() {
-                                self.tool_details.retire(
-                                    &self.state.view.observation.session_id,
-                                    thread,
-                                    turn,
-                                );
-                                self.file_previews.retire(thread, turn);
-                                self.state.view.requests.retain(|request| {
-                                    request.thread_id != thread || request.turn_id != turn
-                                });
+                                self.retire_turn_evidence(thread, turn);
                             }
                             event
                         }
@@ -2767,17 +2764,8 @@ impl Core {
                     .pointer("/turn/error/message")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                self.state.view.requests.retain(|r| {
-                    Some(r.thread_id.as_str()) != self.state.view.thread_id.as_deref()
-                        || r.turn_id != id.unwrap_or("")
-                });
-                if let Some(thread) = self.state.view.thread_id.as_deref() {
-                    self.tool_details.retire(
-                        &self.state.view.observation.session_id,
-                        thread,
-                        id.unwrap(),
-                    );
-                    self.file_previews.retire(thread, id.unwrap());
+                if let Some(thread) = self.state.view.thread_id.clone() {
+                    self.retire_turn_evidence(&thread, id.unwrap());
                 }
                 self.state.view.tool_activity = None;
                 self.state.view.notice = None;
