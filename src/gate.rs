@@ -48,15 +48,8 @@ pub struct GateEvent {
     pub outcome: Option<ChildOutcome>,
 }
 
-pub trait CompletionGate {
-    fn accept_wait(&mut self, request: WaitRequest) -> Result<WaitToken, GateError>;
-    fn apply(&mut self, event: &GateEvent) -> GateChange;
-    fn cancel(&mut self) -> GateChange;
-    fn disconnect(&mut self) -> GateChange;
-}
-
 #[derive(Debug, Default)]
-pub struct PendingGate {
+pub struct CompletionGate {
     next_token: u64,
     pending: Option<PendingWait>,
 }
@@ -81,7 +74,7 @@ impl PendingWait {
     }
 }
 
-impl PendingGate {
+impl CompletionGate {
     pub fn targets(&self) -> Vec<WaitTarget> {
         self.pending
             .as_ref()
@@ -95,10 +88,8 @@ impl PendingGate {
         let pending = self.pending.take()?;
         Some((pending.token, pending.targets.into_values().collect()))
     }
-}
 
-impl CompletionGate for PendingGate {
-    fn accept_wait(&mut self, request: WaitRequest) -> Result<WaitToken, GateError> {
+    pub fn accept_wait(&mut self, request: WaitRequest) -> Result<WaitToken, GateError> {
         if self.pending.is_some() {
             return Err(GateError::AlreadyPending);
         }
@@ -125,7 +116,7 @@ impl CompletionGate for PendingGate {
         Ok(token)
     }
 
-    fn apply(&mut self, event: &GateEvent) -> GateChange {
+    pub fn apply(&mut self, event: &GateEvent) -> GateChange {
         let Some(pending) = self.pending.as_mut() else {
             return GateChange::Pending;
         };
@@ -156,12 +147,12 @@ impl CompletionGate for PendingGate {
         }
     }
 
-    fn cancel(&mut self) -> GateChange {
+    pub fn cancel(&mut self) -> GateChange {
         self.pending.take();
         GateChange::Cancelled
     }
 
-    fn disconnect(&mut self) -> GateChange {
+    pub fn disconnect(&mut self) -> GateChange {
         self.pending.take();
         GateChange::Disconnected
     }
@@ -169,9 +160,7 @@ impl CompletionGate for PendingGate {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ChildOutcome, CompletionGate, GateChange, GateEvent, PendingGate, WaitRequest, WaitTarget,
-    };
+    use super::{ChildOutcome, CompletionGate, GateChange, GateEvent, WaitRequest, WaitTarget};
 
     fn target(id: &str, generation: u64) -> WaitTarget {
         WaitTarget {
@@ -184,7 +173,7 @@ mod tests {
 
     #[test]
     fn releases_once_all_current_generations_are_terminal() {
-        let mut gate = PendingGate::default();
+        let mut gate = CompletionGate::default();
         gate.accept_wait(WaitRequest {
             targets: vec![target("a", 1), target("b", 2)],
         })
@@ -223,7 +212,7 @@ mod tests {
 
     #[test]
     fn pending_result_cannot_be_taken_and_failure_releases_without_other_children() {
-        let mut gate = PendingGate::default();
+        let mut gate = CompletionGate::default();
         gate.accept_wait(WaitRequest {
             targets: vec![target("a", 1), target("b", 1)],
         })
@@ -245,7 +234,7 @@ mod tests {
 
     #[test]
     fn awaiting_generation_requires_a_started_event_before_completion() {
-        let mut gate = PendingGate::default();
+        let mut gate = CompletionGate::default();
         gate.accept_wait(WaitRequest {
             targets: vec![WaitTarget {
                 id: "a".into(),

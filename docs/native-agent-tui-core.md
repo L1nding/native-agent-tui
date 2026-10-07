@@ -181,11 +181,12 @@ Core 应记录上下文和 skill 的事实，但明确来源：服务端确认�
 Gate 是深 Module，外部接口只暴露接受等待、应用事件、取消、断连和取结果：
 
 ```rust
-trait CompletionGate {
-    fn accept_wait(&mut self, request: WaitRequest) -> Result<WaitToken, GateError>;
-    fn apply(&mut self, event: &CoreEvent) -> GateChange;
-    fn cancel(&mut self, reason: CancelReason) -> GateChange;
-    fn disconnect(&mut self) -> GateChange;
+impl CompletionGate {
+    pub fn accept_wait(&mut self, request: WaitRequest) -> Result<WaitToken, GateError>;
+    pub fn apply(&mut self, event: &GateEvent) -> GateChange;
+    pub fn cancel(&mut self) -> GateChange;
+    pub fn disconnect(&mut self) -> GateChange;
+    pub fn take_result(&mut self) -> Option<(WaitToken, Vec<WaitTarget>)>;
 }
 ```
 

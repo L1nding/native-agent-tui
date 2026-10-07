@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use crate::agents::{AgentInfo, AgentLimits, AgentRegistry};
 use crate::app_server::{self, AppServer, AppServerError};
 use crate::config::Config;
-use crate::gate::{ChildOutcome, CompletionGate, GateEvent, PendingGate, WaitRequest, WaitToken};
+use crate::gate::{ChildOutcome, CompletionGate, GateEvent, WaitRequest, WaitToken};
 use crate::interactions::{files::FilePreviews, ApprovalDecision, RequestRef, RequestView};
 use crate::journal::{Journal, JournalError, StoredSnapshot};
 use crate::observation::{AttentionClass, ChildFact, ObservationFacts, Observer};
@@ -257,7 +257,7 @@ impl ClientHandle {
                 peer_cleanup_uncertain: false,
                 generation: 0,
                 retired_turns: VecDeque::new(),
-                gate: PendingGate::default(),
+                gate: CompletionGate::default(),
                 wait: None,
                 ingress_seq: 0,
                 file_previews: FilePreviews::default(),
@@ -352,7 +352,7 @@ struct Core {
     peer_cleanup_uncertain: bool,
     generation: u64,
     retired_turns: VecDeque<String>,
-    gate: PendingGate,
+    gate: CompletionGate,
     wait: Option<PendingTool>,
     ingress_seq: u64,
     file_previews: FilePreviews,
