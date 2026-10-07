@@ -11,7 +11,7 @@ use native_agent_tui::outbox::{OutboxSnapshot, OutboxStatus};
 use native_agent_tui::scheduler::{
     RootTaskSpec, Scheduler, TaskKind, TaskState, WorkflowPlan, WORKFLOW_BYTES,
 };
-use native_agent_tui::state::{display_text_for_cli, SessionPhase};
+use native_agent_tui::state::{display_text, SessionPhase};
 use native_agent_tui::{ui, ClientHandle};
 
 fn print_help() {
@@ -101,7 +101,7 @@ async fn main() -> ExitCode {
     match execute().await {
         Ok(()) => ExitCode::SUCCESS,
         Err((code, error)) => {
-            eprintln!("error: {}", display_text_for_cli(&error));
+            eprintln!("error: {}", display_text(&error));
             ExitCode::from(code)
         }
     }
@@ -407,7 +407,7 @@ async fn execute() -> Result<(), (u8, String)> {
                 for activity in &state.observation.activities {
                     println!(
                         "{} {:?} {:?} {:?} | progress {} | historical quiet {:?}ms | last source {:?}",
-                        display_text_for_cli(&activity.identity.agent_id),
+                        display_text(&activity.identity.agent_id),
                         activity.scope,
                         activity.execution_state,
                         activity.tool_category,

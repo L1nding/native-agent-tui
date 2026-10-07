@@ -514,14 +514,10 @@ pub(crate) fn trim_front(text: &mut String, max_bytes: usize) {
     text.drain(..cut);
 }
 
-pub(crate) fn display_text(text: &str) -> String {
+pub fn display_text(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect()
-}
-
-pub fn display_text_for_cli(text: &str) -> String {
-    display_text(text)
 }
 
 #[cfg(test)]

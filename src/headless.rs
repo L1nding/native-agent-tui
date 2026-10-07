@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use crate::client::{ClientHandle, Command};
 use crate::json_events::{LiveOutput, OutputError};
 use crate::scheduler::{RootTaskSpec, TaskKind};
-use crate::state::{display_text_for_cli, SessionPhase};
+use crate::state::{display_text, SessionPhase};
 
 pub async fn run(
     mut client: ClientHandle,
@@ -69,9 +69,9 @@ pub async fn run(
                     .or_default();
                 if message.text != *previous {
                     if let Some(suffix) = message.text.strip_prefix(previous.as_str()) {
-                        print!("{}", display_text_for_cli(suffix));
+                        print!("{}", display_text(suffix));
                     } else {
-                        print!("\n{}", display_text_for_cli(&message.text));
+                        print!("\n{}", display_text(&message.text));
                     }
                     *previous = message.text.clone();
                     let _ = io::stdout().flush();
