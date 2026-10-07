@@ -90,7 +90,8 @@ enum Pending {
 }
 
 struct Permission {
-    options: Vec<String>,
+    /// (optionId, kind)；kind 是 ACP 标准的 allow_once / reject_once 等。
+    options: Vec<(String, Option<String>)>,
 }
 
 struct AcpBridge {
@@ -106,6 +107,8 @@ struct AcpBridge {
     message_text: HashMap<String, String>,
     last_message_id: Option<String>,
     model: Option<String>,
+    /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
+    tool_inputs: HashMap<String, acp_protocol::ToolInput>,
 }
 
 impl AcpBridge {
@@ -125,6 +128,7 @@ impl AcpBridge {
             message_text: HashMap::new(),
             last_message_id: None,
             model: config.model.clone(),
+            tool_inputs: HashMap::new(),
         }
     }
 
@@ -195,6 +199,7 @@ impl AcpBridge {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 self.message_text.clear();
+                self.tool_inputs.clear();
                 self.last_message_id = None;
                 self.turn_id = Some(format!("acp-turn-{}", id_text(&id)));
                 self.turn_started = true;
@@ -277,11 +282,13 @@ impl AcpBridge {
                         .and_then(|value| value.get("decision"))
                         .and_then(Value::as_str)
                         .unwrap_or("decline");
-                    let outcome = if decision == "cancel" {
-                        json!({"outcome":"cancelled"})
-                    } else {
-                        let option = choose_permission_option(decision, &permission.options);
-                        json!({"outcome":"selected","optionId":option})
+                    // 找不到与决定一致的选项时回复 cancelled，绝不回退到批准类选项。
+                    let outcome = match (
+                        decision,
+                        choose_permission_option(decision, &permission.options),
+                    ) {
+                        ("cancel", _) | (_, None) => json!({"outcome":"cancelled"}),
+                        (_, Some(option)) => json!({"outcome":"selected","optionId":option}),
                     };
                     Envelope::response(id, Some(json!({"outcome": outcome})))
                 };
@@ -550,7 +557,17 @@ impl AcpBridge {
                 self.core.send(Envelope::notification("item/agentMessage/delta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?
             }
             Update::AgentThought { item_id, text } => self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?,
-            Update::ToolCall { item_id, title, kind } => self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","command":title,"kind":kind}}))))?,
+            Update::ToolCall {
+                item_id,
+                title,
+                kind,
+                input,
+            } => {
+                if self.tool_inputs.len() < 256 {
+                    self.tool_inputs.insert(item_id.clone(), input);
+                }
+                self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","command":title,"kind":kind}}))))?;
+            }
             Update::ToolCallUpdate { item_id, status, output } => {
                 match status {
                     ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
@@ -602,10 +619,12 @@ impl AcpBridge {
                 items
                     .iter()
                     .filter_map(|item| {
-                        item.get("optionId")
+                        let id = item
+                            .get("optionId")
                             .or_else(|| item.get("id"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
+                            .and_then(Value::as_str)?;
+                        let kind = item.get("kind").and_then(Value::as_str);
+                        Some((id.to_owned(), kind.map(str::to_owned)))
                     })
                     .collect()
             })
@@ -619,13 +638,29 @@ impl AcpBridge {
             return Ok(());
         }
         self.permissions.insert(id.clone(), Permission { options });
-        // 审批者必须看到要执行的内容：优先 rawInput 的命令、理由和目录。
-        let input = acp_protocol::tool_input(&tool);
+        // 审批者必须看到要执行的内容：优先请求自带的 rawInput；dsh 只给
+        // toolCallId 时，从同一轮先前的 tool_call 查回命令、理由和申请的权限。
+        let mut input = acp_protocol::tool_input(&tool);
+        if input.command.is_none() {
+            if let Some(known) = tool
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .and_then(|id| self.tool_inputs.get(id))
+            {
+                input = known.clone();
+            }
+        }
+        let reason = match (&input.reason, &input.sandbox) {
+            (Some(reason), Some(sandbox)) => format!("{reason} (requests {sandbox})"),
+            (None, Some(sandbox)) => format!("Requests {sandbox}"),
+            (Some(reason), None) => reason.clone(),
+            (None, None) => "DeepSeek ACP permission request".into(),
+        };
         let mut request = json!({
             "threadId": session,
             "turnId": turn,
             "command": input.command.as_deref().unwrap_or(title),
-            "reason": input.reason.as_deref().unwrap_or("DeepSeek ACP permission request"),
+            "reason": reason,
             "kind": "command",
             "availableDecisions": ["accept", "decline", "cancel"],
         });
@@ -653,22 +688,42 @@ fn id_text(id: &RpcId) -> String {
     }
 }
 
-fn choose_permission_option(decision: &str, options: &[String]) -> String {
-    let needle = match decision {
-        "accept" => ["allow", "accept", "yes"],
-        "cancel" => ["cancel", "abort", "stop"],
-        _ => ["deny", "decline", "no"],
+/// 按决定选择 ACP 权限选项：优先标准 kind（once 优先于 always），其次按 optionId
+/// 关键词。拒绝只会选拒绝类选项；没有匹配时返回 None，由调用方回复 cancelled。
+fn choose_permission_option(
+    decision: &str,
+    options: &[(String, Option<String>)],
+) -> Option<String> {
+    let (kind_prefix, allowed, forbidden): (&str, &[&str], &[&str]) = match decision {
+        "accept" => (
+            "allow",
+            &["allow", "accept", "yes"],
+            &["reject", "deny", "decline"],
+        ),
+        "decline" => (
+            "reject",
+            &["reject", "deny", "decline"],
+            &["allow", "accept"],
+        ),
+        _ => return None,
     };
-    options
-        .iter()
-        .find(|option| {
-            needle
-                .iter()
-                .any(|part| option.to_ascii_lowercase().contains(part))
+    let by_kind = |suffix: &str| {
+        options.iter().find(|(_, kind)| {
+            kind.as_deref()
+                .is_some_and(|kind| kind.starts_with(kind_prefix) && kind.ends_with(suffix))
         })
-        .cloned()
-        .or_else(|| options.first().cloned())
-        .unwrap_or_else(|| decision.to_owned())
+    };
+    by_kind("once")
+        .or_else(|| by_kind(""))
+        .or_else(|| {
+            options.iter().find(|(id, kind)| {
+                let id = id.to_ascii_lowercase();
+                kind.is_none()
+                    && allowed.iter().any(|word| id.contains(word))
+                    && !forbidden.iter().any(|word| id.contains(word))
+            })
+        })
+        .map(|(id, _)| id.clone())
 }
 
 #[cfg(test)]
@@ -690,14 +745,29 @@ mod tests {
 
     #[test]
     fn permission_decisions_prefer_matching_acp_option_ids() {
+        let dsh = [
+            ("allow-once".to_owned(), Some("allow_once".to_owned())),
+            ("allow-always".to_owned(), Some("allow_always".to_owned())),
+            ("reject-once".to_owned(), Some("reject_once".to_owned())),
+        ];
         assert_eq!(
-            choose_permission_option("accept", &["allow_once".into(), "deny".into()]),
-            "allow_once"
+            choose_permission_option("accept", &dsh).as_deref(),
+            Some("allow-once")
         );
+        // dsh 的拒绝选项叫 reject-once；曾因只匹配 deny/decline 而回退到 allow-once。
         assert_eq!(
-            choose_permission_option("decline", &["allow_once".into(), "deny".into()]),
-            "deny"
+            choose_permission_option("decline", &dsh).as_deref(),
+            Some("reject-once")
         );
+        assert_eq!(choose_permission_option("cancel", &dsh), None);
+        let untyped = [("allow_once".to_owned(), None), ("deny".to_owned(), None)];
+        assert_eq!(
+            choose_permission_option("decline", &untyped).as_deref(),
+            Some("deny")
+        );
+        // 没有拒绝类选项时不能选中批准选项。
+        let allow_only = [("allow-once".to_owned(), Some("allow_once".to_owned()))];
+        assert_eq!(choose_permission_option("decline", &allow_only), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -958,6 +1028,62 @@ mod tests {
                 .contains("available: hi/gpt-6-luna"),
             "{error}"
         );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn id_only_permission_shows_the_earlier_command_and_requested_sandbox() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId": "s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "run"))
+            .unwrap();
+        core_client.recv().await.unwrap(); // turn/started
+        acp_server.recv().await.unwrap(); // session/prompt
+        core_client.recv().await.unwrap(); // turn/start ack
+        acp_server
+            .send(Envelope::notification(
+                "session/update",
+                Some(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call",
+                    "toolCallId":"call-1","title":"pwsh","kind":"other","status":"in_progress",
+                    "rawInput":{"command":"Start-Sleep -Seconds 1","justification":"执行用户指定的命令",
+                        "sandbox_permissions":"danger-full-access","workdir":"D:\\ws"}}})),
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("item/started")
+        );
+        acp_server
+            .send(Envelope::request(
+                RpcId::Number(9),
+                "session/request_permission",
+                Some(json!({"sessionId":"s","toolCall":{"toolCallId":"call-1"},
+                    "options":[{"optionId":"allow-once"},{"optionId":"reject-once"}]})),
+            ))
+            .unwrap();
+        let request = core_client.recv().await.unwrap();
+        let params = request.params.unwrap();
+        assert_eq!(params["command"], "Start-Sleep -Seconds 1");
+        assert_eq!(
+            params["reason"],
+            "执行用户指定的命令 (requests danger-full-access)"
+        );
+        assert_eq!(params["cwd"], "D:\\ws");
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }

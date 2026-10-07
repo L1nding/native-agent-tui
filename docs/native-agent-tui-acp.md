@@ -58,6 +58,14 @@ instead of failing the turn. dsh puts the real command, justification, and
 working directory in `rawInput`, so approvals and tool lines show those fields
 rather than the bare tool name.
 
+Permission decisions use the standard ACP option `kind` (`allow_once` before
+`allow_always`, `reject_once` before `reject_always`), then option-id keywords.
+Decline and cancel never fall back to an allow option: without a matching
+reject option the bridge answers `cancelled`. dsh sends permission requests that
+carry only `toolCallId`, so the bridge remembers each turn's `tool_call` input
+and shows its command, justification, working directory, and requested sandbox
+(for example `danger-full-access`).
+
 Real backend check (2026-10-07, `dsh` 0.2.0-rc.2): the default DeepSeek
 provider returned "Insufficient Balance". With `--model hi/gpt-6-luna` (a
 provider copied from the user's dsh tauri profile into the acp profile patch

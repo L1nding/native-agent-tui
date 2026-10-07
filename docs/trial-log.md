@@ -15,5 +15,7 @@
 | 9 | 2026-10-07 | Codex 0.159.2，read-only，120 列 | 让根代理派两个子代理分别统计 `src/ui` 和 `tests` 的文件数，完成后汇总 | 成功：25 和 2，与 `ls` 一致（系统验证）；左侧代理列表、F3 切换到子代理对话均正常 | 根 2 次，子代理各 1 次 | 0 | 代理列表清楚 | 已结束代理显示 `Ended / quiet unknown`（已省略） |
 | 10 | 2026-10-07 | Codex 0.159.2，workspace-write，`target/trial-ws` | 第一轮写 `fib`，运行中用 Ctrl+S 排队第二轮“写 unittest” | 成功：头部显示 `queued: 1`，第一轮结束后自动开始第二轮；生成的 3 个测试用 `python -m unittest` 全部通过（系统验证） | 4 + 1 | 0 | 清楚 | 排队提示“Queued 1 root tasks; dependencies remain enforced.”语法错且偏技术化（已改） |
 | 11 | 2026-10-07 | Codex 0.159.2，read-only，`target/trial-ws` | 根代理派子代理用 shell 写 `child.txt` | 成功：审批来自子代理，面板标明 `/root/create_child_file`、命令与理由；头部 `GatePending`，输入框提示 Enter 排队；批准后文件内容为 `hi`（系统验证），根代理核实后汇总 | 根 6 次 + 子代理 2 次 | 1（批准） | 清楚 | 等待子代理的工具调用只显示 `Dynamic`（改为显示 `wait_for_subagent_completion` 等工具名；MCP 显示 server/tool） |
+| 12 | 2026-10-07 | dsh ACP，`hi/gpt-6-luna`，read-only | 运行 `Start-Sleep 60`，Ctrl+C，再追问 | 成功：Interrupted 后会话可继续，模型说明了原因 | 3 + 1 次权限请求 | 1 | 清楚 | 权限请求只带 toolCallId，界面只显示“ACP permission request”（改为按 id 查回命令、理由、目录及申请的 `danger-full-access`） |
+| 13 | 2026-10-07 | 同上 | 运行 `Start-Sleep 1`，对提权请求按 Ctrl+N 拒绝 | **修复前拒绝被当成批准**（dsh 选项名 `reject-once` 未被识别，回退到首个 `allow-once`，命令执行并返回 DONE）；修复后命令未执行，agent 回复权限被拒（系统验证） | 3 | 1（拒绝） | 清楚 | 已修复：按 ACP kind 选择，拒绝/取消绝不回退到批准选项 |
 
 尚未覆盖：5 秒状态理解计时、Orca 内置终端。

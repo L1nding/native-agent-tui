@@ -50,6 +50,8 @@ pub enum Update {
         item_id: String,
         title: String,
         kind: Option<String>,
+        /// 保留给之后只带 toolCallId 的权限请求查回命令、理由和申请的权限。
+        input: ToolInput,
     },
     ToolCallUpdate {
         item_id: String,
@@ -335,6 +337,7 @@ pub fn update(params: &Value) -> Result<(String, Update), AcpProtocolError> {
         },
         "tool_call" => Update::ToolCall {
             item_id: item_id()?,
+            input: tool_input(payload),
             // dsh 的 title 只是工具名（如 pwsh），真正的命令在 rawInput.command。
             title: {
                 let input = tool_input(payload);
@@ -426,6 +429,8 @@ pub struct ToolInput {
     pub cwd: Option<String>,
     /// 非命令类工具（read/edit/glob 等）操作的路径或模式。
     pub target: Option<String>,
+    /// 工具申请的沙箱权限，例如 danger-full-access；审批时必须可见。
+    pub sandbox: Option<String>,
 }
 
 pub fn tool_input(tool: &Value) -> ToolInput {
@@ -450,6 +455,7 @@ pub fn tool_input(tool: &Value) -> ToolInput {
         reason: field(&["justification", "description", "reason"]),
         cwd: field(&["workdir", "cwd"]),
         target: field(&["file_path", "path", "pattern", "url", "query"]),
+        sandbox: field(&["sandbox_permissions"]),
     }
 }
 
