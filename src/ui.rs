@@ -702,7 +702,7 @@ fn handle_key(
                     }
                     .into(),
                 );
-            } else if snapshot.queued_inputs >= ROOT_QUEUE_LIMIT {
+            } else if snapshot.scheduler.queued_roots >= ROOT_QUEUE_LIMIT {
                 local.notice =
                     Some("The task queue is full (8 tasks); your draft is retained.".into());
             } else if send(
@@ -3941,7 +3941,10 @@ mod tests {
             phase: SessionPhase::GatePending,
             thread_id: Some("root".into()),
             root_start_requests: 1,
-            queued_inputs: 2,
+            scheduler: crate::scheduler::SchedulerSnapshot {
+                queued_roots: 2,
+                ..Default::default()
+            },
             agents: vec![
                 AgentSnapshot {
                     info: AgentInfo {
@@ -4060,7 +4063,7 @@ mod tests {
                 text: "root task".into()
             }
         );
-        snapshot.queued_inputs = 8;
+        snapshot.scheduler.queued_roots = 8;
         local.editor.insert("retained draft");
         handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),

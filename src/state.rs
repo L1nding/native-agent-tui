@@ -169,7 +169,6 @@ pub struct CoreSnapshot {
     pub root_turn_count: u64,
     pub gate: Option<GateSnapshot>,
     pub root_start_requests: u64,
-    pub queued_inputs: usize,
     pub scheduler: crate::scheduler::SchedulerSnapshot,
     pub observation: crate::observation::ObservationSnapshot,
     pub timeline: crate::timeline::TimelineSnapshot,

@@ -791,7 +791,6 @@ impl Core {
         }
         self.scheduler.interactions(&self.state.view.requests);
         self.state.view.scheduler = self.scheduler.snapshot();
-        self.state.view.queued_inputs = self.state.view.scheduler.queued_roots;
         self.update_token_budget_snapshot();
         self.reconcile_observation();
         self.state.view.observation = self
@@ -5550,7 +5549,7 @@ mod tests {
             .unwrap();
         client
             .snapshots
-            .wait_for(|s| s.queued_inputs == 1)
+            .wait_for(|s| s.scheduler.queued_roots == 1)
             .await
             .unwrap();
         assert_eq!(client.snapshots.borrow().phase, SessionPhase::GatePending);
@@ -5590,7 +5589,7 @@ mod tests {
                     .unwrap();
                 client
                     .snapshots
-                    .wait_for(|s| s.queued_inputs == 1)
+                    .wait_for(|s| s.scheduler.queued_roots == 1)
                     .await
                     .unwrap();
                 client.commands.send(Command::Interrupt).await.unwrap();
@@ -5599,7 +5598,7 @@ mod tests {
                 send(&mut server, json!({"id":interrupt["id"],"result":{}})).await;
                 send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"interrupted"}}})).await;
                 phase(&mut client, SessionPhase::Interrupted).await;
-                assert_eq!(client.snapshots.borrow().queued_inputs, 1);
+                assert_eq!(client.snapshots.borrow().scheduler.queued_roots, 1);
                 assert_eq!(
                     client
                         .snapshots
@@ -5897,7 +5896,7 @@ mod tests {
             Duration::from_secs(3),
             client
                 .snapshots
-                .wait_for(|s| s.queued_inputs == 1 && s.requests.len() == 1),
+                .wait_for(|s| s.scheduler.queued_roots == 1 && s.requests.len() == 1),
         )
         .await
         .unwrap()

@@ -83,7 +83,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     for (label, count) in [
         ("turns", snapshot.root_turn_count as usize),
         ("children", snapshot.agents.len()),
-        ("queued", snapshot.queued_inputs),
+        ("queued", snapshot.scheduler.queued_roots),
     ] {
         if count > 0 {
             status.push(format!("{label}: {count}"));
@@ -483,10 +483,10 @@ Enter a new task to continue; F8 retries a failed workflow task."
         }
     } else if let Some(gate) = waiting {
         workflow_view::gate_status(snapshot, gate)
-    } else if snapshot.queued_inputs > 0 {
+    } else if snapshot.scheduler.queued_roots > 0 {
         format!(
             "{} root tasks pending; see dependencies and controls in F4.",
-            snapshot.queued_inputs
+            snapshot.scheduler.queued_roots
         )
     } else {
         snapshot.tool_activity.clone().unwrap_or_default()

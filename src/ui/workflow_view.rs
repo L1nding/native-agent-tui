@@ -520,7 +520,7 @@ pub(super) fn gate_status(snapshot: &CoreSnapshot, gate: &crate::state::GateSnap
     let mut lines = vec![format!(
         "Waiting children: {done}/{} | queued: {} | root starts during wait: {}",
         gate.targets.len(),
-        snapshot.queued_inputs,
+        snapshot.scheduler.queued_roots,
         snapshot
             .root_start_requests
             .saturating_sub(gate.root_starts_at_enter)
@@ -693,7 +693,10 @@ mod tests {
     #[test]
     fn gate_status_reports_confirmed_outcomes_and_captured_generations() {
         let mut snapshot = CoreSnapshot {
-            queued_inputs: 3,
+            scheduler: crate::scheduler::SchedulerSnapshot {
+                queued_roots: 3,
+                ..Default::default()
+            },
             root_start_requests: 5,
             agents: vec![agent("child", "root")],
             ..Default::default()
