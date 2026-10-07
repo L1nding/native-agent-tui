@@ -32,3 +32,7 @@ Rust 1.96.0 / Python 3.12 环境运行 `python scripts/verify.py --cargo-test` �
 新增创建时的进程所有权后，清理本包缓存并运行 `python scripts/verify.py --live` 通过：128 项默认测试、4 项真实 Codex 测试、11 个 Windows 所有权场景和其余原生 fixture。先前一次完整运行的 Ready 测试曾预检超时，旧版也单独复现同类失败；这次通过不能关闭启动可靠性问题。对照条件、缓存排除与限制见[进程所有权验证](windows-process-ownership.md)。远端 Actions 仍未运行。
 
 兼容门禁接入后，默认检查增至 134 项 Rust 测试，并新增九个原生兼容场景和本地 schema 指纹检查。最新完整 `--live` 的五项真实 Codex 测试四项通过，Ready 再次因 shell 预检超时失败；该次脚本返回失败。新增真实 schema 导出检查通过，使用明确的 Python 解释器和独立临时目录。启动可靠性与远端 Actions 仍未获得放行，详见[兼容门禁](codex-compatibility.md)。
+
+## 首次远端运行（2026-10-07）
+
+推送 `main` 后，`Verify` workflow 的首次远端运行通过：windows-2025、Rust 1.96.0、Python 3.12，`scripts/verify.py --toolchain 1.96.0 --cargo-test` 用时 4 分 5 秒（run 37587593093）。远端只运行确定性检查和原生夹具，不运行 `--live`；Rust 1.89 最低版本与 Linux/macOS 仍未验证。
