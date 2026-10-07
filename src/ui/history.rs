@@ -726,10 +726,23 @@ impl HistoryPanel {
             rows.push(
                 "Select a retained session. Enter opens its latest committed evidence.".into(),
             );
+            // 当前会话尚未关闭，不能显示为需要复查；标为实时会话并给出实时阶段。
+            let live_session = live
+                .and_then(|live| live.journal.as_ref())
+                .map(|journal| journal.session_id.as_str());
             for (index, session) in self.sessions.iter().enumerate() {
+                let marker = if index == self.selected { ">" } else { " " };
+                if live_session == Some(session.session_id.as_str()) {
+                    rows.push(format!(
+                        "{marker} {} | this session (live: {:?}) | event {}",
+                        session.session_id,
+                        live.map_or(SessionPhase::Unknown, |live| live.phase),
+                        session.committed_seq,
+                    ));
+                    continue;
+                }
                 rows.push(format!(
-                    "{} {} | {:?} | event {} | {}",
-                    if index == self.selected { ">" } else { " " },
+                    "{marker} {} | {:?} | event {} | {}",
                     session.session_id,
                     session.execution_result.unwrap_or(SessionPhase::Unknown),
                     session.committed_seq,

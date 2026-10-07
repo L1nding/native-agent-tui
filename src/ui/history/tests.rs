@@ -327,3 +327,51 @@ async fn export_preview_can_be_scrolled_while_the_destination_remains_editable()
     assert!(panel.pending.is_none());
     service.shutdown().await.unwrap();
 }
+
+#[test]
+fn session_list_marks_the_running_session_as_live_not_review_required() {
+    let info = |id: &str| SessionInfo {
+        schema_version: 2,
+        workspace_id: "workspace".into(),
+        session_id: id.into(),
+        committed_seq: 7,
+        committed_bytes: 1,
+        snapshot_version: 0,
+        recorded_at: None,
+        session_closed: false,
+        needs_recovery: true,
+        execution_result: None,
+    };
+    let panel = HistoryPanel {
+        visible: true,
+        sessions: vec![info("live-session"), info("crashed-session")],
+        ..Default::default()
+    };
+    let live = CoreSnapshot {
+        phase: SessionPhase::Running,
+        journal: Some(crate::journal::JournalView {
+            session_id: "live-session".into(),
+            submitted_seq: 7,
+            committed_seq: 7,
+            committed_version: 1,
+            error: None,
+        }),
+        ..CoreSnapshot::default()
+    };
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    terminal
+        .draw(|frame| panel.draw(frame, Some(&live)))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..20)
+        .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    let row = |id: &str| rows.iter().find(|row| row.contains(id)).cloned().unwrap();
+    let live_row = row("live-session");
+    assert!(
+        live_row.contains("this session (live: Running)"),
+        "{live_row}"
+    );
+    assert!(!live_row.contains("REVIEW REQUIRED"), "{live_row}");
+    assert!(row("crashed-session").contains("REVIEW REQUIRED"));
+}
