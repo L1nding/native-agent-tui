@@ -68,10 +68,23 @@ pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Pending {
     Initialize,
     SessionNew,
+    /// 建会话后按 `--model` 选择模型；确认后才回复 Core 的 thread/start。
+    SelectModel {
+        core_id: RpcId,
+        session: String,
+        label: String,
+        reasoning: Option<String>,
+    },
+    /// 切换模型后 agent 可能把推理强度重置为空；恢复切换前的值。
+    RestoreReasoning {
+        core_id: RpcId,
+        session: String,
+        label: String,
+    },
     Prompt,
     Passthrough,
 }
@@ -92,6 +105,7 @@ struct AcpBridge {
     permissions: HashMap<RpcId, Permission>,
     message_text: HashMap<String, String>,
     last_message_id: Option<String>,
+    model: Option<String>,
 }
 
 impl AcpBridge {
@@ -110,6 +124,7 @@ impl AcpBridge {
             permissions: HashMap::new(),
             message_text: HashMap::new(),
             last_message_id: None,
+            model: config.model.clone(),
         }
     }
 
@@ -191,8 +206,18 @@ impl AcpBridge {
                     })),
                 ))?;
                 self.pending.insert(id.clone(), Pending::Prompt);
-                self.acp
-                    .send(acp_protocol::session_prompt_request(id, &session, text))?;
+                self.acp.send(acp_protocol::session_prompt_request(
+                    id.clone(),
+                    &session,
+                    text,
+                ))?;
+                // ACP 的 prompt 响应要等整轮结束；Core 的 turn/start 只确认已开始，
+                // 必须立即回复，否则长任务会触发 RPC 期限而被误判为 Unknown。
+                // 终态只由 finish_prompt 发出的 turn/completed 表达。
+                self.core.send(Envelope::response(
+                    id,
+                    Some(json!({"turn":{"id":self.turn_id.as_deref().unwrap_or_default()}})),
+                ))?;
             }
             (Some("turn/interrupt"), Some(id)) => {
                 if let Some(session) = &self.session_id {
@@ -295,6 +320,22 @@ impl AcpBridge {
                 .to_owned();
             return self.finish_prompt(id, "failed", Some(text));
         }
+        if let (
+            Some(error),
+            Pending::SelectModel { core_id, .. } | Pending::RestoreReasoning { core_id, .. },
+        ) = (&message.error, &kind)
+        {
+            let text = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("ACP model selection failed");
+            self.core.send(Envelope::error_response(
+                core_id.clone(),
+                -32602,
+                format!("ACP model selection failed: {text}"),
+            ))?;
+            return Ok(());
+        }
         if let Some(error) = message.error {
             self.core.send(Envelope {
                 jsonrpc: None,
@@ -323,9 +364,84 @@ impl AcpBridge {
                     return Ok(());
                 };
                 self.session_id = Some(session.clone());
+                let models = acp_protocol::model_choices(&result);
+                let Some(requested) = self.model.clone() else {
+                    let current = acp_protocol::current_model(&result);
+                    self.core.send(Envelope::response(
+                        id,
+                        Some(json!({"thread":{"id":session},"model":current})),
+                    ))?;
+                    return Ok(());
+                };
+                match acp_protocol::match_model(&models, &requested) {
+                    Ok(choice) => {
+                        let request_id = RpcId::String(format!("acp-model-{}", id_text(&id)));
+                        self.pending.insert(
+                            request_id.clone(),
+                            Pending::SelectModel {
+                                core_id: id,
+                                session: session.clone(),
+                                label: choice.label(),
+                                reasoning: acp_protocol::select_option(&result, "reasoning_effort")
+                                    .map(|(current, _)| current)
+                                    .filter(|current| !current.is_empty()),
+                            },
+                        );
+                        self.acp.send(acp_protocol::session_set_config_option(
+                            request_id,
+                            &session,
+                            "model",
+                            Value::String(choice.value),
+                        ))?;
+                    }
+                    Err(message) => {
+                        self.core
+                            .send(Envelope::error_response(id, -32602, &message))?;
+                    }
+                }
+            }
+            Pending::SelectModel {
+                core_id,
+                session,
+                label,
+                reasoning,
+            } => {
+                let restore = reasoning.filter(|previous| {
+                    acp_protocol::select_option(&result, "reasoning_effort").is_some_and(
+                        |(current, values)| &current != previous && values.contains(previous),
+                    )
+                });
+                if let Some(previous) = restore {
+                    let request_id = RpcId::String(format!("acp-reasoning-{}", id_text(&core_id)));
+                    self.pending.insert(
+                        request_id.clone(),
+                        Pending::RestoreReasoning {
+                            core_id,
+                            session: session.clone(),
+                            label,
+                        },
+                    );
+                    self.acp.send(acp_protocol::session_set_config_option(
+                        request_id,
+                        &session,
+                        "reasoning_effort",
+                        Value::String(previous),
+                    ))?;
+                } else {
+                    self.core.send(Envelope::response(
+                        core_id,
+                        Some(json!({"thread":{"id":session},"model":label})),
+                    ))?;
+                }
+            }
+            Pending::RestoreReasoning {
+                core_id,
+                session,
+                label,
+            } => {
                 self.core.send(Envelope::response(
-                    id,
-                    Some(json!({"thread":{"id":session},"model":null})),
+                    core_id,
+                    Some(json!({"thread":{"id":session},"model":label})),
                 ))?;
             }
             Pending::Prompt => {
@@ -360,10 +476,6 @@ impl AcpBridge {
             ))?;
             self.turn_started = true;
         }
-        self.core.send(Envelope::response(
-            id.clone(),
-            Some(json!({"turn":{"id":turn}})),
-        ))?;
         if let Some(item_id) = self.last_message_id.take() {
             if let Some(text) = self.message_text.remove(&item_id) {
                 self.core.send(Envelope::notification(
@@ -507,7 +619,24 @@ impl AcpBridge {
             return Ok(());
         }
         self.permissions.insert(id.clone(), Permission { options });
-        self.core.send(Envelope::request(id, "item/commandExecution/requestApproval", Some(json!({"threadId":session,"turnId":turn,"command":title,"reason":"DeepSeek ACP permission request","kind":"command","availableDecisions":["accept","decline","cancel"]}))))?;
+        // 审批者必须看到要执行的内容：优先 rawInput 的命令、理由和目录。
+        let input = acp_protocol::tool_input(&tool);
+        let mut request = json!({
+            "threadId": session,
+            "turnId": turn,
+            "command": input.command.as_deref().unwrap_or(title),
+            "reason": input.reason.as_deref().unwrap_or("DeepSeek ACP permission request"),
+            "kind": "command",
+            "availableDecisions": ["accept", "decline", "cancel"],
+        });
+        if let Some(cwd) = input.cwd {
+            request["cwd"] = Value::String(cwd);
+        }
+        self.core.send(Envelope::request(
+            id,
+            "item/commandExecution/requestApproval",
+            Some(request),
+        ))?;
         Ok(())
     }
 }
@@ -635,6 +764,10 @@ mod tests {
             acp_server.recv().await.unwrap().method.as_deref(),
             Some("session/prompt")
         );
+        // turn/start 在 prompt 发出后立即确认，不等整轮结束。
+        let ack = core_client.recv().await.unwrap();
+        assert_eq!(ack.id, Some(RpcId::Number(3)));
+        assert_eq!(ack.result.unwrap()["turn"]["id"], "acp-turn-3");
         acp_server
             .send(Envelope::notification(
                 "session/update",
@@ -677,7 +810,6 @@ mod tests {
                 Some(json!({"stopReason":"end_turn"})),
             ))
             .unwrap();
-        assert_eq!(core_client.recv().await.unwrap().id, Some(RpcId::Number(3)));
         assert_eq!(
             core_client.recv().await.unwrap().method.as_deref(),
             Some("item/completed")
@@ -723,6 +855,9 @@ mod tests {
             Some("turn/started")
         );
         acp_server.recv().await.unwrap();
+        let response = core_client.recv().await.unwrap();
+        assert_eq!(response.id, Some(RpcId::Number(3)));
+        assert!(response.error.is_none());
         acp_server
             .send(Envelope::error_response(
                 RpcId::Number(3),
@@ -730,9 +865,6 @@ mod tests {
                 "Internal error: turn failed: Insufficient Balance",
             ))
             .unwrap();
-        let response = core_client.recv().await.unwrap();
-        assert_eq!(response.id, Some(RpcId::Number(3)));
-        assert!(response.error.is_none());
         let completed = core_client.recv().await.unwrap();
         assert_eq!(completed.method.as_deref(), Some("turn/completed"));
         let turn = &completed.params.unwrap()["turn"];
@@ -740,6 +872,91 @@ mod tests {
         assert_eq!(
             turn["error"]["message"],
             "Internal error: turn failed: Insufficient Balance"
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requested_model_is_selected_and_previous_reasoning_effort_restored() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config {
+            model: Some("hi/gpt-6-astra".into()),
+            ..Config::default()
+        };
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s","configOptions":[
+                    {"id":"model","currentValue":"[\"deepseek-official\",\"flash\"]","options":[
+                        {"group":"hi","options":[{"value":"[\"hi\",\"gpt-6-astra\"]","name":"GPT-6 Astra"}]}]},
+                    {"id":"reasoning_effort","currentValue":"high","options":[{"value":"off"},{"value":"high"}]}]})),
+            ))
+            .unwrap();
+        let select = acp_server.recv().await.unwrap();
+        assert_eq!(select.method.as_deref(), Some("session/set_config_option"));
+        let params = select.params.unwrap();
+        assert_eq!(params["configId"], "model");
+        assert_eq!(params["value"], "[\"hi\",\"gpt-6-astra\"]");
+        acp_server
+            .send(Envelope::response(
+                select.id.unwrap(),
+                Some(json!({"configOptions":[
+                    {"id":"reasoning_effort","currentValue":"","options":[{"value":""},{"value":"high"}]}]})),
+            ))
+            .unwrap();
+        let restore = acp_server.recv().await.unwrap();
+        let params = restore.params.unwrap();
+        assert_eq!(params["configId"], "reasoning_effort");
+        assert_eq!(params["value"], "high");
+        acp_server
+            .send(Envelope::response(restore.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let started = core_client.recv().await.unwrap();
+        assert_eq!(started.id, Some(RpcId::Number(2)));
+        let result = started.result.unwrap();
+        assert_eq!(result["thread"]["id"], "s");
+        assert_eq!(result["model"], "hi/gpt-6-astra");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_model_fails_thread_start_and_lists_choices() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config {
+            model: Some("missing".into()),
+            ..Config::default()
+        };
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(
+                    json!({"sessionId":"s","configOptions":[{"id":"model","options":[
+                    {"value":"[\"hi\",\"gpt-6-luna\"]","name":"GPT-6 Luna"}]}]}),
+                ),
+            ))
+            .unwrap();
+        let response = core_client.recv().await.unwrap();
+        let error = response.error.unwrap();
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("available: hi/gpt-6-luna"),
+            "{error}"
         );
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;

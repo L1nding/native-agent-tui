@@ -44,10 +44,25 @@ so the bridge reports `turn/completed` with status `failed` and the agent's
 error message. The session stays usable for a new task; only a disconnect or
 an unparseable update leaves the outcome Unknown.
 
-Real backend check (2026-10-07, `dsh` 0.2.0-rc.2): startup, `session/new`, and
-`session/prompt` reached the agent; the account returned "Insufficient Balance",
-so no model turn completed and streaming, tool, and permission mapping still
-lack real-backend evidence.
+`--model` selects an ACP `model` config option after `session/new`, either as
+`provider/model` (for example `hi/gpt-6-luna`) or as a model name offered by one
+provider only. Unknown or ambiguous names fail thread start and list the
+choices. dsh resets the reasoning effort when the model changes, so the bridge
+restores the session's previous value when the new model offers it. Without
+`--model`, the header shows the agent's current model.
+
+The bridge acknowledges `turn/start` as soon as `session/prompt` is sent; the
+prompt response arrives only when the whole turn ends and becomes
+`turn/completed`. Tool output larger than 32 KiB is truncated and marked
+instead of failing the turn. dsh puts the real command, justification, and
+working directory in `rawInput`, so approvals and tool lines show those fields
+rather than the bare tool name.
+
+Real backend check (2026-10-07, `dsh` 0.2.0-rc.2): the default DeepSeek
+provider returned "Insufficient Balance". With `--model hi/gpt-6-luna` (a
+provider copied from the user's dsh tauri profile into the acp profile patch
+layer), read-only and file-editing tasks completed in the TUI with streaming,
+tool calls, and a permission request.
 
 ## Validation
 
