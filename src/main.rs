@@ -420,10 +420,11 @@ async fn execute() -> Result<(), (u8, String)> {
         }
         CliCommand::Run {
             goal,
-            config,
+            mut config,
             json_events,
         } => {
-            return run_headless(config, vec![RootTaskSpec::input(goal)], false, json_events).await
+            config.strict_outcome = true;
+            return run_headless(config, vec![RootTaskSpec::input(goal)], false, json_events).await;
         }
         CliCommand::CheckShell(config) => {
             return run_headless(config, Vec::new(), true, false).await
@@ -432,8 +433,9 @@ async fn execute() -> Result<(), (u8, String)> {
             path,
             headless,
             json_events,
-            config,
+            mut config,
         } => {
+            config.strict_outcome = true;
             // Validate the whole plan before starting an execution owner or model turn.
             let mut bytes = Vec::new();
             std::fs::File::open(&path)

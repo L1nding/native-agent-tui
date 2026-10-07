@@ -36,7 +36,7 @@ cargo run --locked -- --export SESSION_ID --output diagnostic.jsonl
 
 队列最多 128 条、64 MiB 编码数据，单条最多 4 MiB；元数据及序列化临时对象另有少量开销。Core 入队不等待磁盘。目录锁冲突在启动时立即报告，写入线程最多等待两秒；退出排空与最终提交最多等待五秒。底层磁盘调用自身无法由此期限强制取消。满队列或写入错误进入可见 Unknown 并清理执行所有者，不能继续宣称可靠完成。
 
-`session_closed`、`execution_result` 和 `cleanup_confirmed` 分开保存。缺少最终关闭记录、Unknown 结果或未确认清理时，`needs_recovery=true` 表示需要检查历史观察证据。它不是自动重试授权。
+`session_closed`、`execution_result` 和 `cleanup_confirmed` 分开保存。`execution_result` 按模式汇总：`--workflow`（含 headless）和 `--run` 要求所有根任务成功；交互 TUI 以最后一轮结果为准，用户中断或失败的早期轮次不会让之后成功的会话记为 Failed。缺少最终关闭记录、Unknown 结果或未确认清理时，`needs_recovery=true` 表示需要检查历史观察证据。它不是自动重试授权。
 
 ## 隐私与当前范围
 

@@ -340,6 +340,7 @@ impl StoredSnapshot {
         }
     }
 
+    /// 严格汇总：工作流与 `--run` 要求所有根任务成功。
     pub fn close(&mut self, outcome: SessionPhase, cleanup_confirmed: bool) {
         let outcome = crate::state::workflow_outcome(
             outcome,
@@ -348,6 +349,15 @@ impl StoredSnapshot {
                 .filter(|task| task.kind == TaskKind::RootTurn)
                 .map(|task| task.state),
         );
+        self.close_with(outcome, cleanup_confirmed);
+    }
+
+    /// 交互会话以最后一轮结果汇总；用户中断过的早期轮次不使会话记为失败。
+    pub fn close_last_turn(&mut self, outcome: SessionPhase, cleanup_confirmed: bool) {
+        self.close_with(outcome, cleanup_confirmed);
+    }
+
+    fn close_with(&mut self, outcome: SessionPhase, cleanup_confirmed: bool) {
         self.session_closed = true;
         self.cleanup_confirmed = Some(cleanup_confirmed);
         self.execution_result = Some(

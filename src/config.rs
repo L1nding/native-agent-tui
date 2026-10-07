@@ -34,6 +34,9 @@ pub struct Config {
     pub acp_profile: String,
     pub mcp_servers: Vec<McpServerConfig>,
     pub model: Option<String>,
+    /// 会话汇总规则：工作流与 `--run` 要求所有根任务成功（严格）；
+    /// 交互 TUI 以最后一轮结果为准，用户中断过的早期轮次不会让会话记为失败。
+    pub strict_outcome: bool,
     pub sandbox: String,
     pub approval_policy: String,
     pub windows_sandbox: Option<String>,
@@ -62,6 +65,7 @@ impl Default for Config {
             acp_profile: "acp".into(),
             mcp_servers: Vec::new(),
             model: None,
+            strict_outcome: false,
             sandbox: "workspace-write".into(),
             approval_policy: "on-request".into(),
             windows_sandbox: None,

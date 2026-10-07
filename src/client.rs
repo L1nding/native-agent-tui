@@ -765,14 +765,16 @@ impl Core {
         self.publish();
         if let Some(journal) = self.journal.take() {
             let mut final_snapshot = StoredSnapshot::capture(&self.state.view);
-            final_snapshot.close(
-                if self.journal_error.is_some() {
-                    SessionPhase::Unknown
-                } else {
-                    outcome
-                },
-                cleanup_error.is_none(),
-            );
+            let outcome = if self.journal_error.is_some() {
+                SessionPhase::Unknown
+            } else {
+                outcome
+            };
+            if self.config.strict_outcome {
+                final_snapshot.close(outcome, cleanup_error.is_none());
+            } else {
+                final_snapshot.close_last_turn(outcome, cleanup_error.is_none());
+            }
             if self.journal_error.is_some() {
                 final_snapshot.issue = Some(crate::journal::PersistenceIssue::JournalUnavailable);
             }
@@ -2939,8 +2941,21 @@ mod tests {
         Config,
         String,
     ) {
+        journal_harness_with(fixture, false).await
+    }
+
+    async fn journal_harness_with(
+        fixture: &JournalFixture,
+        strict_outcome: bool,
+    ) -> (
+        ClientHandle,
+        BufReader<tokio::io::DuplexStream>,
+        Config,
+        String,
+    ) {
         let config = Config {
             journal: fixture.settings(),
+            strict_outcome,
             ..Default::default()
         };
         let observer = Observer::new(config.attention.clone());
@@ -3109,10 +3124,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_journal_reports_earlier_failure_after_the_last_root_succeeds() {
+    async fn session_outcome_is_strict_for_workflows_and_last_turn_for_interactive_use() {
+        for (strict, expected) in [
+            (true, SessionPhase::Failed),
+            (false, SessionPhase::Completed),
+        ] {
+            session_outcome_after_failed_then_completed(strict, expected).await;
+        }
+    }
+
+    async fn session_outcome_after_failed_then_completed(strict: bool, expected: SessionPhase) {
         use crate::scheduler::TaskState;
         let fixture = JournalFixture::new();
-        let (mut client, mut server, config, session) = journal_harness(&fixture).await;
+        let (mut client, mut server, config, session) =
+            journal_harness_with(&fixture, strict).await;
         ready(&mut server).await;
         phase(&mut client, SessionPhase::Ready).await;
         client
@@ -3140,7 +3165,11 @@ mod tests {
         client.commands.send(Command::Quit).await.unwrap();
         assert!(client.join.await.unwrap().journal_error.is_none());
         let replay = Replay::open(&config.journal, &config.cwd, &session, 0).unwrap();
-        assert_eq!(replay.info.execution_result, Some(SessionPhase::Failed));
+        assert_eq!(
+            replay.info.execution_result,
+            Some(expected),
+            "strict={strict}"
+        );
         assert_eq!(
             replay
                 .latest_state()
