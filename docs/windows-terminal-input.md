@@ -47,3 +47,13 @@ python tests/fixtures/windows_terminal_input_check.py --fixture target/debug/exa
 ```
 
 Windows Terminal、Orca 系统剪贴板及 IME 预编辑仍需单独验收。ConPTY UTF-8 注入通过不代表这些界面路径已经通过；Alpha/V2 完整交付仍未完成。
+
+## Windows Terminal GUI 验收（2026-10-07）
+
+用 `orca computer` 驱动真实 Windows Terminal 窗口运行 release 版 TUI（假 app-server，零模型请求）：
+
+- 剪贴板粘贴三行中文加 emoji：输入框显示为一行并以 `↵` 标出换行，未触发提交；Enter 后对话中是一条完整的三行任务。
+- 微软拼音输入法：逐键输入 `nihao` 时组字串显示在输入框光标处，候选窗口贴近光标；空格上屏“你好”。Backspace 删除整个“好”，光标留在宽字符之后。
+- Ctrl+Q 退出后终端恢复，窗口关闭，无残留进程。
+
+按键由合成虚拟按键产生并经过输入法；物理键盘手感、Orca 内置终端和其他输入法未覆盖。

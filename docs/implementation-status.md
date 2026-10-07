@@ -229,7 +229,7 @@ Windows 终端输入改为有界 VT/Win32 记录适配，完整标记的多行�
 - 真实 Codex TUI（ConPTY，`--sandbox read-only`）：问答两轮、token 用量、工具摘要行、命令审批面板与详情首屏均正常；审批后退出无残留，文件未写入。据此修复：审批面板显示 root 而非线程 UUID，摘要剥离 `pwsh -Command` 包装，未设预算时省略 `/unavailable`。
 - elevated 沙箱预检超时根因：Codex elevated 沙箱需要一次性管理员配置（UAC），从 app-server 启动时无法完成；配置后又发现 elevated 运行器不能解析用户目录下的裸名 `pwsh`。预检改用 `powershell.exe`，默认 elevated 预检约 2.6 秒通过；超时提示给出 `codex sandbox -- cmd /c echo ok` 配置步骤。
 - ACP（dsh 0.2.0-rc.2）：启动、`session/new`、`session/prompt` 到达真实 agent，账户余额不足导致未完成模型轮次；prompt 错误改为映射 failed 终态，会话可继续。流式输出、工具和权限映射仍缺真实后端证据。
-- 远端 CI 首次运行通过（run 37587593093）。未完成：Windows Terminal/Orca 的 IME 与剪贴板验收、固定任务集试用、ACP 完整模型轮次。
+- 远端 CI 首次运行通过（run 37587593093）。Windows Terminal 剪贴板与微软拼音输入法 GUI 验收通过（见终端输入验证）；ACP 经 hi/gpt-6-luna 完成真实轮次。未完成：Orca 内置终端输入、更多试用任务（长时间静默、断连恢复、子代理）。
 
 ## 删除式精简（2026-10-07）
 
