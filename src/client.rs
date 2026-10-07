@@ -2406,6 +2406,22 @@ impl Core {
         self.flush_gate();
     }
 
+    fn observe_output(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        item: &str,
+        bytes: usize,
+        finalized: bool,
+    ) {
+        if let Err(error) =
+            self.observer
+                .output(thread, turn, item, bytes, finalized, Instant::now())
+        {
+            self.state.error(SessionPhase::Unknown, error.to_string());
+        }
+    }
+
     fn register_task_child(&mut self, thread: &str, parent: Option<TaskAttempt>, title: &str) {
         if let Err(error) = self.scheduler.register_child(thread, parent, title) {
             self.state.error(SessionPhase::Unknown, error.to_string());
@@ -2578,18 +2594,13 @@ impl Core {
                 if let Some(output) = protocol::decode_observed_output(method, &params) {
                     match output {
                         Ok(output) => match output.kind {
-                            protocol::ObservedOutputKind::Reasoning => {
-                                if let Err(error) = self.observer.output(
-                                    thread,
-                                    turn,
-                                    &output.item_id,
-                                    output.bytes,
-                                    false,
-                                    Instant::now(),
-                                ) {
-                                    self.state.error(SessionPhase::Unknown, error.to_string());
-                                }
-                            }
+                            protocol::ObservedOutputKind::Reasoning => self.observe_output(
+                                thread,
+                                turn,
+                                &output.item_id,
+                                output.bytes,
+                                false,
+                            ),
                             protocol::ObservedOutputKind::Tool(category) => {
                                 if let Some(locator) =
                                     self.tool_locator(thread, turn, &output.item_id)
@@ -2621,16 +2632,7 @@ impl Core {
                             (params["itemId"].as_str(), params["delta"].as_str())
                         {
                             if self.state.child_message(thread, turn, id, text, false) {
-                                if let Err(error) = self.observer.output(
-                                    thread,
-                                    turn,
-                                    id,
-                                    text.len(),
-                                    false,
-                                    Instant::now(),
-                                ) {
-                                    self.state.error(SessionPhase::Unknown, error.to_string());
-                                }
+                                self.observe_output(thread, turn, id, text.len(), false);
                             }
                         }
                     } else if method == "item/completed" && params["item"]["type"] == "agentMessage"
@@ -2640,16 +2642,7 @@ impl Core {
                             params["item"]["text"].as_str(),
                         ) {
                             if self.state.child_message(thread, turn, id, text, true) {
-                                if let Err(error) = self.observer.output(
-                                    thread,
-                                    turn,
-                                    id,
-                                    text.len(),
-                                    true,
-                                    Instant::now(),
-                                ) {
-                                    self.state.error(SessionPhase::Unknown, error.to_string());
-                                }
+                                self.observe_output(thread, turn, id, text.len(), true);
                             }
                         }
                     }
@@ -2816,16 +2809,8 @@ impl Core {
                     (turn, params["itemId"].as_str(), params["delta"].as_str())
                 {
                     if self.state.message(turn, id, delta, false) {
-                        if let Err(error) = self.observer.output(
-                            self.state.view.thread_id.as_deref().unwrap_or(""),
-                            turn,
-                            id,
-                            delta.len(),
-                            false,
-                            Instant::now(),
-                        ) {
-                            self.state.error(SessionPhase::Unknown, error.to_string());
-                        }
+                        let thread = self.state.view.thread_id.clone().unwrap_or_default();
+                        self.observe_output(&thread, turn, id, delta.len(), false);
                     }
                 }
             }
@@ -2846,16 +2831,8 @@ impl Core {
                         (turn, item["id"].as_str(), item["text"].as_str())
                     {
                         if self.state.message(turn, id, text, true) {
-                            if let Err(error) = self.observer.output(
-                                self.state.view.thread_id.as_deref().unwrap_or(""),
-                                turn,
-                                id,
-                                text.len(),
-                                true,
-                                Instant::now(),
-                            ) {
-                                self.state.error(SessionPhase::Unknown, error.to_string());
-                            }
+                            let thread = self.state.view.thread_id.clone().unwrap_or_default();
+                            self.observe_output(&thread, turn, id, text.len(), true);
                         }
                     }
                 } else if method == "item/started" && item["type"] != "userMessage" {
