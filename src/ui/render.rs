@@ -484,10 +484,10 @@ Enter a new task to continue; F8 retries a failed workflow task."
     } else if let Some(gate) = waiting {
         workflow_view::gate_status(snapshot, gate)
     } else if snapshot.scheduler.queued_roots > 0 {
-        format!(
-            "{} root tasks pending; see dependencies and controls in F4.",
-            snapshot.scheduler.queued_roots
-        )
+        match snapshot.scheduler.queued_roots {
+            1 => "1 task waiting to start; F4 shows the queue.".into(),
+            count => format!("{count} tasks waiting to start; F4 shows the queue."),
+        }
     } else {
         String::new()
     }

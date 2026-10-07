@@ -1362,10 +1362,12 @@ impl Core {
         }
         match self.scheduler.enqueue(tasks) {
             Ok(ids) => {
-                self.state.view.notice = Some(format!(
-                    "Queued {} root tasks; dependencies remain enforced.",
-                    ids.len()
-                ))
+                self.state.view.notice = Some(match ids.len() {
+                    1 => "Queued; it starts after the current turn. F4 shows the queue.".into(),
+                    count => format!(
+                        "Queued {count} tasks; they start in order after the current turn. F4 shows the queue."
+                    ),
+                })
             }
             Err(error) => self.state.view.notice = Some(error.to_string()),
         }

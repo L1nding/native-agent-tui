@@ -13,5 +13,6 @@
 | 7 | 2026-10-07 | Codex 0.159.2，read-only，`--attention-tool 10000,25000` | 运行 `Start-Sleep 90`，静默中 Ctrl+C，再追问命令是否完成 | 成功：13 秒“no recent output”、30 秒“silent for a while, check it”；Ctrl+C 1 秒内 Interrupted；追问时模型记得上下文并说明命令可能仍在后台运行 | 1 | 0 | 头部提醒准确 | 状态区显示原始 `commandExecution`（已删除）；中断后工具行仍为 running（改为 ended, outcome unknown）；会话汇总因中断轮次记为 Failed（工作流严格语义，待定） |
 | 8 | 2026-10-07 | 同上 | 运行中强杀 app-server 进程树 | 立即 Disconnected 并说明“外部结果未知”；再次提交被拒且草稿保留；`--recovery` 显示任务 Unknown、需要人工确认 | 1 | 0 | 清楚 | 工具行仍为 running（已修复）；`initialized` 通知在恢复报告中被误报为待检查（已修复） |
 | 9 | 2026-10-07 | Codex 0.159.2，read-only，120 列 | 让根代理派两个子代理分别统计 `src/ui` 和 `tests` 的文件数，完成后汇总 | 成功：25 和 2，与 `ls` 一致（系统验证）；左侧代理列表、F3 切换到子代理对话均正常 | 根 2 次，子代理各 1 次 | 0 | 代理列表清楚 | 已结束代理显示 `Ended / quiet unknown`（已省略） |
+| 10 | 2026-10-07 | Codex 0.159.2，workspace-write，`target/trial-ws` | 第一轮写 `fib`，运行中用 Ctrl+S 排队第二轮“写 unittest” | 成功：头部显示 `queued: 1`，第一轮结束后自动开始第二轮；生成的 3 个测试用 `python -m unittest` 全部通过（系统验证） | 4 + 1 | 0 | 清楚 | 排队提示“Queued 1 root tasks; dependencies remain enforced.”语法错且偏技术化（已改） |
 
-尚未覆盖：多轮修改代码的写入任务、子代理审批、5 秒状态理解计时、Orca 内置终端。
+尚未覆盖：子代理审批、5 秒状态理解计时、Orca 内置终端。
