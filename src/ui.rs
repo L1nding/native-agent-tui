@@ -236,12 +236,7 @@ fn handle_key(
                     .or_else(|| snapshot.requests.iter().find(|request| !request.responding));
                 if let Some(request) = current {
                     local.request_selection = Some(request.reference());
-                    local.request_panel = true;
-                    local.request_scroll = 0;
-                    local.workflow.visible = false;
-                    local.evidence = false;
-                    sync_local_requests(local, snapshot);
-                    local.notice = None;
+                    open_request_panel(snapshot, local);
                 } else {
                     local.request_panel = false;
                     local.notice = Some("No pending requests.".into());
@@ -285,16 +280,7 @@ fn handle_key(
             local.search.close();
         } else {
             if let Some(focus) = local.search.key(key, snapshot) {
-                local.agent_id = if snapshot.thread_id.as_deref() == Some(focus.thread()) {
-                    None
-                } else {
-                    Some(focus.thread().into())
-                };
-                local.conversation_focus = Some(focus);
-                local.workflow.visible = false;
-                local.evidence = false;
-                local.request_panel = false;
-                local.notice = None;
+                focus_conversation(focus, snapshot, local);
             }
             return false;
         }
@@ -315,25 +301,11 @@ fn handle_key(
         } else {
             match local.timeline.key(key, snapshot) {
                 Some(timeline::Locate::Message(focus)) => {
-                    local.agent_id = if snapshot.thread_id.as_deref() == Some(focus.thread()) {
-                        None
-                    } else {
-                        Some(focus.thread().into())
-                    };
-                    local.conversation_focus = Some(focus);
-                    local.workflow.visible = false;
-                    local.evidence = false;
-                    local.request_panel = false;
-                    local.notice = None;
+                    focus_conversation(focus, snapshot, local)
                 }
                 Some(timeline::Locate::Request(reference)) => {
                     local.request_selection = Some(reference);
-                    local.request_panel = true;
-                    local.request_scroll = 0;
-                    local.workflow.visible = false;
-                    local.evidence = false;
-                    sync_local_requests(local, snapshot);
-                    local.notice = None;
+                    open_request_panel(snapshot, local);
                 }
                 Some(timeline::Locate::ToolSearch(thread)) => {
                     local.timeline.close();
@@ -581,12 +553,7 @@ fn handle_key(
                     .map_or(0, |index| (index + 1) % snapshot.requests.len().max(1));
                 local.request_selection = snapshot.requests.get(next).map(RequestView::reference);
             }
-            local.request_panel = true;
-            local.request_scroll = 0;
-            local.notice = None;
-            local.workflow.visible = false;
-            local.evidence = false;
-            sync_local_requests(local, snapshot);
+            open_request_panel(snapshot, local);
         }
         KeyCode::F(3) => {
             local.conversation_focus = None;
@@ -728,6 +695,28 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+fn focus_conversation(focus: search::Focus, snapshot: &CoreSnapshot, local: &mut LocalState) {
+    local.agent_id = if snapshot.thread_id.as_deref() == Some(focus.thread()) {
+        None
+    } else {
+        Some(focus.thread().into())
+    };
+    local.conversation_focus = Some(focus);
+    local.workflow.visible = false;
+    local.evidence = false;
+    local.request_panel = false;
+    local.notice = None;
+}
+
+fn open_request_panel(snapshot: &CoreSnapshot, local: &mut LocalState) {
+    local.request_panel = true;
+    local.request_scroll = 0;
+    local.workflow.visible = false;
+    local.evidence = false;
+    sync_local_requests(local, snapshot);
+    local.notice = None;
 }
 
 fn selected_agent_id<'a>(snapshot: &'a CoreSnapshot, local: &LocalState) -> &'a str {
