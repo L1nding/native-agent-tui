@@ -188,7 +188,6 @@ pub struct CoreSnapshot {
     pub last_headless_action: Option<crate::interactions::HeadlessAction>,
     pub notice: Option<String>,
     pub last_error: Option<String>,
-    pub tool_activity: Option<String>,
     pub usage: UsageSummary,
     pub usage_facts: Vec<UsageFact>,
     pub token_budget: TokenBudgetSnapshot,
@@ -286,6 +285,43 @@ impl SessionState {
                 }
             }
         }
+        self.render_tool_lines(index);
+    }
+
+    /// 轮次结束时仍未报告终态的工具，结果不确定；不能继续显示为 running。
+    pub fn finish_tool_lines(&mut self, thread: &str, turn: &str) {
+        if let Some(index) = self
+            .tool_lines
+            .iter()
+            .position(|group| group.thread_id == thread && group.turn_id == turn)
+        {
+            self.finish_tool_group(index);
+        }
+    }
+
+    /// 断连或执行不可用时，所有仍在运行的工具结果都不确定。
+    pub fn finish_all_tool_lines(&mut self) {
+        for index in 0..self.tool_lines.len() {
+            self.finish_tool_group(index);
+        }
+    }
+
+    fn finish_tool_group(&mut self, index: usize) {
+        let mut changed = false;
+        for (_, line) in &mut self.tool_lines[index].lines {
+            if let Some(rest) = line.strip_prefix("▸ running") {
+                *line = format!("▸ ended, outcome unknown{rest}");
+                changed = true;
+            }
+        }
+        if changed {
+            self.render_tool_lines(index);
+        }
+    }
+
+    fn render_tool_lines(&mut self, index: usize) {
+        let group = &self.tool_lines[index];
+        let (thread, turn) = (group.thread_id.clone(), group.turn_id.clone());
         let mut text = if group.dropped > 0 {
             format!(
                 "… {} earlier tool calls (Ctrl+T)
@@ -316,8 +352,8 @@ impl SessionState {
             Some(message) => message.text = text,
             None => self.view.messages.push(ConversationItem {
                 id,
-                thread_id: thread.into(),
-                turn_id: turn.into(),
+                thread_id: thread,
+                turn_id: turn,
                 role: "Tool".into(),
                 text,
                 complete: true,
@@ -349,7 +385,6 @@ impl SessionState {
         }
         self.view.turn_id = Some(id);
         self.view.phase = SessionPhase::Running;
-        self.view.tool_activity = None;
     }
 
     pub fn message(&mut self, turn: &str, id: &str, text: &str, complete: bool) -> bool {
@@ -463,7 +498,6 @@ impl SessionState {
         self.view.last_error = Some(error.into());
         // 进行中的提示（如“正在检查 shell”）在出错后已过期，留着会遮住错误原因。
         self.view.notice = None;
-        self.view.tool_activity = None;
     }
 }
 
@@ -530,6 +564,25 @@ mod tests {
                 .filter(|m| m.role == "Tool")
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn unfinished_tool_lines_become_unknown_when_the_turn_ends() {
+        let mut state = SessionState::default();
+        state.tool_line("root", "turn", "a", "▸ done · exit 0 · ls".into());
+        state.tool_line("root", "turn", "b", "▸ running · Start-Sleep 90".into());
+        state.finish_tool_lines("root", "turn");
+        let tools = state
+            .view
+            .messages
+            .iter()
+            .find(|m| m.role == "Tool")
+            .unwrap();
+        assert_eq!(
+            tools.text,
+            "▸ done · exit 0 · ls
+▸ ended, outcome unknown · Start-Sleep 90"
         );
     }
 

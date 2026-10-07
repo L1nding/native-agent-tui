@@ -489,7 +489,7 @@ Enter a new task to continue; F8 retries a failed workflow task."
             snapshot.scheduler.queued_roots
         )
     } else {
-        snapshot.tool_activity.clone().unwrap_or_default()
+        String::new()
     }
 }
 

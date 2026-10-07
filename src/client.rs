@@ -831,6 +831,7 @@ impl Core {
                 | SessionPhase::Stopped
         ) {
             self.tool_details.execution_unavailable();
+            self.state.finish_all_tool_lines();
         }
         self.state.view.tool_details = self.tool_details.snapshot();
         let transport = self.pipe.stats();
@@ -1021,6 +1022,8 @@ impl Core {
             None
         };
 
+        // 通知没有响应；写出即完成，不能留在 Sent 被恢复报告当成待检查的外部结果。
+        let notification = envelope.id.is_none();
         if let Err(error) = self.pipe.send(envelope) {
             if let Some(id) = outbox_id {
                 if let Some(outbox) = &mut self.outbox {
@@ -1034,6 +1037,9 @@ impl Core {
                 if let Err(error) = outbox.mark_sent(id) {
                     let _ = outbox.mark_unknown(id);
                     return Err(Self::outbox_failure(error));
+                }
+                if notification {
+                    outbox.mark_confirmed(id).map_err(Self::outbox_failure)?;
                 }
             }
         }
@@ -2404,6 +2410,7 @@ impl Core {
 
     /// 轮次终结后清理其工具详情、文件预览和未决请求。
     fn retire_turn_evidence(&mut self, thread: &str, turn: &str) {
+        self.state.finish_tool_lines(thread, turn);
         let session = &self.state.view.observation.session_id;
         self.tool_details.retire(session, thread, turn);
         self.file_previews.retire(thread, turn);
@@ -2763,7 +2770,6 @@ impl Core {
                 if let Some(thread) = self.state.view.thread_id.clone() {
                     self.retire_turn_evidence(&thread, id.unwrap());
                 }
-                self.state.view.tool_activity = None;
                 self.state.view.notice = None;
                 self.interrupt_requested = false;
                 self.interrupt_sent = false;
@@ -2819,10 +2825,6 @@ impl Core {
                             self.observe_output(&thread, turn, id, text.len(), true);
                         }
                     }
-                } else if method == "item/started" && item["type"] != "userMessage" {
-                    self.state.view.tool_activity = item["type"].as_str().map(str::to_owned);
-                } else if method == "item/completed" {
-                    self.state.view.tool_activity = None;
                 }
             }
             "error" => {
@@ -3003,6 +3005,12 @@ mod tests {
             .expect("turn/start intent must be durable before sending");
         assert_eq!(record.status, crate::outbox::OutboxStatus::Sent);
         assert!(!std::fs::read_to_string(&path).unwrap().contains(prompt));
+        // 通知没有响应，写出后即确认，恢复报告不应要求检查它的外部结果。
+        let initialized = sent
+            .records()
+            .find(|record| record.intent.method == "initialized")
+            .unwrap();
+        assert_eq!(initialized.status, crate::outbox::OutboxStatus::Confirmed);
 
         send(
             &mut server,

@@ -496,3 +496,25 @@ async fn tool_calls_leave_one_summary_line_per_item_after_the_turn_retires() {
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();
 }
+
+#[tokio::test]
+async fn disconnect_marks_running_tool_lines_as_unknown() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"shell-1","type":"commandExecution","status":"inProgress","command":"Start-Sleep 60"}}}),
+    )
+    .await;
+    drop(server);
+    phase(&mut client, SessionPhase::Disconnected).await;
+    let snapshot = client.snapshots.borrow().clone();
+    let tools = snapshot
+        .messages
+        .iter()
+        .find(|message| message.role == "Tool")
+        .unwrap();
+    assert_eq!(tools.text, "▸ ended, outcome unknown · Start-Sleep 60");
+    client.join.await.unwrap();
+}
