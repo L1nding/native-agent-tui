@@ -230,3 +230,8 @@ Windows 终端输入改为有界 VT/Win32 记录适配，完整标记的多行�
 - elevated 沙箱预检超时根因：Codex elevated 沙箱需要一次性管理员配置（UAC），从 app-server 启动时无法完成；配置后又发现 elevated 运行器不能解析用户目录下的裸名 `pwsh`。预检改用 `powershell.exe`，默认 elevated 预检约 2.6 秒通过；超时提示给出 `codex sandbox -- cmd /c echo ok` 配置步骤。
 - ACP（dsh 0.2.0-rc.2）：启动、`session/new`、`session/prompt` 到达真实 agent，账户余额不足导致未完成模型轮次；prompt 错误改为映射 failed 终态，会话可继续。流式输出、工具和权限映射仍缺真实后端证据。
 - 远端 CI 首次运行通过（run 37587593093）。未完成：Windows Terminal/Orca 的 IME 与剪贴板验收、固定任务集试用、ACP 完整模型轮次。
+
+## 删除式精简（2026-10-07）
+
+按 `refactor-goal.md` 的删除测试完成 12 处精简，净删 130 行（11 个文件，+181/−311）：删除 `display_text_for_cli` 转发、`CoreSnapshot` 手写 Default、重复的 `queued_inputs` 快照字段、单实现的 `CompletionGate` trait（具体类型改名为 `CompletionGate`，释放与旧 generation 过滤逻辑不变）、未使用的 ACP 配置构造函数和 `Outbox::mark_failed`；合并 journal 投影、UI 会话定位与请求面板打开、TUI 启动、输出观测错误分支、轮次终结清理和 RPC 等待登记中的重复代码。rebase 到当前 main 后 `python scripts/verify.py` 通过（380 项默认测试与全部原生夹具）。跳过的候选（行为或优先级有差异）见本次提交记录。
+
