@@ -2191,7 +2191,9 @@ impl Core {
             );
         }
         if let Some(detail) = self.tool_details.get(&locator) {
-            let line = crate::tool_details::summary_line(&detail);
+            // 工作目录内的路径显示为相对路径，摘要更短。
+            let prefix = format!("{}{}", self.config.cwd.display(), std::path::MAIN_SEPARATOR);
+            let line = crate::tool_details::summary_line(&detail).replace(&prefix, "");
             self.state
                 .tool_line(&notice.thread_id, &notice.turn_id, &notice.item_id, line);
         }

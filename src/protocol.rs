@@ -95,8 +95,25 @@ pub fn decode_observed_tool_details(item: &Value, category: ToolCategory) -> Obs
     let result = match category {
         ToolCategory::Shell => None,
         ToolCategory::File => item.get("changes").and_then(|changes| {
-            let count = changes.as_array()?.len();
-            Some(format!("file changes: {count}"))
+            let changes = changes.as_array()?;
+            let paths: Vec<&str> = changes
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .take(3)
+                .collect();
+            let mut text = format!(
+                "{} file{}",
+                changes.len(),
+                if changes.len() == 1 { "" } else { "s" }
+            );
+            if !paths.is_empty() {
+                text.push_str(": ");
+                text.push_str(&paths.join(", "));
+                if changes.len() > paths.len() {
+                    text.push_str(&format!(" (+{})", changes.len() - paths.len()));
+                }
+            }
+            bounded_text(Some(&Value::String(text)))
         }),
         ToolCategory::Mcp => bounded_json(item.get("result").filter(|v| !v.is_null()))
             .or_else(|| bounded_json(item.get("error"))),
@@ -657,6 +674,20 @@ pub fn shell_script(command: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_change_details_name_the_first_paths() {
+        let item = serde_json::json!({"changes":[
+            {"path":"calc.py"},{"path":"src/a.rs"},{"path":"src/b.rs"},{"path":"src/c.rs"}]});
+        let details = super::decode_observed_tool_details(&item, super::ToolCategory::File);
+        assert_eq!(
+            details.result.as_deref(),
+            Some("4 files: calc.py, src/a.rs, src/b.rs (+1)")
+        );
+        let one = serde_json::json!({"changes":[{"path":"calc.py"}]});
+        let details = super::decode_observed_tool_details(&one, super::ToolCategory::File);
+        assert_eq!(details.result.as_deref(), Some("1 file: calc.py"));
+    }
+
     #[test]
     fn shell_script_unwraps_common_shell_wrappers_only() {
         assert_eq!(

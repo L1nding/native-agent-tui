@@ -96,6 +96,11 @@ pub fn summary_line(detail: &ToolDetail) -> String {
                 None => line.to_owned(),
             }
         })
+        .or_else(|| {
+            (detail.category == ToolCategory::File)
+                .then(|| detail.result.clone())
+                .flatten()
+        })
         .unwrap_or_else(|| format!("{:?}", detail.category));
     let state = match detail.lifecycle {
         ToolLifecycle::Running => "running",
