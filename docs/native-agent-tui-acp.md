@@ -39,6 +39,16 @@ startup, prompt, and interruption acknowledgements. A cancel notification is
 never treated as a completed turn; only the ACP stop reason or a disconnect can
 end the turn.
 
+A JSON-RPC error response to `session/prompt` is a definite end of that turn,
+so the bridge reports `turn/completed` with status `failed` and the agent's
+error message. The session stays usable for a new task; only a disconnect or
+an unparseable update leaves the outcome Unknown.
+
+Real backend check (2026-10-07, `dsh` 0.2.0-rc.2): startup, `session/new`, and
+`session/prompt` reached the agent; the account returned "Insufficient Balance",
+so no model turn completed and streaming, tool, and permission mapping still
+lack real-backend evidence.
+
 ## Validation
 
 Use the normal Rust checks:

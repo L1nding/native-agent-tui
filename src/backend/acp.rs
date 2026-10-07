@@ -285,6 +285,16 @@ impl AcpBridge {
         let Some(kind) = self.pending.remove(&id) else {
             return Ok(());
         };
+        if let (Some(error), Pending::Prompt) = (&message.error, &kind) {
+            // ACP 的 prompt 错误响应表示这一轮已确定以错误结束，不是不确定结果；
+            // 映射为 failed 终态，用户可以继续提交或重试。
+            let text = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("ACP prompt failed")
+                .to_owned();
+            return self.finish_prompt(id, "failed", Some(text));
+        }
         if let Some(error) = message.error {
             self.core.send(Envelope {
                 jsonrpc: None,
@@ -319,53 +329,62 @@ impl AcpBridge {
                 ))?;
             }
             Pending::Prompt => {
-                let turn = self
-                    .turn_id
-                    .clone()
-                    .unwrap_or_else(|| format!("acp-turn-{}", id_text(&id)));
-                if !self.turn_started {
-                    self.core.send(Envelope::notification(
-                        "turn/started",
-                        Some(json!({"threadId":self.session_id,"turn":{"id":turn}})),
-                    ))?;
-                    self.turn_started = true;
-                }
-                self.core.send(Envelope::response(
-                    id.clone(),
-                    Some(json!({"turn":{"id":turn}})),
-                ))?;
-                if let Some(item_id) = self.last_message_id.take() {
-                    if let Some(text) = self.message_text.remove(&item_id) {
-                        self.core.send(Envelope::notification(
-                            "item/completed",
-                            Some(json!({
-                                "threadId": self.session_id,
-                                "turnId": turn,
-                                "item": {"id": item_id, "type": "agentMessage", "text": text}
-                            })),
-                        ))?;
-                    }
-                }
                 let status = match acp_protocol::stop_reason(&result) {
                     Some("end_turn" | "completed") => "completed",
                     Some("cancelled" | "canceled") => "interrupted",
-                    Some(_) => "failed",
-                    None => "failed",
+                    Some(_) | None => "failed",
                 };
-                self.core.send(Envelope::notification(
-                    "turn/completed",
-                    Some(json!({
-                        "threadId":self.session_id,
-                        "turn":{"id":turn,"status":status}
-                    })),
-                ))?;
-                self.turn_started = false;
-                self.turn_id = None;
+                self.finish_prompt(id, status, None)?;
             }
             Pending::Passthrough => {
                 self.core.send(Envelope::response(id, Some(result)))?;
             }
         }
+        Ok(())
+    }
+
+    fn finish_prompt(
+        &mut self,
+        id: RpcId,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<(), TransportError> {
+        let turn = self
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| format!("acp-turn-{}", id_text(&id)));
+        if !self.turn_started {
+            self.core.send(Envelope::notification(
+                "turn/started",
+                Some(json!({"threadId":self.session_id,"turn":{"id":turn}})),
+            ))?;
+            self.turn_started = true;
+        }
+        self.core.send(Envelope::response(
+            id.clone(),
+            Some(json!({"turn":{"id":turn}})),
+        ))?;
+        if let Some(item_id) = self.last_message_id.take() {
+            if let Some(text) = self.message_text.remove(&item_id) {
+                self.core.send(Envelope::notification(
+                    "item/completed",
+                    Some(json!({
+                        "threadId": self.session_id,
+                        "turnId": turn,
+                        "item": {"id": item_id, "type": "agentMessage", "text": text}
+                    })),
+                ))?;
+            }
+        }
+        self.core.send(Envelope::notification(
+            "turn/completed",
+            Some(json!({
+                "threadId":self.session_id,
+                "turn":{"id":turn,"status":status,"error":error.map(|message| json!({"message":message}))}
+            })),
+        ))?;
+        self.turn_started = false;
+        self.turn_id = None;
         Ok(())
     }
 
@@ -668,6 +687,60 @@ mod tests {
             Some("turn/completed")
         );
 
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_error_response_becomes_a_failed_turn_not_an_unknown_rpc() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let bridge =
+            tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &Config::default()).run());
+        core_client
+            .send(app_server::thread_start(
+                RpcId::Number(2),
+                &Config::default(),
+            ))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId": "session-1"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_start(
+                RpcId::Number(3),
+                "session-1",
+                "hello",
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("turn/started")
+        );
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::error_response(
+                RpcId::Number(3),
+                -32603,
+                "Internal error: turn failed: Insufficient Balance",
+            ))
+            .unwrap();
+        let response = core_client.recv().await.unwrap();
+        assert_eq!(response.id, Some(RpcId::Number(3)));
+        assert!(response.error.is_none());
+        let completed = core_client.recv().await.unwrap();
+        assert_eq!(completed.method.as_deref(), Some("turn/completed"));
+        let turn = &completed.params.unwrap()["turn"];
+        assert_eq!(turn["status"], "failed");
+        assert_eq!(
+            turn["error"]["message"],
+            "Internal error: turn failed: Insufficient Balance"
+        );
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
