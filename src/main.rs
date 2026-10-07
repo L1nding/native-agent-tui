@@ -466,14 +466,7 @@ async fn execute() -> Result<(), (u8, String)> {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err((2, "The workflow TUI needs an interactive terminal. Add --headless for scripted execution.".into()));
             }
-            let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
-                .map_err(|error| (3, error.to_string()))?;
-            let client = ClientHandle::spawn(config)
-                .await
-                .map_err(|error| (3, error.to_string()))?;
-            ui::run_tasks_with_history(client, tasks, history)
-                .await
-                .map_err(|error| (3, error.to_string()))?;
+            return run_tui(config, tasks).await;
         }
         CliCommand::Tui { goal, config } => {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -487,21 +480,21 @@ async fn execute() -> Result<(), (u8, String)> {
                         .into(),
                 ));
             }
-            let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
-                .map_err(|error| (3, error.to_string()))?;
-            let client = ClientHandle::spawn(config)
-                .await
-                .map_err(|error| (3, error.to_string()))?;
-            ui::run_tasks_with_history(
-                client,
-                goal.into_iter().map(RootTaskSpec::input).collect(),
-                history,
-            )
-            .await
-            .map_err(|error| (3, error.to_string()))?;
+            return run_tui(config, goal.into_iter().map(RootTaskSpec::input).collect()).await;
         }
     }
     Ok(())
+}
+
+async fn run_tui(config: Config, tasks: Vec<RootTaskSpec>) -> Result<(), (u8, String)> {
+    let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
+        .map_err(|error| (3, error.to_string()))?;
+    let client = ClientHandle::spawn(config)
+        .await
+        .map_err(|error| (3, error.to_string()))?;
+    ui::run_tasks_with_history(client, tasks, history)
+        .await
+        .map_err(|error| (3, error.to_string()))
 }
 
 async fn run_headless(
