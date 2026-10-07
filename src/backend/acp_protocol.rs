@@ -153,19 +153,6 @@ pub fn session_close(id: RpcId, session_id: &str) -> Envelope {
     ))
 }
 
-pub fn session_set_config_option(
-    id: RpcId,
-    session_id: &str,
-    config_id: &str,
-    value: Value,
-) -> Envelope {
-    acp(Envelope::request(
-        id,
-        SESSION_SET_CONFIG_OPTION,
-        Some(json!({"sessionId": session_id, "configId": config_id, "value": value})),
-    ))
-}
-
 pub fn session_id(value: &Value) -> Option<String> {
     value
         .get("sessionId")
