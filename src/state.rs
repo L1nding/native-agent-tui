@@ -10,9 +10,10 @@ use crate::interactions::RequestView;
 pub const MESSAGE_BYTES: usize = 32 * 1024;
 pub const HISTORY_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionPhase {
+    #[default]
     Created,
     Launching,
     Initializing,
@@ -161,7 +162,7 @@ impl UsageSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoreSnapshot {
     pub version: u64,
     pub phase: SessionPhase,
@@ -204,45 +205,6 @@ pub struct GateSnapshot {
     pub pending: bool,
     pub root_starts_at_enter: u64,
     pub root_starts_at_release: Option<u64>,
-}
-
-impl Default for CoreSnapshot {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            phase: SessionPhase::Created,
-            root_turn_count: 0,
-            gate: None,
-            root_start_requests: 0,
-            queued_inputs: 0,
-            scheduler: Default::default(),
-            observation: Default::default(),
-            timeline: Default::default(),
-            tool_details: Default::default(),
-            diagnostics: Default::default(),
-            journal: None,
-            persistence: PersistenceState::default(),
-            agents: Vec::new(),
-            thread_id: None,
-            turn_id: None,
-            model: None,
-            cwd: String::new(),
-            sandbox: String::new(),
-            approval_policy: String::new(),
-            messages: Vec::new(),
-            requests: Vec::new(),
-            last_headless_action: None,
-            notice: None,
-            last_error: None,
-            tool_activity: None,
-            usage: UsageSummary::default(),
-            usage_facts: Vec::new(),
-            token_budget: TokenBudgetSnapshot::default(),
-            skills: crate::skills::SkillsSnapshot::default(),
-            history_truncated: false,
-            startup_blocked: false,
-        }
-    }
 }
 
 /// Modified only by the Core command/event owner.
