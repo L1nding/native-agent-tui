@@ -286,10 +286,6 @@ impl Outbox {
         self.transition(id, OutboxStatus::Unknown)
     }
 
-    pub fn mark_failed(&mut self, id: u64) -> Result<(), OutboxError> {
-        self.transition(id, OutboxStatus::Failed)
-    }
-
     fn transition(&mut self, id: u64, status: OutboxStatus) -> Result<(), OutboxError> {
         let current = self
             .records
