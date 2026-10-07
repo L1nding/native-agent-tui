@@ -1101,6 +1101,7 @@ mod tests {
             revision: 7,
             category: ToolCategory::Shell,
             lifecycle: ToolLifecycle::Running,
+            name: None,
             command: Some("needle 中文".into()),
             cwd: None,
             parameters: None,

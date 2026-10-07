@@ -62,6 +62,7 @@ fn tool_details(locator: ToolDetailLocator) -> ToolDetailsSnapshot {
         revision: 1,
         category: crate::protocol::ToolCategory::Shell,
         lifecycle: ToolLifecycle::Completed,
+        name: None,
         command: Some("echo result".into()),
         cwd: None,
         parameters: None,

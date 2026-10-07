@@ -44,6 +44,9 @@ pub(super) fn draw(
                 .duration_ms
                 .map_or_else(|| "unavailable".into(), |ms| ms.to_string())
         ));
+        if let Some(name) = &detail.name {
+            lines.push(format!("Tool: {name}"));
+        }
         lines.push(format!(
             "Command: {}",
             detail.command.as_deref().unwrap_or("unavailable")

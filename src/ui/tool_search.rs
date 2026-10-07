@@ -185,6 +185,7 @@ mod tests {
             revision: 4,
             category: ToolCategory::Shell,
             lifecycle: ToolLifecycle::Running,
+            name: None,
             command: Some("echo 中文👋".into()),
             cwd: None,
             parameters: None,

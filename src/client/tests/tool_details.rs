@@ -518,3 +518,24 @@ async fn disconnect_marks_running_tool_lines_as_unknown() {
     assert_eq!(tools.text, "▸ ended, outcome unknown · Start-Sleep 60");
     client.join.await.unwrap();
 }
+
+#[tokio::test]
+async fn dynamic_tool_summary_shows_the_tool_name_not_the_category() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":"wait-1","type":"dynamicToolCall","status":"inProgress","tool":"wait_for_subagent_completion","arguments":{"targets":[]}}}}),
+    )
+    .await;
+    let snapshot = client.snapshots.borrow().clone();
+    let tools = snapshot
+        .messages
+        .iter()
+        .find(|message| message.role == "Tool")
+        .unwrap();
+    assert_eq!(tools.text, "▸ running · wait_for_subagent_completion");
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}

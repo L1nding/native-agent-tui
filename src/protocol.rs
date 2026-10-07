@@ -48,6 +48,8 @@ pub struct ObservedTool {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObservedToolDetails {
+    /// MCP/动态工具的名称（MCP 带 server 前缀）；命令类工具为空。
+    pub name: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub parameters: Option<String>,
@@ -125,7 +127,19 @@ pub fn decode_observed_tool_details(item: &Value, category: ToolCategory) -> Obs
         .flatten();
     let exit_code = item.get("exitCode").and_then(Value::as_i64);
     let duration_ms = item.get("durationMs").and_then(Value::as_u64);
+    let name = match category {
+        ToolCategory::Mcp => match (
+            bounded_text(item.get("server")),
+            bounded_text(item.get("tool")),
+        ) {
+            (Some(server), Some(tool)) => Some(format!("{server}/{tool}")),
+            (_, tool) => tool,
+        },
+        ToolCategory::Dynamic => bounded_text(item.get("tool")),
+        _ => None,
+    };
     ObservedToolDetails {
+        name,
         command,
         cwd,
         parameters,
@@ -674,6 +688,23 @@ pub fn shell_script(command: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dynamic_and_mcp_details_carry_the_tool_name() {
+        let dynamic = serde_json::json!({"type":"dynamicToolCall","tool":"wait_for_subagent_completion",
+            "namespace":"native","arguments":{"targets":[]}});
+        let details = super::decode_observed_tool_details(&dynamic, super::ToolCategory::Dynamic);
+        assert_eq!(
+            details.name.as_deref(),
+            Some("wait_for_subagent_completion")
+        );
+        let mcp = serde_json::json!({"type":"mcpToolCall","server":"docs","tool":"search"});
+        let details = super::decode_observed_tool_details(&mcp, super::ToolCategory::Mcp);
+        assert_eq!(details.name.as_deref(), Some("docs/search"));
+        let shell = serde_json::json!({"type":"commandExecution","tool":"ignored","command":"ls"});
+        let details = super::decode_observed_tool_details(&shell, super::ToolCategory::Shell);
+        assert_eq!(details.name, None);
+    }
+
     #[test]
     fn file_change_details_name_the_first_paths() {
         let item = serde_json::json!({"changes":[

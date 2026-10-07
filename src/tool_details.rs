@@ -42,6 +42,7 @@ pub struct ToolDetail {
     pub revision: u64,
     pub category: ToolCategory,
     pub lifecycle: ToolLifecycle,
+    pub name: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub parameters: Option<String>,
@@ -74,6 +75,7 @@ impl ToolDetail {
                 .as_ref()
                 .map_or(0, String::capacity)
             + self.locator.item_id.capacity()
+            + self.name.as_ref().map_or(0, String::capacity)
             + self.command.as_ref().map_or(0, String::capacity)
             + self.cwd.as_ref().map_or(0, String::capacity)
             + self.parameters.as_ref().map_or(0, String::capacity)
@@ -101,6 +103,7 @@ pub fn summary_line(detail: &ToolDetail) -> String {
                 .then(|| detail.result.clone())
                 .flatten()
         })
+        .or_else(|| detail.name.clone())
         .unwrap_or_else(|| format!("{:?}", detail.category));
     let state = match detail.lifecycle {
         ToolLifecycle::Running => "running",
@@ -201,6 +204,9 @@ impl ToolDetails {
             if existing.command.is_none() {
                 existing.command = fields.command;
             }
+            if existing.name.is_none() {
+                existing.name = fields.name;
+            }
             if existing.cwd.is_none() {
                 existing.cwd = fields.cwd;
             }
@@ -219,6 +225,7 @@ impl ToolDetails {
             revision: 1,
             category,
             lifecycle: ToolLifecycle::Running,
+            name: fields.name,
             command: fields.command,
             cwd: fields.cwd,
             parameters: fields.parameters,
@@ -252,6 +259,7 @@ impl ToolDetails {
                 revision: 1,
                 category,
                 lifecycle,
+                name: fields.name,
                 command: fields.command,
                 cwd: fields.cwd,
                 parameters: fields.parameters,

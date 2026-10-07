@@ -14,5 +14,6 @@
 | 8 | 2026-10-07 | 同上 | 运行中强杀 app-server 进程树 | 立即 Disconnected 并说明“外部结果未知”；再次提交被拒且草稿保留；`--recovery` 显示任务 Unknown、需要人工确认 | 1 | 0 | 清楚 | 工具行仍为 running（已修复）；`initialized` 通知在恢复报告中被误报为待检查（已修复） |
 | 9 | 2026-10-07 | Codex 0.159.2，read-only，120 列 | 让根代理派两个子代理分别统计 `src/ui` 和 `tests` 的文件数，完成后汇总 | 成功：25 和 2，与 `ls` 一致（系统验证）；左侧代理列表、F3 切换到子代理对话均正常 | 根 2 次，子代理各 1 次 | 0 | 代理列表清楚 | 已结束代理显示 `Ended / quiet unknown`（已省略） |
 | 10 | 2026-10-07 | Codex 0.159.2，workspace-write，`target/trial-ws` | 第一轮写 `fib`，运行中用 Ctrl+S 排队第二轮“写 unittest” | 成功：头部显示 `queued: 1`，第一轮结束后自动开始第二轮；生成的 3 个测试用 `python -m unittest` 全部通过（系统验证） | 4 + 1 | 0 | 清楚 | 排队提示“Queued 1 root tasks; dependencies remain enforced.”语法错且偏技术化（已改） |
+| 11 | 2026-10-07 | Codex 0.159.2，read-only，`target/trial-ws` | 根代理派子代理用 shell 写 `child.txt` | 成功：审批来自子代理，面板标明 `/root/create_child_file`、命令与理由；头部 `GatePending`，输入框提示 Enter 排队；批准后文件内容为 `hi`（系统验证），根代理核实后汇总 | 根 6 次 + 子代理 2 次 | 1（批准） | 清楚 | 等待子代理的工具调用只显示 `Dynamic`（改为显示 `wait_for_subagent_completion` 等工具名；MCP 显示 server/tool） |
 
-尚未覆盖：子代理审批、5 秒状态理解计时、Orca 内置终端。
+尚未覆盖：5 秒状态理解计时、Orca 内置终端。
