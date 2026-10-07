@@ -13,6 +13,7 @@ use super::workflow::{
     ConversationTarget,
 };
 use crate::agents::AgentSnapshot;
+use crate::observation::AttentionLevel;
 use crate::scheduler::TaskSnapshot;
 use crate::state::{display_text, CoreSnapshot};
 
@@ -134,7 +135,10 @@ pub(super) fn draw_agents(
             "  ".repeat(row.depth.saturating_sub(1)),
             agent_usage_brief(snapshot, agent)
         )));
-        if let Some(activity) = focus_activity(snapshot, &agent.info.id) {
+        // 已结束的代理只看上一行的终态；静默时长对它没有意义。
+        if let Some(activity) = focus_activity(snapshot, &agent.info.id)
+            .filter(|activity| activity.attention.level != AttentionLevel::Ended)
+        {
             agents.push(Line::from(format!(
                 "    {}{:?} / quiet {}",
                 "  ".repeat(row.depth.saturating_sub(1)),

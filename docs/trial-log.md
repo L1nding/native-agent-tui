@@ -10,5 +10,8 @@
 | 4 | 2026-10-07 | Codex 0.159.2，workspace-write，临时目录 `target/trial-ws` | 修复 `calc.py` 中 add 的减号 bug，只改该文件 | 成功；文件变为 `a + b`（系统验证），重复三次结果一致 | 2 次（读取 + 文件修改） | 0（工作区内写入无需审批） | 头部与摘要清楚 | 文件修改摘要只显示 `File`（已改为 `1 file: calc.py`，路径相对工作目录） |
 | 5 | 2026-10-07 | dsh ACP，`--model hi/gpt-6-luna`，read-only | 同任务 1 | 成功；排序正确（系统验证） | 3 次 + 1 次权限请求 | 1（脚本批准） | 清楚 | 长任务超过 30 秒被判 Unknown（turn/start 改为立即确认）；读取大文件超 32 KiB 使整轮失败（改为截断）；权限请求只显示“ACP permission request”（改为显示 rawInput 命令、理由、目录） |
 | 6 | 2026-10-07 | dsh ACP，`--model hi/gpt-6-luna`，workspace-write，`target/trial-ws` | 同任务 4 | 成功；文件变为 `a + b`（系统验证） | 5 次（glob/read/edit） | 0 | 清楚 | 工具摘要只有工具名（改为附带路径/模式） |
+| 7 | 2026-10-07 | Codex 0.159.2，read-only，`--attention-tool 10000,25000` | 运行 `Start-Sleep 90`，静默中 Ctrl+C，再追问命令是否完成 | 成功：13 秒“no recent output”、30 秒“silent for a while, check it”；Ctrl+C 1 秒内 Interrupted；追问时模型记得上下文并说明命令可能仍在后台运行 | 1 | 0 | 头部提醒准确 | 状态区显示原始 `commandExecution`（已删除）；中断后工具行仍为 running（改为 ended, outcome unknown）；会话汇总因中断轮次记为 Failed（工作流严格语义，待定） |
+| 8 | 2026-10-07 | 同上 | 运行中强杀 app-server 进程树 | 立即 Disconnected 并说明“外部结果未知”；再次提交被拒且草稿保留；`--recovery` 显示任务 Unknown、需要人工确认 | 1 | 0 | 清楚 | 工具行仍为 running（已修复）；`initialized` 通知在恢复报告中被误报为待检查（已修复） |
+| 9 | 2026-10-07 | Codex 0.159.2，read-only，120 列 | 让根代理派两个子代理分别统计 `src/ui` 和 `tests` 的文件数，完成后汇总 | 成功：25 和 2，与 `ls` 一致（系统验证）；左侧代理列表、F3 切换到子代理对话均正常 | 根 2 次，子代理各 1 次 | 0 | 代理列表清楚 | 已结束代理显示 `Ended / quiet unknown`（已省略） |
 
-尚未覆盖：多轮修改代码的写入任务、长时间静默、断连与恢复、子代理场景、5 秒状态理解计时。
+尚未覆盖：多轮修改代码的写入任务、子代理审批、5 秒状态理解计时、Orca 内置终端。
