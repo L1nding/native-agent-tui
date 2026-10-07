@@ -810,11 +810,7 @@ impl Core {
                 }
             }
         }
-        self.state.view.journal = self.journal.as_ref().map(Journal::view).or(self
-            .state
-            .view
-            .journal
-            .take());
+        self.project_journal();
         self.state.view.timeline = self.observer.timeline_snapshot();
         if matches!(
             self.state.view.phase,
@@ -829,9 +825,6 @@ impl Core {
         let transport = self.pipe.stats();
         self.state.view.diagnostics.transport_bytes_in = transport.bytes_in;
         self.state.view.diagnostics.transport_bytes_out = transport.bytes_out;
-        if let Some(view) = &mut self.state.view.journal {
-            view.error = self.journal_error.clone().or(view.error.take());
-        }
         self.state.view.startup_blocked = !self.preflight_passed
             && !matches!(
                 self.state.view.phase,
@@ -840,24 +833,23 @@ impl Core {
                     | SessionPhase::Initializing
                     | SessionPhase::CheckingShell
             );
-        self.project_persistence_state();
         self.snapshot_tx.send_replace(self.state.snapshot());
     }
 
     fn publish_journal_status(&mut self) {
+        self.project_journal();
+        self.state.view.observation.snapshot_version = self.state.view.version + 1;
+        self.snapshot_tx.send_replace(self.state.snapshot());
+    }
+
+    /// 将 journal 视图、错误和提交水位投影为 Core 可消费的脱敏状态。
+    fn project_journal(&mut self) {
         if let Some(journal) = &self.journal {
             self.state.view.journal = Some(journal.view());
         }
         if let Some(view) = &mut self.state.view.journal {
             view.error = self.journal_error.clone().or(view.error.take());
         }
-        self.project_persistence_state();
-        self.state.view.observation.snapshot_version = self.state.view.version + 1;
-        self.snapshot_tx.send_replace(self.state.snapshot());
-    }
-
-    /// 将 journal 的提交水位投影为 Core 可消费的脱敏状态。
-    fn project_persistence_state(&mut self) {
         self.state.view.persistence = persistence_state(
             self.state.view.journal.as_ref(),
             self.journal_error.as_ref(),
