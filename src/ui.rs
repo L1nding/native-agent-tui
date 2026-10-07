@@ -2007,6 +2007,11 @@ mod tests {
                 .collect();
             assert!(rendered.contains("quiet 31s"), "{rendered}");
             assert!(rendered.contains("attention:1"), "{rendered}");
+            // 头部用直白描述，不暴露原始事件来源和序号。
+            if height > 16 {
+                assert!(rendered.contains("last event:"), "{rendered}");
+                assert!(!rendered.contains("AppServer #"), "{rendered}");
+            }
             if width >= 100 {
                 assert!(rendered.contains("tokens:4/10"), "{rendered}");
             }

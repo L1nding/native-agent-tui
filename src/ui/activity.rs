@@ -62,10 +62,39 @@ pub(super) fn activity_brief(activity: &ActivitySnapshot) -> String {
     )
 }
 
+/// 头部用的直白描述；F11 证据视图仍显示 `activity_brief` 的原始枚举。
 pub(super) fn reminder_brief(activity: &ActivitySnapshot, reminders: &Reminders) -> String {
-    let mut text = activity_brief(activity);
+    use crate::observation::ActivityKind::*;
+    use crate::protocol::ToolCategory;
+    let doing = match activity.kind {
+        Starting => "Starting",
+        ModelRequest => "Waiting for the model",
+        ModelStreaming => "Agent is writing",
+        ToolRunning => match activity.tool_category {
+            Some(ToolCategory::Shell) => "Running a command",
+            Some(ToolCategory::File) => "Changing files",
+            Some(ToolCategory::Mcp | ToolCategory::Dynamic) => "Calling a tool",
+            Some(ToolCategory::Delegation) => "Delegating to a child agent",
+            Some(ToolCategory::Web) => "Searching the web",
+            Some(ToolCategory::Compaction) => "Compacting context",
+            Some(_) | None => "Running a tool",
+        },
+        WaitingApproval => "Needs your approval",
+        WaitingUserInput => "Needs your answer",
+        WaitingChildren => "Waiting for child agents",
+        WaitingTransport => "Waiting for app-server",
+        Completed => "Done",
+        Failed => "Failed",
+        Unknown => "Outcome unknown",
+    };
+    let mut text = format!("{doing} · quiet {}", age(activity.silence_ms));
+    match activity.attention.level {
+        AttentionLevel::Quiet => text.push_str(" · no recent output"),
+        AttentionLevel::AttentionNeeded => text.push_str(" · silent for a while, check it"),
+        _ => {}
+    }
     if reminders.is_acknowledged(activity) {
-        text.push_str(" | reminder off locally");
+        text.push_str(" · reminder off locally");
     }
     text
 }
@@ -90,13 +119,23 @@ pub(super) fn next_action(activity: &ActivitySnapshot, reminders: &Reminders) ->
 }
 
 pub(super) fn evidence_brief(activity: &ActivitySnapshot, reminders: &Reminders) -> String {
+    // 只给出事件类别的可读形式；来源和序号在 F11/Ctrl+T 中查看。
+    let last = activity.last_evidence.as_ref().map_or_else(
+        || "unknown".into(),
+        |evidence| {
+            let mut words = String::new();
+            for ch in format!("{:?}", evidence.kind).chars() {
+                if ch.is_uppercase() && !words.is_empty() {
+                    words.push(' ');
+                }
+                words.extend(ch.to_lowercase());
+            }
+            words
+        },
+    );
     format!(
-        "Next: {} | Last: {}",
-        next_action(activity, reminders),
-        activity.last_evidence.as_ref().map_or_else(
-            || "unknown".into(),
-            |evidence| format!("{:?} {:?} #{}", evidence.kind, evidence.source, evidence.id)
-        )
+        "Next: {} · last event: {last}",
+        next_action(activity, reminders)
     )
 }
 
