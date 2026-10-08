@@ -469,7 +469,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "requires the pinned Codex 0.159.2 and Python; no model calls"]
+    #[ignore = "requires the pinned Codex 0.161.0 and Python; no model calls"]
     async fn live_codex_schemas_match_the_reviewed_protocol_manifest() {
         struct FixtureDirectory(PathBuf);
         impl Drop for FixtureDirectory {

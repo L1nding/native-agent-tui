@@ -18,7 +18,7 @@ def main():
     repo = Path(__file__).resolve().parents[2]
     binary = args.binary.resolve()
     codex = args.codex or os.environ.get("CODEX_BIN") or shutil.which("codex.cmd" if os.name == "nt" else "codex")
-    assert codex, "Codex 0.159.2 is required"
+    assert codex, "Codex 0.161.0 is required"
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
     with tempfile.TemporaryDirectory(prefix="live-codex-jsonl-", dir=repo / "target") as temp, ExitStack() as owners:
@@ -42,7 +42,7 @@ def main():
         home = root / "home"
         home.mkdir()
         version = subprocess.run([codex, "--version"], env=env, capture_output=True, timeout=15, creationflags=flags)
-        assert version.returncode == 0 and b"0.159.2" in version.stdout, "This fixture requires the pinned Codex 0.159.2 baseline"
+        assert version.returncode == 0 and b"0.161.0" in version.stdout, "This fixture requires the pinned Codex 0.161.0 baseline"
         bundled = subprocess.run([codex, "debug", "models", "--bundled"], env=env, capture_output=True, timeout=15, creationflags=flags)
         assert bundled.returncode == 0, bundled.stderr.decode()
         catalog = json.loads(bundled.stdout)
@@ -85,7 +85,7 @@ requires_openai_auth = false
         history = [json.loads(line) for line in replay.stdout.splitlines()]
         assert history[-2]["payload"] == final
         assert history[-1]["payload"]["execution_result"] == "completed" and not history[-1]["payload"]["live_attached"]
-        print("Real Codex 0.159.2 CLI JSONL: passed (localhost model, one root, durable Completed, read-only replay)")
+        print("Real Codex 0.161.0 CLI JSONL: passed (localhost model, one root, durable Completed, read-only replay)")
 
 
 if __name__ == "__main__":

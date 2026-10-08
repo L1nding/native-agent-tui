@@ -316,7 +316,7 @@ impl LiveRequests {
 }
 
 #[tokio::test]
-#[ignore = "requires Codex 0.159.2 and Python; localhost provider and isolated fixture files"]
+#[ignore = "requires Codex 0.161.0 and Python; localhost provider and isolated fixture files"]
 async fn live_codex_file_decisions_and_shell_approval_preserve_the_selected_sandbox() {
     let mut fixture = LiveRequests::launch("approvals").await.unwrap();
     let observed: Result<(), String> = async {
@@ -430,7 +430,7 @@ async fn live_codex_file_decisions_and_shell_approval_preserve_the_selected_sand
 }
 
 #[tokio::test]
-#[ignore = "requires Codex 0.159.2 and Python; explicit optional input feature in fixture home"]
+#[ignore = "requires Codex 0.161.0 and Python; explicit optional input feature in fixture home"]
 async fn live_codex_input_answers_follow_real_question_ids_and_resolve_before_completion() {
     let mut fixture = LiveRequests::launch("input").await.unwrap();
     let observed: Result<(), String> = async {
@@ -500,7 +500,7 @@ async fn live_codex_input_answers_follow_real_question_ids_and_resolve_before_co
 }
 
 #[tokio::test]
-#[ignore = "requires Codex 0.159.2 and Python; request-specific cancel and no external model"]
+#[ignore = "requires Codex 0.161.0 and Python; request-specific cancel and no external model"]
 async fn live_codex_command_cancel_rejects_the_write_and_waits_for_interrupted() {
     let mut fixture = LiveRequests::launch("cancel").await.unwrap();
     let observed: Result<(), String> = async {

@@ -5,7 +5,7 @@
 ## 范围
 
 - 平台：只支持 Windows。Linux/macOS 标为未支持。
-- 后端：Codex CLI 0.159.2 为正式后端；`deepseek-acp` 为实验后端，不进入放行条件。
+- 后端：Codex CLI 0.161.0 为正式后端；`deepseek-acp` 为实验后端，不进入放行条件。
 - 功能：单 agent 对话、审批/输入、中断/停止、活动证据与 Attention、JSONL/Python 消费者、journal 回放、历史搜索和脱敏导出。现有 child/Gate 路径只做回归，不宣称 V2 可用。
 
 ## 已有证据
@@ -18,8 +18,9 @@
 ## 发布前必须完成
 
 1. [ ] 推送本地 `main`，确认远端 `Verify` workflow 在最终提交上通过。
-2. [ ] 在最终提交上运行 `python scripts/verify.py --live`，记录通过数与失败项；环境失败不算通过。
+2. [ ] 在最终提交上运行 `python scripts/verify.py --live`，记录通过数与失败项；环境失败不算通过。2026-10-08 在锁定 0.161.0 的提交上通过（391 项默认、9 项真实），之后若有代码提交需重跑。
 3. [ ] 人工验收（需真人操作）：
+   - [ ] Codex 升级到 0.161.0 后，在交互终端运行一次 `codex sandbox -- cmd /c echo ok` 并批准 UAC，再确认默认 elevated 沙箱下 `--check-shell` 通过。
    - [ ] Orca 窗口内真实 Ctrl+V 粘贴多行中文与 emoji。
    - [ ] Orca 窗口内中文输入法组字、候选确认与退格。
    - [ ] 5 秒状态理解：选 3 个试用场景（审批待处理、子代理静默、断连），记录能否在 5 秒内说出当前活动、等待对象和所需动作。
@@ -32,7 +33,7 @@
    cargo build --locked --release
    ```
 
-   Release 说明写明：只支持 Windows；需要 Codex CLI 0.159.2；ACP 为实验后端；journal 只保存脱敏投影，不能重建完整对话。
+   Release 说明写明：只支持 Windows；需要 Codex CLI 0.161.0；ACP 为实验后端；journal 只保存脱敏投影，不能重建完整对话。
 
 ## 不阻塞 Alpha
 

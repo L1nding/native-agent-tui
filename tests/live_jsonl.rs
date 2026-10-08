@@ -1,6 +1,6 @@
 #[cfg(windows)]
 #[test]
-#[ignore = "requires Codex 0.159.2 and Python; all model traffic stays on localhost"]
+#[ignore = "requires Codex 0.161.0 and Python; all model traffic stays on localhost"]
 fn live_cli_jsonl_matches_the_real_app_server_and_durable_replay() {
     let output = std::process::Command::new(
         std::env::var_os("NATIVE_AGENT_TUI_PYTHON").unwrap_or_else(|| "python".into()),

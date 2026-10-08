@@ -4719,7 +4719,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "requires Codex 0.159.2 and Python; all model traffic stays on localhost"]
+    #[ignore = "requires Codex 0.161.0 and Python; all model traffic stays on localhost"]
     async fn live_app_server_gate_has_zero_provider_requests_while_a_child_is_pending() {
         use std::io::{Read, Write};
         struct FixtureHome(std::path::PathBuf);
@@ -6452,7 +6452,7 @@ mod tests {
         );
         let mut main = BufReader::new(main_server);
         let mut initialize: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.159.2/initialize.json"
+            "../tests/fixtures/codex-0.161.0/initialize.json"
         ))
         .unwrap();
         initialize["id"] = next(&mut main).await["id"].clone();
@@ -6467,7 +6467,7 @@ mod tests {
         .await;
         phase(
             &mut client,
-            if thread_version == "0.159.2" {
+            if thread_version == "0.161.0" {
                 SessionPhase::CheckingShell
             } else {
                 SessionPhase::Failed
@@ -6481,7 +6481,7 @@ mod tests {
         let request = next(peer).await;
         assert_eq!(request["method"], "initialize");
         let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.159.2/initialize.json"
+            "../tests/fixtures/codex-0.161.0/initialize.json"
         ))
         .unwrap();
         response["id"] = request["id"].clone();
@@ -6495,7 +6495,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_preflight_keeps_main_rpc_ids_separate_and_blocks_queued_tasks_until_cleanup()
     {
-        let (client, mut main, mut peer) = isolated_harness("0.159.2").await;
+        let (client, mut main, mut peer) = isolated_harness("0.161.0").await;
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -6541,7 +6541,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_isolated_initialize_cannot_execute_shell_or_dispatch_model() {
-        let (mut client, _main, mut peer) = isolated_harness("0.159.2").await;
+        let (mut client, _main, mut peer) = isolated_harness("0.161.0").await;
         let initialize = next(&mut peer).await;
         send(
             &mut peer,
@@ -6565,7 +6565,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn isolated_preflight_timeout_remains_unknown_and_cannot_retry_queued_task() {
-        let (mut client, mut main, mut peer) = isolated_harness("0.159.2").await;
+        let (mut client, mut main, mut peer) = isolated_harness("0.161.0").await;
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -6602,7 +6602,7 @@ mod tests {
             json!({"id":2,"result":{"exitCode":"PRIVATE_CODE","stdout":"native-agent-tui-shell-ok"}}),
             json!({"id":"PRIVATE_REQUEST","method":"PRIVATE_INTERACTION","params":{}}),
         ] {
-            let (mut client, mut main, mut peer) = isolated_harness("0.159.2").await;
+            let (mut client, mut main, mut peer) = isolated_harness("0.161.0").await;
             client
                 .commands
                 .send(Command::SubmitRootInput {
@@ -6629,7 +6629,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_preflight_eof_preserves_unknown_shell_outcome() {
-        let (mut client, mut main, mut peer) = isolated_harness("0.159.2").await;
+        let (mut client, mut main, mut peer) = isolated_harness("0.161.0").await;
         initialize_peer(&mut peer).await;
         drop(peer);
         phase(&mut client, SessionPhase::Unknown).await;
@@ -6643,7 +6643,7 @@ mod tests {
     async fn isolated_preflight_success_cannot_release_tasks_after_cleanup_crosses_deadline() {
         let (confirmation, cleanup) = tokio::sync::oneshot::channel();
         let (mut client, mut main, mut peer) =
-            isolated_harness_with_cleanup("0.159.2", Some(cleanup)).await;
+            isolated_harness_with_cleanup("0.161.0", Some(cleanup)).await;
         let request = initialize_peer(&mut peer).await;
         send(&mut peer, json!({"id":request["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
         // EOF confirms the worker has consumed success and entered its cleanup stage.
@@ -6661,7 +6661,7 @@ mod tests {
 
     #[tokio::test]
     async fn quitting_during_isolated_preflight_joins_its_cancelled_owner() {
-        let (client, _main, mut peer) = isolated_harness("0.159.2").await;
+        let (client, _main, mut peer) = isolated_harness("0.161.0").await;
         initialize_peer(&mut peer).await;
         client.commands.send(Command::Quit).await.unwrap();
         let report = tokio::time::timeout(Duration::from_secs(2), client.join)
@@ -6678,7 +6678,7 @@ mod tests {
     async fn isolated_preflight_cannot_become_ready_before_cleanup_or_after_uncertain_cleanup() {
         let (confirmation, cleanup) = tokio::sync::oneshot::channel();
         let (mut client, mut main, mut peer) =
-            isolated_harness_with_cleanup("0.159.2", Some(cleanup)).await;
+            isolated_harness_with_cleanup("0.161.0", Some(cleanup)).await;
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -7198,7 +7198,7 @@ mod tests {
         let init = next(server).await;
         assert_eq!(init["method"], "initialize");
         let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.159.2/initialize.json"
+            "../tests/fixtures/codex-0.161.0/initialize.json"
         ))
         .unwrap();
         response["id"] = init["id"].clone();
@@ -7208,7 +7208,7 @@ mod tests {
         assert_eq!(thread["method"], "thread/start");
         send(
             server,
-            json!({"id":thread["id"],"result":{"thread":{"id":"root","cliVersion":"0.159.2"},"model":"test-model"}}),
+            json!({"id":thread["id"],"result":{"thread":{"id":"root","cliVersion":"0.161.0"},"model":"test-model"}}),
         )
         .await;
         let preflight = next(server).await;
@@ -7228,7 +7228,7 @@ mod tests {
     #[tokio::test]
     async fn pinned_startup_transcript_reaches_ready_with_zero_model_turns() {
         let (mut client, mut server) = harness().await;
-        let records: Vec<Value> = include_str!("../tests/fixtures/codex-0.159.2/startup.jsonl")
+        let records: Vec<Value> = include_str!("../tests/fixtures/codex-0.161.0/startup.jsonl")
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -7297,7 +7297,7 @@ mod tests {
         let (mut client, mut server) = harness().await;
         let request = next(&mut server).await;
         let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.159.2/initialize.json"
+            "../tests/fixtures/codex-0.161.0/initialize.json"
         ))
         .unwrap();
         response["id"] = request["id"].clone();

@@ -2,12 +2,12 @@
 use serde_json::Value;
 use thiserror::Error;
 
-pub const SUPPORTED_CODEX_VERSION: &str = "0.159.2";
+pub const SUPPORTED_CODEX_VERSION: &str = "0.161.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CompatibilityError {
     #[error(
-        "Unsupported Codex version; execution requires codex-cli 0.159.2. No task was started."
+        "Unsupported Codex version; execution requires codex-cli 0.161.0. No task was started."
     )]
     Version,
     #[error(
@@ -70,18 +70,18 @@ mod tests {
     #[test]
     fn execution_accepts_only_the_exact_verified_release_banner() {
         for valid in [
-            b"codex-cli 0.159.2".as_slice(),
-            b"codex-cli 0.159.2\n",
-            b"codex-cli 0.159.2\r\n",
+            b"codex-cli 0.161.0".as_slice(),
+            b"codex-cli 0.161.0\n",
+            b"codex-cli 0.161.0\r\n",
         ] {
             assert_eq!(verify_version(valid), Ok(()));
         }
         for invalid in [
             b"".as_slice(),
-            b"codex-cli 0.159.20\n",
-            b"codex-cli 0.159.2-dev\n",
-            b"codex-cli 0.159.2\nPRIVATE_BANNER",
-            b"PRIVATE_BANNER 0.159.2",
+            b"codex-cli 0.161.00\n",
+            b"codex-cli 0.161.0-dev\n",
+            b"codex-cli 0.161.0\nPRIVATE_BANNER",
+            b"PRIVATE_BANNER 0.161.0",
             b"\xff",
         ] {
             assert_eq!(verify_version(invalid), Err(CompatibilityError::Version));
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn required_initialize_fields_are_checked_without_retaining_private_metadata() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.159.2/initialize.json"
+            "../tests/fixtures/codex-0.161.0/initialize.json"
         ))
         .unwrap();
         assert_eq!(verify_initialize(&fixture["result"]), Ok(()));
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn a_launcher_banner_cannot_replace_the_new_threads_reported_release() {
-        let transcript: Vec<Value> = include_str!("../tests/fixtures/codex-0.159.2/startup.jsonl")
+        let transcript: Vec<Value> = include_str!("../tests/fixtures/codex-0.161.0/startup.jsonl")
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -135,7 +135,7 @@ mod tests {
         assert_eq!(verify_thread_start(valid), Ok(()));
         for version in [
             Value::Null,
-            json!("0.159.20"),
+            json!("0.161.00"),
             json!("PRIVATE_VERSION"),
             json!(159),
         ] {

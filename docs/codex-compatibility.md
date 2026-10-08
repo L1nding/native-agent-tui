@@ -4,12 +4,13 @@
 
 | 后端与环境 | 执行状态 | 证据与限制 |
 | --- | --- | --- |
-| Codex CLI 0.159.2 / 本机 Windows | 唯一允许的后端版本 | 真实初始化、零模型 shell 预检、localhost Gate 和 CLI JSONL；隔离预检已接入，验收范围见启动可靠性记录 |
+| Codex CLI 0.161.0 / 本机 Windows | 唯一允许的后端版本（2026-10-08 起） | schema 差异经人工审核；真实初始化、零模型 shell 预检、localhost Gate 和 CLI JSONL 见下方升级记录 |
+| Codex CLI 0.159.2 | 禁止执行（旧基线） | 2026-10-08 前的验证记录保留为历史证据 |
 | 其他 CLI 版本，包括 prerelease | 禁止执行 | 模型目录查询前拒绝，没有忽略门禁的 CLI 开关 |
 | Linux/macOS、其他 Windows 环境 | 尚未获得发布验收 | 源码路径和版本判断不能替代原生验证 |
 | 历史会话 | 只读可用 | 列表、历史、回放和脱敏导出不查询或启动 Codex |
 
-0.159.2 是项目验证的固定基线，不表示最新版本。选择已有兼容安装：
+0.161.0 是项目当前验证的固定基线（此前为 0.159.2），不表示最新版本。选择已有兼容安装：
 
 ```text
 cargo run --locked -- --codex PATH_TO_CODEX --check-shell
@@ -20,14 +21,14 @@ cargo run --locked -- --codex PATH_TO_CODEX --check-shell
 ## 启动边界
 
 1. `--version` 查询最多读取 4096 字节，等待五秒。只接受准确的
-   `codex-cli 0.159.2`，可带一个 LF 或 CRLF；相似版本、额外文本、空输出
+   `codex-cli 0.161.0`，可带一个 LF 或 CRLF；相似版本、额外文本、空输出
    和查询失败均拒绝。
 2. 版本通过后读取有效模型目录，随后启动 app-server。
 3. `initialize` 必须提供有界、非空字符串 `userAgent`、`codexHome`、
    `platformFamily`、`platformOs`。缺失或类型错误时，不发送 `initialized`、
    `thread/start` 或 shell 预检。其他字段允许保留在协议响应中，但不会
    从初始化 metadata 写入 Core 快照或 journal。
-4. 新线程必须报告 `thread.cliVersion = 0.159.2` 和非空、有界的 `thread.id`。
+4. 新线程必须报告 `thread.cliVersion = 0.161.0` 和非空、有界的 `thread.id`。
    不符时拒绝 shell 预检和任务。版本 banner 不能替代新线程返回的版本。
 5. 正常 Windows 启动在主线程通过上述门禁后，为 shell 预检启动独立
    app-server。辅助进程重新核对准确版本和 initialize 必需字段，使用
@@ -46,7 +47,7 @@ cargo run --locked -- --codex PATH_TO_CODEX --check-shell
 
 ## Schema 与夹具
 
-`tests/fixtures/codex-0.159.2/` 保存两个小型原始 schema、脱敏初始化响应、
+`tests/fixtures/codex-0.161.0/` 保存两个小型原始 schema、脱敏初始化响应、
 合成启动 transcript，以及八份导出 schema 的规范化 SHA-256 指纹。
 这些指纹覆盖初始化、线程创建、shell 响应、轮次终态、两类审批与输入。
 指纹反映被审核的完整源 schema，合成 transcript 用于 Core 行为回归，
@@ -116,3 +117,17 @@ number 后，指纹检查返回 1，确认差异会阻止兼容放行。
 重复启动检查及 Windows 管道继承的诊断证据见
 [启动可靠性诊断](startup-reliability.md)。检查失败会立即停止剩余独立
 启动，不重试模型任务；诊断干预后的成功不能作为无干预启动验收。
+
+## 升级记录：0.159.2 → 0.161.0（2026-10-08）
+
+本机 Codex 升到 0.161.0 后，门禁按设计拒绝执行，`verify.py --live` 的九项真实测试全部在版本检查处失败。为对照，在独立临时目录安装官方 0.159.2，两版分别导出 schema；0.159.2 导出与原指纹 14/14 一致，证明对照有效。
+
+人工审核结论：
+
+- 清单内 14 份 schema 中 12 份不变；`ThreadStartResponse` 与 `TurnCompletedNotification` 只有内嵌的 `CodexErrorInfo` 变化：`oneOf` 改为 `anyOf`，并新增兜底分支 `{"type": ["string","object"]}`。Core 不解析该字段，没有影响。两份的 `required` 列表不变。
+- 全部 440 份旧 schema 中 28 份变化，其余差异均为新增可选字段（`loginId`、`origin`）、描述文字和新方法：Bedrock GovCloud 检查、`thread/prediction` 请求及其通知。客户端不发 `thread/prediction`，未知通知在分发处忽略，不计为进展。
+- 审批请求（`ServerRequest`）与 item 完成通知不变。
+
+更新内容：固定版本常量、`tests/fixtures/codex-0.161.0/`（两项指纹、合成 transcript 的 `cliVersion`）、测试与 Python 夹具中的版本字符串。近似版本拒绝用例随之改为 `0.161.00`、`0.161.0-dev` 等，语义不变。
+
+验证：`python scripts/verify.py --live` 全部通过——391 项默认测试、九项真实 Codex 0.161.0 测试（schema 导出、sandbox 覆盖、命令取消、文件审批、输入回答、localhost Gate、skills、Core Ready、CLI JSONL）及全部原生夹具。release 版 `--check-shell --windows-sandbox unelevated` 通过；默认 elevated 沙箱返回 `setup refresh had errors`，属于升级后需重新执行一次管理员设置（见 README 的 Windows sandbox setup），不是协议不兼容。

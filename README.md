@@ -4,7 +4,7 @@ A Rust terminal client for the local Codex app-server. Interactive and headless 
 
 ## Run
 
-Install Rust and make an authenticated Codex CLI **0.159.2** available on `PATH`. Execution checks the exact CLI release before catalog lookup, then validates initialization and the new thread's reported release. `--codex PATH` or `CODEX_BIN` selects a compatible executable; Windows uses `codex.cmd` by default. Other versions are refused before model execution. See [backend compatibility](docs/codex-compatibility.md).
+Install Rust and make an authenticated Codex CLI **0.161.0** available on `PATH`. Execution checks the exact CLI release before catalog lookup, then validates initialization and the new thread's reported release. `--codex PATH` or `CODEX_BIN` selects a compatible executable; Windows uses `codex.cmd` by default. Other versions are refused before model execution. See [backend compatibility](docs/codex-compatibility.md).
 
 ```text
 cargo run --locked -- --check-shell
@@ -142,7 +142,7 @@ Use `cargo test --locked --all-targets` when nextest is unavailable. Contributor
 
 ### Optional live verification (Windows)
 
-The local provider fixture requires Codex 0.159.2 and Python. It uses an isolated `CODEX_HOME`, no API keys, and localhost Responses SSE. It holds two child turns and counts provider requests before releasing each one:
+The local provider fixture requires Codex 0.161.0 and Python. It uses an isolated `CODEX_HOME`, no API keys, and localhost Responses SSE. It holds two child turns and counts provider requests before releasing each one:
 
 ```powershell
 $env:NATIVE_AGENT_TUI_PYTHON = (python -c 'import sys; print(sys.executable)')

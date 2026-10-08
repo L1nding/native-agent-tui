@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn duplicate_requested_cwd_groups_are_rejected() {
         let value: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.159.2/skills-list-repeated-cwd.json"
+            "../tests/fixtures/codex-0.161.0/skills-list-repeated-cwd.json"
         ))
         .unwrap();
         assert!(parse_result(&value, "/workspace").is_none());

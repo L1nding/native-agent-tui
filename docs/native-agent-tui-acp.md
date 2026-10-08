@@ -1,7 +1,7 @@
 # DeepSeek Harness ACP backend
 
 The first ACP backend is selected with `--backend deepseek-acp`. Codex remains
-the default and keeps its pinned `0.159.2` compatibility checks.
+the default and keeps its pinned `0.161.0` compatibility checks.
 
 ## Process boundary
 

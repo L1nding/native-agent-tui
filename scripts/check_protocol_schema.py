@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 REPO = Path(__file__).resolve().parents[1]
-FIXTURES = REPO / 'tests/fixtures/codex-0.159.2'
+FIXTURES = REPO / 'tests/fixtures/codex-0.161.0'
 
 
 def fingerprint(value):

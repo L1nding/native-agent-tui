@@ -22,7 +22,7 @@ if stage == "version":
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                                  creationflags=subprocess.CREATE_NO_WINDOW) if os.name == "nt" else None
         record_processes(root, [os.getpid(), child.pid] if child else [os.getpid()])
-        print("codex-cli 0.159.2", flush=True)
+        print("codex-cli 0.161.0", flush=True)
         try:
             import time
             time.sleep(120)
@@ -35,13 +35,13 @@ if stage == "version":
     if mode == "peer_version_bad" and stages.count('version') > 1:
         print("PRIVATE_PEER_BANNER")
     elif mode == "version_bad":
-        print("codex-cli 0.159.20")
+        print("codex-cli 0.161.00")
     elif mode == "version_private":
-        print("PRIVATE_BANNER 0.159.2")
+        print("PRIVATE_BANNER 0.161.0")
     elif mode == "version_large":
         print("PRIVATE_BANNER" * 1000)
     else:
-        print("codex-cli 0.159.2")
+        print("codex-cli 0.161.0")
     sys.exit(1 if mode == "version_failure" else 0)
 
 if "debug" in sys.argv and "models" in sys.argv:
@@ -103,13 +103,13 @@ try:
             record.write(json.dumps({"method": method, "id": message.get("id"),
                                      "decision": message.get("result", {}).get("decision")}) + "\n")
         if method == "initialize":
-            response = json.loads((Path(__file__).parent / "codex-0.159.2/initialize.json").read_text())
+            response = json.loads((Path(__file__).parent / "codex-0.161.0/initialize.json").read_text())
             response["id"] = message["id"]
             if mode == "initialize_bad" or is_peer and mode == "peer_initialize_bad":
                 response["result"] = {"userAgent": "PRIVATE_METADATA"}
             send(response)
         elif method == "thread/start":
-            send({"id": message["id"], "result": {"thread": {"id": "root", "cliVersion": "PRIVATE_VERSION" if mode == "thread_version_bad" else "0.159.2"}, "model": "fixture-model"}})
+            send({"id": message["id"], "result": {"thread": {"id": "root", "cliVersion": "PRIVATE_VERSION" if mode == "thread_version_bad" else "0.161.0"}, "model": "fixture-model"}})
         elif method == "command/exec":
             send({"id": message["id"], "result": {"exitCode": 1 if mode == "peer_shell_bad" and is_peer else 0, "stdout": "native-agent-tui-shell-ok"}})
         elif method == "turn/start":

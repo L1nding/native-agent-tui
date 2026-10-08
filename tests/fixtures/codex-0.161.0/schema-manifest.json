@@ -1,5 +1,5 @@
 {
-  "codex_version": "0.159.2",
+  "codex_version": "0.161.0",
   "experimental": true,
   "canonical_json": "sorted keys, UTF-8, compact separators",
   "schemas": {
@@ -19,7 +19,7 @@
       ]
     },
     "v2/ThreadStartResponse.json": {
-      "sha256": "0afc9860d4a1d41f2af9ac36603af033264c33e1660abc2f9790be9900ce326a",
+      "sha256": "263b8a4e91c27ab12ff340dc57c923701e765fcdfb8b4a6976399532486499f9",
       "required": [
         "approvalPolicy",
         "approvalsReviewer",
@@ -53,7 +53,7 @@
       "required": []
     },
     "v2/TurnCompletedNotification.json": {
-      "sha256": "78e6f8b0eff801649f93623eed4ec5551caa7d05dda740d36515d0d34cd82c70",
+      "sha256": "dd9dd96d966bdda7105625f4a566684401b2a9804b211568ff2715cdb21d66e2",
       "required": [
         "threadId",
         "turn"

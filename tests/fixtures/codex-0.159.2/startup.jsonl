@@ -1,3 +1,0 @@
-{"id":1,"result":{"userAgent":"native-agent-tui/0.1.0 (fixture; sanitized)","codexHome":"C:\\fixture\\codex-home","platformFamily":"windows","platformOs":"windows"}}
-{"id":2,"result":{"thread":{"id":"root","cliVersion":"0.159.2","createdAt":0,"updatedAt":0,"cwd":"C:\\fixture\\workspace","ephemeral":true,"modelProvider":"fixture","preview":"","projectId":null,"sessionId":"session","source":"appServer","status":{"type":"idle"},"turns":[]},"model":"fixture-model","modelProvider":"fixture","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"readOnly"},"cwd":"C:\\fixture\\workspace"}}
-{"id":3,"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok","stderr":""}}
