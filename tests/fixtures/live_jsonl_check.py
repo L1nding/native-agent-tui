@@ -57,6 +57,20 @@ def main():
             assert not journal.exists()
         print("Live JSONL invalid commands: passed (redacted diagnostics, zero execution)")
 
+        # 文本模式下多个根任务的回答各占一行，不能粘连。
+        text_root = temp / "workflow-text"
+        text_root.mkdir()
+        text_workflow = text_root / "workflow.json"
+        text_workflow.write_text(json.dumps({"tasks": [{"text": "first"}, {"text": "second"}]}))
+        text = subprocess.run(
+            [str(binary), "--cwd", str(repo), "--codex", str(fake), "--journal-dir", str(text_root / "journal"),
+             "--workflow", str(text_workflow), "--headless"],
+            capture_output=True, timeout=15, creationflags=flags,
+            env=dict(os.environ, NATIVE_JSONL_FIXTURE_ROOT=str(text_root), NATIVE_JSONL_FIXTURE_MODE="success"))
+        assert text.returncode == 0, text.stderr.decode(errors="replace")
+        assert text.stdout.decode("utf-8").splitlines() == ["PRIVATE_OUTPUT 中文"] * 2, text.stdout
+        print("Headless workflow text: passed (one line per root answer)")
+
         def start(mode):
             root = temp / mode
             root.mkdir()

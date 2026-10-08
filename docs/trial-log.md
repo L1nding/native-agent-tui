@@ -18,5 +18,6 @@
 | 12 | 2026-10-07 | dsh ACP，`hi/gpt-6-luna`，read-only | 运行 `Start-Sleep 60`，Ctrl+C，再追问 | 成功：Interrupted 后会话可继续，模型说明了原因 | 3 + 1 次权限请求 | 1 | 清楚 | 权限请求只带 toolCallId，界面只显示“ACP permission request”（改为按 id 查回命令、理由、目录及申请的 `danger-full-access`） |
 | 13 | 2026-10-07 | 同上 | 运行 `Start-Sleep 1`，对提权请求按 Ctrl+N 拒绝 | **修复前拒绝被当成批准**（dsh 选项名 `reject-once` 未被识别，回退到首个 `allow-once`，命令执行并返回 DONE）；修复后命令未执行，agent 回复权限被拒（系统验证） | 3 | 1（拒绝） | 清楚 | 已修复：按 ACP kind 选择，拒绝/取消绝不回退到批准选项 |
 | 14 | 2026-10-07 | Codex 0.159.2，read-only | 列出 `docs/adr` 后依次打开 Ctrl+T、Ctrl+F、F12 | 成功：时间线、搜索（4 处命中并定位）、历史列表均可用 | 1 | 0 | 时间线被逐片段 Output 淹没；历史列表把当前会话标为 REVIEW REQUIRED | 已修复：全部视图折叠同一 item 的连续 Output（Output 分类保留全部）；当前会话显示 this session (live: 阶段) |
+| 15 | 2026-10-08 | Codex 0.159.2，`--workflow --headless`，read-only | 两个依赖任务分别只回复 STEP1、STEP2 | 成功：按依赖顺序执行，退出码 0，会话汇总 Completed | 0 | 0 | — | 两条回答输出为 `STEP1STEP2` 粘连（已改为每条回答另起一行，原生夹具新增检查） |
 
 尚未覆盖：5 秒状态理解计时、Orca 内置终端。

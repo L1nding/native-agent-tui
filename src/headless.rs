@@ -30,6 +30,7 @@ pub async fn run(
             .is_err();
     }
     let mut displayed = std::collections::HashMap::<(String, String), String>::new();
+    let mut printed_any = false;
     let mut declined = std::collections::HashSet::new();
     let mut interaction_deadline = None;
     let mut output_done = output
@@ -68,11 +69,13 @@ pub async fn run(
                     .entry((message.turn_id.clone(), message.id.clone()))
                     .or_default();
                 if message.text != *previous {
-                    if let Some(suffix) = message.text.strip_prefix(previous.as_str()) {
-                        print!("{}", display_text(suffix));
-                    } else {
-                        print!("\n{}", display_text(&message.text));
+                    // 新消息另起一行，多个根任务的回答不会粘在一起。
+                    let starts_new = previous.is_empty() && printed_any;
+                    match message.text.strip_prefix(previous.as_str()) {
+                        Some(suffix) if !starts_new => print!("{}", display_text(suffix)),
+                        _ => print!("\n{}", display_text(&message.text)),
                     }
+                    printed_any = true;
                     *previous = message.text.clone();
                     let _ = io::stdout().flush();
                 }
