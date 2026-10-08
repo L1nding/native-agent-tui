@@ -57,3 +57,13 @@ Windows Terminal、Orca 系统剪贴板及 IME 预编辑仍需单独验收。Con
 - Ctrl+Q 退出后终端恢复，窗口关闭，无残留进程。
 
 按键由合成虚拟按键产生并经过输入法；物理键盘手感、Orca 内置终端和其他输入法未覆盖。
+
+## Orca 内置终端验收（2026-10-08）
+
+用 `orca terminal create --shell cmd.exe` 在 Orca 内置终端运行 release 版 TUI（假 app-server），`orca terminal read --screen` 读取渲染结果：
+
+- 中文加 emoji 任务提交后在对话中正确显示，宽字符框线对齐。
+- `orca terminal send --text` 是逐键键入，换行等同 Enter；带括号粘贴标记（与 xterm.js 粘贴一致）的两行文本保留在同一输入框并以 `↵` 标出，Enter 后对话中为一条两行任务。
+- Ctrl+Q 退出后回到 cmd 提示符，无残留进程。
+
+未覆盖 Orca 中的真实 Ctrl+V 剪贴板与输入法组字（需在其窗口内人工操作）。
