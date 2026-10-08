@@ -235,3 +235,7 @@ Windows 终端输入改为有界 VT/Win32 记录适配，完整标记的多行�
 
 按 `refactor-goal.md` 的删除测试完成 12 处精简，净删 130 行（11 个文件，+181/−311）：删除 `display_text_for_cli` 转发、`CoreSnapshot` 手写 Default、重复的 `queued_inputs` 快照字段、单实现的 `CompletionGate` trait（具体类型改名为 `CompletionGate`，释放与旧 generation 过滤逻辑不变）、未使用的 ACP 配置构造函数和 `Outbox::mark_failed`；合并 journal 投影、UI 会话定位与请求面板打开、TUI 启动、输出观测错误分支、轮次终结清理和 RPC 等待登记中的重复代码。rebase 到当前 main 后 `python scripts/verify.py` 通过（380 项默认测试与全部原生夹具）。跳过的候选（行为或优先级有差异）见本次提交记录。
 
+## 真实场景覆盖（2026-10-07 至 10-08）
+
+用真实 Codex 与 dsh ACP（`hi/gpt-6-luna`）跑通 16 条试用（见[试用记录](trial-log.md)）：只读与写入任务、命令/文件审批、子代理并行与子代理审批、长时间静默提醒、中断后追问、运行中断连与恢复报告、Ctrl+S 排队多轮写代码、时间线/搜索/历史、headless 工作流和脱敏导出。期间修复：ACP 拒绝权限被误当成批准（安全问题）、ACP 只带 toolCallId 的权限请求不显示内容、ACP 长任务超时被判 Unknown、超大工具输出使整轮失败、中断/断连后工具行仍为 running、通知被恢复报告误报、交互会话因早期中断被汇总为 Failed（改为按模式汇总）、headless 多任务输出粘连，以及多处界面噪音。未覆盖：Orca 内置终端、5 秒状态理解计时（需真人）。
+
