@@ -1,6 +1,6 @@
 [package]
 name = "native-agent-tui"
-version = "0.1.0"
+version = "0.1.0-alpha"
 edition = "2021"
 rust-version = "1.89"
 description = "A native terminal UI for observing and coordinating agent execution"
