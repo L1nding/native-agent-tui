@@ -86,9 +86,15 @@ Dependency scheduling and task controls now run through Core. `--workflow FILE [
 
 ## Roadmap
 
-The planned V1 / `0.1.0-alpha` focuses on reliable single-agent work, activity evidence, attention hints, and journal-based observation recovery. Existing child/Gate behavior remains covered by regression tests; V2 targets scheduling for 1–3 direct children.
+The next release, `0.1.0-alpha`, covers reliable single-agent work, activity evidence, attention hints, and journal-based observation recovery. Existing child/Gate behavior remains covered by regression tests; V2 first validates 1–3 real concurrent direct children and handoff, with scheduling recovery and resource budgets after that.
 
-See the [product plan](docs/native-agent-tui-plan.md), [observability contract](docs/native-agent-tui-observability.md), and [GitHub roadmap](https://github.com/L1nding/native-agent-tui/issues/1). The JSONL/replay CLI shown in the design is planned, not an available command.
+### Supported platforms
+
+`0.1.0-alpha` supports **Windows only**. Linux and macOS may compile, but process cleanup, terminal input, and startup have not been validated there; treat them as unsupported.
+
+The `deepseek-acp` backend is **experimental**. It is not covered by the Codex compatibility gate and may change without notice.
+
+See the [product plan](docs/native-agent-tui-plan.md), [release checklist](docs/release-0.1.0-alpha.md), [observability contract](docs/native-agent-tui-observability.md), and [GitHub roadmap](https://github.com/L1nding/native-agent-tui/issues/1).
 
 ## Activity observation
 

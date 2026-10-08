@@ -94,3 +94,19 @@ stdout 不能重新附着为另一个进程的订阅连接；`--since` 指定 se
 7. **ACP 后端**：补齐与 Codex 对等的兼容门禁和真实测试后，才列为正式支持后端。
 
 每步完成后在[实施状态](implementation-status.md)记录验证证据；顺序可因试用反馈调整，但不得跳过安全不变量。
+
+## 7. 功能盘点后的决定（2026-10-08）
+
+第 6 节第 1–4 步已完成：16 条真实试用及其修复见[试用记录](trial-log.md)，删除式精简见对应 `refactor:` 提交。盘点后确认：
+
+| 决定 | 结论 | 影响 |
+| --- | --- | --- |
+| 下一步 | 发布 `0.1.0-alpha` | 第二轮删除式精简（`refactor-goal.md`）、V2 和 ACP 正式化都排在 Alpha 之后 |
+| 支持平台 | Alpha 只声明 Windows | Linux/macOS 标为未支持；不为 Alpha 增加非 Windows CI |
+| V2 第一阶段 | 真实 1–3 child 并发验收与 handoff | 持久调度恢复和细粒度资源预算移到 V2 后续阶段 |
+| ACP 后端 | 保持实验 | 先补兼容门禁与真实测试；Alpha 不列为正式后端 |
+| GitHub issue | 按实际进度整理 | 关闭已完成的 S 阶段 issue，剩余项改写为 Alpha/V2 issue |
+
+Alpha 剩余步骤和放行条件见[发布清单](release-0.1.0-alpha.md)。
+
+GitHub issue 已同步：#2–#13 按实际进度关闭，剩余项转入 #14（Alpha 发布）、#15（V2 第一阶段）、#16（V2 后续）、#17（ACP 兼容门禁）、#18（Alpha 之后的待办）。#1 保留为总路线图。
