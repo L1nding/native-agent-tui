@@ -803,7 +803,7 @@ impl AcpBridge {
                 let response = if let Some(error) = message.error {
                     Envelope {
                         jsonrpc: None,
-                        id: Some(id),
+                        id: Some(id.clone()),
                         method: None,
                         params: None,
                         result: None,
@@ -824,9 +824,17 @@ impl AcpBridge {
                         ("cancel", _) | (_, None) => json!({"outcome":"cancelled"}),
                         (_, Some(option)) => json!({"outcome":"selected","optionId":option}),
                     };
-                    Envelope::response(id, Some(json!({"outcome": outcome})))
+                    Envelope::response(id.clone(), Some(json!({"outcome": outcome})))
                 };
                 self.acp.send(with_jsonrpc(response))?;
+                // ACP 没有单独的“请求已解决”通知：答复交给 dsh 就是解决。告诉 Core，
+                // 否则这条请求会一直显示为待处理，挡住同一轮里后来的请求。
+                if let Some(session) = &self.session_id {
+                    self.core.send(Envelope::notification(
+                        "serverRequest/resolved",
+                        Some(json!({"threadId": session, "requestId": id})),
+                    ))?;
+                }
             }
             _ => {}
         }
@@ -1422,6 +1430,89 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answered_permission_is_reported_resolved_so_a_later_one_can_be_answered() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let bridge =
+            tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &Config::default()).run());
+        core_client
+            .send(Envelope::request(
+                RpcId::Number(1),
+                "initialize",
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(1),
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::thread_start(
+                RpcId::Number(2),
+                &Config::default(),
+            ))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+
+        // 同一轮里先后两个审批：第一个答复后必须被报告为已解决。
+        for (request, decision, expected) in [
+            (
+                70,
+                "accept",
+                json!({"outcome":"selected","optionId":"allow-once"}),
+            ),
+            (
+                71,
+                "decline",
+                json!({"outcome":"selected","optionId":"reject-once"}),
+            ),
+        ] {
+            acp_server
+                .send(Envelope::request(
+                    RpcId::Number(request),
+                    "session/request_permission",
+                    Some(json!({"sessionId":"s","toolCall":{"toolCallId":"t","title":"Run","rawInput":{"command":"echo hi"}},
+                        "options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]})),
+                ))
+                .unwrap();
+            let asked = tokio::time::timeout(Duration::from_secs(2), core_client.recv())
+                .await
+                .expect("the permission request did not reach Core")
+                .unwrap();
+            assert_eq!(asked.id, Some(RpcId::Number(request)));
+            core_client
+                .send(Envelope::response(
+                    RpcId::Number(request),
+                    Some(json!({"decision": decision})),
+                ))
+                .unwrap();
+            let answered = acp_server.recv().await.unwrap();
+            assert_eq!(answered.id, Some(RpcId::Number(request)));
+            assert_eq!(answered.result.unwrap()["outcome"], expected);
+            let resolved = core_client.recv().await.unwrap();
+            assert_eq!(resolved.method.as_deref(), Some("serverRequest/resolved"));
+            assert_eq!(
+                resolved.params.unwrap(),
+                json!({"threadId":"s","requestId":request})
+            );
+        }
+
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
     #[test]
     fn permission_decisions_prefer_matching_acp_option_ids() {
         let dsh = [
@@ -1845,6 +1936,10 @@ mod tests {
             permission_response.result.unwrap()["outcome"]["optionId"],
             "allow_once"
         );
+        // 答复交给 agent 后，Core 被告知这条请求已解决。
+        let resolved = core_client.recv().await.unwrap();
+        assert_eq!(resolved.method.as_deref(), Some("serverRequest/resolved"));
+        assert_eq!(resolved.params.unwrap()["requestId"], "permission");
         acp_server
             .send(Envelope::response(
                 RpcId::Number(3),
