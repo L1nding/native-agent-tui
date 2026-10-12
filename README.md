@@ -1,47 +1,35 @@
 # native-agent-tui
 
-A Rust terminal client for the local Codex app-server. Interactive and headless runs share the same Core, process transport, and lifecycle rules.
+A Rust terminal client built on [dsh](https://github.com/deepseek-ai) (DeepSeek Harness). dsh runs the agent, its plugins and its sessions; this program is the terminal front end. Interactive and headless runs share the same Core, process transport, and lifecycle rules.
+
+```text
+native-agent-tui (Rust) ──stdio JSON-RPC──> dsh --profile zf-tui ──> zf-tui-bridge plugin
+                                                                      ├─ zf/* methods: answered from dsh services
+                                                                      └─ everything else: dsh's own ACP server
+```
 
 ## Run
 
-Install Rust and make an authenticated Codex CLI available on `PATH`. Any release is accepted; the protocol fixtures were verified against **0.161.0**. Execution checks for a `codex-cli` version banner before catalog lookup, then validates initialization and the new thread's identity. `--codex PATH` or `CODEX_BIN` selects the executable; Windows uses `codex.cmd` by default. See [backend compatibility](docs/codex-compatibility.md).
+Install Rust and dsh, then install the bridge plugin from this repository into a dsh profile named `zf-tui` (see [dsh-plugin/README.md](dsh-plugin/README.md)):
 
 ```text
-cargo run --locked -- --check-shell
+cd dsh-plugin && pnpm install && pnpm run build
+dsh plugin --profile zf-tui add link:<absolute path to this repository>/dsh-plugin
+```
+
+`--dsh PATH` or `DSH_BIN` selects the launcher (Windows uses `dsh.cmd` by default); `--profile NAME` selects another profile. Providers, models and credentials are dsh's own configuration.
+
+```text
 cargo run --locked
 cargo run --locked -- --tui "Inspect this repository"
 cargo run --locked -- --workflow docs/workflow-example.json
-cargo run --locked -- --run "Reply with exactly READY" --sandbox read-only
+cargo run --locked -- --run "Reply with exactly READY" --model PROVIDER/MODEL
 cargo run --locked -- --help
 ```
 
 The TUI requires an interactive terminal. `--run` prints streamed agent text and returns a nonzero exit code for failure, interruption, or an uncertain result. Headless runs decline approvals and interrupt when user input is required.
 
-### Windows sandbox setup
-
-Startup does not run a sandbox shell check by default; the sandbox is first used when the model executes a command. Pass `--startup-shell-check` to verify it before the first task, or run `--check-shell` on its own.
-
-The client inherits Codex's Windows sandbox implementation. The elevated sandbox needs a one-time administrator setup (repeated after some Codex upgrades). Started from app-server, that setup cannot show its UAC prompt, so shell preflight times out. Run it once in an interactive terminal and approve the prompt:
-
-```text
-codex sandbox -- cmd /c echo ok
-```
-
-Preflight runs `powershell.exe` because the elevated Codex 0.159.2 runner does not resolve a bare `pwsh` installed under the user profile. An explicit unelevated override is also available:
-
-```text
-cargo run --locked -- --check-shell --windows-sandbox unelevated
-cargo run --locked -- --sandbox read-only --windows-sandbox unelevated
-```
-
-To keep this choice without passing the flag, add the following to the Codex `config.toml`; the client never edits that file for you:
-
-```toml
-[windows]
-sandbox = "unelevated"
-```
-
-This flag leaves the selected `--sandbox` policy in place. Preflight uses that policy, runs before any model turn, and stops execution if it fails.
+A session is ready once dsh confirms it; nothing is executed at startup. Command execution and its isolation belong to dsh.
 
 ## Controls
 
@@ -66,12 +54,12 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F10 | Edit temporary attention thresholds; Up/Down class, Tab field, Enter apply |
 | F11 / PageUp, PageDown | Open activity evidence / scroll its details |
 | F12 | Browse retained sessions and export redacted historical evidence |
-| Left on an empty task input | Sessions page: this workspace's saved conversations by title, the ones waiting for an answer first. Enter resumes the selected conversation here with its earlier messages (dsh backend); Right or Esc returns. Conversations are saved the way dsh stores sessions, as append-only logs at `.zf/sessions/--<workspace>--/<session id>/session.v1.jsonl` in the user's home directory, so they can be listed and resumed; the journal itself stays redacted |
+| Left on an empty task input | Sessions page: this workspace's saved conversations by title, the ones waiting for an answer first. Enter resumes the selected conversation here with its earlier messages; Right or Esc returns. Conversations are saved the way dsh stores sessions, as append-only logs at `.zf/sessions/--<workspace>--/<session id>/session.v1.jsonl` in the user's home directory, so they can be listed and resumed; the journal itself stays redacted |
 | Ctrl+P | Open the local command palette; type to filter, Enter to open a panel, Esc to close |
-| `/model` + Enter | Pick the model from the backend's list; `/model NAME` selects it directly. Applies from the next turn and is remembered per backend in `.zf/preferences.json` in the user's home directory; `--model` overrides it for one run |
-| Ctrl+N / Ctrl+E in the `/model` list | Add a provider and model, or edit the highlighted one (dsh backend). Written to `profiles/<profile>/cordis.patch.yml` under `DSH_HOME` (backed up first); an entered API key goes to dsh's `.credentials.yaml`. Saving reloads dsh at once when no turn is running |
-| Ctrl+T in the `/model` list or the provider form | Test a model: a separate dsh process sends one short message through it and reports the reply time or the provider's error. The conversation is not touched. In the form, Ctrl+T saves first and keeps the form open (dsh backend) |
-| Ctrl+R in the `/model` list | Reload dsh configuration without leaving the TUI: a new dsh process resumes the same session, so the conversation continues and edited providers and models appear in the list (dsh backend) |
+| `/model` + Enter | Pick the model from the backend's list; `/model NAME` selects it directly. Applies from the next turn and is remembered in `.zf/preferences.json` in the user's home directory; `--model` overrides it for one run |
+| Ctrl+N / Ctrl+E in the `/model` list | Add a provider and model, or edit the highlighted one. Written to `profiles/<profile>/cordis.patch.yml` under `DSH_HOME` (backed up first); an entered API key goes to dsh's `.credentials.yaml`. Saving reloads dsh at once when no turn is running |
+| Ctrl+T in the `/model` list or the provider form | Test a model: a separate dsh process sends one short message through it and reports the reply time or the provider's error. The conversation is not touched. In the form, Ctrl+T saves first and keeps the form open |
+| Ctrl+R in the `/model` list | Reload dsh configuration without leaving the TUI: a new dsh process resumes the same session, so the conversation continues and edited providers and models appear in the list |
 | `/setting` | Language, theme, sandbox, approval and attention thresholds; each choice is saved to `.zf/preferences.json` in the user's home directory. Language and theme apply at once, sandbox and approval from the next start. `--sandbox`, `--approval` and the `NATIVE_AGENT_TUI_LANG` / `NATIVE_AGENT_TUI_THEME` variables take precedence |
 | `/search` `/timeline` `/context` `/skills` `/requests` `/workflow` `/evidence` `/attention` `/help` `/agent` `/tools` `/quit` | Typed in the task input and sent with Enter; each opens the same panel as its key. A single `/word` is never sent to the model |
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
@@ -89,8 +77,6 @@ Live execution covers startup checks, repeated conversation turns, streamed/fina
 
 The root can call `wait_for_subagent_completion` with `{"targets":[]}` to capture all currently known direct children, or list child thread IDs, paths, or registered nicknames. Waiting has no deadline. Current child turns release it when all complete or any fails/is interrupted; old completions and status messages cannot release a new turn. Child requests remain answerable, and root input queues until the current root turn completes (at most eight tasks). Interruption or failure retains dependent tasks as blocked for inspection or explicit retry.
 
-Startup obtains the effective catalog with `codex debug models`, writes a private temporary copy with `tool_mode: direct`, and removes it when the app-server owner exits. User configuration stays intact. This requires a Codex version supporting that command and the pinned protocol.
-
 Dependency scheduling and task controls now run through Core. `--workflow FILE [--headless]` validates a JSON task DAG before launching; headless execution succeeds only when all root tasks succeed. Native child count, depth, and active turn limits are configurable with `--max-native-children`, `--max-native-depth`, and `--max-native-turns`. See [task controls and limits](docs/scheduler-usage.md) and [scheduler validation](docs/scheduler-validation.md). Fine-grained resource budgets, execution recovery, and detailed diagnostics remain planned; see [remaining work](docs/implementation-status.md).
 
 ## Roadmap
@@ -101,7 +87,7 @@ The next release, `0.1.0-alpha`, covers reliable single-agent work, activity evi
 
 `0.1.0-alpha` supports **Windows only**. Linux and macOS may compile, but process cleanup, terminal input, and startup have not been validated there; treat them as unsupported.
 
-The `deepseek-acp` backend is the CLI default and is **experimental**. It is not covered by the Codex compatibility checks and may change without notice. Use `--backend codex` (or `--codex PATH`) for Codex.
+The dsh integration is **experimental** and may change without notice.
 
 See the [product plan](docs/native-agent-tui-plan.md), [release checklist](docs/release-0.1.0-alpha.md), [observability contract](docs/native-agent-tui-observability.md), and [GitHub roadmap](https://github.com/L1nding/native-agent-tui/issues/1).
 
@@ -111,13 +97,13 @@ Activity evidence and silence attention are now projected by Core for each agent
 
 ## Journal and replay
 
-Sessions now persist redacted state in the OS user data directory. `--sessions` lists this workspace's history; `--replay SESSION_ID [--since SEQ] --json-events` reads a fixed committed prefix without launching Codex or answering historical requests. F11 shows the session and committed sequence. Select a storage directory with `--journal-dir PATH`.
+Sessions now persist redacted state in the OS user data directory. `--sessions` lists this workspace's history; `--replay SESSION_ID [--since SEQ] --json-events` reads a fixed committed prefix without launching dsh or answering historical requests. F11 shows the session and committed sequence. Select a storage directory with `--journal-dir PATH`.
 
 Default retention is 30 days / 500 MiB; active and uncertain sessions are protected. Missing terminal records remain unknown. New sessions use schema 2; schema 1 history stays readable. See [storage and replay](docs/journal-replay.md) and [validation](docs/journal-validation.md).
 
 ## History and export
 
-F12 opens retained sessions while live execution continues. `--history [SESSION_ID]` opens the same read-only view without launching Codex. Browse events with Left/Right or `g`; press `e` to preview a range and save it to a new file.
+F12 opens retained sessions while live execution continues. `--history [SESSION_ID]` opens the same read-only view without launching dsh. Browse events with Left/Right or `g`; press `e` to preview a range and save it to a new file.
 
 ```text
 cargo run --locked -- --history
@@ -133,7 +119,7 @@ From the retained-session list or an opened session, press `/` or `Ctrl+F` to se
 
 `--run TASK --json-events` and `--workflow FILE --headless --json-events` stream committed redacted state on stdout. A separate writer catches up from the journal; blocked output cannot hold Core. Broken pipes and sustained stalls stop the owner with a nonzero exit code. Final snapshots keep execution results and cleanup confirmation separate.
 
-Approvals are declined; unavailable decline decisions and user input request interruption with fixed recorded reasons. JSONL does not accept answers on stdin. See [the stream contract and Python consumer](docs/jsonl-events.md) and [pipe / real Codex validation](docs/jsonl-validation.md).
+Approvals are declined; unavailable decline decisions and user input request interruption with fixed recorded reasons. JSONL does not accept answers on stdin. See [the stream contract and Python consumer](docs/jsonl-events.md) and [pipe validation](docs/jsonl-validation.md).
 
 ## Verify
 
@@ -148,17 +134,6 @@ cargo build --locked --release
 Use `cargo test --locked --all-targets` when nextest is unavailable. Contributor guidance and architecture documents are under [docs/](docs/AGENTS.md).
 
 `python scripts/verify.py` runs these checks plus doctests and native CLI/Python fixtures, stopping on the first failure. Windows CI uses the same entry point with Rust 1.96.0; see [continuous verification](docs/ci-validation.md).
-
-### Optional live verification (Windows)
-
-The local provider fixture requires Codex 0.161.0 and Python. It uses an isolated `CODEX_HOME`, no API keys, and localhost Responses SSE. It holds two child turns and counts provider requests before releasing each one:
-
-```powershell
-$env:NATIVE_AGENT_TUI_PYTHON = (python -c 'import sys; print(sys.executable)')
-cargo nextest run --locked --run-ignored only live_app_server_gate --no-capture
-```
-
-Set `NATIVE_AGENT_TUI_PYTHON` to the actual Python executable if `python` resolves to a Windows Store alias. The fixture changes `use_responses_lite` only in its isolated catalog so its ordinary SSE responses match the selected wire format.
 
 ## Conversation search
 

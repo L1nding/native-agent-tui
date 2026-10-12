@@ -599,12 +599,12 @@ mod tests {
     #[test]
     fn error_replaces_stale_progress_notice() {
         let mut state = SessionState::default();
-        state.view.notice = Some("Checking the sandbox shell".into());
-        state.error(SessionPhase::Unknown, "Shell preflight timed out");
+        state.view.notice = Some("Starting the session".into());
+        state.error(SessionPhase::Unknown, "Session start timed out");
         assert_eq!(state.view.notice, None);
         assert_eq!(
             state.view.last_error.as_deref(),
-            Some("Shell preflight timed out")
+            Some("Session start timed out")
         );
     }
 

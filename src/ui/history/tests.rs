@@ -400,7 +400,7 @@ fn chinese_history_view_renders_read_only_and_review_wording_inside_borders() {
         let screen = rows.join("\n");
         for text in [
             "历史 | 只读",
-            "离线 | 没有 Codex 执行",
+            "离线 | 不执行任何操作",
             "历史观察",
             "结果: 状态未知 | 需要复核",
             "操作",

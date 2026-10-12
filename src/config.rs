@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use crate::agents::{
     DEFAULT_MAX_NATIVE_CHILDREN, DEFAULT_MAX_NATIVE_DEPTH, DEFAULT_MAX_NATIVE_TURNS,
 };
-use crate::backend::BackendKind;
 use crate::history::search::Category;
 use crate::journal::JournalSettings;
 use crate::observation::{AttentionClass, AttentionSettings, ConfigSource};
@@ -25,12 +24,15 @@ pub enum McpServerConfig {
     },
 }
 
+/// The dsh profile the TUI boots unless `--profile` names another.
+pub const DEFAULT_PROFILE: &str = "zf-tui";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    pub backend: BackendKind,
     pub cwd: PathBuf,
-    pub executable: PathBuf,
+    /// The `dsh` launcher (or `DSH_BIN`).
     pub dsh_executable: PathBuf,
+    /// The dsh profile to boot; it must carry the `zf-tui-bridge` plugin.
     pub acp_profile: String,
     pub mcp_servers: Vec<McpServerConfig>,
     pub model: Option<String>,
@@ -45,11 +47,6 @@ pub struct Config {
     /// `--sandbox` / `--approval` were given; saved settings do not replace them.
     pub sandbox_explicit: bool,
     pub approval_explicit: bool,
-    pub windows_sandbox: Option<String>,
-    /// Run the sandbox shell check before the session becomes Ready. The CLI
-    /// leaves it off unless `--startup-shell-check` is given, so the sandbox is
-    /// first used when the model executes a command.
-    pub startup_shell_check: bool,
     pub max_native_children: usize,
     pub max_native_depth: usize,
     pub max_native_turns: usize,
@@ -62,17 +59,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backend: BackendKind::Codex,
             cwd: PathBuf::from("."),
-            executable: std::env::var_os("CODEX_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(if cfg!(windows) { "codex.cmd" } else { "codex" })
-                }),
             dsh_executable: std::env::var_os("DSH_BIN")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "dsh.cmd" } else { "dsh" })),
-            acp_profile: "acp".into(),
+            acp_profile: DEFAULT_PROFILE.into(),
             mcp_servers: Vec::new(),
             model: None,
             model_is_preference: false,
@@ -81,8 +72,6 @@ impl Default for Config {
             approval_policy: "on-request".into(),
             sandbox_explicit: false,
             approval_explicit: false,
-            windows_sandbox: None,
-            startup_shell_check: true,
             max_native_children: DEFAULT_MAX_NATIVE_CHILDREN,
             max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
             max_native_turns: DEFAULT_MAX_NATIVE_TURNS,
@@ -98,7 +87,6 @@ impl Default for Config {
 pub enum CliCommand {
     Help,
     Version,
-    CheckShell(Config),
     Sessions(Config),
     Recovery {
         session: String,
@@ -174,14 +162,7 @@ where
     S: Into<String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    let mut config = Config {
-        startup_shell_check: false,
-        ..Default::default()
-    };
-    // The CLI defaults to dsh. Naming a Codex executable or asking for the Codex
-    // shell check selects Codex unless --backend says otherwise.
-    let mut backend = None;
-    let mut codex_requested = false;
+    let mut config = Config::default();
     let mut mode = None;
     let mut goal = None;
     let mut headless = false;
@@ -200,8 +181,8 @@ where
         match option.as_str() {
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
-            "--run" | "--tui" | "--check-shell" | "--workflow" | "--sessions" | "--replay"
-            | "--history" | "--export" | "--search" | "--recovery" => {
+            "--run" | "--tui" | "--workflow" | "--sessions" | "--replay" | "--history"
+            | "--export" | "--search" | "--recovery" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
@@ -218,21 +199,7 @@ where
                 }
             }
             "--headless" if !headless => headless = true,
-            "--startup-shell-check" => config.startup_shell_check = true,
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
-            "--codex" => {
-                config.executable = value(&args, &mut index, option)?.into();
-                codex_requested = true;
-            }
-            "--backend" => {
-                let raw = value(&args, &mut index, option)?;
-                backend = Some(raw.parse::<BackendKind>().map_err(|expected| {
-                    CliError::InvalidValue {
-                        option: option.clone(),
-                        value: expected.into(),
-                    }
-                })?);
-            }
             "--dsh" => config.dsh_executable = value(&args, &mut index, option)?.into(),
             "--profile" => config.acp_profile = value(&args, &mut index, option)?,
             "--model" => config.model = Some(value(&args, &mut index, option)?),
@@ -301,16 +268,6 @@ where
                 })?;
                 attention_overrides.push((class, quiet, attention));
             }
-            "--windows-sandbox" => {
-                let val = value(&args, &mut index, option)?;
-                if !cfg!(windows) || !["elevated", "unelevated"].contains(&val.as_str()) {
-                    return Err(CliError::InvalidValue {
-                        option: option.clone(),
-                        value: val,
-                    });
-                }
-                config.windows_sandbox = Some(val);
-            }
             "--sandbox" | "--approval" => {
                 let val = value(&args, &mut index, option)?;
                 let allowed = if option == "--sandbox" {
@@ -335,11 +292,6 @@ where
             _ => return Err(CliError::UnknownOption(option.clone())),
         }
     }
-    config.backend = backend.unwrap_or(if codex_requested || mode == Some("--check-shell") {
-        BackendKind::Codex
-    } else {
-        BackendKind::DeepSeekAcp
-    });
     if headless && mode != Some("--workflow") {
         return Err(CliError::ConflictingModes);
     }
@@ -415,7 +367,6 @@ where
             json_events,
             config,
         },
-        Some("--check-shell") => CliCommand::CheckShell(config),
         _ => CliCommand::Tui { goal, config },
     })
 }
@@ -476,7 +427,7 @@ mod tests {
             CliCommand::History { session: None, .. }
         ));
         assert!(
-            matches!(parse_args(["--history", "session-1", "--codex", "missing"]).unwrap(), CliCommand::History { session: Some(session), .. } if session == "session-1")
+            matches!(parse_args(["--history", "session-1", "--dsh", "missing"]).unwrap(), CliCommand::History { session: Some(session), .. } if session == "session-1")
         );
         let CliCommand::Export {
             session,
@@ -531,7 +482,7 @@ mod tests {
             "--json-events",
             "--journal-dir",
             "local history",
-            "--codex",
+            "--dsh",
             "never-execute",
         ])
         .unwrap()
@@ -542,7 +493,7 @@ mod tests {
         assert_eq!(since, 0);
         assert!(json_events);
         assert_eq!(config.journal.root, Some(PathBuf::from("local history")));
-        assert_eq!(config.executable, PathBuf::from("never-execute"));
+        assert_eq!(config.dsh_executable, PathBuf::from("never-execute"));
         assert!(matches!(
             parse_args(["--sessions"]).unwrap(),
             CliCommand::Sessions(_)
@@ -616,7 +567,6 @@ mod tests {
             vec!["--replay", "s", "--json-events", "--json-events"],
             vec!["--replay", "s", "--run", "task"],
             vec!["--replay", "s", "--workflow", "plan.json"],
-            vec!["--replay", "s", "--check-shell"],
             vec!["--replay", "s", "--headless"],
             vec!["--sessions", "--tui"],
             vec!["--journal-dir"],
@@ -633,7 +583,6 @@ mod tests {
             vec!["--json-events"],
             vec!["--tui", "--json-events"],
             vec!["--workflow", "plan.json", "--json-events"],
-            vec!["--check-shell", "--json-events"],
         ] {
             assert_eq!(parse_args(args), Err(CliError::JsonEventsOptions));
         }
@@ -783,9 +732,14 @@ mod tests {
             vec!["--run"],
             vec!["--run", "--help"],
             vec!["--run", "hi", "--bogus"],
-            vec!["--tui", "--check-shell"],
+            vec!["--tui", "--run", "task"],
             vec!["--sandbox", "invalid"],
-            vec!["--windows-sandbox", "disabled"],
+            // 随 Codex 后端一起移除的选项不再被接受。
+            vec!["--windows-sandbox", "unelevated"],
+            vec!["--check-shell"],
+            vec!["--startup-shell-check"],
+            vec!["--run", "hi", "--codex", "codex"],
+            vec!["--run", "hi", "--backend", "codex"],
         ] {
             assert!(parse_args(args).is_err());
         }
@@ -800,53 +754,21 @@ mod tests {
     }
 
     #[test]
-    fn selects_deepseek_acp_without_changing_codex_defaults() {
+    fn dsh_launcher_and_profile_can_be_overridden() {
         let CliCommand::Run { config, .. } = parse_args([
-            "--backend",
-            "deepseek-acp",
             "--dsh",
             "custom-dsh",
             "--profile",
-            "acp-test",
+            "other-profile",
             "--run",
             "hello",
         ])
         .unwrap() else {
             panic!()
         };
-        assert_eq!(config.backend, BackendKind::DeepSeekAcp);
         assert_eq!(config.dsh_executable, PathBuf::from("custom-dsh"));
-        assert_eq!(config.acp_profile, "acp-test");
-        assert_eq!(Config::default().backend, BackendKind::Codex);
-    }
-
-    #[test]
-    fn cli_defaults_to_dsh_unless_codex_is_named() {
-        let backend = |args: &[&str]| match parse_args(args.iter().copied()).unwrap() {
-            CliCommand::Run { config, .. } | CliCommand::CheckShell(config) => config.backend,
-            _ => panic!(),
-        };
-        assert_eq!(backend(&["--run", "hello"]), BackendKind::DeepSeekAcp);
-        assert_eq!(
-            backend(&["--run", "hello", "--codex", "custom-codex"]),
-            BackendKind::Codex
-        );
-        assert_eq!(backend(&["--check-shell"]), BackendKind::Codex);
-        assert_eq!(
-            backend(&["--run", "hello", "--backend", "codex"]),
-            BackendKind::Codex
-        );
-        assert_eq!(
-            backend(&[
-                "--run",
-                "hello",
-                "--codex",
-                "custom-codex",
-                "--backend",
-                "deepseek-acp"
-            ]),
-            BackendKind::DeepSeekAcp
-        );
+        assert_eq!(config.acp_profile, "other-profile");
+        assert_eq!(Config::default().acp_profile, DEFAULT_PROFILE);
     }
 
     #[test]
@@ -871,31 +793,5 @@ mod tests {
         ] {
             assert!(parse_args(args).is_err());
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_sandbox_override_is_explicit_and_validated() {
-        let CliCommand::CheckShell(config) =
-            parse_args(["--check-shell", "--windows-sandbox", "unelevated"]).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(config.windows_sandbox.as_deref(), Some("unelevated"));
-        assert_eq!(Config::default().windows_sandbox, None);
-    }
-
-    #[test]
-    fn startup_shell_check_is_off_unless_requested() {
-        let CliCommand::CheckShell(config) = parse_args(["--check-shell"]).unwrap() else {
-            panic!()
-        };
-        assert!(!config.startup_shell_check);
-        let CliCommand::CheckShell(config) =
-            parse_args(["--check-shell", "--startup-shell-check"]).unwrap()
-        else {
-            panic!()
-        };
-        assert!(config.startup_shell_check);
     }
 }

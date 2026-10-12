@@ -13,7 +13,7 @@ fn fixture(phase: SessionPhase) -> CoreSnapshot {
     let mut snapshot = CoreSnapshot {
         phase,
         thread_id: Some("root".into()),
-        model: Some("codex".into()),
+        model: Some("hi/luna".into()),
         cwd: "D:/workspace/native-agent".into(),
         sandbox: "workspace-write".into(),
         approval_policy: "on-request".into(),

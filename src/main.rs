@@ -15,29 +15,21 @@ use native_agent_tui::state::{display_text, SessionPhase};
 use native_agent_tui::{ui, ClientHandle};
 
 fn print_help() {
-    let windows = if cfg!(windows) {
-        "\nWindows option: --windows-sandbox elevated|unelevated (inherits Codex config)\n"
-    } else {
-        ""
-    };
     println!("Native Agent TUI {}", env!("CARGO_PKG_VERSION"));
     println!(
-        "Default execution uses dsh --profile <name>; --backend codex or --codex PATH uses codex-cli (any release; verified against {}).",
-        native_agent_tui::compatibility::VERIFIED_CODEX_VERSION
+        "Runs on dsh: boots `dsh --profile {}` and talks to its zf-tui-bridge plugin.",
+        config::DEFAULT_PROFILE
     );
     println!(
         r#"
 Quick start:
   native-agent-tui                     Open the TUI in the current directory; F1 lists keys
-  native-agent-tui --check-shell       Check Codex and the sandbox without a model turn
   native-agent-tui --run "TASK"        Run one task and print the answer
-  If the shell check fails on Windows, add --windows-sandbox unelevated.
 
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]
   native-agent-tui --run TASK [--json-events] [OPTIONS]
   native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
-  native-agent-tui --check-shell [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
   native-agent-tui --recovery SESSION_ID [OPTIONS]
   native-agent-tui --search QUERY [--search-category CATEGORY] [--search-thread ID] [--search-turn ID] [OPTIONS]
@@ -47,15 +39,11 @@ Usage:
 
 Options:
   --cwd PATH       Working directory (default: current directory)
-  --codex PATH     Codex executable (or CODEX_BIN)
-  --backend NAME    deepseek-acp (default) | codex; --codex and --check-shell imply codex
-  --dsh PATH        DeepSeek Harness executable (or DSH_BIN)
-  --profile NAME    DeepSeek ACP profile (default: acp)
-  --model NAME     Requested model; uses Codex configuration when omitted
+  --dsh PATH       dsh launcher (or DSH_BIN)
+  --profile NAME   dsh profile carrying the zf-tui-bridge plugin (default: zf-tui)
+  --model NAME     Requested model as provider/model; the last /model choice when omitted
   --sandbox MODE   read-only | workspace-write | danger-full-access
   --approval MODE  untrusted | on-request | never (default: on-request)
-  --startup-shell-check  Verify the sandbox shell before the first task (default: off;
-                         the sandbox is first used when the model runs a command)
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)
@@ -72,11 +60,11 @@ Options:
 
 Workflow files contain a JSON task DAG, validated before launching.
 Sessions persist redacted snapshots by default. Replay is read-only and
-never launches app-server. --json-events streams committed redacted state.
+never launches dsh. --json-events streams committed redacted state.
 --history opens offline read-only observation. --export previews the range;
 --output writes that captured range with stable identity aliases to a new file.
---recovery summarizes committed recovery facts and outbox delivery states without launching Codex or writing journal.
---search scans retained redacted evidence across sessions without launching Codex.
+--recovery summarizes committed recovery facts and outbox delivery states without launching dsh or writing journal.
+--search scans retained redacted evidence across sessions without launching dsh.
   Search filters: all, lifecycle, output, tool, compaction, request, waiting.
 Default is the TUI; --headless returns 0 only when all root tasks succeed.
 See docs/scheduler-usage.md and docs/workflow-example.json.
@@ -98,7 +86,6 @@ Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat
 
 Headless runs decline interactive approvals; use the TUI to review them."#
     );
-    print!("{windows}");
 }
 
 #[tokio::main]
@@ -438,10 +425,7 @@ async fn execute() -> Result<(), (u8, String)> {
             json_events,
         } => {
             config.strict_outcome = true;
-            return run_headless(config, vec![RootTaskSpec::input(goal)], false, json_events).await;
-        }
-        CliCommand::CheckShell(config) => {
-            return run_headless(config, Vec::new(), true, false).await
+            return run_headless(config, vec![RootTaskSpec::input(goal)], json_events).await;
         }
         CliCommand::Workflow {
             path,
@@ -477,7 +461,7 @@ async fn execute() -> Result<(), (u8, String)> {
                 })?
                 .tasks;
             if headless {
-                return run_headless(config, tasks, false, json_events).await;
+                return run_headless(config, tasks, json_events).await;
             }
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err((2, "The workflow TUI needs an interactive terminal. Add --headless for scripted execution.".into()));
@@ -516,21 +500,15 @@ async fn run_tui(config: Config, tasks: Vec<RootTaskSpec>) -> Result<(), (u8, St
 async fn run_headless(
     config: Config,
     tasks: Vec<RootTaskSpec>,
-    check_only: bool,
     json_events: bool,
 ) -> Result<(), (u8, String)> {
     let journal = config.journal.clone();
     let cwd = config.cwd.clone();
-    let client = if check_only {
-        ClientHandle::check_shell(config).await
-    } else {
-        ClientHandle::spawn(config).await
-    }
-    .map_err(|error| {
+    let client = ClientHandle::spawn(config).await.map_err(|error| {
         (
             3,
             if json_events {
-                "Execution startup failed; inspect local Codex configuration and journal storage."
+                "Execution startup failed; inspect the local dsh installation and journal storage."
                     .into()
             } else {
                 error.to_string()
@@ -550,7 +528,7 @@ async fn run_headless(
     } else {
         None
     };
-    native_agent_tui::headless::run(client, tasks, check_only, output).await
+    native_agent_tui::headless::run(client, tasks, output).await
 }
 
 fn replay_error(error: JournalError) -> (u8, String) {

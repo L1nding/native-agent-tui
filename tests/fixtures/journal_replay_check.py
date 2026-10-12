@@ -37,14 +37,14 @@ def main():
                        input=generated.stdout)
         assert consumer.returncode == 0, consumer.stderr.decode()
         print(consumer.stdout.decode().strip())
-        # Executing this selected Codex would leave a marker even if launch then failed.
+        # Executing this selected backend would leave a marker even if launch then failed.
         poison = temp / ("poison.cmd" if os.name == "nt" else "poison")
         marker = temp / "executed.marker"
         poison.write_text('@echo off\necho launched>"%~dp0executed.marker"\nexit /b 83\n'
                           if os.name == "nt" else '#!/bin/sh\ntouch "$(dirname "$0")/executed.marker"\nexit 83\n')
         if os.name != "nt":
             poison.chmod(0o700)
-        common = [str(binary), "--cwd", str(repo), "--journal-dir", str(root), "--codex", str(poison)]
+        common = [str(binary), "--cwd", str(repo), "--journal-dir", str(root), "--dsh", str(poison)]
         before = files(root)
         replay = run(common + ["--replay", session, "--json-events"])
         assert replay.returncode == 0 and not replay.stderr, replay.stderr.decode()

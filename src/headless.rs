@@ -9,7 +9,6 @@ use crate::state::{display_text, SessionPhase};
 pub async fn run(
     mut client: ClientHandle,
     tasks: Vec<RootTaskSpec>,
-    check_only: bool,
     mut output: Option<LiveOutput>,
 ) -> Result<(), (u8, String)> {
     let json_events = output.is_some();
@@ -121,12 +120,6 @@ pub async fn run(
                 .map(|task| task.state),
         );
         match outcome {
-            SessionPhase::Ready if check_only => {
-                if !json_events {
-                    println!("shell preflight: passed (zero model turns)");
-                }
-                break Ok(());
-            }
             SessionPhase::Completed => {
                 if !json_events {
                     println!();

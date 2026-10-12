@@ -1,4 +1,4 @@
-"""Native read-only recovery and export checks; Codex must never be launched."""
+"""Native read-only recovery and export checks; the backend must never be launched."""
 import argparse
 import hashlib
 import json
@@ -38,7 +38,7 @@ def main():
                           if os.name == "nt" else '#!/bin/sh\ntouch "$(dirname "$0")/executed.marker"\nexit 83\n')
         if os.name != "nt":
             poison.chmod(0o700)
-        common = [str(binary), "--cwd", str(repo), "--journal-dir", str(journal), "--codex", str(poison)]
+        common = [str(binary), "--cwd", str(repo), "--journal-dir", str(journal), "--dsh", str(poison)]
         preview = run(common + ["--export", session])
         assert preview.returncode == 0, preview.stderr.decode()
         assert b"stable_aliases" in preview.stdout and b"PRIVATE_" not in preview.stdout

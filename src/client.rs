@@ -28,9 +28,6 @@ use crate::state::{
 use crate::tool_details::{ToolDetailLocator, ToolDetails, ToolLifecycle};
 use crate::transport::{PipeTransport, TransportError};
 
-#[cfg(all(test, windows))]
-mod live_requests;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     SubmitRootInput {
@@ -127,14 +124,10 @@ pub struct ClientHandle {
 
 impl ClientHandle {
     pub async fn spawn(config: Config) -> Result<Self, ClientError> {
-        Self::launch(config, false).await
+        Self::launch(config).await
     }
 
-    pub async fn check_shell(config: Config) -> Result<Self, ClientError> {
-        Self::launch(config, true).await
-    }
-
-    async fn launch(config: Config, check_only: bool) -> Result<Self, ClientError> {
+    async fn launch(config: Config) -> Result<Self, ClientError> {
         let mut config = app_server::normalize_config(config)?;
         // 命令行参数优先；否则沿用上次在 /model、/setting 里保存的选择。
         let saved = crate::preferences::path(&config.journal)
@@ -144,10 +137,10 @@ impl ClientHandle {
                 crate::preferences::Preferences::load(&path)
             })
             .unwrap_or_default();
-        if !check_only {
+        {
             use crate::preferences::Setting;
             if config.model.is_none() {
-                if let Some(model) = saved.model(config.backend.label()) {
+                if let Some(model) = saved.model(crate::backend::PREFERENCE_KEY) {
                     config.model = Some(model.to_owned());
                     config.model_is_preference = true;
                 }
@@ -228,7 +221,6 @@ impl ClientHandle {
             pipe,
             config,
             Some(server),
-            check_only,
             Some((observer, journal, outbox)),
         ))
     }
@@ -258,27 +250,7 @@ impl ClientHandle {
         pipe: PipeTransport,
         config: Config,
         server: Option<AppServer>,
-        check_only: bool,
         prepared: Option<(Observer, Journal, Outbox)>,
-    ) -> Self {
-        let shell_source = if cfg!(windows) && !check_only && config.startup_shell_check {
-            server
-                .as_ref()
-                .and_then(AppServer::shell_peer)
-                .map(crate::shell_check::Source::Peer)
-        } else {
-            None
-        };
-        Self::start_with_shell_source(pipe, config, server, check_only, prepared, shell_source)
-    }
-
-    fn start_with_shell_source(
-        pipe: PipeTransport,
-        config: Config,
-        server: Option<AppServer>,
-        check_only: bool,
-        prepared: Option<(Observer, Journal, Outbox)>,
-        shell_source: Option<crate::shell_check::Source>,
     ) -> Self {
         let agent_limits = AgentLimits {
             max_children: config.max_native_children,
@@ -333,10 +305,7 @@ impl ClientHandle {
                 interrupt_sent: false,
                 token_budget_stop_started: false,
                 agent_budget_interrupts: BTreeMap::new(),
-                preflight_passed: false,
-                shell_source,
-                shell_check: None,
-                peer_cleanup_uncertain: false,
+                session_ready: false,
                 generation: 0,
                 retired_turns: VecDeque::new(),
                 gate: CompletionGate::default(),
@@ -349,12 +318,10 @@ impl ClientHandle {
                 completed_waits: VecDeque::new(),
                 identity_pending: BTreeSet::new(),
                 identity_requested: BTreeSet::new(),
-                check_only,
                 skills_generation: 0,
                 skills_refresh_queued: false,
                 skills_refresh_force_reload: false,
                 skills_refresh_source: None,
-                model_override: None,
                 conversation_id: String::new(),
                 conversation_written: HashMap::new(),
                 conversation_meta: None,
@@ -374,7 +341,6 @@ impl ClientHandle {
 enum RpcKind {
     Initialize,
     ThreadStart,
-    Preflight,
     AgentRead,
     StartTurn {
         generation: u64,
@@ -450,10 +416,8 @@ struct Core {
     token_budget_stop_started: bool,
     /// 已触发的 agent/turn 预算键；同一代只允许一次中断。
     agent_budget_interrupts: BTreeMap<String, (String, u64)>,
-    preflight_passed: bool,
-    shell_source: Option<crate::shell_check::Source>,
-    shell_check: Option<crate::shell_check::ShellCheck>,
-    peer_cleanup_uncertain: bool,
+    /// The backend confirmed a session; tasks may be dispatched to it.
+    session_ready: bool,
     generation: u64,
     retired_turns: VecDeque<String>,
     gate: CompletionGate,
@@ -466,13 +430,10 @@ struct Core {
     completed_waits: VecDeque<(RpcId, String, String)>,
     identity_pending: BTreeSet<String>,
     identity_requested: BTreeSet<String>,
-    check_only: bool,
     skills_generation: u64,
     skills_refresh_queued: bool,
     skills_refresh_force_reload: bool,
     skills_refresh_source: Option<SkillRefreshSource>,
-    /// A model chosen in this session; Codex receives it with each turn/start.
-    model_override: Option<String>,
     /// Name of the saved conversation this session writes to; a resume adopts
     /// the resumed conversation's name so later turns continue the same file.
     conversation_id: String,
@@ -553,23 +514,6 @@ impl Core {
             per_agent_limit: self.config.max_agent_tokens,
             per_agent_stop_triggered: !self.agent_budget_interrupts.is_empty(),
         };
-    }
-
-    fn shell_timeout(&mut self) {
-        let message = self.shell_timeout_message();
-        self.state.error(SessionPhase::Unknown, message);
-    }
-
-    /// 超时后只给出可操作的建议，不自动放宽沙箱或重试。
-    fn shell_timeout_message(&self) -> String {
-        let advice = if !cfg!(windows) {
-            "Check the configured shell and sandbox."
-        } else if self.config.windows_sandbox.as_deref() == Some("unelevated") {
-            "Check the Codex Windows sandbox setup."
-        } else {
-            "The elevated Codex sandbox may need one-time admin setup: run `codex sandbox -- cmd /c echo ok` in a terminal and approve the UAC prompt. Or restart with --windows-sandbox unelevated (keep it with `[windows] sandbox = \"unelevated\"` in the Codex config.toml)."
-        };
-        format!("Shell preflight timed out; no model turn was started. {advice} Automatic retry is disabled.")
     }
 
     fn token_budget_exhausted(&self) -> Option<u64> {
@@ -761,37 +705,7 @@ impl Core {
                         }
                     }
                 }
-                report = async { self.shell_check.as_mut().expect("active check").wait().await }, if self.shell_check.is_some() => {
-                    let expired = self.shell_check.as_ref().is_some_and(|check| check.deadline <= Instant::now());
-                    self.shell_check.take();
-                    self.peer_cleanup_uncertain |= !report.cleanup_confirmed;
-                    if !report.cleanup_confirmed {
-                        self.state.error(SessionPhase::Unknown, "Isolated shell preflight process cleanup could not be confirmed");
-                    } else if expired {
-                        self.shell_timeout();
-                    } else {
-                        use crate::shell_check::Outcome;
-                        match report.outcome {
-                            Outcome::Passed => {
-                                self.state.view.phase = SessionPhase::Ready;
-                                self.state.view.notice = None;
-                                self.preflight_passed = true;
-                                self.skills_generation = self.skills_generation.wrapping_add(1);
-                                self.queue_skills_refresh(SkillRefreshSource::Initial, false);
-                            }
-                            Outcome::TimedOut => self.shell_timeout(),
-                            Outcome::Cancelled => self.state.error(SessionPhase::Failed, "Shell preflight cancelled; no model turn was started"),
-                            Outcome::TransportUnavailable | Outcome::ProtocolRejected => self.state.error(SessionPhase::Unknown, "Isolated shell preflight has no verified response; its external outcome is unknown. No model turn was started"),
-                            Outcome::BackendRejected => self.state.error(SessionPhase::Failed, "Isolated shell preflight backend version or launch was rejected; no model turn was started"),
-                            Outcome::InitializeRejected => self.state.error(SessionPhase::Failed, "Isolated shell preflight initialize response failed verification; no model turn was started"),
-                            Outcome::ShellRejected => self.state.error(SessionPhase::Failed, "Isolated shell preflight returned an unsuccessful check; no model turn was started"),
-                        }
-                    }
-                }
-                _ = clock.tick(), if !self.pending.is_empty() || !self.child_interrupts.is_empty() || self.shell_check.is_some() => {
-                    if self.shell_check.as_ref().is_some_and(|check| check.deadline <= Instant::now()) {
-                        self.shell_timeout();
-                    }
+                _ = clock.tick(), if !self.pending.is_empty() || !self.child_interrupts.is_empty() => {
                     let expired = self.pending.iter().find(|(_, rpc)| rpc.deadline <= Instant::now()).map(|(id, rpc)| (id.clone(), rpc.kind));
                     if let Some((id, kind)) = expired {
                         self.pending.remove(&id);
@@ -811,12 +725,10 @@ impl Core {
                                 "Model switch was not confirmed in time; the current model is unchanged as far as known.".into(),
                             );
                         } else {
-                            let message = if matches!(kind, RpcKind::Preflight) {
-                            self.shell_timeout_message()
-                        } else {
-                            format!("app-server {kind:?} response timed out; automatic retry is disabled")
-                        };
-                            self.state.error(SessionPhase::Unknown, message);
+                            self.state.error(
+                                SessionPhase::Unknown,
+                                format!("dsh {kind:?} response timed out; automatic retry is disabled"),
+                            );
                         }
                     }
                 }
@@ -856,22 +768,12 @@ impl Core {
             self.state.view.phase = SessionPhase::Stopping;
             self.publish();
         }
-        if let Some(check) = &self.shell_check {
-            check.cancel();
-        }
         self.pipe.close_writer().await;
-        let mut cleanup_error = if let Some(server) = &mut self.server {
+        let cleanup_error = if let Some(server) = &mut self.server {
             server.shutdown().await.err().map(|error| error.to_string())
         } else {
             None
         };
-        if let Some(mut check) = self.shell_check.take() {
-            self.peer_cleanup_uncertain |= !check.wait().await.cleanup_confirmed;
-        }
-        if self.peer_cleanup_uncertain {
-            cleanup_error =
-                Some("Isolated shell preflight process cleanup could not be confirmed".into());
-        }
         if !matches!(
             outcome,
             SessionPhase::Failed | SessionPhase::Unknown | SessionPhase::Disconnected
@@ -955,7 +857,7 @@ impl Core {
         let transport = self.pipe.stats();
         self.state.view.diagnostics.transport_bytes_in = transport.bytes_in;
         self.state.view.diagnostics.transport_bytes_out = transport.bytes_out;
-        self.state.view.startup_blocked = !self.preflight_passed
+        self.state.view.startup_blocked = !self.session_ready
             && !matches!(
                 self.state.view.phase,
                 SessionPhase::Created
@@ -1022,8 +924,7 @@ impl Core {
             SessionPhase::Ready | SessionPhase::Completed | SessionPhase::Interrupted
         );
         let scheduler = self.scheduler.snapshot();
-        !self.check_only
-            && self.preflight_passed
+        self.session_ready
             && phase_allows_query
             && self.wait.is_none()
             && self
@@ -1212,23 +1113,10 @@ impl Core {
     }
 
     fn send_rpc(&mut self, kind: RpcKind) -> Result<(), TransportError> {
-        if matches!(kind, RpcKind::Preflight) {
-            if let Some(source) = self.shell_source.take() {
-                self.state.view.phase = SessionPhase::CheckingShell;
-                self.state.view.notice =
-                    Some("Checking the sandbox shell; no model turn has started.".into());
-                self.shell_check = Some(crate::shell_check::ShellCheck::start(
-                    source,
-                    self.config.clone(),
-                ));
-                return Ok(());
-            }
-        }
         let id = self.next_rpc_id();
         let envelope = match kind {
             RpcKind::Initialize => app_server::initialize(id.clone()),
             RpcKind::ThreadStart => app_server::thread_start(id.clone(), &self.config),
-            RpcKind::Preflight => app_server::preflight(id.clone(), &self.config),
             RpcKind::SkillsList { force_reload, .. } => {
                 app_server::skills_list(id.clone(), &self.config.cwd, force_reload)
             }
@@ -1255,11 +1143,6 @@ impl Core {
             }
         };
         let outbox_id = self.send_effect(envelope, None)?;
-        if matches!(kind, RpcKind::Preflight) {
-            self.state.view.phase = SessionPhase::CheckingShell;
-            self.state.view.notice =
-                Some("Checking the sandbox shell; no model turn has started.".into());
-        }
         let skills_cwd = matches!(kind, RpcKind::SkillsList { .. })
             .then(|| self.config.cwd.display().to_string());
         self.expect_response(
@@ -1371,9 +1254,9 @@ impl Core {
                         | SessionPhase::Initializing
                         | SessionPhase::CheckingShell
                 );
-                if !self.preflight_passed && !initializing {
+                if !self.session_ready && !initializing {
                     self.state.view.notice = Some(
-                        "Shell preflight has not passed; restart after fixing the startup error."
+                        "This session did not start; restart after fixing the startup error."
                             .into(),
                     );
                     return;
@@ -1422,9 +1305,7 @@ impl Core {
             Command::AddModelProvider { spec, test } => {
                 use crate::backend::dsh_config;
                 // 只有真实启动的 dsh 会话才改用户的 dsh 配置。
-                let result = if !self.config.backend.is_acp() {
-                    Err("Providers can be added for the dsh backend only; Codex reads them from its own config.toml.".to_owned())
-                } else if self.journal.is_none() {
+                let result = if self.journal.is_none() {
                     Err("This session cannot change the dsh profile.".to_owned())
                 } else {
                     dsh_config::home()
@@ -1584,8 +1465,7 @@ impl Core {
 
     fn list_models(&mut self) {
         use crate::models::ModelsAvailability;
-        if self.check_only
-            || self.state.view.thread_id.is_none()
+        if self.state.view.thread_id.is_none()
             || self
                 .pending
                 .values()
@@ -1608,7 +1488,7 @@ impl Core {
             return "";
         }
         let saved = crate::preferences::path(&self.config.journal).is_some_and(|path| {
-            crate::preferences::save_model(&path, self.config.backend.label(), model).is_ok()
+            crate::preferences::save_model(&path, crate::backend::PREFERENCE_KEY, model).is_ok()
         });
         if saved {
             " Remembered for the next start."
@@ -1669,7 +1549,7 @@ impl Core {
                 });
             }
             records.push(crate::conversations::Record::Meta {
-                backend: self.config.backend.label().into(),
+                backend: crate::backend::PREFERENCE_KEY.into(),
                 thread_id: meta.0.clone(),
                 model: meta.1.clone(),
                 at_ms,
@@ -1716,14 +1596,11 @@ impl Core {
         if id == self.conversation_id {
             return Err("it is the conversation already open here.".into());
         }
-        if saved.backend != self.config.backend.label() {
+        if saved.backend != crate::backend::PREFERENCE_KEY {
             return Err(format!(
-                "it belongs to the {} backend; start with --backend {} to resume it.",
-                saved.backend, saved.backend
+                "it belongs to the removed {} backend.",
+                saved.backend
             ));
-        }
-        if !self.config.backend.is_acp() {
-            return Err("resuming is available for the dsh backend only.".into());
         }
         if !self.idle_for_backend_change() || self.state.view.resuming.is_some() {
             return Err("wait for the current turn to finish first.".into());
@@ -1747,8 +1624,6 @@ impl Core {
         let model = model.trim().to_owned();
         let refusal = if model.is_empty() || model.len() > crate::models::MAX_MODEL_BYTES {
             Some("name a model to test")
-        } else if !self.config.backend.is_acp() {
-            Some("only the dsh backend can test a model")
         } else if self.journal.is_none() {
             Some("this session cannot start a test process")
         } else if matches!(self.state.view.models.test, ModelTest::Running { .. }) {
@@ -1784,8 +1659,7 @@ impl Core {
     /// No turn, gate or task is active, so the model or backend can change.
     fn idle_for_backend_change(&self) -> bool {
         let scheduler = self.scheduler.snapshot();
-        !self.check_only
-            && self.preflight_passed
+        self.session_ready
             && self.state.view.thread_id.is_some()
             && self.wait.is_none()
             && self.state.view.phase.can_submit()
@@ -1796,9 +1670,6 @@ impl Core {
     }
 
     fn reload_backend(&mut self) -> Result<(), String> {
-        if !self.config.backend.is_acp() {
-            return Err("only the dsh backend can be reloaded; restart to reload Codex.".into());
-        }
         if !self.idle_for_backend_change() {
             return Err("wait for the current turn to finish, then press Ctrl+R in /model.".into());
         }
@@ -1828,16 +1699,6 @@ impl Core {
             );
             return;
         }
-        if !self.config.backend.is_acp() {
-            // Codex takes the model with turn/start; there is nothing to confirm yet.
-            self.model_override = Some(model.clone());
-            self.state.view.notice = Some(format!(
-                "Model set to {model} from the next turn.{}",
-                self.remember_model(&model)
-            ));
-            self.state.view.model = Some(model);
-            return;
-        }
         let id = self.next_rpc_id();
         let request = app_server::model_select(id.clone(), &model);
         match self.send_effect(request, None) {
@@ -1853,7 +1714,7 @@ impl Core {
     }
 
     fn request_is_live(&self, request: &RequestView) -> bool {
-        self.preflight_passed
+        self.session_ready
             && !matches!(
                 self.state.view.phase,
                 SessionPhase::Unknown
@@ -1875,17 +1736,14 @@ impl Core {
     }
 
     fn queue_tasks(&mut self, tasks: Vec<RootTaskSpec>) {
-        if self.check_only
-            || (!self.preflight_passed
-                && !matches!(
-                    self.state.view.phase,
-                    SessionPhase::Launching
-                        | SessionPhase::Initializing
-                        | SessionPhase::CheckingShell
-                ))
+        if !self.session_ready
+            && !matches!(
+                self.state.view.phase,
+                SessionPhase::Launching | SessionPhase::Initializing
+            )
         {
             self.state.view.notice =
-                Some("Task dispatch requires a successful shell preflight.".into());
+                Some("Task dispatch requires a session; this one did not start.".into());
             return;
         }
         match self.scheduler.enqueue(tasks) {
@@ -1926,8 +1784,7 @@ impl Core {
         if self.persistence_error().is_some() {
             return;
         }
-        if !self.preflight_passed
-            || self.check_only
+        if !self.session_ready
             || self.wait.is_some()
             || !self.state.view.phase.can_submit()
             || self.state.view.thread_id.is_none()
@@ -2048,8 +1905,7 @@ impl Core {
         let thread = self.state.view.thread_id.clone().unwrap();
         // 新 root turn 尚未收到 usage；旧 turn 事实不能重新绑定到这一代。
         self.state.clear_usage_fact(&thread);
-        let request =
-            app_server::turn_start(id.clone(), &thread, text, self.model_override.as_deref());
+        let request = app_server::turn_start(id.clone(), &thread, text, None);
         let outbox_id = match self.send_effect(request, self.root_attempt) {
             Ok(outbox_id) => outbox_id,
             Err(error) => {
@@ -2146,7 +2002,7 @@ impl Core {
                             .state
                             .agents
                             .active_turn(&request.thread_id, &request.turn_id);
-                        if !(child_request && self.preflight_passed
+                        if !(child_request && self.session_ready
                             || root_request
                                 && matches!(
                                     self.state.view.phase,
@@ -2374,32 +2230,20 @@ impl Core {
     fn response(&mut self, kind: RpcKind, result: Value) {
         let action = match kind {
             RpcKind::Initialize => {
-                if !self.config.backend.is_acp() {
-                    if let Err(error) = crate::compatibility::verify_initialize(&result) {
-                        self.state.error(SessionPhase::Failed, error.to_string());
-                        return;
-                    }
-                }
                 if let Err(error) =
                     self.send_effect(Envelope::notification("initialized", None), None)
                 {
                     self.state.error(SessionPhase::Failed, error.to_string());
                     return;
                 }
-                Some(if self.check_only && !self.config.backend.is_acp() {
-                    RpcKind::Preflight
-                } else {
-                    RpcKind::ThreadStart
-                })
+                Some(RpcKind::ThreadStart)
             }
             RpcKind::ThreadStart => {
-                if !self.config.backend.is_acp() {
-                    if let Err(error) = crate::compatibility::verify_thread_start(&result) {
-                        self.state.error(SessionPhase::Failed, error.to_string());
-                        return;
-                    }
-                }
-                let Some(id) = result.pointer("/thread/id").and_then(Value::as_str) else {
+                let Some(id) = result
+                    .pointer("/thread/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty() && id.len() <= 1024)
+                else {
                     self.state.error(
                         SessionPhase::Failed,
                         "thread/start response is missing thread.id",
@@ -2417,47 +2261,13 @@ impl Core {
                 if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
                     self.state.view.cwd = cwd.into();
                 }
-                if self.config.backend.is_acp() {
-                    // ACP has no Codex command/exec preflight. The session/new
-                    // response is the explicit backend readiness fact.
-                    self.state.view.phase = SessionPhase::Ready;
-                    self.state.view.notice = None;
-                    self.preflight_passed = true;
-                    None
-                } else if !self.config.startup_shell_check {
-                    // Like Codex itself: the sandbox is first exercised when the
-                    // model runs a command, so a new thread is the readiness fact.
-                    self.state.view.phase = SessionPhase::Ready;
-                    self.state.view.notice = None;
-                    self.preflight_passed = true;
-                    self.skills_generation = self.skills_generation.wrapping_add(1);
-                    self.queue_skills_refresh(SkillRefreshSource::Initial, false);
-                    None
-                } else {
-                    Some(RpcKind::Preflight)
-                }
-            }
-            RpcKind::Preflight => {
-                if result.get("exitCode").and_then(Value::as_i64) != Some(0)
-                    || !result
-                        .get("stdout")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .contains("native-agent-tui-shell-ok")
-                {
-                    self.state.error(
-                        SessionPhase::Failed,
-                        "Shell preflight failed; no model turn was started",
-                    );
-                    return;
-                }
+                // A confirmed session is the readiness fact; the sandbox is dsh's
+                // own and is first exercised when the agent runs a command.
                 self.state.view.phase = SessionPhase::Ready;
                 self.state.view.notice = None;
-                self.preflight_passed = true;
-                if !self.check_only {
-                    self.skills_generation = self.skills_generation.wrapping_add(1);
-                    self.queue_skills_refresh(SkillRefreshSource::Initial, false);
-                }
+                self.session_ready = true;
+                self.skills_generation = self.skills_generation.wrapping_add(1);
+                self.queue_skills_refresh(SkillRefreshSource::Initial, false);
                 None
             }
             RpcKind::StartTurn { .. } => {
@@ -2487,7 +2297,7 @@ impl Core {
                 models.availability = listed.availability;
                 models.options = listed.options;
                 models.truncated = listed.truncated;
-                if self.config.backend.is_acp() && self.journal.is_some() {
+                if self.journal.is_some() {
                     self.state.view.models.providers = crate::backend::dsh_config::home()
                         .map(|home| {
                             crate::backend::dsh_config::providers(&home, &self.config.acp_profile)
@@ -3657,7 +3467,6 @@ mod tests {
                 PipeTransport::new(read, write),
                 config.clone(),
                 None,
-                false,
                 Some((observer, journal, outbox)),
             ),
             BufReader::new(server),
@@ -4028,7 +3837,7 @@ mod tests {
         let invalid = fixture.root.join("file-not-directory");
         std::fs::write(&invalid, b"occupied").unwrap();
         let config = Config {
-            executable: fixture.root.join("must-never-launch"),
+            dsh_executable: fixture.root.join("must-never-launch"),
             journal: crate::journal::JournalSettings {
                 root: Some(invalid),
                 ..Default::default()
@@ -4129,7 +3938,6 @@ mod tests {
         let runner = tokio::spawn(crate::headless::run(
             client,
             vec![RootTaskSpec::input("PRIVATE_PROMPT".into())],
-            false,
             Some(output),
         ));
         ready(&mut server).await;
@@ -4194,12 +4002,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        let runner = tokio::spawn(crate::headless::run(
-            client,
-            Vec::new(),
-            false,
-            Some(output),
-        ));
+        let runner = tokio::spawn(crate::headless::run(client, Vec::new(), Some(output)));
         assert_eq!(next(&mut server).await["method"], "turn/interrupt");
         let result = tokio::time::timeout(Duration::from_secs(4), runner)
             .await
@@ -4246,12 +4049,7 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap();
-        let runner = tokio::spawn(crate::headless::run(
-            client,
-            Vec::new(),
-            false,
-            Some(output),
-        ));
+        let runner = tokio::spawn(crate::headless::run(client, Vec::new(), Some(output)));
         tokio::time::timeout(
             Duration::from_secs(3),
             snapshots.wait_for(|s| s.phase == SessionPhase::Unknown),
@@ -5398,329 +5196,6 @@ mod tests {
         client.join.await.unwrap();
     }
 
-    #[cfg(windows)]
-    #[tokio::test]
-    #[ignore = "requires Codex 0.161.0 and Python; all model traffic stays on localhost"]
-    async fn live_app_server_gate_has_zero_provider_requests_while_a_child_is_pending() {
-        use std::io::{Read, Write};
-        struct FixtureHome(std::path::PathBuf);
-        impl Drop for FixtureHome {
-            fn drop(&mut self) {
-                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .canonicalize()
-                    .unwrap();
-                if let Ok(path) = self.0.canonicalize() {
-                    if path.starts_with(&root)
-                        && path
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .starts_with("gate-fixture-")
-                    {
-                        let _ = std::fs::remove_dir_all(path);
-                    }
-                }
-            }
-        }
-        fn http(port: u16, method: &str, path: &str) -> Value {
-            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            write!(
-                stream,
-                "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-            )
-            .unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            let body = response.split_once("\r\n\r\n").unwrap().1;
-            if body.is_empty() {
-                Value::Null
-            } else {
-                serde_json::from_str(body).unwrap()
-            }
-        }
-        let mut provider_command = tokio::process::Command::new(
-            std::env::var_os("NATIVE_AGENT_TUI_PYTHON").unwrap_or_else(|| "python".into()),
-        );
-        provider_command
-            .arg("-u")
-            .arg(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/gate_provider.py"),
-            )
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .creation_flags(0x08000000);
-        let mut provider = provider_command.spawn().unwrap();
-        let mut port_line = String::new();
-        let stdout = provider.stdout.take().unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            BufReader::new(stdout).read_line(&mut port_line),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let port: u16 = port_line.trim().parse().unwrap();
-        let home = FixtureHome(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(format!("gate-fixture-{}", std::process::id())),
-        );
-        std::fs::create_dir(&home.0).unwrap();
-        let journal_fixture = JournalFixture::new();
-        let config = app_server::normalize_config(Config {
-            journal: journal_fixture.settings(),
-            windows_sandbox: Some("unelevated".into()),
-            sandbox: "read-only".into(),
-            model: Some("gpt-6.1-sol".into()),
-            ..Default::default()
-        })
-        .unwrap();
-        let catalog_output = tokio::process::Command::new(&config.executable)
-            .env("CODEX_HOME", &home.0)
-            .args(["debug", "models", "--bundled"])
-            .output()
-            .await
-            .unwrap();
-        assert!(catalog_output.status.success());
-        let mut catalog: Value = serde_json::from_slice(&catalog_output.stdout).unwrap();
-        for model in catalog["models"].as_array_mut().unwrap() {
-            // The fixture serves ordinary Responses SSE, not the optional lite wire format.
-            model["use_responses_lite"] = json!(false);
-        }
-        let catalog =
-            app_server::DirectCatalog::from_bytes(&serde_json::to_vec(&catalog).unwrap()).unwrap();
-        let mut command = crate::owned_process::Command::new(&config.executable);
-        command
-            .env("CODEX_HOME", &home.0)
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CODEX_API_KEY");
-        command.args(["-c", &catalog.config_override()]);
-        command.args(["-c", "windows.sandbox=\"unelevated\"", "-c", "model_provider=\"gate_fixture\"", "-c", &format!("model_providers.gate_fixture={{name=\"Gate fixture\",base_url=\"http://127.0.0.1:{port}/v1\",wire_api=\"responses\",requires_openai_auth=false}}"), "app-server", "--strict-config", "--listen", "stdio://"]).current_dir(&config.cwd);
-        let observer = Observer::new(config.attention.clone());
-        let initial = ClientHandle::initial(&config, &observer);
-        let session = initial.observation.session_id.clone();
-        let journal = Journal::open(
-            &config.journal,
-            &config.cwd,
-            StoredSnapshot::capture(&initial),
-        )
-        .unwrap();
-        let outbox =
-            Outbox::open(config.journal.outbox_path(&config.cwd, &session).unwrap()).unwrap();
-        let replay_config = config.clone();
-        let mut server = AppServer::spawn_command(command).unwrap();
-        let pipe = server.pipe.take().unwrap();
-        let mut client = ClientHandle::start(
-            pipe,
-            config,
-            Some(server),
-            false,
-            Some((observer, journal, outbox)),
-        );
-        client
-            .commands
-            .send(Command::SubmitRootInput {
-                text: "ROOT_TASK: Spawn the fixture worker, then use the registered wait tool."
-                    .into(),
-            })
-            .await
-            .unwrap();
-        let observation: Result<(), String> = async {
-            for round in 0..2u64 {
-                let gate = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    client.snapshots.wait_for(|s| {
-                        s.phase == SessionPhase::GatePending
-                            && s.gate.as_ref().is_some_and(|gate| {
-                                gate.targets
-                                    .iter()
-                                    .any(|target| target.generation == round + 1)
-                            })
-                            || matches!(
-                                s.phase,
-                                SessionPhase::Failed
-                                    | SessionPhase::Unknown
-                                    | SessionPhase::Disconnected
-                                    | SessionPhase::Completed
-                            )
-                    }),
-                )
-                .await
-                .map_err(|_| "fixture did not reach GatePending".to_owned())?
-                .map_err(|error| error.to_string())?
-                .clone();
-                if gate.phase != SessionPhase::GatePending || gate.agents.len() != 1 {
-                    return Err(format!(
-                        "expected one waiting child: phase={:?}, error={:?}",
-                        gate.phase, gate.last_error
-                    ));
-                }
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while http(port, "GET", "/stats")["child_requests"] != round + 1 {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .map_err(|_| "child provider request missing".to_owned())?;
-                client.commands.send(Command::ConfigureAttention { class: AttentionClass::Children, quiet_ms: 10, attention_ms: 20 }).await.map_err(|error| error.to_string())?;
-                let attention = tokio::time::timeout(Duration::from_secs(3), client.snapshots.wait_for(|snapshot| {
-                    snapshot.observation.activities.iter().any(|activity| activity.identity.agent_id == "root"
-                        && activity.kind == crate::observation::ActivityKind::WaitingChildren
-                        && activity.attention.level == crate::observation::AttentionLevel::AttentionNeeded)
-                })).await.map_err(|_| "Gate attention did not rise".to_owned())?.map_err(|error| error.to_string())?.clone();
-                let root_progress = attention.observation.activities.iter().find(|activity| activity.identity.agent_id == "root" && activity.scope == crate::observation::ActivityScope::Turn).unwrap().progress_seq;
-                // Sample AFTER a held interval: an early sample cannot prove the quiet window.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let counts = http(port, "GET", "/stats");
-                if counts["root_requests"] != 2 * (round + 1)
-                    || counts["child_requests"] != round + 1
-                    || counts["root_requests_while_child_held"] != 0
-                {
-                    return Err(format!("requests changed during Gate: {counts}"));
-                }
-                if client.snapshots.borrow().phase != SessionPhase::GatePending {
-                    return Err("Gate released before the child response was released".into());
-                }
-                if client.snapshots.borrow().observation.activities.iter().find(|activity| activity.identity.agent_id == "root" && activity.scope == crate::observation::ActivityScope::Turn).unwrap().progress_seq != root_progress {
-                    return Err("Observation ticking invented Gate evidence".into());
-                }
-                client
-                    .commands
-                    .send(Command::Schedule(SchedulerCommand::PauseWorkflow))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                tokio::time::timeout(
-                    Duration::from_secs(3),
-                    client.snapshots.wait_for(|s| s.scheduler.paused),
-                )
-                .await
-                .map_err(|_| "pause was not applied".to_owned())?
-                .map_err(|error| error.to_string())?;
-                if round == 0 {
-                    http(port, "POST", "/release/0");
-                } else {
-                    let task = client
-                        .snapshots
-                        .borrow()
-                        .scheduler
-                        .tasks
-                        .iter()
-                        .find(|task| task.kind == TaskKind::NativeChild)
-                        .unwrap()
-                        .id;
-                    client
-                        .commands
-                        .send(Command::Schedule(SchedulerCommand::Cancel(task)))
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                let terminal = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    client.snapshots.wait_for(|s| {
-                        s.agents[0].outcome.is_some()
-                            || matches!(s.phase, SessionPhase::Unknown | SessionPhase::Disconnected)
-                    }),
-                )
-                .await
-                .map_err(|_| "child did not terminate after completion/interrupt".to_owned())?
-                .map_err(|error| error.to_string())?
-                .clone();
-                let expected = if round == 0 {
-                    ChildOutcome::Completed
-                } else {
-                    ChildOutcome::Interrupted
-                };
-                if terminal.agents[0].outcome != Some(expected)
-                    || terminal.phase != SessionPhase::GatePending
-                {
-                    return Err(format!(
-                        "wrong child terminal fact while paused: {:?}; {:?}",
-                        terminal.phase, terminal.agents[0].outcome
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                if http(port, "GET", "/stats")["root_requests"] != 2 * (round + 1) {
-                    return Err("ready Gate resumed the parent while paused".into());
-                }
-                if round == 1 {
-                    http(port, "POST", "/release/1");
-                }
-                client
-                    .commands
-                    .send(Command::Schedule(SchedulerCommand::ResumeWorkflow))
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            let done = tokio::time::timeout(
-                Duration::from_secs(10),
-                client.snapshots.wait_for(|s| {
-                    matches!(
-                        s.phase,
-                        SessionPhase::Completed
-                            | SessionPhase::Unknown
-                            | SessionPhase::Failed
-                            | SessionPhase::Disconnected
-                    )
-                }),
-            )
-            .await
-            .map_err(|_| "root did not finish".to_owned())?
-            .map_err(|error| error.to_string())?
-            .clone();
-            if done.phase != SessionPhase::Completed
-                || !done
-                    .messages
-                    .iter()
-                    .any(|message| message.text == "GATE_DONE")
-                || http(port, "GET", "/stats")["root_requests"] != 5
-            {
-                return Err(format!(
-                    "root failed to resume: {:?}; {:?}",
-                    done.phase, done.last_error
-                ));
-            }
-            let tasks = crate::scheduler::WorkflowPlan::parse(br#"{"tasks":[{"id":100,"text":"WORKFLOW_FIRST"},{"id":101,"text":"WORKFLOW_SECOND","dependencies":[100]}]}"#)?.tasks;
-            client.commands.send(Command::QueueRootTasks { tasks }).await.map_err(|error| error.to_string())?;
-            let workflow = tokio::time::timeout(Duration::from_secs(10), client.snapshots.wait_for(|s| s.scheduler.tasks.iter().filter(|task| task.id.0 >= 100).filter(|task| task.state == crate::scheduler::TaskState::Succeeded).count() == 2 || matches!(s.phase, SessionPhase::Unknown | SessionPhase::Failed | SessionPhase::Disconnected))).await.map_err(|_| "sequential workflow did not complete".to_owned())?.map_err(|error| error.to_string())?.clone();
-            if workflow.phase != SessionPhase::Completed || workflow.root_start_requests != 3 || http(port, "GET", "/stats")["root_requests"] != 7 {
-                return Err(format!("workflow did not dispatch exactly two more turns: {:?}; {:?}", workflow.phase, workflow.last_error));
-            }
-            Ok(())
-        }
-        .await;
-        let counts = http(port, "GET", "/stats");
-        // Clean up the owned server and provider before reporting any assertion failure.
-        http(port, "POST", "/release/0");
-        http(port, "POST", "/release/1");
-        let _ = client.commands.send(Command::Quit).await;
-        let exit = client.join.await;
-        provider.stdin.take();
-        let provider_exit = tokio::time::timeout(Duration::from_secs(3), provider.wait()).await;
-        observation.unwrap_or_else(|error| panic!("{error}; provider counters: {counts}"));
-        let exit = exit.unwrap();
-        assert!(exit.cleanup_error.is_none() && exit.journal_error.is_none());
-        let replay = Replay::open(&replay_config.journal, &replay_config.cwd, &session, 0).unwrap();
-        assert!(replay.info.session_closed && !replay.info.needs_recovery);
-        assert_eq!(replay.info.execution_result, Some(SessionPhase::Completed));
-        assert_eq!(replay.latest_state().root_start_requests, 3);
-        let mut bytes = Vec::new();
-        replay.write_jsonl(&mut bytes).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(
-            !text.contains("ROOT_TASK:")
-                && !text.contains("WORKFLOW_FIRST")
-                && !text.contains("GATE_DONE")
-        );
-        assert!(provider_exit.unwrap().unwrap().success());
-    }
-
     #[tokio::test]
     async fn paused_gate_observes_children_and_approvals_but_replies_only_after_resume() {
         use crate::scheduler::TaskState;
@@ -5845,7 +5320,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dag_dispatch_waits_for_preflight_pause_and_dependencies_and_uses_new_retry_attempts() {
+    async fn dag_dispatch_waits_for_the_session_pause_and_dependencies_and_uses_new_retry_attempts()
+    {
         use crate::scheduler::{TaskId, TaskState};
         let (mut client, mut server) = harness().await;
         let mut first = RootTaskSpec::input("first".into());
@@ -5866,15 +5342,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let preflight = initialized(&mut server).await;
+        initialized(&mut server).await;
         client
             .snapshots
             .wait_for(|s| s.scheduler.tasks.len() == 2)
             .await
             .unwrap();
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        send(&mut server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
         phase(&mut client, SessionPhase::Ready).await;
+        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
         let skills = next(&mut server).await;
         assert_eq!(skills["method"], "skills/list");
         send(&mut server, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
@@ -6883,204 +6358,6 @@ mod tests {
         client.join.await.unwrap();
     }
 
-    #[cfg(windows)]
-    #[tokio::test]
-    #[ignore = "requires the installed authenticated Codex app-server"]
-    async fn live_app_server_skills_list_finds_fixture_without_a_model_turn() {
-        struct Fixture {
-            root: std::path::PathBuf,
-            previous_home: Option<std::ffi::OsString>,
-        }
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                if let Some(home) = self.previous_home.take() {
-                    std::env::set_var("CODEX_HOME", home);
-                } else {
-                    std::env::remove_var("CODEX_HOME");
-                }
-                let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
-                    .canonicalize()
-                    .unwrap();
-                if let Ok(root) = self.root.canonicalize() {
-                    if root.starts_with(&target)
-                        && root
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .starts_with("skills-fixture-")
-                    {
-                        let _ = std::fs::remove_dir_all(root);
-                    }
-                }
-            }
-        }
-        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-        let root = loop {
-            let candidate = target.join(format!(
-                "skills-fixture-{}-{}",
-                std::process::id(),
-                NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("could not create skills smoke fixture: {error}"),
-            }
-        };
-        let workspace = root.join("workspace");
-        let home = root.join("home");
-        let skill = workspace
-            .join(".agents")
-            .join("skills")
-            .join("fixture-skill");
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            skill.join("SKILL.md"),
-            "---\nname: fixture-skill\ndescription: isolated skills list smoke fixture\n---\n# Fixture skill\n",
-        )
-        .unwrap();
-        let fixture = Fixture {
-            root,
-            previous_home: std::env::var_os("CODEX_HOME"),
-        };
-        std::env::set_var("CODEX_HOME", home);
-        let journal = JournalFixture::new();
-        let config = Config {
-            cwd: workspace,
-            journal: journal.settings(),
-            sandbox: "read-only".into(),
-            windows_sandbox: Some("unelevated".into()),
-            ..Default::default()
-        };
-        let mut client = ClientHandle::spawn(config).await.unwrap();
-        let snapshot = tokio::time::timeout(
-            Duration::from_secs(45),
-            client.snapshots.wait_for(|snapshot| {
-                snapshot.phase == SessionPhase::Ready
-                    && snapshot.skills.freshness == crate::skills::SkillFreshness::Current
-            }),
-        )
-        .await
-        .expect("live skills/list did not return within 45 seconds")
-        .unwrap()
-        .clone();
-        assert!(matches!(
-            snapshot.skills.availability,
-            crate::skills::SkillAvailability::Available | crate::skills::SkillAvailability::Partial
-        ));
-        assert!(snapshot
-            .skills
-            .entries
-            .iter()
-            .any(|entry| entry.name == "fixture-skill"));
-        assert_eq!(snapshot.root_turn_count, 0);
-        assert_eq!(snapshot.root_start_requests, 0);
-        let second_skill = fixture
-            .root
-            .join("workspace/.agents/skills/explicit-refresh");
-        std::fs::create_dir_all(&second_skill).unwrap();
-        std::fs::write(
-            second_skill.join("SKILL.md"),
-            "---\nname: explicit-refresh\ndescription: explicit reload fixture\n---\n# Explicit refresh\n",
-        )
-        .unwrap();
-        client.commands.send(Command::RefreshSkills).await.unwrap();
-        let refreshed = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.snapshots.wait_for(|snapshot| {
-                snapshot.skills.freshness == crate::skills::SkillFreshness::Current
-                    && snapshot
-                        .skills
-                        .entries
-                        .iter()
-                        .any(|entry| entry.name == "explicit-refresh")
-            }),
-        )
-        .await
-        .expect("explicit forceReload did not find the newly added fixture skill")
-        .unwrap()
-        .clone();
-        assert_eq!(refreshed.root_turn_count, 0);
-        assert_eq!(refreshed.root_start_requests, 0);
-        client.commands.send(Command::Quit).await.unwrap();
-        let report = client.join.await.unwrap();
-        assert!(report.cleanup_error.is_none());
-        drop(fixture);
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    #[ignore = "requires the installed authenticated Codex app-server"]
-    async fn live_windows_core_reaches_ready_without_a_model_turn() {
-        let fixture = JournalFixture::new();
-        let config = Config {
-            journal: fixture.settings(),
-            windows_sandbox: Some("unelevated".into()),
-            sandbox: "read-only".into(),
-            ..Default::default()
-        };
-        let retained_config = config.clone();
-        let mut client = ClientHandle::spawn(config).await.unwrap();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(35),
-            client.snapshots.wait_for(|s| {
-                matches!(
-                    s.phase,
-                    SessionPhase::Ready
-                        | SessionPhase::Failed
-                        | SessionPhase::Unknown
-                        | SessionPhase::Disconnected
-                )
-            }),
-        )
-        .await
-        .map(|result| result.unwrap().clone());
-        let _ = client.commands.send(Command::Quit).await;
-        let report = client.join.await.unwrap();
-        let snapshot = outcome.unwrap_or_else(|_| {
-            let latest = client.snapshots.borrow();
-            panic!("live startup did not reach a result within 35 seconds; phase={:?}, notice={:?}, error={:?}", latest.phase, latest.notice, latest.last_error)
-        });
-        let session = client
-            .snapshots
-            .borrow()
-            .journal
-            .as_ref()
-            .expect("startup must retain its journal")
-            .session_id
-            .clone();
-        let replay =
-            Replay::open(&retained_config.journal, &retained_config.cwd, &session, 0).unwrap();
-        let final_state = replay.latest_state();
-        eprintln!(
-            "[startup-check] {}",
-            json!({
-                "phase": format!("{:?}", snapshot.phase),
-                "ready": snapshot.phase == SessionPhase::Ready,
-                "root_turn_count": snapshot.root_turn_count,
-                "root_start_requests": final_state.root_start_requests,
-                "cleanup_confirmed": report.cleanup_error.is_none() && final_state.cleanup_confirmed == Some(true),
-                "journal_confirmed": report.journal_error.is_none() && final_state.session_closed,
-                "shell_preflight_timeout": snapshot.last_error.as_deref().is_some_and(|error| error.contains("Shell preflight timed out")),
-            })
-        );
-        assert_eq!(final_state.root_start_requests, 0);
-        assert_eq!(snapshot.root_turn_count, 0);
-        assert!(report.cleanup_error.is_none());
-        assert!(report.journal_error.is_none());
-        assert_eq!(final_state.cleanup_confirmed, Some(true));
-        assert!(final_state.session_closed);
-        assert_eq!(
-            snapshot.phase,
-            SessionPhase::Ready,
-            "{:?}",
-            snapshot.last_error
-        );
-    }
-
     async fn harness() -> (ClientHandle, BufReader<tokio::io::DuplexStream>) {
         harness_with_config(Config::default()).await
     }
@@ -7091,296 +6368,11 @@ mod tests {
         let (client, server) = tokio::io::duplex(65536);
         let (read, write) = tokio::io::split(client);
         (
-            ClientHandle::start(PipeTransport::new(read, write), config, None, false, None),
+            ClientHandle::start(PipeTransport::new(read, write), config, None, None),
             BufReader::new(server),
         )
     }
 
-    async fn isolated_harness(
-        thread_id: &str,
-    ) -> (
-        ClientHandle,
-        BufReader<tokio::io::DuplexStream>,
-        BufReader<tokio::io::DuplexStream>,
-    ) {
-        isolated_harness_with_cleanup(thread_id, None).await
-    }
-
-    async fn isolated_harness_with_cleanup(
-        thread_id: &str,
-        cleanup: Option<tokio::sync::oneshot::Receiver<bool>>,
-    ) -> (
-        ClientHandle,
-        BufReader<tokio::io::DuplexStream>,
-        BufReader<tokio::io::DuplexStream>,
-    ) {
-        let (main_client, main_server) = tokio::io::duplex(65536);
-        let (main_read, main_write) = tokio::io::split(main_client);
-        let (peer_client, peer_server) = tokio::io::duplex(65536);
-        let (peer_read, peer_write) = tokio::io::split(peer_client);
-        let peer = PipeTransport::new(peer_read, peer_write);
-        let source = match cleanup {
-            Some(confirmation) => crate::shell_check::Source::ScriptedCleanup(peer, confirmation),
-            None => crate::shell_check::Source::Pipe(peer),
-        };
-        let mut client = ClientHandle::start_with_shell_source(
-            PipeTransport::new(main_read, main_write),
-            Config::default(),
-            None,
-            false,
-            None,
-            Some(source),
-        );
-        let mut main = BufReader::new(main_server);
-        let mut initialize: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.161.0/initialize.json"
-        ))
-        .unwrap();
-        initialize["id"] = next(&mut main).await["id"].clone();
-        send(&mut main, initialize).await;
-        assert_eq!(next(&mut main).await["method"], "initialized");
-        let start = next(&mut main).await;
-        assert_eq!(start["method"], "thread/start");
-        send(
-            &mut main,
-            json!({"id":start["id"],"result":{"thread":{"id":thread_id,"cliVersion":"0.161.0"}}}),
-        )
-        .await;
-        phase(
-            &mut client,
-            if thread_id == "root" {
-                SessionPhase::CheckingShell
-            } else {
-                SessionPhase::Failed
-            },
-        )
-        .await;
-        (client, main, BufReader::new(peer_server))
-    }
-
-    async fn initialize_peer(peer: &mut BufReader<tokio::io::DuplexStream>) -> Value {
-        let request = next(peer).await;
-        assert_eq!(request["method"], "initialize");
-        let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.161.0/initialize.json"
-        ))
-        .unwrap();
-        response["id"] = request["id"].clone();
-        send(peer, response).await;
-        assert_eq!(next(peer).await["method"], "initialized");
-        let preflight = next(peer).await;
-        assert_eq!(preflight["method"], "command/exec");
-        preflight
-    }
-
-    #[tokio::test]
-    async fn isolated_preflight_keeps_main_rpc_ids_separate_and_blocks_queued_tasks_until_cleanup()
-    {
-        let (client, mut main, mut peer) = isolated_harness("root").await;
-        client
-            .commands
-            .send(Command::SubmitRootInput {
-                text: "after check".into(),
-            })
-            .await
-            .unwrap();
-        let preflight = initialize_peer(&mut peer).await;
-        // Main connection cannot satisfy the auxiliary request, even with matching numeric IDs.
-        send(&mut main, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), next(&mut main))
-                .await
-                .is_err()
-        );
-        assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        send(&mut peer, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
-        let skills = next(&mut main).await;
-        assert_eq!(skills["method"], "skills/list");
-        send(&mut main, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
-        let turn = next(&mut main).await;
-        assert_eq!(turn["method"], "turn/start");
-        assert_eq!(turn["params"]["threadId"], "root");
-        let mut line = String::new();
-        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
-        client.commands.send(Command::Quit).await.unwrap();
-        assert!(client.join.await.unwrap().cleanup_error.is_none());
-    }
-
-    #[tokio::test]
-    async fn incompatible_main_thread_cannot_launch_isolated_preflight() {
-        let (client, _main, mut peer) = isolated_harness(" ").await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), next(&mut peer))
-                .await
-                .is_err()
-        );
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_isolated_initialize_cannot_execute_shell_or_dispatch_model() {
-        let (mut client, _main, mut peer) = isolated_harness("root").await;
-        let initialize = next(&mut peer).await;
-        send(
-            &mut peer,
-            json!({"id":initialize["id"],"result":{"userAgent":"PRIVATE_METADATA"}}),
-        )
-        .await;
-        phase(&mut client, SessionPhase::Failed).await;
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        assert!(!client
-            .snapshots
-            .borrow()
-            .last_error
-            .as_deref()
-            .unwrap()
-            .contains("PRIVATE_"));
-        let mut line = String::new();
-        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn isolated_preflight_timeout_remains_unknown_and_cannot_retry_queued_task() {
-        let (mut client, mut main, mut peer) = isolated_harness("root").await;
-        client
-            .commands
-            .send(Command::SubmitRootInput {
-                text: "must remain queued".into(),
-            })
-            .await
-            .unwrap();
-        initialize_peer(&mut peer).await;
-        tokio::time::advance(crate::shell_check::DEADLINE + Duration::from_secs(1)).await;
-        phase(&mut client, SessionPhase::Unknown).await;
-        {
-            let snapshot = client.snapshots.borrow();
-            let error = snapshot.last_error.as_deref().unwrap();
-            assert!(error.contains("Shell preflight timed out"), "{error}");
-            if cfg!(windows) {
-                assert!(error.contains("--windows-sandbox unelevated"), "{error}");
-            }
-            assert_eq!(snapshot.notice, None);
-        }
-        let report = client.join.await.unwrap();
-        assert!(report.cleanup_error.is_none());
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        let mut line = String::new();
-        assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
-        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn isolated_preflight_uncertain_responses_cannot_dispatch_or_reveal_private_text() {
-        for response in [
-            json!({"id":999,"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}}),
-            json!({"id":2,"error":{"code":-1,"message":"PRIVATE_ERROR"}}),
-            json!({"id":2,"result":{"exitCode":0}}),
-            json!({"id":2,"result":{"exitCode":"PRIVATE_CODE","stdout":"native-agent-tui-shell-ok"}}),
-            json!({"id":"PRIVATE_REQUEST","method":"PRIVATE_INTERACTION","params":{}}),
-        ] {
-            let (mut client, mut main, mut peer) = isolated_harness("root").await;
-            client
-                .commands
-                .send(Command::SubmitRootInput {
-                    text: "PRIVATE_TASK".into(),
-                })
-                .await
-                .unwrap();
-            initialize_peer(&mut peer).await;
-            send(&mut peer, response).await;
-            phase(&mut client, SessionPhase::Unknown).await;
-            assert!(client.join.await.unwrap().cleanup_error.is_none());
-            assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-            assert!(!client
-                .snapshots
-                .borrow()
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("PRIVATE_"));
-            let mut line = String::new();
-            assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn isolated_preflight_eof_preserves_unknown_shell_outcome() {
-        let (mut client, mut main, mut peer) = isolated_harness("root").await;
-        initialize_peer(&mut peer).await;
-        drop(peer);
-        phase(&mut client, SessionPhase::Unknown).await;
-        assert!(client.join.await.unwrap().cleanup_error.is_none());
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        let mut line = String::new();
-        assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn isolated_preflight_success_cannot_release_tasks_after_cleanup_crosses_deadline() {
-        let (confirmation, cleanup) = tokio::sync::oneshot::channel();
-        let (mut client, mut main, mut peer) =
-            isolated_harness_with_cleanup("root", Some(cleanup)).await;
-        let request = initialize_peer(&mut peer).await;
-        send(&mut peer, json!({"id":request["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
-        // EOF confirms the worker has consumed success and entered its cleanup stage.
-        let mut line = String::new();
-        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
-        assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
-        tokio::time::advance(crate::shell_check::DEADLINE + Duration::from_secs(1)).await;
-        confirmation.send(true).unwrap();
-        phase(&mut client, SessionPhase::Unknown).await;
-        let report = client.join.await.unwrap();
-        assert!(report.cleanup_error.is_none());
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        assert_eq!(main.read_line(&mut line).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn quitting_during_isolated_preflight_joins_its_cancelled_owner() {
-        let (client, _main, mut peer) = isolated_harness("root").await;
-        initialize_peer(&mut peer).await;
-        client.commands.send(Command::Quit).await.unwrap();
-        let report = tokio::time::timeout(Duration::from_secs(2), client.join)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(report.cleanup_error.is_none());
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        let mut line = String::new();
-        assert_eq!(peer.read_line(&mut line).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn isolated_preflight_cannot_become_ready_before_cleanup_or_after_uncertain_cleanup() {
-        let (confirmation, cleanup) = tokio::sync::oneshot::channel();
-        let (mut client, mut main, mut peer) =
-            isolated_harness_with_cleanup("root", Some(cleanup)).await;
-        client
-            .commands
-            .send(Command::SubmitRootInput {
-                text: "must remain blocked".into(),
-            })
-            .await
-            .unwrap();
-        let request = initialize_peer(&mut peer).await;
-        send(&mut peer,json!({"id":request["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), next(&mut main))
-                .await
-                .is_err()
-        );
-        assert_eq!(client.snapshots.borrow().phase, SessionPhase::CheckingShell);
-        confirmation.send(false).unwrap();
-        phase(&mut client, SessionPhase::Unknown).await;
-        let report = client.join.await.unwrap();
-        assert!(report.cleanup_error.is_some());
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-    }
     async fn next(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(3), server.read_line(&mut line))
@@ -7396,116 +6388,28 @@ mod tests {
             .await
             .unwrap();
     }
+    /// Answers the first skills inventory the way a backend without one does.
+    async fn skip_skills(server: &mut BufReader<tokio::io::DuplexStream>) {
+        let skills = next(server).await;
+        assert_eq!(skills["method"], "skills/list");
+        send(
+            server,
+            json!({"id":skills["id"],"error":{"code":-32601,"message":"skills/list is unavailable"}}),
+        )
+        .await;
+    }
+
+    /// Brings a client to Ready and answers its first skills inventory.
     async fn ready(server: &mut BufReader<tokio::io::DuplexStream>) {
-        let preflight = initialized(server).await;
-        send(server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok","stderr":""}})).await;
+        initialized(server).await;
         let skills = next(server).await;
         assert_eq!(skills["method"], "skills/list");
         send(server, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
     }
 
     #[tokio::test]
-    async fn codex_model_list_is_on_demand_and_a_selection_rides_the_next_turn_start() {
-        use crate::models::{ModelOption, ModelsAvailability};
-
-        let (mut client, mut server) = harness().await;
-        ready(&mut server).await;
-        phase(&mut client, SessionPhase::Ready).await;
-        client.commands.send(Command::ListModels).await.unwrap();
-        let list = next(&mut server).await;
-        assert_eq!(list["method"], "model/list");
-        send(
-            &mut server,
-            json!({"id":list["id"],"error":{"code":-32601,"message":"PRIVATE_DETAIL"}}),
-        )
-        .await;
-        client
-            .snapshots
-            .wait_for(|s| s.models.availability == ModelsAvailability::Unsupported)
-            .await
-            .unwrap();
-        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
-
-        client.commands.send(Command::ListModels).await.unwrap();
-        let list = next(&mut server).await;
-        send(
-            &mut server,
-            json!({"id":list["id"],"result":{"data":[
-                {"id":"a","model":"model-a","displayName":"Model A"},
-                {"id":"b","model":"model-b","displayName":"Model B"}
-            ],"nextCursor":null}}),
-        )
-        .await;
-        client
-            .snapshots
-            .wait_for(|s| s.models.availability == ModelsAvailability::Available)
-            .await
-            .unwrap();
-        assert_eq!(
-            client.snapshots.borrow().models.options[1],
-            ModelOption {
-                id: "model-b".into(),
-                name: "Model B".into()
-            }
-        );
-
-        client
-            .commands
-            .send(Command::SelectModel {
-                model: " model-b ".into(),
-            })
-            .await
-            .unwrap();
-        client
-            .snapshots
-            .wait_for(|s| s.model.as_deref() == Some("model-b"))
-            .await
-            .unwrap();
-        client
-            .commands
-            .send(Command::SubmitRootInput {
-                text: "hello".into(),
-            })
-            .await
-            .unwrap();
-        let start = next(&mut server).await;
-        assert_eq!(start["method"], "turn/start");
-        assert_eq!(start["params"]["model"], "model-b");
-        send(
-            &mut server,
-            json!({"id":start["id"],"result":{"turn":{"id":"turn-1"}}}),
-        )
-        .await;
-        phase(&mut client, SessionPhase::Running).await;
-        // 运行中的轮次不接受切换；已知模型保持不变。
-        client
-            .commands
-            .send(Command::SelectModel {
-                model: "model-a".into(),
-            })
-            .await
-            .unwrap();
-        client
-            .snapshots
-            .wait_for(|s| {
-                s.notice
-                    .as_deref()
-                    .is_some_and(|notice| notice.contains("no turn is running"))
-            })
-            .await
-            .unwrap();
-        assert_eq!(client.snapshots.borrow().model.as_deref(), Some("model-b"));
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn acp_model_switch_is_confirmed_before_the_next_turn_starts() {
-        let (mut client, mut server) = harness_with_config(Config {
-            backend: crate::backend::BackendKind::DeepSeekAcp,
-            ..Default::default()
-        })
-        .await;
+    async fn model_switch_is_confirmed_before_the_next_turn_starts() {
+        let (mut client, mut server) = harness_with_config(Config::default()).await;
         let request = next(&mut server).await;
         assert_eq!(request["method"], "initialize");
         send(&mut server, json!({"id":request["id"],"result":{}})).await;
@@ -7518,6 +6422,7 @@ mod tests {
         )
         .await;
         phase(&mut client, SessionPhase::Ready).await;
+        skip_skills(&mut server).await;
 
         let select = |model: &str| Command::SelectModel {
             model: model.into(),
@@ -7586,7 +6491,6 @@ mod tests {
             std::env::temp_dir().join(format!("native-agent-tui-resume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let config = || Config {
-            backend: crate::backend::BackendKind::DeepSeekAcp,
             journal: crate::journal::JournalSettings {
                 root: Some(root.clone()),
                 ..Default::default()
@@ -7609,6 +6513,7 @@ mod tests {
             )
             .await;
             phase(&mut client, SessionPhase::Ready).await;
+            skip_skills(&mut server).await;
             (client, server)
         }
         let submit = |text: &str| Command::SubmitRootInput { text: text.into() };
@@ -7726,12 +6631,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_reload_holds_new_turns_until_confirmed_and_then_refreshes_the_model_list() {
-        let (mut client, mut server) = harness_with_config(Config {
-            backend: crate::backend::BackendKind::DeepSeekAcp,
-            ..Default::default()
-        })
-        .await;
+    async fn reload_holds_new_turns_until_confirmed_and_then_refreshes_the_model_list() {
+        let (mut client, mut server) = harness_with_config(Config::default()).await;
         let request = next(&mut server).await;
         send(&mut server, json!({"id":request["id"],"result":{}})).await;
         assert_eq!(next(&mut server).await["method"], "initialized");
@@ -7742,6 +6643,7 @@ mod tests {
         )
         .await;
         phase(&mut client, SessionPhase::Ready).await;
+        skip_skills(&mut server).await;
 
         client.commands.send(Command::ReloadBackend).await.unwrap();
         let reload = next(&mut server).await;
@@ -7794,12 +6696,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reload_that_never_started_leaves_the_session_usable_and_codex_is_not_reloaded() {
-        let (mut client, mut server) = harness_with_config(Config {
-            backend: crate::backend::BackendKind::DeepSeekAcp,
-            ..Default::default()
-        })
-        .await;
+    async fn a_reload_that_never_started_and_an_unlaunched_session_change_nothing() {
+        let (mut client, mut server) = harness_with_config(Config::default()).await;
         let request = next(&mut server).await;
         send(&mut server, json!({"id":request["id"],"result":{}})).await;
         assert_eq!(next(&mut server).await["method"], "initialized");
@@ -7810,6 +6708,7 @@ mod tests {
         )
         .await;
         phase(&mut client, SessionPhase::Ready).await;
+        skip_skills(&mut server).await;
         client.commands.send(Command::ReloadBackend).await.unwrap();
         let reload = next(&mut server).await;
         send(
@@ -7828,58 +6727,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
-
-        let (mut client, mut server) = harness().await;
-        ready(&mut server).await;
-        phase(&mut client, SessionPhase::Ready).await;
-        // 测试只对 dsh 开放；没有在跑的测试时，迟到的结果被忽略。
+        // 没有真正启动的会话不会为测试另起进程；迟到的结果也不会改写这个结论。
         client
             .commands
             .send(Command::TestModel {
-                model: "gpt-6-luna".into(),
+                model: "hi/luna".into(),
             })
             .await
             .unwrap();
+        let refused = crate::models::ModelTest::Failed {
+            model: "hi/luna".into(),
+            message: "this session cannot start a test process".into(),
+        };
         client
             .snapshots
-            .wait_for(|s| {
-                s.models.test
-                    == crate::models::ModelTest::Failed {
-                        model: "gpt-6-luna".into(),
-                        message: "only the dsh backend can test a model".into(),
-                    }
-            })
+            .wait_for(|s| s.models.test == refused)
             .await
             .unwrap();
         client
             .commands
             .send(Command::ModelTestFinished {
-                model: "gpt-6-luna".into(),
+                model: "hi/luna".into(),
                 outcome: Ok(5),
             })
             .await
             .unwrap();
-        client.commands.send(Command::ReloadBackend).await.unwrap();
-        client
-            .snapshots
-            .wait_for(|s| {
-                s.notice
-                    .as_deref()
-                    .is_some_and(|notice| notice.contains("only the dsh backend"))
-            })
-            .await
-            .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            client.snapshots.borrow().models.test,
-            crate::models::ModelTest::Failed { .. }
-        ));
+        client.commands.send(Command::ListModels).await.unwrap();
+        assert_eq!(next(&mut server).await["method"], "model/list");
+        assert_eq!(client.snapshots.borrow().models.test, refused);
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }
@@ -8259,8 +7134,7 @@ mod tests {
     #[tokio::test]
     async fn unanswered_initial_skills_query_does_not_block_root_start_or_quit() {
         let (mut client, mut server) = harness().await;
-        let preflight = initialized(&mut server).await;
-        send(&mut server, json!({"id":preflight["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
+        initialized(&mut server).await;
         phase(&mut client, SessionPhase::Ready).await;
         let skills = next(&mut server).await;
         assert_eq!(skills["method"], "skills/list");
@@ -8355,26 +7229,19 @@ mod tests {
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }
-    async fn initialized(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+    /// Answers the handshake and the new session; the client is Ready afterwards.
+    async fn initialized(server: &mut BufReader<tokio::io::DuplexStream>) {
         let init = next(server).await;
         assert_eq!(init["method"], "initialize");
-        let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.161.0/initialize.json"
-        ))
-        .unwrap();
-        response["id"] = init["id"].clone();
-        send(server, response).await;
+        send(server, json!({"id":init["id"],"result":{}})).await;
         assert_eq!(next(server).await["method"], "initialized");
         let thread = next(server).await;
         assert_eq!(thread["method"], "thread/start");
         send(
             server,
-            json!({"id":thread["id"],"result":{"thread":{"id":"root","cliVersion":"0.161.0"},"model":"test-model"}}),
+            json!({"id":thread["id"],"result":{"thread":{"id":"root"},"model":"test-model"}}),
         )
         .await;
-        let preflight = next(server).await;
-        assert_eq!(preflight["method"], "command/exec");
-        preflight
     }
     async fn phase(client: &mut ClientHandle, expected: SessionPhase) {
         tokio::time::timeout(
@@ -8387,109 +7254,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_startup_transcript_reaches_ready_with_zero_model_turns() {
-        let (mut client, mut server) = harness().await;
-        let records: Vec<Value> = include_str!("../tests/fixtures/codex-0.161.0/startup.jsonl")
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        for (method, response) in ["initialize", "thread/start", "command/exec"]
-            .into_iter()
-            .zip(records)
-        {
-            let request = next(&mut server).await;
-            assert_eq!(request["method"], method);
-            assert_eq!(request["id"], response["id"]);
-            send(&mut server, response).await;
-            if method == "initialize" {
-                assert_eq!(next(&mut server).await["method"], "initialized");
-            }
-        }
-        phase(&mut client, SessionPhase::Ready).await;
-        assert_eq!(client.snapshots.borrow().root_turn_count, 0);
-        assert_eq!(client.snapshots.borrow().root_start_requests, 0);
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_initialize_cannot_start_a_thread_preflight_or_queued_task() {
-        for result in [
-            json!({}),
-            json!({"userAgent":"PRIVATE_METADATA"}),
-            Value::Null,
-        ] {
-            let (mut client, mut server) = harness().await;
-            let request = next(&mut server).await;
-            client
-                .commands
-                .send(Command::SubmitRootInput {
-                    text: "PRIVATE_PROMPT".into(),
-                })
-                .await
-                .unwrap();
-            send(&mut server, json!({"id":request["id"],"result":result})).await;
-            phase(&mut client, SessionPhase::Failed).await;
-            client
-                .commands
-                .send(Command::SubmitRootInput {
-                    text: "PRIVATE_RETRY".into(),
-                })
-                .await
-                .unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), next(&mut server))
-                    .await
-                    .is_err()
-            );
-            let snapshot = client.snapshots.borrow();
-            assert_eq!(snapshot.root_start_requests, 0);
-            assert_eq!(snapshot.root_turn_count, 0);
-            assert!(snapshot.thread_id.is_none());
-            assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
-            drop(snapshot);
-            client.commands.send(Command::Quit).await.unwrap();
-            client.join.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn without_the_startup_shell_check_a_new_thread_is_ready_and_no_command_runs() {
-        let (mut client, mut server) = harness_with_config(Config {
-            startup_shell_check: false,
-            ..Default::default()
-        })
-        .await;
-        let request = next(&mut server).await;
-        let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.161.0/initialize.json"
-        ))
-        .unwrap();
-        response["id"] = request["id"].clone();
-        send(&mut server, response).await;
-        assert_eq!(next(&mut server).await["method"], "initialized");
-        let request = next(&mut server).await;
-        assert_eq!(request["method"], "thread/start");
-        send(
-            &mut server,
-            json!({"id":request["id"],"result":{"thread":{"id":"root"},"model":"test-model"}}),
-        )
-        .await;
-        phase(&mut client, SessionPhase::Ready).await;
-        assert_eq!(next(&mut server).await["method"], "skills/list");
-        assert!(!client.snapshots.borrow().startup_blocked);
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_new_thread_without_identity_cannot_start_preflight_or_a_model_turn() {
+    async fn a_new_thread_without_identity_cannot_start_a_model_turn() {
         let (mut client, mut server) = harness().await;
         let request = next(&mut server).await;
-        let mut response: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/codex-0.161.0/initialize.json"
-        ))
-        .unwrap();
+        let mut response: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/protocol/initialize.json"))
+                .unwrap();
         response["id"] = request["id"].clone();
         send(&mut server, response).await;
         assert_eq!(next(&mut server).await["method"], "initialized");
@@ -8634,7 +7404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_is_visible_and_preflight_never_starts_a_model_turn() {
+    async fn disconnect_is_visible_and_never_starts_a_model_turn() {
         let (mut client, mut server) = harness().await;
         ready(&mut server).await;
         phase(&mut client, SessionPhase::Ready).await;
@@ -8645,12 +7415,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_preflight_cannot_be_bypassed_by_submitting_a_task() {
+    async fn a_session_that_failed_to_start_cannot_be_bypassed_by_submitting_a_task() {
         let (mut client, mut server) = harness().await;
-        let preflight = initialized(&mut server).await;
+        let init = next(&mut server).await;
+        send(&mut server, json!({"id":init["id"],"result":{}})).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let thread = next(&mut server).await;
+        assert_eq!(thread["method"], "thread/start");
         send(
             &mut server,
-            json!({"id":preflight["id"],"result":{"exitCode":1,"stdout":"","stderr":""}}),
+            json!({"id":thread["id"],"error":{"code":-32602,"message":"the profile has no model route"}}),
         )
         .await;
         phase(&mut client, SessionPhase::Failed).await;

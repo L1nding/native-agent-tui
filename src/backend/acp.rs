@@ -172,7 +172,7 @@ type Respawn = Box<dyn FnMut() -> std::io::Result<(PipeTransport, Option<Replace
 pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
     let (process_pipe, child, stderr) = launch(config)?;
 
-    // The Core sees the same bounded JSONL transport it uses for Codex. A
+    // The Core sees the same bounded JSONL transport it always used. A
     // duplex pair keeps ACP translation out of Core and preserves writer
     // ownership, queue limits, and EOF semantics at both boundaries.
     let (core_io, bridge_io) = tokio::io::duplex(64 * 1024);

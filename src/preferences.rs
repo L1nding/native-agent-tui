@@ -50,7 +50,7 @@ impl Setting {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
-    /// Last selected model per backend name (`codex`, `deepseek-acp`).
+    /// Last selected model per backend name (`deepseek-acp`).
     #[serde(default)]
     models: BTreeMap<String, String>,
     /// `Setting::key` to one of `Setting::values`.
@@ -211,11 +211,11 @@ mod tests {
         assert_eq!(Preferences::load(&path), Preferences::default());
 
         save_model(&path, "deepseek-acp", "hi/gpt-6-luna").unwrap();
-        save_model(&path, "codex", "gpt-6.1-sol").unwrap();
+        save_model(&path, "another-backend", "gpt-6.1-sol").unwrap();
         save_model(&path, "deepseek-acp", "hi/gpt-6.1-sol").unwrap();
         let loaded = Preferences::load(&path);
         assert_eq!(loaded.model("deepseek-acp"), Some("hi/gpt-6.1-sol"));
-        assert_eq!(loaded.model("codex"), Some("gpt-6.1-sol"));
+        assert_eq!(loaded.model("another-backend"), Some("gpt-6.1-sol"));
         assert_eq!(loaded.model("other"), None);
 
         save_setting(&path, Setting::Theme, "light").unwrap();
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(loaded.attention("Model"), Some((1000, 2000)));
         assert_eq!(loaded.attention("Tool"), None);
         // 写设置不能丢掉已保存的模型。
-        assert_eq!(loaded.model("codex"), Some("gpt-6.1-sol"));
+        assert_eq!(loaded.model("another-backend"), Some("gpt-6.1-sol"));
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -238,15 +238,15 @@ mod tests {
 
         for bad in [
             "not json".to_owned(),
-            r#"{"models":{"codex":" "}}"#.to_owned(),
+            r#"{"models":{"another-backend":" "}}"#.to_owned(),
             format!(
-                r#"{{"models":{{"codex":"{}"}}}}"#,
+                r#"{{"models":{{"another-backend":"{}"}}}}"#,
                 "x".repeat(MAX_MODEL_BYTES + 1)
             ),
             " ".repeat(MAX_BYTES as usize + 1),
         ] {
             std::fs::write(&path, bad).unwrap();
-            assert_eq!(Preferences::load(&path).model("codex"), None);
+            assert_eq!(Preferences::load(&path).model("another-backend"), None);
         }
         // 默认位置在用户目录的 .zf 下；显式指定数据目录时没有旧位置可迁移。
         if let Some(default) = super::path(&JournalSettings::default()) {
@@ -261,14 +261,20 @@ mod tests {
         let legacy = root.join("old").join(FILE);
         let moved = root.join("new").join(".zf").join(FILE);
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        save_model(&legacy, "codex", "from-old").unwrap();
+        save_model(&legacy, "another-backend", "from-old").unwrap();
         move_legacy(&legacy, &moved);
         assert!(!legacy.exists());
-        assert_eq!(Preferences::load(&moved).model("codex"), Some("from-old"));
-        save_model(&legacy, "codex", "stale").unwrap();
+        assert_eq!(
+            Preferences::load(&moved).model("another-backend"),
+            Some("from-old")
+        );
+        save_model(&legacy, "another-backend", "stale").unwrap();
         move_legacy(&legacy, &moved);
         assert!(legacy.exists());
-        assert_eq!(Preferences::load(&moved).model("codex"), Some("from-old"));
+        assert_eq!(
+            Preferences::load(&moved).model("another-backend"),
+            Some("from-old")
+        );
         move_legacy(
             &root.join("absent").join(FILE),
             &root.join("untouched").join(FILE),

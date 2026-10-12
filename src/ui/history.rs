@@ -574,7 +574,7 @@ impl HistoryPanel {
             )
         } else {
             vec![Line::from(Span::styled(
-                tr("Offline | no Codex execution", "离线 | 没有 Codex 执行"),
+                tr("Offline | no execution", "离线 | 不执行任何操作"),
                 theme.secondary(),
             ))]
         });

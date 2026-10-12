@@ -149,7 +149,7 @@ impl Fixture {
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .arg("--journal-dir")
             .arg(&self.0)
-            .arg("--codex")
+            .arg("--dsh")
             .arg(self.0.join("must-never-execute"))
             .args(args)
             .output()
@@ -191,7 +191,7 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
-async fn export_cli_previews_and_saves_retained_unknown_state_without_starting_codex() {
+async fn export_cli_previews_and_saves_retained_unknown_state_without_starting_the_backend() {
     let fixture = Fixture::new();
     let destination = Fixture::new();
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -371,7 +371,7 @@ async fn replay_cli_never_executes_or_writes_and_keeps_read_success_separate_fro
 }
 
 #[tokio::test]
-async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_codex() {
+async fn recovery_cli_reports_task_classes_and_never_writes_or_launches_the_backend() {
     let fixture = Fixture::new();
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut active = snapshot_with_task_states(

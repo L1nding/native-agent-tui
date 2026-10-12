@@ -40,7 +40,7 @@ Preserve thread, turn, item, request, and generation identities across async wor
 Use Tokio duplex streams for protocol ordering, `ClientHandle` for lifecycle
 behavior, and Ratatui `TestBackend` for rendering. Windows cleanup tests launch
 owned hidden processes. Name tests after observable behavior, such as
-`failed_preflight_cannot_be_bypassed_by_submitting_a_task`. Cover changed lifecycle
+`a_session_that_failed_to_start_cannot_be_bypassed_by_submitting_a_task`. Cover changed lifecycle
 paths and uncertain outcomes; no numerical coverage threshold is configured.
 
 ## Commit & Pull Request Guidelines
@@ -51,7 +51,7 @@ list validation results, and include terminal captures for visible UI changes.
 
 ## Configuration
 
-Select Codex through `--codex` or `CODEX_BIN`. On Windows,
-`--windows-sandbox unelevated` explicitly overrides the sandbox implementation;
-`--sandbox` still selects execution policy. Keep credentials and private answers
-out of logs and screenshots.
+Select the dsh launcher through `--dsh` or `DSH_BIN` and the profile through
+`--profile` (default `zf-tui`, which must have the `dsh-plugin` bridge
+installed). Providers, models and credentials are dsh configuration. Keep
+credentials and private answers out of logs and screenshots.

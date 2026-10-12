@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--toolchain", help="Installed rustup toolchain, for example 1.96.0")
     parser.add_argument("--cargo-test", action="store_true", help="Use cargo test even when nextest is installed")
     parser.add_argument("--fixtures-only", action="store_true", help="Use existing release binaries; skip Rust checks/build")
-    parser.add_argument("--live", action="store_true", help="Also run ignored tests requiring the supported local Codex")
+    parser.add_argument("--live", action="store_true", help="Also run ignored tests requiring a local dsh installation")
     args = parser.parse_args()
     cargo = ["cargo"] + ([f"+{args.toolchain}"] if args.toolchain else [])
     binary = REPO / "target/release" / ("native-agent-tui.exe" if os.name == "nt" else "native-agent-tui")
@@ -47,20 +47,13 @@ def main():
     if not binary.is_file() or not fixture.is_file():
         parser.error("release binaries are missing; run without --fixtures-only to build them")
     fixtures = REPO / "tests/fixtures"
-    run([sys.executable, str(REPO / "scripts/check_protocol_schema.py")])
-    run([sys.executable, str(fixtures / "startup_verifier_check.py")])
-    run([sys.executable, str(fixtures / "compatibility_cli_check.py"), "--binary", str(binary)])
     for script in ["history_cli_check.py", "journal_replay_check.py"]:
         run([sys.executable, str(fixtures / script), "--fixture", str(fixture), "--binary", str(binary)])
     # Keep JSONL as bytes; shell pipelines can recode text and hide the producer exit code.
     generated = run([str(fixture)], stdout=subprocess.PIPE)
     run([sys.executable, str(fixtures / "observation_consumer.py")], input=generated.stdout)
-    run([sys.executable, str(fixtures / "live_jsonl_check.py"), "--binary", str(binary)])
     if os.name == "nt":
         run([sys.executable, str(fixtures / "windows_terminal_input_check.py"), "--fixture", str(binary.parent / "examples/input_fixture.exe")])
-        run([sys.executable, str(fixtures / "timeline_tui_check.py"), "--binary", str(binary)])
-        run([sys.executable, str(fixtures / "timeline_tui_check.py"), "--binary", str(binary), "--tool-details"])
-        run([sys.executable, str(fixtures / "workflow_tui_check.py"), "--binary", str(binary)])
         run([sys.executable, str(fixtures / "process_identity_check.py")])
         run([sys.executable, str(fixtures / "process_ownership_check.py"), "--fixture", str(binary.parent / "examples/process_fixture.exe")])
     if args.live:

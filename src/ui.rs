@@ -3143,8 +3143,8 @@ mod tests {
             phase: SessionPhase::Failed,
             thread_id: Some("root".into()),
             startup_blocked: true,
-            last_error: Some("shell preflight failed with exit code 1".into()),
-            notice: Some("Shell preflight has not passed".into()),
+            last_error: Some("the profile has no model route".into()),
+            notice: Some("The session has not started".into()),
             ..CoreSnapshot::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -3162,8 +3162,8 @@ mod tests {
         };
         let mut local = LocalState::default();
         let rendered = render(&mut terminal, &local);
-        assert!(rendered.contains("exit code 1"), "{rendered}");
-        assert!(rendered.contains("has not passed"), "{rendered}");
+        assert!(rendered.contains("no model route"), "{rendered}");
+        assert!(rendered.contains("has not started"), "{rendered}");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         local.editor.insert("保留的任务");
@@ -3176,7 +3176,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(local.editor.text, "保留的任务");
         let rendered = render(&mut terminal, &local);
-        assert!(rendered.contains("exit code 1"), "{rendered}");
+        assert!(rendered.contains("no model route"), "{rendered}");
         assert!(rendered.contains("cannot run tasks"), "{rendered}");
     }
 
@@ -3230,7 +3230,9 @@ mod tests {
     fn unusable_session_keeps_draft_and_shows_failure_reason() {
         let snapshot = CoreSnapshot {
             phase: SessionPhase::Unknown,
-            last_error: Some("Shell preflight timed out; no model turn was started.".into()),
+            last_error: Some(
+                "dsh thread/start response timed out; no model turn was started.".into(),
+            ),
             ..CoreSnapshot::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -3260,7 +3262,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(rendered.contains("Shell preflight timed out"), "{rendered}");
+        assert!(rendered.contains("response timed out"), "{rendered}");
         assert!(rendered.contains("Ctrl+Q"), "{rendered}");
     }
 

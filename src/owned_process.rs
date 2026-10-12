@@ -23,23 +23,13 @@ impl Command {
         self.0.current_dir(directory);
         self
     }
-
-    #[cfg(all(test, windows))]
-    pub(crate) fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
-        self.0.env(key, value);
-        self
-    }
-
-    #[cfg(all(test, windows))]
-    pub(crate) fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
-        self.0.env_remove(key);
-        self
-    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum Input {
     Pipe,
+    // Used by the standalone native fixture, which includes this module.
+    #[allow(dead_code)]
     Null,
 }
 

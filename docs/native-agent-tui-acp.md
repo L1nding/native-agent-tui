@@ -1,16 +1,16 @@
 # DeepSeek Harness ACP backend
 
-The ACP backend `deepseek-acp` is the CLI default since 2026-10-12. Codex is
-selected with `--backend codex`; naming an executable with `--codex PATH` or
-running `--check-shell` also selects Codex unless `--backend` is given. Codex
-is no longer pinned to one release.
+dsh is the only backend since 2026-10-12; the Codex backend was removed. The
+process is `dsh --profile zf-tui`, where the `zf-tui-bridge` plugin from
+`dsh-plugin/` answers `zf/*` methods and forwards every other frame to dsh's
+own ACP server.
 
 ## Process boundary
 
 The ACP process is started as:
 
 ```text
-dsh --profile acp
+dsh --profile zf-tui
 ```
 
 `--dsh PATH` and `--profile NAME` override the executable and profile. ACP
@@ -30,7 +30,7 @@ The bridge maps `initialize`, `session/new`, `session/prompt`,
 assistant, reasoning, tool, usage, approval, and terminal facts. In-progress
 tool updates stay open; only ACP terminal tool statuses become completed,
 failed, or cancelled facts. ACP-only fields that do not have a Core equivalent
-stay unavailable; the bridge never fabricates Codex child or model metadata.
+stay unavailable; the bridge never fabricates child or model metadata.
 
 `Config::mcp_servers` is a typed seam for ACP stdio and HTTP MCP definitions.
 It is encoded at the protocol edge, so future configuration loading does not
@@ -88,5 +88,5 @@ The bridge lifecycle and permission mapping are covered by a duplex fake ACP
 server test. A Windows smoke check with the installed Harness is:
 
 ```text
-cargo run -- --backend deepseek-acp --check-shell
+cargo run -- --run "Reply with exactly READY" --model PROVIDER/MODEL
 ```
