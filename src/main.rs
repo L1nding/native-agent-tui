@@ -29,6 +29,7 @@ Quick start:
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]
   native-agent-tui --run TASK [--json-events] [OPTIONS]
+  native-agent-tui --modeling MODELER_REPO [--target "建模八层"] [--modeling-project RELATIVE_PATH]
   native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
   native-agent-tui --recovery SESSION_ID [OPTIONS]
@@ -121,6 +122,24 @@ async fn execute() -> Result<(), (u8, String)> {
             },
         )
     })? {
+        CliCommand::Modeling {
+            repository,
+            project,
+            target,
+        } => {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return Err((2, "建模模式需要交互式终端".into()));
+            }
+            ui::run_modeling(
+                native_agent_tui::modeling::Options {
+                    repository,
+                    project,
+                },
+                target,
+            )
+            .await
+            .map_err(|error| (1, error.to_string()))?;
+        }
         CliCommand::Help => print_help(),
         CliCommand::Version => println!("native-agent-tui {}", env!("CARGO_PKG_VERSION")),
         CliCommand::History { session, config } => {

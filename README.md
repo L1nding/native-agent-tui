@@ -9,7 +9,6 @@ native-agent-tui (Rust) ──stdio JSON-RPC──> dsh --profile zf-tui ──>
 ```
 
 ## Run
-
 Install Rust and dsh, then install the bridge plugin from this repository into a dsh profile named `zf-tui` (see [dsh-plugin/README.md](dsh-plugin/README.md)):
 
 ```text
@@ -31,6 +30,18 @@ cargo run --locked -- --help
 The TUI requires an interactive terminal. `--run` prints streamed agent text and returns a nonzero exit code for failure, interruption, or an uncertain result. Headless runs decline approvals and interrupt when user input is required.
 
 A session is ready once dsh confirms it; nothing is executed at startup. Command execution and its isolation belong to dsh: a session runs under one of dsh's **permission presets** (a sandbox mode bundled with an approval policy, for example `read-only`, `workspace-write`, `danger-full-access`). `--permission PRESET` selects one for a run. The session is not ready, and no task starts, until dsh confirms exactly that preset; an unknown preset or a refusal ends the run with an error.
+
+## 建模模式
+
+建模模式是过渡入口，与默认的 dsh/ACP 通用模式分别启动。Python 建模器负责阶段推进、模型调用、Scene IR 写入和产物验证；Rust 建模 owner 管理子进程与有序事件，界面展示状态并提交操作。
+
+```text
+cargo run --locked -- --modeling D:\project\blender-agent-modeler --target "建模八层"
+```
+
+省略 `--target` 可在界面输入楼层或楼栋目标；`--modeling-project RELATIVE_PATH` 选择建模项目，默认是 `projects/hospital-site`。界面显示阶段进度、AI 摘要、待确认问题、预览以及 GLB、BLEND 和报告产物。`Ctrl+Y` / `Ctrl+N` 回答当前确认，`Ctrl+O` 打开选中产物，`Ctrl+C` 取消建模进程及其子进程。最终复核失败后可按 `F5` 重试，也可输入“复核上次”恢复最近一次复核。
+
+此入口通过 `blender-agent workflow-stdio` 的有界、有序 JSONL 事件获取状态。建模模型仍由建模器的 `config/models.yaml` 配置；普通模式的 `/model` 和 dsh provider 设置尚未接管独立建模模式。当前整合保留这一边界，后续工作流迁移另行实施。整合基线与验证结果见 [建模整合记录](docs/modeling-integration.md)。
 
 ## Controls
 
