@@ -55,6 +55,21 @@ export type TitleResult =
   | { sessionId: string; status: 'fulfilled'; value: { title?: { title: string; updatedAt: number } } }
   | { sessionId: string; status: 'rejected'; reason: unknown }
 
+/** One skill as `ctx.skills.list()` reports it; bodies are not loaded. */
+export interface SkillSummary {
+  name: string
+  description?: string
+  /** Absent for skills a plugin provides without a file. */
+  path?: string
+  source?: string
+  invocation?: { modelInvocable?: boolean; userInvocable?: boolean }
+}
+
+/** `ctx.skills`: the host's skill registry, fed by every installed skill provider. */
+export interface SkillRegistry {
+  list(options?: { cwd?: string }): Promise<readonly SkillSummary[]>
+}
+
 /** `ctx.sessionQuery`: read-only views over live and stored sessions. */
 export interface SessionQuery {
   listSessions(signal?: AbortSignal): Promise<readonly { header: SessionHeader; live: boolean }[]>
@@ -100,6 +115,7 @@ export interface HostContext {
   get(name: 'appExit'): ((code: number) => void) | undefined
   get(name: 'appReady'): AppReady | undefined
   get(name: 'sessionQuery'): SessionQuery | undefined
+  get(name: 'skills'): SkillRegistry | undefined
   get(name: string): unknown
 }
 

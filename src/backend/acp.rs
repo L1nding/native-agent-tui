@@ -229,7 +229,46 @@ enum Pending {
         session: String,
     },
     Prompt,
+    /// The plugin's skill catalog, to be reshaped into the inventory Core reads.
+    Skills {
+        cwd: String,
+    },
     Passthrough,
+}
+
+/// Reshapes the plugin's skill catalog into the single-workspace inventory
+/// Core reads. dsh names where a skill came from; Core groups by who owns it.
+/// A skill without a file gets a `dsh:` locator so it is still listed.
+fn skills_inventory(result: &Value, cwd: &str) -> Value {
+    let Some(listed) = result.get("skills").and_then(Value::as_array) else {
+        // 没有清单字段：交给 Core 按格式错误处理，而不是当成“没有技能”。
+        return json!({});
+    };
+    let skills: Vec<Value> = listed
+        .iter()
+        .filter_map(|skill| {
+            let name = skill.get("name").and_then(Value::as_str)?;
+            let source = skill.get("source").and_then(Value::as_str).unwrap_or("");
+            let scope = if source.starts_with("project") {
+                "repo"
+            } else if source.starts_with("user") {
+                "user"
+            } else {
+                "system"
+            };
+            let invocable = |field: &str| skill.get(field).and_then(Value::as_bool) == Some(true);
+            Some(json!({
+                "name": name,
+                "path": skill
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("dsh:{source}/{name}"), str::to_owned),
+                "scope": scope,
+                "enabled": invocable("modelInvocable") || invocable("userInvocable"),
+            }))
+        })
+        .collect();
+    json!({"data":[{"cwd":cwd,"errors":[],"skills":skills}]})
 }
 
 struct Permission {
@@ -598,11 +637,20 @@ impl AcpBridge {
                 }
             }
             (Some("skills/list"), Some(id)) => {
-                self.core.send(Envelope::error_response(
-                    id,
-                    -32601,
-                    "ACP skills/list is unavailable",
-                ))?;
+                // Core asks for one workspace and matches the answer by this exact text.
+                let cwd = message
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.pointer("/cwds/0"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&self.cwd)
+                    .to_owned();
+                self.acp.send(with_jsonrpc(Envelope::request(
+                    id.clone(),
+                    "zf/skills/list",
+                    Some(json!({"cwd": cwd})),
+                )))?;
+                self.pending.insert(id, Pending::Skills { cwd });
             }
             (Some(acp_protocol::SESSION_CLOSE), Some(id)) => {
                 self.acp.send(with_jsonrpc(message))?;
@@ -890,6 +938,12 @@ impl AcpBridge {
                     Some(_) | None => "failed",
                 };
                 self.finish_prompt(id, status, None)?;
+            }
+            Pending::Skills { cwd } => {
+                self.core.send(Envelope::response(
+                    id,
+                    Some(skills_inventory(&result, &cwd)),
+                ))?;
             }
             Pending::Passthrough => {
                 self.core.send(Envelope::response(id, Some(result)))?;
@@ -1250,6 +1304,92 @@ mod tests {
         assert_eq!(refused.id, Some(RpcId::Number(8)));
         assert!(refused.result.is_none());
         assert_eq!(refused.error.unwrap()["code"], -32603);
+
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skills_come_from_the_plugin_catalog_in_the_inventory_shape_core_reads() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let bridge =
+            tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &Config::default()).run());
+        let cwd = std::path::Path::new("C:/workspace");
+
+        core_client
+            .send(app_server::skills_list(RpcId::Number(4), cwd, false))
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(2), acp_server.recv())
+            .await
+            .expect("bridge did not ask for skills")
+            .unwrap();
+        assert_eq!(request.method.as_deref(), Some("zf/skills/list"));
+        assert_eq!(request.params.unwrap()["cwd"], "C:/workspace");
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(4),
+                Some(json!({"skills":[
+                    {"name":"review","description":"d","source":"project-dsh","path":"C:/workspace/.dsh/skills/review/SKILL.md","modelInvocable":true,"userInvocable":true},
+                    {"name":"mine","source":"user-agents","path":"C:/home/skills/mine/SKILL.md","modelInvocable":false,"userInvocable":true},
+                    {"name":"virtual","source":"bundled","modelInvocable":false,"userInvocable":false},
+                    {"source":"bundled"},
+                ]})),
+            ))
+            .unwrap();
+        let answer = core_client.recv().await.unwrap().result.unwrap();
+        let parsed = crate::skills::parse_result(&answer, "C:/workspace").unwrap();
+        assert_eq!(
+            parsed.availability,
+            crate::skills::SkillAvailability::Available
+        );
+        assert_eq!((parsed.skill_count, parsed.enabled_count), (3, 2));
+        let listed: Vec<(&str, &str, &str, bool)> = parsed
+            .entries
+            .iter()
+            .map(|skill| {
+                (
+                    skill.name.as_str(),
+                    skill.scope.as_str(),
+                    skill.path.as_str(),
+                    skill.enabled,
+                )
+            })
+            .collect();
+        assert!(listed.contains(&(
+            "review",
+            "repo",
+            "C:/workspace/.dsh/skills/review/SKILL.md",
+            true
+        )));
+        assert!(listed.contains(&("mine", "user", "C:/home/skills/mine/SKILL.md", true)));
+        assert!(listed.contains(&("virtual", "system", "dsh:bundled/virtual", false)));
+
+        // 插件没有技能注册表时的拒绝原样到达；缺清单字段的答复不算“没有技能”。
+        core_client
+            .send(app_server::skills_list(RpcId::Number(5), cwd, true))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::error_response(
+                RpcId::Number(5),
+                -32603,
+                "this dsh profile mounts no skill registry",
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().error.unwrap()["code"],
+            -32603
+        );
+        core_client
+            .send(app_server::skills_list(RpcId::Number(6), cwd, true))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(RpcId::Number(6), Some(json!({}))))
+            .unwrap();
+        let malformed = core_client.recv().await.unwrap().result.unwrap();
+        assert!(crate::skills::parse_result(&malformed, "C:/workspace").is_none());
 
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;

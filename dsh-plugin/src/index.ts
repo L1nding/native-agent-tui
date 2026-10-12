@@ -101,6 +101,24 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
     /** Root sessions with dsh's titles, newest first; `cwd` narrows to one workspace. */
     'zf/session/list': (params) => listSessions(ctx, typeof params['cwd'] === 'string' ? params['cwd'] : undefined),
 
+    /** Skills every installed provider offers for one workspace; bodies are not loaded. */
+    'zf/skills/list': async (params) => {
+      const registry = ctx.get('skills')
+      if (registry === undefined) throw new Error('this dsh profile mounts no skill registry')
+      const cwd = typeof params['cwd'] === 'string' ? params['cwd'] : undefined
+      const skills = await registry.list(cwd === undefined ? {} : { cwd })
+      return {
+        skills: skills.map((skill) => ({
+          name: skill.name,
+          description: skill.description ?? '',
+          source: skill.source ?? 'custom',
+          modelInvocable: skill.invocation?.modelInvocable === true,
+          userInvocable: skill.invocation?.userInvocable === true,
+          ...(skill.path === undefined ? {} : { path: skill.path }),
+        })),
+      }
+    },
+
     /** User and assistant text of one session, for showing a resumed conversation. */
     'zf/session/history': (params) => {
       const sessionId = params['sessionId']
