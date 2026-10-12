@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import os
+from types import SimpleNamespace
 from pathlib import Path
 import subprocess
 import tempfile
@@ -27,6 +30,25 @@ class DomainDispatchTest(unittest.TestCase):
             domain.assert_called_once()
             tui.assert_not_called()
             cli.assert_not_called()
+
+    def test_full_domain_cases_refuse_a_nonisolated_fixture_scene(self):
+        path = Path(__file__).with_name("dsh_tui_check.py")
+        spec = importlib.util.spec_from_file_location("dsh_check_isolation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for case in ("chair", "mixed"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                context = root / "context.json"
+                context.write_text(json.dumps({"scene_path": "tests/fixtures/scene.json"}), encoding="utf-8")
+                report = module.Report(root)
+                args = SimpleNamespace(domain_case=case)
+                with patch.dict(os.environ, {"MODELING_COMPLEX_CONTEXT": str(context), "MODELING_COMPLEX_ROOT": str(root)}), \
+                     patch.object(module, "Tui") as tui:
+                    module.domain_checks(report, Path("fake.exe"), [], args, root, root)
+                tui.assert_not_called()
+                self.assertEqual(len(report.failed()), 1)
+                self.assertIn("isolated scene", report.rows[0][0])
 
 
 if __name__ == "__main__":

@@ -141,9 +141,16 @@ class Report:
             if tui is not None:
                 shot = self.evidence / f"failed-{len(self.rows) + 1:02}.txt"
                 shot.write_text(tui.screen(), encoding="utf-8")
+                if "建模 · " in tui.screen():
+                    tui.keys("\x1b[17~", 0.5)
+                    (self.evidence / f"failed-{len(self.rows) + 1:02}-conversation.txt").write_text(tui.screen(), encoding="utf-8")
                 reason += f" (screen: {shot.name})"
             self.rows.append((name, "FAIL", reason, time.monotonic() - started))
         status = self.rows[-1]
+        (self.evidence / "report.json").write_text(json.dumps([
+            {"step": name, "status": verdict, "detail": detail, "seconds": seconds}
+            for name, verdict, detail, seconds in self.rows
+        ], ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[{status[1]}] {name} ({status[3]:.1f}s) {status[2]}".rstrip(), flush=True)
         return status[1] == "PASS"
 
@@ -201,7 +208,10 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed"], help="modeling scenario for --only domain")
     args = parser.parse_args()
+    if args.domain_case and args.only != "domain":
+        parser.error("--domain-case requires --only domain")
     binary = args.binary.resolve()
     repo = Path(__file__).resolve().parents[2]
     root = repo / "target" / ("dsh-e2e-" + uuid.uuid4().hex[:8])
@@ -545,35 +555,105 @@ def domain_checks(report, binary, common, args, workspace, root):
     if not context.is_file():
         report.step("complex fixture context exists", lambda: expect(False, f"missing {context}"))
         return
+    case = args.domain_case or ("chair" if os.environ.get("MODELING_COMPLEX_FULL") == "1" else "scan")
+    if case != "scan":
+        binding = json.loads(context.read_text(encoding="utf-8"))
+        scene = (repository / binding["scene_path"]).resolve()
+        if not scene.is_relative_to((repository / "outputs").resolve()):
+            report.step("full domain scenario uses an isolated scene", lambda: expect(False,
+                        "full domain checks require a copied fixture scene under repository/outputs"))
+            return
     domain_journal = root / "domain-journal"
     domain_journal.mkdir(parents=True, exist_ok=True)
     command = [str(binary), "--cwd", str(repository), "--domain-context", str(context),
                "--model", args.model, "--journal-dir", str(domain_journal),
                "--dsh", args.dsh, "--profile", args.profile]
     tui = Tui(command, repository, report.evidence)
+    mixed = case == "mixed"
+    def finished():
+        screen = tui.wait("domain turn completed", lambda s: any(state in s for state in
+                          (" · Completed · ", " · Failed · ", " · Interrupted · "))
+                          and "A turn is running" not in s, 240)
+        expect(" · Completed · " in screen, "domain turn ended without success")
+        return screen
+    def fact(what, predicate, timeout=300):
+        # The ledger and plan share a scrollable business view. Search its bounded
+        # viewport range instead of assuming a fact is on the first screen.
+        last_move, page = time.monotonic(), 0
+        def visible(screen):
+            nonlocal last_move, page
+            if predicate(screen):
+                return True
+            if " · Failed · " in screen or " · Interrupted · " in screen:
+                raise Failed(f"{what}: domain turn ended without success")
+            if time.monotonic() - last_move >= 1:
+                if page >= 10:
+                    tui.keys("\x1b[5~" * page, 0.1)
+                    page = 0
+                else:
+                    tui.keys("\x1b[6~", 0.1)
+                    page += 1
+                last_move = time.monotonic()
+            return False
+        screen = tui.wait(what, visible, timeout)
+        (root / (what.replace(" ", "-") + ".txt")).write_text(screen, encoding="utf-8")
+        return screen
+    def send(prompt):
+        finished()
+        tui.keys(CTRL_U)
+        tui.type(prompt)
+        tui.keys(ENTER, 0.5)
     try:
-        def run_domain():
+        def scan():
             tui.wait("modeling session ready", lambda s: "建模" in s and "Initializing" not in s, 120)
             tui.type("开始混合楼层建模。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances 分页扫描并展示来源实例对账；保留已有、待新增、疑似重复、待确认和缺能力状态，先不要提交构建方案。")
             tui.keys(ENTER, 0.5)
-            screen = tui.wait("source ledger", lambda s: "来源实例对账" in s or "source_ledger" in s, 180)
+            screen = fact("source ledger", lambda s: "来源实例对账" in s, 180)
             expect("pending_addition" in screen and "suspected_duplicate" in screen,
                    "ledger did not expose expected mixed-floor states")
-            if os.environ.get("MODELING_COMPLEX_FULL") != "1":
-                tui.keys(CTRL_C)
-                return
-            tui.type("根据当前台账，只为 source.mixed.instance.84.80.7E 这一张待新增椅子准备可执行方案；保留 source_id、实例身份和来源 XY，使用 0.5 米宽深、0.9 米示意高度，明确高度为 assumed；不要扫描其他类别。")
-            tui.keys(ENTER, 0.5)
-            proposal = tui.wait("typed chair proposal", lambda s: bool(__import__("re").search(r"方案 [0-9a-f]{32} · 修订", s)) and ("prepared" in s or "blocked" in s), 300)
-            expect("prepared" in proposal, "chair proposal was not executable")
-            tui.type("只把这张椅子向北移动 1 米，保留来源和身份")
-            tui.keys(ENTER, 0.5)
-            revised = tui.wait("chair revision", lambda s: "修订 2" in s, 180)
-            expect("prepared" in revised, "chair revision was not prepared")
-            tui.keys(CTRL_Y, 1.0)
-            tui.wait("approval result", lambda s: "applied" in s or "授权" in s or "具体版本" in s, 180)
+        if not report.step("real dsh scans and shows the mixed-floor ledger", scan, tui):
+            return
+        if case == "scan":
             tui.keys(CTRL_C)
-        report.step("real dsh scans and shows the mixed-floor ledger", run_domain, tui)
+            return
+        def propose():
+            prompt = ("根据当前台账，为 source.mixed.instance.84.80.7E 的椅子、source.mixed.instance.84.69 的柜子和 source.mixed.instance.84.6B 的洗手盆准备同一个可执行候选。保留来源 XY、变换和稳定身份；椅高0.9米、柜高1.8米、盆高0.85米允许作为 assumed 示意尺寸。只包含这三个实例，不包含已建、疑似重复、门窗、楼梯或井道。" if mixed else
+                      "根据当前台账，只为 source.mixed.instance.84.80.7E 这一张待新增椅子准备可执行方案；保留 source_id、实例身份和来源 XY，使用 0.5 米宽深、0.9 米示意高度，明确高度为 assumed；不要扫描其他类别。")
+            send(prompt)
+            proposal = fact("typed chair proposal", lambda s: bool(__import__("re").search(r"方案 [0-9a-f]{32} · 修订", s))
+                            and ("prepared" in s or "blocked" in s))
+            expect("prepared" in proposal, "chair proposal was not executable")
+            finished()
+        if not report.step("real dsh prepares executable source-backed components", propose, tui):
+            return
+        def revise():
+            send("只把椅子向北移动 1 米，保留来源和身份，其余候选保持原样。")
+            revised = fact("chair revision", lambda s: "修订 2" in s, 240)
+            expect("prepared" in revised, "chair revision was not prepared")
+            finished()
+        if not report.step("natural-language feedback produces revision two", revise, tui):
+            return
+        if mixed:
+            def select():
+                send("部分采纳：只保留椅子和洗手盆，跳过柜子。请生成依赖完整的新子方案并在台账保留跳过理由；不要把跳过记为建成。")
+                selected = fact("partial selection", lambda s: "修订 3" in s, 240)
+                expect("prepared" in selected, "partial selection was not prepared")
+                finished()
+            if not report.step("partial acceptance keeps chair and basin and skips cabinet", select, tui):
+                return
+            def rotate():
+                send("只将椅子相对当前朝向再旋转45度，保持位置和身份；洗手盆及其定义保持原样。")
+                revised = fact("chair rotation", lambda s: "修订 4" in s, 240)
+                expect("prepared" in revised, "second local revision was not prepared")
+                finished()
+            if not report.step("a second local revision rotates only the selected chair", rotate, tui):
+                return
+        def apply_and_build():
+            tui.keys(CTRL_Y, 1.0)
+            fact("applied scene", lambda s: "场景应用 applied" in s, 240)
+            fact("validated applied artifact", lambda s: "产物验证 valid=true · current=true" in s, 240)
+            finished()
+        report.step("concrete UI approval applies and builds the revised components", apply_and_build, tui)
     finally:
         tui.close()
 
