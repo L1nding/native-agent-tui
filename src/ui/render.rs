@@ -960,6 +960,45 @@ mod tests {
     }
 
     #[test]
+    fn conversation_shows_reasoning_and_tool_updates_without_stale_cached_rows() {
+        let (mut snapshot, local) = running(vec![]);
+        for (id, role, text, thread) in [
+            ("shared", "Reasoning", "Inspect the input", "root"),
+            ("tools:turn", "Tool", "▸ running · echo probe", "root"),
+            ("shared", "Agent", "Here is the answer", "root"),
+            ("shared", "Reasoning", "Other agent thought", "child"),
+        ] {
+            snapshot.messages.push(ConversationItem {
+                id: id.into(),
+                thread_id: thread.into(),
+                turn_id: "turn".into(),
+                role: role.into(),
+                text: text.into(),
+                complete: false,
+                truncated: false,
+            });
+        }
+        let screen = rows(&snapshot, &local, 120, 30).join("\n");
+        assert!(
+            screen.contains("Thinking") && screen.contains("Inspect the input"),
+            "{screen}"
+        );
+        assert!(screen.contains("running · echo probe"), "{screen}");
+        assert!(screen.contains("Here is the answer"), "{screen}");
+        assert!(!screen.contains("Other agent thought"), "{screen}");
+        snapshot.messages[0].text.push_str(" carefully");
+        snapshot.messages[1].text = "▸ failed · exit 1 · echo probe".into();
+        let screen = rows(&snapshot, &local, 120, 30).join("\n");
+        assert!(screen.contains("Inspect the input carefully"), "{screen}");
+        assert!(screen.contains("failed · exit 1 · echo probe"), "{screen}");
+        assert!(!screen.contains("running · echo probe"), "{screen}");
+        lang::with_zh(|| {
+            let screen = rows(&snapshot, &local, 120, 30).join("\n");
+            assert!(screen.contains("思考过程"), "{screen}");
+        });
+    }
+
+    #[test]
     fn ctrl_e_unfolds_tool_groups_and_leaves_the_draft_alone() {
         let (mut snapshot, mut local) = running(vec![]);
         snapshot.messages.push(ConversationItem {

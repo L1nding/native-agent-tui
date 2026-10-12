@@ -366,6 +366,30 @@ pub fn decode_observed_output(
     })())
 }
 
+/// Final reasoning items may contain full text, or only the server's summary.
+/// Prefer full text when both exist, so one item is never displayed twice.
+pub fn decode_reasoning_text(item: &Value) -> Option<String> {
+    if item["type"] != "reasoning" {
+        return None;
+    }
+    fn text(value: &Value) -> Option<String> {
+        if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+            return Some(text.to_owned());
+        }
+        let parts = value.as_array()?;
+        let text = parts
+            .iter()
+            .filter_map(|part| part.as_str().or_else(|| part["text"].as_str()))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+    text(&item["text"])
+        .or_else(|| text(&item["content"]))
+        .or_else(|| text(&item["summary"]))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaitCall {

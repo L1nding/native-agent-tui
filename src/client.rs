@@ -897,6 +897,7 @@ impl Core {
         ) {
             self.tool_details.execution_unavailable();
             self.state.finish_all_tool_lines();
+            self.state.finish_all_reasoning();
         }
         self.state.view.tool_details = self.tool_details.snapshot();
         let transport = self.pipe.stats();
@@ -2583,13 +2584,14 @@ impl Core {
                             .into_iter()
                             .enumerate()
                             .map(|(index, message)| crate::state::ConversationItem {
-                                id: format!("history-{index}"),
+                                id: message.id.unwrap_or_else(|| format!("history-{index}")),
                                 thread_id: thread.clone(),
-                                turn_id: String::new(),
-                                role: if message.role == "user" {
-                                    "You"
-                                } else {
-                                    "Agent"
+                                turn_id: message.turn_id.unwrap_or_default(),
+                                role: match message.role.as_str() {
+                                    "user" => "You",
+                                    "reasoning" => "Reasoning",
+                                    "tool" => "Tool",
+                                    _ => "Agent",
                                 }
                                 .into(),
                                 text: message.text,
@@ -3162,6 +3164,7 @@ impl Core {
     /// 轮次终结后清理其工具详情、文件预览和未决请求。
     fn retire_turn_evidence(&mut self, thread: &str, turn: &str) {
         self.state.finish_tool_lines(thread, turn);
+        self.state.finish_reasoning(thread, turn);
         let session = &self.state.view.observation.session_id;
         self.tool_details.retire(session, thread, turn);
         self.file_previews.retire(thread, turn);
@@ -3338,6 +3341,14 @@ impl Core {
                 ))
                 || self.state.agents.active_turn(thread, turn);
             if owned {
+                if method == "item/completed" {
+                    if let (Some(id), Some(text)) = (
+                        params["item"]["id"].as_str(),
+                        protocol::decode_reasoning_text(&params["item"]),
+                    ) {
+                        self.state.reasoning(thread, turn, id, &text, true);
+                    }
+                }
                 if let Some(notice) = protocol::decode_observed_tool(method, &params) {
                     match notice {
                         Ok(notice) => match self.observer.tool(&notice, Instant::now()) {
@@ -3367,13 +3378,23 @@ impl Core {
                 if let Some(output) = protocol::decode_observed_output(method, &params) {
                     match output {
                         Ok(output) => match output.kind {
-                            protocol::ObservedOutputKind::Reasoning => self.observe_output(
-                                thread,
-                                turn,
-                                &output.item_id,
-                                output.bytes,
-                                false,
-                            ),
+                            protocol::ObservedOutputKind::Reasoning => {
+                                if self.state.reasoning(
+                                    thread,
+                                    turn,
+                                    &output.item_id,
+                                    &output.text,
+                                    false,
+                                ) {
+                                    self.observe_output(
+                                        thread,
+                                        turn,
+                                        &output.item_id,
+                                        output.bytes,
+                                        false,
+                                    );
+                                }
+                            }
                             protocol::ObservedOutputKind::Tool(category) => {
                                 if let Some(locator) =
                                     self.tool_locator(thread, turn, &output.item_id)
@@ -7027,7 +7048,9 @@ mod tests {
             &mut server,
             json!({"id":history["id"],"result":{"omitted":0,"messages":[
                 {"role":"user","text":"fix the parser\nmore detail","truncated":false},
-                {"role":"assistant","text":"done","truncated":false},
+                {"role":"reasoning","id":"shared","turnId":"saved-turn","text":"Inspect the parser","truncated":false},
+                {"role":"tool","id":"call-1","turnId":"saved-turn","text":"▸ done · cargo check","truncated":false},
+                {"role":"assistant","id":"shared","turnId":"saved-turn","text":"done","truncated":false},
             ]}}),
         )
         .await;
@@ -7060,10 +7083,19 @@ mod tests {
                 shown,
                 [
                     ("You", "fix the parser\nmore detail"),
+                    ("Reasoning", "Inspect the parser"),
+                    ("Tool", "▸ done · cargo check"),
                     ("Agent", "done"),
                     ("You", "second question")
                 ]
             );
+            assert_eq!(snapshot.messages[1].id, "shared");
+            assert_eq!(snapshot.messages[2].id, "call-1");
+            assert_eq!(snapshot.messages[2].turn_id, "saved-turn");
+            assert!(snapshot
+                .messages
+                .iter()
+                .all(|m| m.thread_id == "thread-one"));
         }
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
