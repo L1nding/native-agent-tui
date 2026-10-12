@@ -39,6 +39,27 @@ export interface SessionHeader {
   createdAt?: number
   delegationDepth?: number
   agentPreset?: string
+  parentSession?: string
+  origin?: string
+}
+
+/** One stored event; `data` is read defensively because event types are host-extensible. */
+export interface SessionEvent {
+  type: string
+  seq?: number
+  data?: unknown
+}
+
+/** Result of one title read in a batch; a failure stays with its own session. */
+export type TitleResult =
+  | { sessionId: string; status: 'fulfilled'; value: { title?: { title: string; updatedAt: number } } }
+  | { sessionId: string; status: 'rejected'; reason: unknown }
+
+/** `ctx.sessionQuery`: read-only views over live and stored sessions. */
+export interface SessionQuery {
+  listSessions(signal?: AbortSignal): Promise<readonly { header: SessionHeader; live: boolean }[]>
+  readTitleSnapshots(ids: readonly string[], signal?: AbortSignal): Promise<readonly TitleResult[]>
+  readSurface(sessionId: string): Promise<{ events: readonly SessionEvent[] }>
 }
 
 /** One element of `sessionPersistence.list()`. */
@@ -78,6 +99,7 @@ export interface HostContext {
   effect(callback: () => () => void, label?: string): unknown
   get(name: 'appExit'): ((code: number) => void) | undefined
   get(name: 'appReady'): AppReady | undefined
+  get(name: 'sessionQuery'): SessionQuery | undefined
   get(name: string): unknown
 }
 

@@ -322,9 +322,6 @@ impl ClientHandle {
                 skills_refresh_queued: false,
                 skills_refresh_force_reload: false,
                 skills_refresh_source: None,
-                conversation_id: String::new(),
-                conversation_written: HashMap::new(),
-                conversation_meta: None,
                 resuming: None,
             }
             .run(),
@@ -357,6 +354,10 @@ enum RpcKind {
         source: SkillRefreshSource,
     },
     ModelList,
+    /// dsh's sessions of this workspace, for the sessions page.
+    ThreadList,
+    /// Readable messages of the session just resumed.
+    ThreadHistory,
     ModelSelect,
     BackendReload,
     ThreadResume,
@@ -434,16 +435,8 @@ struct Core {
     skills_refresh_queued: bool,
     skills_refresh_force_reload: bool,
     skills_refresh_source: Option<SkillRefreshSource>,
-    /// Name of the saved conversation this session writes to; a resume adopts
-    /// the resumed conversation's name so later turns continue the same file.
-    conversation_id: String,
-    /// Text length last written for each message key, to append only what changed.
-    conversation_written: HashMap<String, usize>,
-    /// The backend session and model last written to the conversation's log;
-    /// None until this session has written its first record there.
-    conversation_meta: Option<(String, Option<String>)>,
-    /// The saved conversation a pending thread/resume will install.
-    resuming: Option<crate::conversations::SavedConversation>,
+    /// The dsh session a pending resume switches to, until its messages are shown.
+    resuming: Option<crate::conversations::ConversationSummary>,
 }
 
 struct PendingTool {
@@ -718,6 +711,16 @@ impl Core {
                         } else if matches!(kind, RpcKind::ModelList) {
                             self.state.view.models.availability =
                                 crate::models::ModelsAvailability::TimedOut;
+                        } else if matches!(kind, RpcKind::ThreadList) {
+                            self.state.view.notice =
+                                Some("Sessions were not listed in time.".into());
+                        } else if matches!(kind, RpcKind::ThreadHistory) {
+                            // 会话已经切换成功；只是之前的消息没能显示。
+                            self.resuming = None;
+                            self.state.view.resuming = None;
+                            self.state.view.notice = Some(
+                                "Resumed; its earlier messages were not loaded in time.".into(),
+                            );
                         } else if matches!(kind, RpcKind::ModelSelect) {
                             // 未确认的切换不改变已知模型；用户可以重新选择。
                             self.state.view.models.switching = None;
@@ -743,7 +746,6 @@ impl Core {
                 self.scheduler.disconnected();
             }
             self.publish();
-            self.save_conversation(false);
             if self.state.view.phase == SessionPhase::Unknown {
                 // A late reply cannot turn an uncertain side effect into a fresh success.
                 self.unknown_pending_outbox();
@@ -752,7 +754,6 @@ impl Core {
             }
         }
 
-        self.save_conversation(true);
         self.unknown_pending_outbox();
         let outcome = self.state.view.phase;
         self.scheduler.disconnected();
@@ -1131,7 +1132,12 @@ impl Core {
                 id.clone(),
                 self.resuming
                     .as_ref()
-                    .map_or("", |conversation| conversation.thread_id.as_str()),
+                    .map_or("", |conversation| conversation.id.as_str()),
+            ),
+            RpcKind::ThreadList => app_server::thread_list(id.clone(), &self.config.cwd),
+            RpcKind::ThreadHistory => app_server::thread_history(
+                id.clone(),
+                self.state.view.thread_id.as_deref().unwrap_or(""),
             ),
             RpcKind::StartTurn { .. }
             | RpcKind::AgentRead
@@ -1352,8 +1358,14 @@ impl Core {
                 }
             }
             Command::ListConversations => {
-                if let Some(directory) = self.conversation_directory() {
-                    self.state.view.conversations = crate::conversations::list(&directory);
+                let listing = self
+                    .pending
+                    .values()
+                    .any(|rpc| matches!(rpc.kind, RpcKind::ThreadList));
+                if !listing && self.session_ready {
+                    if let Err(error) = self.send_rpc(RpcKind::ThreadList) {
+                        self.state.view.notice = Some(format!("Sessions were not listed: {error}"));
+                    }
                 }
             }
             Command::ResumeConversation { id } => {
@@ -1497,118 +1509,30 @@ impl Core {
         }
     }
 
-    /// Where conversations are kept. A session that was not launched uses the
-    /// store only when its data directory was named explicitly, so it can
-    /// never write into the user's own.
-    fn conversation_directory(&self) -> Option<std::path::PathBuf> {
-        (self.journal.is_some() || self.config.journal.root.is_some())
-            .then(|| {
-                crate::conversations::directory(
-                    &self.config.journal,
-                    &self.config.cwd.display().to_string(),
-                )
-            })
-            .flatten()
-    }
-
-    /// Saves the root conversation when it changed and nothing is mid-stream:
-    /// between turns, while a request waits for the user, or at the end.
-    fn save_conversation(&mut self, closing: bool) {
-        let view = &self.state.view;
-        let Some(thread) = view.thread_id.as_deref() else {
-            return;
-        };
-        if !(closing || view.phase.can_submit() || !view.requests.is_empty()) {
-            return;
-        }
-        if !view
-            .messages
-            .iter()
-            .any(|message| message.thread_id == thread && message.role == "You")
-        {
-            return;
-        }
-        let Some(directory) = self.conversation_directory() else {
-            return;
-        };
-        let writer = view.observation.session_id.clone();
-        if self.conversation_id.is_empty() {
-            self.conversation_id = writer.clone();
-        }
-        let at_ms = crate::conversations::now_ms();
-        let mut records = Vec::new();
-        let meta = (thread.to_owned(), view.model.clone());
-        // 这个会话第一次写这段对话时先写身份；新对话还要先写首行。
-        if self.conversation_meta.as_ref() != Some(&meta) {
-            if self.conversation_meta.is_none() && self.conversation_id == writer {
-                records.push(crate::conversations::Record::Session {
-                    version: 1,
-                    id: self.conversation_id.clone(),
-                    cwd: self.config.cwd.display().to_string(),
-                    at_ms,
-                });
-            }
-            records.push(crate::conversations::Record::Meta {
-                backend: crate::backend::PREFERENCE_KEY.into(),
-                thread_id: meta.0.clone(),
-                model: meta.1.clone(),
-                at_ms,
-            });
-        }
-        // 只追加新增或内容变了的消息；同一个 id 的后一条记录生效。
-        let mut written = Vec::new();
-        for message in &view.messages {
-            if message.thread_id != thread || message.text.is_empty() {
-                continue;
-            }
-            // 恢复来的消息沿用文件里的 id；本会话的消息加上会话前缀，避免和别的会话重名。
-            let key = if self.conversation_written.contains_key(&message.id) {
-                message.id.clone()
-            } else {
-                format!("{writer}:{}", message.id)
-            };
-            if self.conversation_written.get(&key) != Some(&message.text.len()) {
-                records.push(crate::conversations::Record::Message {
-                    id: key.clone(),
-                    role: message.role.clone(),
-                    text: message.text.clone(),
-                    at_ms,
-                });
-                written.push((key, message.text.len()));
-            }
-        }
-        if records.is_empty() {
-            return;
-        }
-        // 写失败时下次变化再试；对话保存不影响执行。
-        if crate::conversations::append(&directory, &self.conversation_id, &records).is_ok() {
-            self.conversation_meta = Some(meta);
-            self.conversation_written.extend(written);
-            self.state.view.conversation_id = self.conversation_id.clone();
-        }
-    }
+    /// Switches this session to another dsh session; dsh keeps both.
     fn resume_conversation(&mut self, id: &str) -> Result<(), String> {
-        let directory = self
-            .conversation_directory()
-            .ok_or("this session has no conversation store.")?;
-        let saved = crate::conversations::load(&directory, id)
-            .ok_or("its saved conversation could not be read.")?;
-        if id == self.conversation_id {
-            return Err("it is the conversation already open here.".into());
+        if id.is_empty() || id.len() > 1024 {
+            return Err("no session was named.".into());
         }
-        if saved.backend != crate::backend::PREFERENCE_KEY {
-            return Err(format!(
-                "it belongs to the removed {} backend.",
-                saved.backend
-            ));
+        if self.state.view.thread_id.as_deref() == Some(id) {
+            return Err("it is the conversation already open here.".into());
         }
         if !self.idle_for_backend_change() || self.state.view.resuming.is_some() {
             return Err("wait for the current turn to finish first.".into());
         }
-        // 先存好当前对话，再切换。
-        self.save_conversation(true);
-        self.state.view.resuming = Some(saved.title());
-        self.resuming = Some(saved);
+        let target = self
+            .state
+            .view
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .cloned()
+            .unwrap_or_else(|| crate::conversations::ConversationSummary {
+                id: id.to_owned(),
+                ..Default::default()
+            });
+        self.state.view.resuming = Some(Self::resume_label(&target));
+        self.resuming = Some(target);
         if let Err(error) = self.send_rpc(RpcKind::ThreadResume) {
             self.state.view.resuming = None;
             self.resuming = None;
@@ -1616,6 +1540,14 @@ impl Core {
         }
         self.state.view.notice = Some("Resuming the conversation...".into());
         Ok(())
+    }
+
+    fn resume_label(target: &crate::conversations::ConversationSummary) -> String {
+        if target.title.is_empty() {
+            "untitled session".into()
+        } else {
+            target.title.clone()
+        }
     }
 
     /// Starts a model test in a task of its own; the result returns as a command.
@@ -2136,6 +2068,22 @@ impl Core {
                         };
                         return;
                     }
+                    if matches!(pending.kind, RpcKind::ThreadList) {
+                        let message: String = message.chars().take(400).collect();
+                        self.state.view.notice =
+                            Some(format!("Sessions were not listed: {message}"));
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::ThreadHistory) {
+                        // 会话已经切换成功；只是之前的消息没能显示。
+                        self.state.view.resuming = None;
+                        self.resuming = None;
+                        let message: String = message.chars().take(400).collect();
+                        self.state.view.notice = Some(format!(
+                            "Resumed; its earlier messages could not be loaded: {message}"
+                        ));
+                        return;
+                    }
                     if matches!(pending.kind, RpcKind::ThreadResume) {
                         // 没能恢复：当前对话原样保留。
                         self.state.view.resuming = None;
@@ -2306,49 +2254,77 @@ impl Core {
                 }
                 None
             }
+            RpcKind::ThreadList => {
+                match crate::conversations::parse_list(&result) {
+                    Some(listed) => self.state.view.conversations = listed,
+                    None => {
+                        self.state.view.notice =
+                            Some("Sessions were not listed: the answer was malformed.".into())
+                    }
+                }
+                None
+            }
             RpcKind::ThreadResume => {
-                self.state.view.resuming = None;
-                let Some(saved) = self.resuming.take() else {
+                let Some(target) = self.resuming.as_ref() else {
+                    self.state.view.resuming = None;
                     return;
                 };
                 let thread = result
                     .pointer("/thread/id")
                     .and_then(Value::as_str)
-                    .unwrap_or(&saved.thread_id)
+                    .unwrap_or(&target.id)
                     .to_owned();
                 if let Some(model) = result.get("model").and_then(Value::as_str) {
                     self.state.view.model = Some(model.into());
                 }
-                // 界面换成恢复的对话；之前的对话已经保存，可以再恢复回来。
-                self.state.view.messages = saved
-                    .messages
-                    .iter()
-                    .map(|message| crate::state::ConversationItem {
-                        id: message.id.clone(),
-                        thread_id: thread.clone(),
-                        turn_id: String::new(),
-                        role: message.role.clone(),
-                        text: message.text.clone(),
-                        complete: true,
-                        truncated: false,
-                    })
-                    .collect();
+                // 界面换成恢复的会话；之前的会话仍在 dsh 里，可以再恢复回来。
+                self.state.view.messages.clear();
                 self.state.tool_lines.clear();
                 self.state.view.history_truncated = false;
                 self.state.view.thread_id = Some(thread);
                 self.state.view.turn_id = None;
                 self.state.view.last_error = None;
                 self.state.view.phase = SessionPhase::Ready;
-                // 已在文件里的消息不重写；身份记录等后端会话或模型变化时再追加。
-                self.conversation_written = saved
-                    .messages
-                    .iter()
-                    .map(|message| (message.id.clone(), message.text.len()))
-                    .collect();
-                self.conversation_meta = Some((saved.thread_id.clone(), saved.model.clone()));
-                self.state.view.notice = Some(format!("Resumed: {}", saved.title()));
-                self.state.view.conversation_id = saved.id.clone();
-                self.conversation_id = saved.id;
+                // 消息显示出来之前仍算恢复中，新一轮排在其后。
+                Some(RpcKind::ThreadHistory)
+            }
+            RpcKind::ThreadHistory => {
+                self.state.view.resuming = None;
+                let Some(target) = self.resuming.take() else {
+                    return;
+                };
+                let label = Self::resume_label(&target);
+                let thread = self.state.view.thread_id.clone().unwrap_or_default();
+                match crate::conversations::parse_history(&result) {
+                    Some(history) => {
+                        self.state.view.history_truncated = history.omitted > 0;
+                        self.state.view.messages = history
+                            .messages
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, message)| crate::state::ConversationItem {
+                                id: format!("history-{index}"),
+                                thread_id: thread.clone(),
+                                turn_id: String::new(),
+                                role: if message.role == "user" {
+                                    "You"
+                                } else {
+                                    "Agent"
+                                }
+                                .into(),
+                                text: message.text,
+                                complete: true,
+                                truncated: message.truncated,
+                            })
+                            .collect();
+                        self.state.view.notice = Some(format!("Resumed: {label}"));
+                    }
+                    None => {
+                        self.state.view.notice = Some(format!(
+                            "Resumed: {label}. Its earlier messages could not be read."
+                        ))
+                    }
+                }
                 Some(RpcKind::ModelList)
             }
             RpcKind::BackendReload => {
@@ -6486,58 +6462,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_saved_conversation_is_listed_by_title_and_resumed_with_its_messages() {
-        let root =
-            std::env::temp_dir().join(format!("native-agent-tui-resume-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let config = || Config {
-            journal: crate::journal::JournalSettings {
-                root: Some(root.clone()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // 启动到 Ready；`thread` 是后端给这次会话的 id。
-        async fn start(
-            config: Config,
-            thread: &str,
-        ) -> (ClientHandle, BufReader<tokio::io::DuplexStream>) {
-            let (mut client, mut server) = harness_with_config(config).await;
-            let request = next(&mut server).await;
-            send(&mut server, json!({"id":request["id"],"result":{}})).await;
-            assert_eq!(next(&mut server).await["method"], "initialized");
-            let request = next(&mut server).await;
-            send(
-                &mut server,
-                json!({"id":request["id"],"result":{"thread":{"id":thread},"model":"hi/luna"}}),
-            )
-            .await;
-            phase(&mut client, SessionPhase::Ready).await;
-            skip_skills(&mut server).await;
-            (client, server)
-        }
+    async fn sessions_are_listed_from_the_backend_and_a_resume_shows_its_earlier_messages() {
+        let (mut client, mut server) = harness_with_config(Config::default()).await;
+        let request = next(&mut server).await;
+        send(&mut server, json!({"id":request["id"],"result":{}})).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"thread":{"id":"thread-two"},"model":"hi/luna"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+        skip_skills(&mut server).await;
         let submit = |text: &str| Command::SubmitRootInput { text: text.into() };
 
-        // 第一次会话：发一条消息后退出，对话被保存。
-        let (client, mut server) = start(config(), "thread-one").await;
-        let first_id = client.snapshots.borrow().observation.session_id.clone();
+        // 列表来自后端；重复的请求在答复前不再发出。
+        for _ in 0..2 {
+            client
+                .commands
+                .send(Command::ListConversations)
+                .await
+                .unwrap();
+        }
+        let list = next(&mut server).await;
+        assert_eq!(list["method"], "thread/list");
+        assert_eq!(
+            list["params"]["cwd"],
+            Config::default().cwd.display().to_string()
+        );
+        send(
+            &mut server,
+            json!({"id":list["id"],"result":{"sessions":[
+                {"id":"thread-two","updatedAt":30,"live":true},
+                {"id":"thread-one","title":"fix the parser","updatedAt":20},
+            ]}}),
+        )
+        .await;
         client
-            .commands
-            .send(submit("fix the parser\nmore detail"))
+            .snapshots
+            .wait_for(|s| s.conversations.len() == 2)
             .await
             .unwrap();
-        let turn = next(&mut server).await;
-        assert_eq!(turn["method"], "turn/start");
-        assert_eq!(turn["params"]["threadId"], "thread-one");
-        client.commands.send(Command::Quit).await.unwrap();
-        client.join.await.unwrap();
+        assert_eq!(
+            client.snapshots.borrow().conversations[1].title,
+            "fix the parser"
+        );
 
-        // 第二次会话：列表里按标题出现，Enter 对应的命令把它恢复回来。
-        let (mut client, mut server) = start(config(), "thread-two").await;
+        // 当前会话不需要恢复。
         client
             .commands
             .send(Command::ResumeConversation {
-                id: "missing".into(),
+                id: "thread-two".into(),
             })
             .await
             .unwrap();
@@ -6546,37 +6522,26 @@ mod tests {
             .wait_for(|s| {
                 s.notice
                     .as_deref()
-                    .is_some_and(|notice| notice.contains("could not be read"))
+                    .is_some_and(|notice| notice.contains("already open here"))
             })
             .await
             .unwrap();
-        client
-            .commands
-            .send(Command::ListConversations)
-            .await
-            .unwrap();
-        client
-            .snapshots
-            .wait_for(|s| s.conversations.len() == 1)
-            .await
-            .unwrap();
-        {
-            let snapshot = client.snapshots.borrow();
-            assert_eq!(snapshot.conversations[0].id, first_id);
-            assert_eq!(snapshot.conversations[0].title, "fix the parser");
-            assert_eq!(snapshot.conversations[0].turns, 1);
-        }
+
         client
             .commands
             .send(Command::ResumeConversation {
-                id: first_id.clone(),
+                id: "thread-one".into(),
             })
             .await
             .unwrap();
         let resume = next(&mut server).await;
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "thread-one");
-        // 确认前不开始新一轮。
+        assert_eq!(
+            client.snapshots.borrow().resuming.as_deref(),
+            Some("fix the parser")
+        );
+        // 确认并显示出之前的消息之前，不开始新一轮。
         client
             .commands
             .send(submit("second question"))
@@ -6590,6 +6555,22 @@ mod tests {
         send(
             &mut server,
             json!({"id":resume["id"],"result":{"thread":{"id":"thread-one"},"model":"hi/luna"}}),
+        )
+        .await;
+        let history = next(&mut server).await;
+        assert_eq!(history["method"], "thread/history");
+        assert_eq!(history["params"]["threadId"], "thread-one");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"id":history["id"],"result":{"omitted":0,"messages":[
+                {"role":"user","text":"fix the parser\nmore detail","truncated":false},
+                {"role":"assistant","text":"done","truncated":false},
+            ]}}),
         )
         .await;
         let mut started = None;
@@ -6611,23 +6592,89 @@ mod tests {
         {
             let snapshot = client.snapshots.borrow();
             assert_eq!(snapshot.thread_id.as_deref(), Some("thread-one"));
-            assert_eq!(snapshot.conversation_id, first_id);
             assert!(snapshot.resuming.is_none());
-            let texts: Vec<&str> = snapshot.messages.iter().map(|m| m.text.as_str()).collect();
-            assert_eq!(texts, ["fix the parser\nmore detail", "second question"]);
+            let shown: Vec<(&str, &str)> = snapshot
+                .messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.text.as_str()))
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    ("You", "fix the parser\nmore detail"),
+                    ("Agent", "done"),
+                    ("You", "second question")
+                ]
+            );
         }
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
+    }
 
-        // 恢复后的新一轮接着写回同一个对话，而不是另存一份。
-        let directory =
-            crate::conversations::directory(&config().journal, &config().cwd.display().to_string())
-                .unwrap();
-        let saved = crate::conversations::load(&directory, &first_id).unwrap();
-        assert_eq!(saved.thread_id, "thread-one");
-        assert_eq!(saved.summary().turns, 2);
-        assert_eq!(crate::conversations::list(&directory).len(), 1);
-        std::fs::remove_dir_all(&root).unwrap();
+    #[tokio::test]
+    async fn a_resume_whose_messages_cannot_be_loaded_still_switches_the_session() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::ResumeConversation { id: "other".into() })
+            .await
+            .unwrap();
+        let resume = next(&mut server).await;
+        assert_eq!(resume["method"], "thread/resume");
+        send(
+            &mut server,
+            json!({"id":resume["id"],"result":{"thread":{"id":"other"}}}),
+        )
+        .await;
+        let history = next(&mut server).await;
+        assert_eq!(history["method"], "thread/history");
+        send(
+            &mut server,
+            json!({"id":history["id"],"error":{"code":-32603,"message":"no query service"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.resuming.is_none()
+                    && s.notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("could not be loaded"))
+            })
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.thread_id.as_deref(), Some("other"));
+            assert_eq!(snapshot.phase, SessionPhase::Ready);
+        }
+        // 列表失败只是提示，会话照常可用。
+        client
+            .commands
+            .send(Command::ListConversations)
+            .await
+            .unwrap();
+        let list = next(&mut server).await;
+        assert_eq!(list["method"], "thread/list");
+        send(
+            &mut server,
+            json!({"id":list["id"],"error":{"code":-32601,"message":"unknown method"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("Sessions were not listed"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

@@ -193,12 +193,9 @@ pub struct CoreSnapshot {
     pub token_budget: TokenBudgetSnapshot,
     pub skills: crate::skills::SkillsSnapshot,
     pub models: crate::models::ModelsSnapshot,
-    /// Saved conversations of this workspace, as last listed for the sessions page.
+    /// dsh's sessions of this workspace, as last listed for the sessions page.
     pub conversations: Vec<crate::conversations::ConversationSummary>,
-    /// Name of the saved conversation this session is writing to; empty
-    /// until the first save, when it is this session's own id.
-    pub conversation_id: String,
-    /// Title of a saved conversation the backend is being asked to resume.
+    /// Title of the dsh session this one is switching to.
     pub resuming: Option<String>,
     /// Choices stored for the next start; empty for a setting never saved.
     pub saved_settings: BTreeMap<crate::preferences::Setting, String>,

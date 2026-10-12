@@ -47,7 +47,8 @@ dsh plugin --profile zf-tui add link:D:/project/native-agent-tui/dsh-plugin
 | 方法 | 返回 |
 |---|---|
 | `zf/hello` | 协议版本、插件版本、ACP 服务的状态（`loading` / `mounted` / `unavailable`）、本插件的方法列表 |
-| `zf/session/list` | dsh 会话持久化服务列出的会话（`header`、`revision`、`sizeBytes`） |
+| `zf/session/list` | 参数 `cwd`（可选，只列这个工作区）。返回根会话 `sessions[]`：`id`、`cwd`、`createdAt`、`updatedAt`、`title`（dsh 的标题，没有则缺省）、`live`（是否已在本进程加载），按时间倒序；子代理会话不列出。`titles` 说明标题服务是否可用 |
+| `zf/session/history` | 参数 `sessionId`。返回 `messages[]`：`role`（`user` / `assistant`）、`text`、`truncated`，只含真人输入和助手的文本（不含注入的上下文、推理和工具调用）；最多 200 条，更早的计入 `omitted`。需要 dsh 的 `sessionQuery` 服务 |
 | 其他 | ACP v1，见 dsh 的 `@deepseek-ai/dsh-acp` |
 
 未知的 `zf/` 方法返回 `-32601`。输入流关闭时，ACP 连接随之关闭并排空它的 Agent，然后宿主正常退出。

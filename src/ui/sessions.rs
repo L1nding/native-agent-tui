@@ -1,6 +1,6 @@
-//! Sessions page: this workspace's saved conversations, with the ones that
-//! wait for an answer first. Opened with Left from an empty task input;
-//! Enter resumes the selected conversation in this session.
+//! Sessions page: this workspace's dsh sessions by title, with the one that
+//! waits for an answer first. Opened with Left from an empty task input;
+//! Enter resumes the selected session here.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::{Line, Span};
@@ -10,8 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use super::activity::{clip_spans, hint_row, selected_line, tone, truncate_display_label};
 use super::lang::{self, tr};
 use super::theme;
-use crate::history::{HistoryHandle, HistoryRequest, HistoryResult, SessionOverview};
-use crate::state::{CoreSnapshot, SessionPhase};
+use crate::state::CoreSnapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Group {
@@ -33,18 +32,13 @@ struct Row {
     id: String,
     title: String,
     live: bool,
-    /// What is known about how the session that ran it ended.
     state: String,
     updated_at_ms: u64,
-    turns: usize,
 }
 
 #[derive(Default)]
 pub(super) struct SessionsPanel {
     pub visible: bool,
-    pending: Option<u64>,
-    /// Execution status per session, from the journal; titles come from Core.
-    sessions: Vec<SessionOverview>,
     selected: usize,
     pub notice: Option<String>,
 }
@@ -52,9 +46,9 @@ pub(super) struct SessionsPanel {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SessionsEvent {
     Close,
-    /// Continue this saved conversation in the running session.
+    /// Continue this dsh session here.
     Resume(String),
-    /// Ask Core to read the saved conversations again.
+    /// Ask Core to list the sessions again.
     Refresh,
     Quit,
     Consumed,
@@ -86,68 +80,26 @@ fn elapsed(then: u64, now: Option<u64>) -> String {
 }
 
 impl SessionsPanel {
-    /// The caller also asks Core for the conversation list.
-    pub fn open(&mut self, service: &mut HistoryHandle) {
+    /// The caller also asks Core for the session list.
+    pub fn open(&mut self) {
         self.visible = true;
         self.selected = 0;
-        self.refresh(service);
+        self.notice = None;
     }
 
-    fn refresh(&mut self, service: &mut HistoryHandle) {
-        if self.pending.is_some() {
-            return;
-        }
-        match service.request(HistoryRequest::Overview) {
-            Ok(id) => {
-                self.pending = Some(id);
-                self.notice = None;
-            }
-            Err(error) => self.notice = Some(error.to_string()),
-        }
-    }
-
-    /// Takes the overview this page asked for; other results belong to the history view.
-    pub fn updated(&mut self, service: &HistoryHandle) {
-        let update = service.status.borrow();
-        if self.pending != Some(update.request_id) {
-            return;
-        }
-        let Some(result) = &update.result else {
-            return;
-        };
-        self.pending = None;
-        match result {
-            Ok(HistoryResult::Overview(sessions)) => self.sessions = sessions.clone(),
-            Ok(_) => {}
-            Err(error) => self.notice = Some(error.to_string()),
-        }
-    }
-
-    /// Rows in display order: conversations that wait for an answer, then the
-    /// rest, newest first within each group.
+    /// Rows in display order: the session that waits for an answer, then the
+    /// rest, newest first. A session nobody has written to has no title and
+    /// is left out unless it is the one open here.
     fn rows(&self, snapshot: &CoreSnapshot) -> Vec<Row> {
-        let live_id = if snapshot.conversation_id.is_empty() {
-            snapshot.observation.session_id.as_str()
-        } else {
-            snapshot.conversation_id.as_str()
-        };
+        let live_id = snapshot.thread_id.as_deref().unwrap_or("");
         let mut rows: Vec<Row> = snapshot
             .conversations
             .iter()
+            .filter(|conversation| conversation.id == live_id || !conversation.title.is_empty())
             .map(|conversation| {
                 let live = conversation.id == live_id;
-                let status = self
-                    .sessions
-                    .iter()
-                    .find(|session| session.info.session_id == conversation.id);
-                let pending = if live {
-                    snapshot.requests.len()
-                } else {
-                    status
-                        .filter(|status| !status.info.session_closed)
-                        .and_then(|status| status.pending_requests)
-                        .unwrap_or(0)
-                };
+                // 只有当前进程里的会话才可能有等待回答的请求。
+                let pending = if live { snapshot.requests.len() } else { 0 };
                 let state = if pending > 0 {
                     if lang::zh() {
                         format!("有 {pending} 个请求等待回答")
@@ -157,16 +109,7 @@ impl SessionsPanel {
                 } else if live {
                     tr("open here", "当前对话").to_owned()
                 } else {
-                    match status {
-                        Some(status) if !status.info.session_closed => {
-                            tr("not closed", "未关闭").to_owned()
-                        }
-                        Some(status) if status.phase == Some(SessionPhase::Completed) => {
-                            tr("completed", "已完成").to_owned()
-                        }
-                        Some(status) => lang::phase(status.phase.unwrap_or(SessionPhase::Unknown)),
-                        None => String::new(),
-                    }
+                    String::new()
                 };
                 Row {
                     group: if pending > 0 {
@@ -175,11 +118,14 @@ impl SessionsPanel {
                         Group::Conversations
                     },
                     id: conversation.id.clone(),
-                    title: conversation.title.clone(),
+                    title: if conversation.title.is_empty() {
+                        tr("(no message yet)", "（还没有消息）").to_owned()
+                    } else {
+                        conversation.title.clone()
+                    },
                     live,
                     state,
                     updated_at_ms: conversation.updated_at_ms,
-                    turns: conversation.turns,
                 }
             })
             .collect();
@@ -188,25 +134,7 @@ impl SessionsPanel {
         rows
     }
 
-    /// Sessions the journal knows that have no saved conversation to resume.
-    fn unsaved(&self, snapshot: &CoreSnapshot) -> usize {
-        self.sessions
-            .iter()
-            .filter(|session| {
-                !snapshot
-                    .conversations
-                    .iter()
-                    .any(|conversation| conversation.id == session.info.session_id)
-            })
-            .count()
-    }
-
-    pub fn key(
-        &mut self,
-        key: KeyEvent,
-        service: &mut HistoryHandle,
-        snapshot: &CoreSnapshot,
-    ) -> SessionsEvent {
+    pub fn key(&mut self, key: KeyEvent, snapshot: &CoreSnapshot) -> SessionsEvent {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let rows = self.rows(snapshot);
         match key.code {
@@ -219,10 +147,7 @@ impl SessionsPanel {
             KeyCode::Down => self.selected = (self.selected + 1).min(rows.len().saturating_sub(1)),
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = rows.len().saturating_sub(1),
-            KeyCode::Char('r') if !control => {
-                self.refresh(service);
-                return SessionsEvent::Refresh;
-            }
+            KeyCode::Char('r') if !control => return SessionsEvent::Refresh,
             KeyCode::Enter => {
                 if let Some(row) = rows.get(self.selected.min(rows.len().saturating_sub(1))) {
                     self.visible = false;
@@ -269,8 +194,8 @@ impl SessionsPanel {
             listed.push((
                 Line::from(Span::styled(
                     tr(
-                        "No saved conversations yet. One appears here after its first message.",
-                        "还没有保存的对话。发出第一条消息后，它会出现在这里。",
+                        "No sessions yet. One appears here after its first message.",
+                        "还没有会话。发出第一条消息后，它会出现在这里。",
                     ),
                     theme.secondary(),
                 )),
@@ -306,12 +231,7 @@ impl SessionsPanel {
             }
             let marker = if index == selected { "> " } else { "  " };
             let time = elapsed(row.updated_at_ms, now);
-            let turns = if lang::zh() {
-                format!("{} 轮", row.turns)
-            } else {
-                format!("{} turn(s)", row.turns)
-            };
-            let fixed = marker.width() + time_width + 1 + state_width + 2 + turns.width() + 2;
+            let fixed = marker.width() + time_width + 1 + state_width + 2;
             let title = truncate_display_label(&row.title, width.saturating_sub(fixed).max(8));
             let pad = |text: &str, to: usize| " ".repeat(to.saturating_sub(text.width()));
             let spans = vec![
@@ -325,14 +245,13 @@ impl SessionsPanel {
                     pad(&title, width.saturating_sub(fixed))
                 )),
                 Span::styled(
-                    format!("{}{}  ", row.state, pad(&row.state, state_width)),
+                    format!("{}{}", row.state, pad(&row.state, state_width)),
                     if row.group == Group::NeedsInput {
                         tone(theme.warning)
                     } else {
                         theme.secondary()
                     },
                 ),
-                Span::styled(turns, theme.faint()),
             ];
             listed.push((
                 if index == selected {
@@ -359,20 +278,10 @@ impl SessionsPanel {
         while lines.len() + 2 < inner.height as usize {
             lines.push(Line::from(""));
         }
-        let unsaved = self.unsaved(snapshot);
-        let note = if unsaved == 0 {
-            tr(
-                "Enter continues the conversation here with its earlier messages.",
-                "Enter 在这里接着聊，之前的消息会一并显示。",
-            )
-            .to_owned()
-        } else if lang::zh() {
-            format!("另有 {unsaved} 个更早的会话没有保存对话内容，不能恢复。")
-        } else {
-            format!(
-                "{unsaved} earlier session(s) have no saved conversation and cannot be resumed."
-            )
-        };
+        let note = tr(
+            "Sessions are dsh's own. Enter continues one here with its earlier messages.",
+            "会话由 dsh 保存。Enter 在这里接着聊，之前的消息会一并显示。",
+        );
         lines.push(Line::from(clip_spans(
             vec![Span::styled(note, theme.secondary())],
             width,
@@ -392,59 +301,30 @@ impl SessionsPanel {
 mod tests {
     use super::*;
     use crate::conversations::ConversationSummary;
-    use crate::journal::SessionInfo;
 
-    fn status(id: &str, closed: bool, phase: SessionPhase, pending: usize) -> SessionOverview {
-        SessionOverview {
-            info: SessionInfo {
-                schema_version: 1,
-                workspace_id: "w".into(),
-                session_id: id.into(),
-                committed_seq: 7,
-                committed_bytes: 0,
-                snapshot_version: 1,
-                recorded_at: None,
-                session_closed: closed,
-                needs_recovery: !closed,
-                execution_result: Some(phase),
-            },
-            pending_requests: Some(pending),
-            phase: Some(phase),
-        }
-    }
-
-    fn conversation(id: &str, title: &str, minutes_ago: u64, turns: usize) -> ConversationSummary {
+    fn conversation(id: &str, title: &str, minutes_ago: u64) -> ConversationSummary {
         ConversationSummary {
             id: id.into(),
-            backend: "deepseek-acp".into(),
             title: title.into(),
             updated_at_ms: now_ms().unwrap() - minutes_ago * 60_000 - 5_000,
-            turns,
         }
     }
 
     fn fixture() -> (SessionsPanel, CoreSnapshot) {
         let panel = SessionsPanel {
             visible: true,
-            sessions: vec![
-                status("done-1", true, SessionPhase::Completed, 0),
-                status("asks-1", false, SessionPhase::Running, 2),
-                status("failed-1", true, SessionPhase::Failed, 0),
-                status("old-without-text", true, SessionPhase::Completed, 0),
-            ],
             ..Default::default()
         };
-        let mut snapshot = CoreSnapshot {
-            phase: SessionPhase::Ready,
+        let snapshot = CoreSnapshot {
+            thread_id: Some("live-1".into()),
             conversations: vec![
-                conversation("live-1", "Refactor the parser", 1, 3),
-                conversation("done-1", "修复登录页面的重定向问题", 30, 2),
-                conversation("asks-1", "Add retry to the uploader", 125, 5),
-                conversation("failed-1", "Explain the build error", 60 * 26, 1),
+                conversation("live-1", "Refactor the parser", 1),
+                conversation("done-1", "修复登录页面的重定向问题", 30),
+                conversation("blank-1", "", 45),
+                conversation("old-1", "Explain the build error", 60 * 26),
             ],
             ..Default::default()
         };
-        snapshot.observation.session_id = "live-1".into();
         (panel, snapshot)
     }
 
@@ -471,39 +351,32 @@ mod tests {
     }
 
     #[test]
-    fn conversations_show_their_titles_with_the_waiting_ones_first() {
-        let (panel, snapshot) = fixture();
+    fn sessions_show_their_titles_and_the_one_waiting_for_an_answer_comes_first() {
+        let (mut panel, snapshot) = fixture();
         let rows = panel.rows(&snapshot);
+        // 没有标题的会话还没有人写过消息，不列出。
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            ["asks-1", "live-1", "done-1", "failed-1"]
+            ["live-1", "done-1", "old-1"]
         );
-        assert_eq!(rows[0].group, Group::NeedsInput);
-        assert!(rows[1].live);
+        assert!(rows[0].live);
 
         let text = screen(&panel, &snapshot, 120, 20);
         for expected in [
             "Sessions in this workspace",
-            "Waiting for input (1)",
-            "> 2h ago",
-            "Add retry to the uploader",
-            "2 request(s) waiting for an answer",
-            "5 turn(s)",
             "Conversations (3)",
+            "> 1m ago",
             "Refactor the parser",
             "open here",
             "修复登录页面的重定向问题",
             "30m ago",
-            "completed",
             "Explain the build error",
             "1d ago",
-            "Failed",
-            "1 earlier session(s) have no saved conversation",
+            "Sessions are dsh's own.",
             "Enter resume",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
-        assert!(!text.contains("evidence"), "{text}");
 
         // 当前对话一有请求就排到“等待输入”里。
         let mut asking = snapshot.clone();
@@ -514,11 +387,36 @@ mod tests {
         )
         .unwrap()];
         let rows = panel.rows(&asking);
-        assert_eq!(rows[0].id, "live-1");
-        assert_eq!(rows[0].group, Group::NeedsInput);
-        // 恢复过别的对话后，“当前”跟着 Core 报告的对话走。
+        assert_eq!(
+            (rows[0].id.as_str(), rows[0].group),
+            ("live-1", Group::NeedsInput)
+        );
+        let text = screen(&panel, &asking, 120, 20);
+        assert!(text.contains("Waiting for input (1)"), "{text}");
+        assert!(
+            text.contains("1 request(s) waiting for an answer"),
+            "{text}"
+        );
+
+        // Enter 在当前对话上只是返回；在别的会话上请求恢复。
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(panel.key(enter, &snapshot), SessionsEvent::Close);
+        panel.visible = true;
+        panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &snapshot);
+        assert_eq!(
+            panel.key(enter, &snapshot),
+            SessionsEvent::Resume("done-1".into())
+        );
+        assert_eq!(
+            panel.key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &snapshot
+            ),
+            SessionsEvent::Refresh
+        );
+        // 恢复之后，“当前”跟着 Core 报告的会话走。
         let mut resumed = snapshot.clone();
-        resumed.conversation_id = "done-1".into();
+        resumed.thread_id = Some("done-1".into());
         let rows = panel.rows(&resumed);
         assert!(rows.iter().find(|row| row.id == "done-1").unwrap().live);
         assert!(!rows.iter().find(|row| row.id == "live-1").unwrap().live);
@@ -528,19 +426,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_workspace_says_when_a_conversation_will_appear() {
+    fn a_new_session_is_listed_before_its_first_message_and_an_empty_list_says_so() {
         let mut panel = SessionsPanel {
             visible: true,
             ..Default::default()
         };
-        let snapshot = CoreSnapshot::default();
+        let mut snapshot = CoreSnapshot::default();
         let text = screen(&panel, &snapshot, 110, 12);
-        assert!(text.contains("No saved conversations yet."), "{text}");
-        assert!(
-            text.contains("Enter continues the conversation here"),
-            "{text}"
-        );
-        panel.notice = Some("history worker closed".into());
-        assert!(screen(&panel, &snapshot, 110, 12).contains("history worker closed"));
+        assert!(text.contains("No sessions yet."), "{text}");
+        snapshot.thread_id = Some("new".into());
+        snapshot.conversations = vec![conversation("new", "", 0)];
+        let text = screen(&panel, &snapshot, 110, 12);
+        assert!(text.contains("(no message yet)"), "{text}");
+        assert!(text.contains("open here"), "{text}");
+        panel.notice = Some("Sessions could not be listed".into());
+        assert!(screen(&panel, &snapshot, 110, 12).contains("Sessions could not be listed"));
     }
 }

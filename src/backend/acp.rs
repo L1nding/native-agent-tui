@@ -527,6 +527,29 @@ impl AcpBridge {
                     self.mcp_servers.clone(),
                 ))?;
             }
+            // The bridge plugin answers these from dsh's session services.
+            (Some("thread/list"), Some(id)) => {
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp.send(with_jsonrpc(Envelope::request(
+                    id,
+                    "zf/session/list",
+                    Some(json!({"cwd": self.cwd})),
+                )))?;
+            }
+            (Some("thread/history"), Some(id)) => {
+                let session = message
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp.send(with_jsonrpc(Envelope::request(
+                    id,
+                    "zf/session/history",
+                    Some(json!({"sessionId": session})),
+                )))?;
+            }
             (Some("model/list"), Some(id)) => {
                 let data: Vec<Value> = self
                     .models
@@ -1177,6 +1200,59 @@ mod tests {
         // 没有拒绝类选项时不能选中批准选项。
         let allow_only = [("allow-once".to_owned(), Some("allow_once".to_owned()))];
         assert_eq!(choose_permission_option("decline", &allow_only), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_and_history_are_asked_of_the_bridge_plugin_and_answers_return_as_given() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+
+        core_client
+            .send(app_server::thread_list(RpcId::Number(7), &config.cwd))
+            .unwrap();
+        let list = tokio::time::timeout(Duration::from_secs(2), acp_server.recv())
+            .await
+            .expect("bridge did not forward the list")
+            .unwrap();
+        assert_eq!(list.jsonrpc.as_deref(), Some("2.0"));
+        assert_eq!(list.method.as_deref(), Some("zf/session/list"));
+        assert_eq!(
+            list.params.unwrap()["cwd"],
+            config.cwd.display().to_string()
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(7),
+                Some(json!({"sessions":[{"id":"s","title":"t"}]})),
+            ))
+            .unwrap();
+        let answer = core_client.recv().await.unwrap();
+        assert_eq!(answer.id, Some(RpcId::Number(7)));
+        assert_eq!(answer.result.unwrap()["sessions"][0]["title"], "t");
+
+        core_client
+            .send(app_server::thread_history(RpcId::Number(8), "s"))
+            .unwrap();
+        let history = acp_server.recv().await.unwrap();
+        assert_eq!(history.method.as_deref(), Some("zf/session/history"));
+        assert_eq!(history.params.unwrap()["sessionId"], "s");
+        // 插件的拒绝原样回到 Core，不被改写成成功。
+        acp_server
+            .send(Envelope::error_response(
+                RpcId::Number(8),
+                -32603,
+                "session \"s\" not found",
+            ))
+            .unwrap();
+        let refused = core_client.recv().await.unwrap();
+        assert_eq!(refused.id, Some(RpcId::Number(8)));
+        assert!(refused.result.is_none());
+        assert_eq!(refused.error.unwrap()["code"], -32603);
+
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

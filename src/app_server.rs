@@ -211,6 +211,20 @@ pub(crate) fn backend_reload(id: RpcId) -> Envelope {
     Envelope::request(id, "backend/reload", Some(json!({})))
 }
 
+/// dsh's sessions of one workspace; answered by the bridge plugin.
+pub(crate) fn thread_list(id: RpcId, cwd: &std::path::Path) -> Envelope {
+    Envelope::request(
+        id,
+        "thread/list",
+        Some(json!({"cwd":cwd.display().to_string()})),
+    )
+}
+
+/// Readable messages of one dsh session; answered by the bridge plugin.
+pub(crate) fn thread_history(id: RpcId, thread: &str) -> Envelope {
+    Envelope::request(id, "thread/history", Some(json!({"threadId":thread})))
+}
+
 /// Understood by the ACP bridge only: continue another saved session in the
 /// running agent process.
 pub(crate) fn thread_resume(id: RpcId, thread: &str) -> Envelope {

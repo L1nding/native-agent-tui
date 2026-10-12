@@ -17,6 +17,7 @@
 
 import { createInterface } from 'node:readline'
 import { loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
+import { listSessions, readHistory } from './sessions.js'
 
 export const name = 'zf-tui-bridge'
 
@@ -45,8 +46,6 @@ function describe(error: unknown): string {
  * @param config - route for sessions the TUI creates.
  */
 export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
-  // Handlers run outside this plugin's injection scope; capture services now.
-  const persistence = ctx.sessionPersistence
   const logger = ctx.logger
 
   /** Write one frame. Stdout carries protocol frames only. */
@@ -99,8 +98,17 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       methods: Object.keys(methods),
     }),
 
-    /** Stored sessions as dsh's persistence service lists them. */
-    'zf/session/list': async () => ({ sessions: await persistence.list() }),
+    /** Root sessions with dsh's titles, newest first; `cwd` narrows to one workspace. */
+    'zf/session/list': (params) => listSessions(ctx, typeof params['cwd'] === 'string' ? params['cwd'] : undefined),
+
+    /** User and assistant text of one session, for showing a resumed conversation. */
+    'zf/session/history': (params) => {
+      const sessionId = params['sessionId']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      const query = ctx.get('sessionQuery')
+      if (query === undefined) throw new Error('this dsh profile mounts no session query service')
+      return readHistory(query, sessionId)
+    },
   }
 
   const handleOwn = (frame: Frame): void => {

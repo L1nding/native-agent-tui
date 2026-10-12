@@ -88,7 +88,6 @@ pub async fn run_tasks_with_history(
                         if is_search {
                             history_panel.search_updated(&history);
                         } else {
-                            sessions_panel.updated(&history);
                             history_panel.updated(&mut history);
                         }
                     } else {
@@ -112,7 +111,7 @@ pub async fn run_tasks_with_history(
                                     if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 } else if sessions_panel.visible {
                                     use super::sessions::SessionsEvent;
-                                    match sessions_panel.key(key, &mut history, &snapshot) {
+                                    match sessions_panel.key(key, &snapshot) {
                                         SessionsEvent::Quit => return Ok(()),
                                         SessionsEvent::Resume(id) => { let _ = client.commands.try_send(Command::ResumeConversation { id }); }
                                         SessionsEvent::Refresh => { let _ = client.commands.try_send(Command::ListConversations); }
@@ -125,7 +124,7 @@ pub async fn run_tasks_with_history(
                                     local.timeline.close();
                                     history_panel.open(&mut history, None);
                                 } else if super::left_opens_sessions(key, &snapshot, &local) {
-                                    sessions_panel.open(&mut history);
+                                    sessions_panel.open();
                                     let _ = client.commands.try_send(Command::ListConversations);
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 dirty = true;
