@@ -171,3 +171,48 @@ fn unrelated_historical_artifact_does_not_poison_current_artifact_sequence() {
         .unwrap()
         .contains("current.glb"));
 }
+
+fn hosted_proposal() -> Value {
+    let mut value = envelope();
+    value["proposal"]["draft"]["operations"] = json!([{
+        "collection":"openings", "basis":"assumed",
+        "value_json":json!({"id":"door.1","kind":"door","wall_id":"wall.host",
+            "offset":1.5,"width":1.0,"height":2.1,"sill_height":0.0,
+            "source_ids":["source.door"],
+            "metadata":{"source_instance_id":"source.door","width_basis":"source",
+                "height_basis":"assumed","sill_basis":"assumed"}}).to_string()}]);
+    value["proposal"]["hosted_sources"] = json!({"source.door":{"origin_m":[2,2]}});
+    value
+}
+
+#[test]
+fn hosted_aperture_fact_shows_host_dimensions_pose_and_provenance_with_exact_binding() {
+    let fact = proposal_fact(&hosted_proposal()).unwrap();
+    assert!(fact.ready);
+    assert_eq!(fact.binding.proposal_id, "proposal");
+    assert_eq!(fact.binding.revision, 2);
+    assert!(fact.objects[0].contains("door.1 · door · 宿主 wall.host"));
+    assert!(fact.objects[0].contains("[2,2]"));
+    assert!(fact.objects[1].contains("偏距 1.5 · 宽 1.0 · 高 2.1 · 窗台 0.0"));
+    assert!(fact.objects[2].contains("宽 source · 高 assumed · 窗台 assumed"));
+    let mut facts = DomainFacts::new(None);
+    facts.snapshot.proposal = Some(fact.clone());
+    assert!(facts.can_authorize(&fact.binding));
+    let mut stale = fact.binding;
+    stale.revision = 1;
+    assert!(!facts.can_authorize(&stale));
+}
+
+#[test]
+fn malformed_hosted_dimensions_cannot_become_an_approval_fact() {
+    let mut value = hosted_proposal();
+    let mut opening: Value = serde_json::from_str(
+        value["proposal"]["draft"]["operations"][0]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    opening["width"] = json!("unknown");
+    value["proposal"]["draft"]["operations"][0]["value_json"] = json!(opening.to_string());
+    assert!(proposal_fact(&value).is_none());
+}

@@ -404,6 +404,44 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     };
     let mut objects = Vec::new();
     for op in p["draft"]["operations"].as_array()?.iter().take(512) {
+        if op["collection"] == "openings" {
+            let opening: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+            let kind = opening["kind"].as_str()?;
+            if !matches!(kind, "door" | "window")
+                || ["offset", "width", "height", "sill_height"]
+                    .iter()
+                    .any(|key| opening[key].as_f64().is_none())
+            {
+                return None;
+            }
+            let source = opening["metadata"]["source_instance_id"]
+                .as_str()
+                .unwrap_or("");
+            objects.push(format!(
+                "{} · {} · 宿主 {} · 来源位置 {}",
+                opening["id"].as_str()?,
+                kind,
+                opening["wall_id"].as_str()?,
+                p["hosted_sources"][source]["origin_m"]
+            ));
+            objects.push(format!(
+                "孔洞尺寸(m)：偏距 {} · 宽 {} · 高 {} · 窗台 {}",
+                opening["offset"], opening["width"], opening["height"], opening["sill_height"]
+            ));
+            objects.push(format!(
+                "参数依据：宽 {} · 高 {} · 窗台 {}",
+                opening["metadata"]["width_basis"]
+                    .as_str()
+                    .unwrap_or("unknown"),
+                opening["metadata"]["height_basis"]
+                    .as_str()
+                    .unwrap_or("unknown"),
+                opening["metadata"]["sill_basis"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ));
+            continue;
+        }
         if op["collection"] != "solids" {
             continue;
         }

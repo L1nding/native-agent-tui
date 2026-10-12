@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted"], help="modeling scenario for --only domain")
     args = parser.parse_args()
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
@@ -606,6 +606,10 @@ def domain_checks(report, binary, common, args, workspace, root):
         tui.type(prompt)
         tui.keys(ENTER, 0.5)
     try:
+        if case == "hosted":
+            from domain_hosted_check import run_hosted_checks
+            run_hosted_checks(report, tui, send, finished, fact, context, root)
+            return
         def scan():
             tui.wait("modeling session ready", lambda s: "建模" in s and "Initializing" not in s, 120)
             scan_prompt = ("开始八层医院隔离副本扫描。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances；每页明确使用 limit=20 以保持领域事实可读，按 next_offset 读完全部页面后再展示来源实例台账汇总。明确 total_objects、state_counts、scan_id 和未决状态，不读取临时文件，不提交方案。" if hospital else

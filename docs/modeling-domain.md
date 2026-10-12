@@ -29,3 +29,16 @@ Core 从已校验线程／回合身份、带 registry-derived MCP identity 的 c
 验收同时保存每个阶段的场景／来源哈希、提案链、批准／应用记录与实际屏幕到 `clarification-stages.json` 及阶段文本。模型器 `scripts/verify_complex_clarification.py` 再核对未决阻塞、版本失效、来源与保护对象不变、具体授权绑定、assumed 保留、真实 Blender 重建及 GLB 回读。实际屏幕必须显示具体澄清问题，仅出现“待确认”不算问题可见。
 
 真实 C07 证据 `target/dsh-e2e-de078e5a`：8 步通过，默认建模页可见三个阶段的具体普通对话问题，V1 blocked→V2 prepared→V3 blocked→V4 applied；仅最终版本获得具体批准与 Blender／重建／GLB 验证。模型器独立核验生成 `verified-clarification.json`（valid=true）；此前 `be33d6f7` 虽原脚本绿灯，仍因问题不可见被独立核验拒绝；`0834f997` 的纯待确认分叉失败促成领域修订修复。这些证据独立于 543 项 Rust 测试，不宣称 C08 关系验证器、C09–C11 真实恢复专项或医院完整闭环完成。AI／人工视觉复核为 not_run。
+
+
+## C08 门窗宿主与真实开口验收
+
+Core 在既有领域提案事实中投影 Opening，展示稳定对象 ID、门／窗类别、宿主、封存 CAD 来源位置、偏距／宽度／高度／窗台（米），以及宽度、高度和窗台的参数依据。非法尺寸类型或未知开口类别不能成为批准事实；具体批准仍绑定 proposal／revision／token／hash。该投影沿用 DomainSnapshot 和 typed Command，不由普通 Agent 回复生成授权。
+
+真实入口 `--domain-case hosted` 通过键盘推进同一平台 Agent，完成扫描、宿主歧义提问、原链修订、事实参数复核及 Ctrl+Y 批准／应用／构建。必须使用模型器 `outputs/` 下新建的隔离场景副本；设置 `MODELING_COMPLEX_ROOT` 和 `MODELING_COMPLEX_CONTEXT` 后执行 `tests/fixtures/dsh_tui_check.py --binary target/release/native-agent-tui.exe --model hi/gpt-6.1-sol --only domain --domain-case hosted`。脚本仅推进交互并读取证据，不直接准备、授权或应用场景。
+
+最终运行 `target/dsh-e2e-0990eef1`：5 步通过、0 失败，进程清理通过。输入为模型器 `outputs/complex-hosted-61498c2e/context.json`；`hosted-stages.json` 与阶段屏幕保存未批准不写入、具体提问及审批前两处参数／依据实际可见。V1 blocked→V2 applied，仅最终版本获得授权。模型器 `scripts/verify_complex_hosted.py` 独立核验为 valid=true，并核对实际 Blender 构建／重建／GLB 回读、孔洞探测、墙体体积 4.092 m³、保护对象、来源和产物哈希。
+
+保留 `eb0e16b8`、`04d90bad`、`8f4ace6f` 三次失败：两次暴露具体提问措辞谓词过窄，一次真实 Blender 拒绝新增门扇遮挡受保护既有洞口，促成领域准备／应用阶段的反向影响检查。`04d90bad/verified-failure-retention.json` 仅证明构建失败保留已应用场景，未覆盖取消／断连恢复或旧有效产物保留。
+
+全量 `scripts/verify.py` 通过：545 项 Rust 测试通过，2 项可选 live 默认跳过；格式、编译、Clippy、doctest、release、终端和进程专项通过。以上真实验收独立执行。关系能力 `relations/2` 仅在专用门窗路线开放宿主和真实开口，楼梯／井道跨层仍缺验证器；C09–C11 其余真实专项及医院完整闭环继续实施。AI／人工视觉复核仍为 not_run。
