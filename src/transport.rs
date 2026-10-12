@@ -185,6 +185,10 @@ impl PipeTransport {
 
     pub async fn close_writer(&mut self) {
         self.outgoing.take();
+        // 已经结束的写任务不能再等一次；重复关闭什么也不做。
+        if self.writer.is_finished() {
+            return;
+        }
         if tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.writer)
             .await
             .is_err()
@@ -295,6 +299,25 @@ mod tests {
         let line = read_frame(&mut reader, MAX_LINE_BYTES).await.unwrap();
         assert_eq!(line, r#"{"method":"initialized"}"#);
         assert!(transport.stats().bytes_out > 0);
+    }
+
+    #[tokio::test]
+    async fn closing_the_writer_flushes_queued_frames_and_may_be_repeated() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let (read, write) = tokio::io::split(client);
+        let mut transport = PipeTransport::new(read, write);
+        transport
+            .send(Envelope::notification("initialized", None))
+            .unwrap();
+        transport.close_writer().await;
+        // 第二次关闭不能再等待已经结束的写任务。
+        transport.close_writer().await;
+        let mut reader = BufReader::new(&mut server);
+        let line = read_frame(&mut reader, MAX_LINE_BYTES).await.unwrap();
+        assert_eq!(line, r#"{"method":"initialized"}"#);
+        assert!(transport
+            .send(Envelope::notification("late", None))
+            .is_err());
     }
 
     #[tokio::test]
