@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked"], help="modeling scenario for --only domain")
     args = parser.parse_args()
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
@@ -645,6 +645,33 @@ def domain_checks(report, binary, common, args, workspace, root):
             return
         if case == "scan":
             tui.keys(CTRL_C)
+            return
+        if case == "blocked":
+            def blocked_proposal():
+                send("只为 source.mixed.instance.84.80.7E 准备一张椅子，把它放到受保护柱 column.protected 的中心 (9,4,0)。使用 0.5 米宽深、0.9 米示意高度，明确高度为 assumed；不要移动或修改受保护柱，预期领域校验应报告 blocked。")
+                proposal = fact(
+                    "blocked chair proposal",
+                    lambda s: bool(__import__("re").search(r"方案 [0-9a-f]{32} · 修订", s))
+                    and "blocked" in s,
+                    240,
+                )
+                expect("blocked" in proposal, "protected-column placement was not blocked")
+                finished()
+
+            if not report.step("real dsh blocks a protected-column placement", blocked_proposal, tui):
+                return
+
+            def adjust_blocked_proposal():
+                send("保留椅子的来源身份、尺寸依据和保护柱不变，把椅子移回来源位置 (12,7,0)，重新准备可执行版本。")
+                revised = fact(
+                    "blocked chair adjustment",
+                    lambda s: "修订 2" in s and "prepared" in s,
+                    240,
+                )
+                expect("prepared" in revised, "blocked chair adjustment was not prepared")
+                finished()
+
+            report.step("real dsh adjusts the blocked placement without changing protection", adjust_blocked_proposal, tui)
             return
         def propose():
             prompt = ("根据当前台账，为 source.mixed.instance.84.80.7E 的椅子、source.mixed.instance.84.69 的柜子和 source.mixed.instance.84.6B 的洗手盆准备同一个可执行候选。保留来源 XY、变换和稳定身份；椅高0.9米、柜高1.8米、盆高0.85米允许作为 assumed 示意尺寸。只包含这三个实例，不包含已建、疑似重复、门窗、楼梯或井道。" if mixed else
