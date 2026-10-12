@@ -638,7 +638,8 @@ def domain_checks(report, binary, common, args, workspace, root):
                 expect("待确认" in screen or "pending_confirmation" in screen,
                        "hospital ledger did not expose unresolved source states")
             else:
-                expect("pending_addition" in screen and "suspected_duplicate" in screen,
+                expect("pending_addition" in screen and "suspected_duplicate" in screen
+                       and "capability_missing" in screen,
                        "ledger did not expose expected mixed-floor states")
         if not report.step("real dsh scans and shows the mixed-floor ledger", scan, tui):
             return
