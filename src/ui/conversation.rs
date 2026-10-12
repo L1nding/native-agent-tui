@@ -16,6 +16,11 @@ use super::theme::{self, Theme};
 use crate::state::{display_text, ConversationItem};
 use crate::tool_details::ToolLifecycle;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static PROJECTED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A turn's tool summary folds once it has more calls than this.
 pub(super) const TOOL_FOLD_LIMIT: usize = 4;
 /// Unfinished or failed calls that stay visible while a group is folded.
@@ -29,6 +34,204 @@ pub(super) struct Transcript {
     pub focused: Option<usize>,
     /// Tool groups long enough to fold; the key hint is only useful when non-zero.
     pub foldable: usize,
+}
+
+/// A bounded cache of message layouts, owned by this UI only. Width changes are
+/// lazy: old history is laid out only when scrolling brings it into the viewport.
+#[derive(Default)]
+pub(super) struct ProjectionCache {
+    entries: std::collections::VecDeque<CachedMessage>,
+    bytes: usize,
+}
+
+struct CachedMessage {
+    message: ConversationItem,
+    width: usize,
+    expanded: bool,
+    target: Option<usize>,
+    theme: &'static str,
+    zh: bool,
+    transcript: Transcript,
+    bytes: usize,
+}
+
+pub(super) struct Viewport {
+    pub transcript: Transcript,
+    pub below: usize,
+}
+
+impl ProjectionCache {
+    fn message(
+        &mut self,
+        message: &ConversationItem,
+        focus: Option<&Focus>,
+        width: usize,
+        expanded: bool,
+    ) -> &Transcript {
+        let target = focus
+            .filter(|focus| focus.matches(message))
+            .map(|focus| focus.offset);
+        let found = self.entries.iter().position(|entry| {
+            entry.message.id == message.id
+                && entry.message.thread_id == message.thread_id
+                && entry.message.turn_id == message.turn_id
+                && entry.message.role == message.role
+        });
+        if let Some(index) = found {
+            let entry = self.entries.remove(index).unwrap();
+            self.bytes -= entry.bytes;
+            if entry.message == *message
+                && entry.width == width
+                && entry.expanded == expanded
+                && entry.target == target
+                && entry.theme == theme::name()
+                && entry.zh == lang::zh()
+            {
+                self.bytes += entry.bytes;
+                self.entries.push_front(entry);
+                return &self.entries[0].transcript;
+            }
+        }
+        let transcript = transcript(std::iter::once(message), focus, width, expanded);
+        let bytes = std::mem::size_of::<CachedMessage>()
+            + message.text.len()
+            + message.id.len()
+            + message.thread_id.len()
+            + message.turn_id.len()
+            + message.role.len()
+            + transcript.lines.capacity() * std::mem::size_of::<Line<'static>>()
+            + transcript
+                .lines
+                .iter()
+                .map(|line| {
+                    line.spans.capacity() * std::mem::size_of::<Span<'static>>()
+                        + line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        // Keep at most 64 hot messages / 4 MiB of derived UI data. One oversized
+        // message may occupy the cache alone, so returning a layout stays simple.
+        while !self.entries.is_empty()
+            && (self.entries.len() >= 64 || self.bytes + bytes > 4 * 1024 * 1024)
+        {
+            self.bytes -= self.entries.pop_back().unwrap().bytes;
+        }
+        self.bytes += bytes;
+        self.entries.push_front(CachedMessage {
+            message: message.clone(),
+            width,
+            expanded,
+            target,
+            theme: theme::name(),
+            zh: lang::zh(),
+            transcript,
+            bytes,
+        });
+        &self.entries[0].transcript
+    }
+
+    /// Search navigation and painting use exactly the same cached row positions.
+    pub fn focused_scroll<'a>(
+        &mut self,
+        messages: impl DoubleEndedIterator<Item = &'a ConversationItem>,
+        focus: &Focus,
+        width: usize,
+        height: usize,
+        expanded: bool,
+    ) -> Option<usize> {
+        let mut below = 0;
+        for message in messages.rev() {
+            let layout = self.message(message, Some(focus), width, expanded);
+            if let Some(row) = layout.focused {
+                below += layout.lines.len().saturating_sub(row + 1);
+                return Some(below.saturating_sub(height.saturating_sub(height / 3 + 1)));
+            }
+            below += layout.lines.len() + 1;
+        }
+        None
+    }
+
+    pub fn viewport<'a>(
+        &mut self,
+        messages: impl DoubleEndedIterator<Item = &'a ConversationItem> + Clone,
+        focus: Option<&Focus>,
+        width: usize,
+        height: usize,
+        scroll: usize,
+        expanded: bool,
+    ) -> Viewport {
+        let scroll = focus
+            .filter(|focus| messages.clone().any(|message| focus.matches(message)))
+            .and_then(|focus| self.focused_scroll(messages.clone(), focus, width, height, expanded))
+            .unwrap_or(scroll);
+        self.window(messages, focus, width, height, scroll, expanded)
+    }
+
+    fn window<'a>(
+        &mut self,
+        messages: impl DoubleEndedIterator<Item = &'a ConversationItem> + Clone,
+        focus: Option<&Focus>,
+        width: usize,
+        height: usize,
+        scroll: usize,
+        expanded: bool,
+    ) -> Viewport {
+        let retry = messages.clone();
+        let mut visible = std::collections::VecDeque::new();
+        let mut seen = 0usize;
+        let mut foldable = 0;
+        let mut focus_from_bottom = None;
+        for message in messages.rev() {
+            if seen > 0 {
+                if seen >= scroll && visible.len() < height {
+                    visible.push_front(Line::default());
+                }
+                seen += 1;
+            }
+            let layout = self.message(message, focus, width, expanded);
+            foldable += layout.foldable;
+            if let Some(row) = layout.focused {
+                focus_from_bottom = Some(seen + layout.lines.len().saturating_sub(row + 1));
+            }
+            // Clone only visible styled rows, never the whole retained history.
+            for line in layout
+                .lines
+                .iter()
+                .rev()
+                .skip(scroll.saturating_sub(seen))
+                .take(height.saturating_sub(visible.len()))
+            {
+                visible.push_front(line.clone());
+            }
+            seen += layout.lines.len();
+            if seen >= scroll.saturating_add(height) {
+                break;
+            }
+        }
+        // Ctrl+PageUp can overshoot the oldest row. Fill from the top just as the
+        // uncached transcript did, instead of showing an empty conversation.
+        if seen < scroll.saturating_add(height) && scroll > 0 {
+            let clamped = seen.saturating_sub(height);
+            if clamped != scroll {
+                return self.window(retry, focus, width, height, clamped, expanded);
+            }
+        }
+        let focused = focus_from_bottom.and_then(|row| {
+            row.checked_sub(scroll)
+                .and_then(|from_bottom| visible.len().checked_sub(from_bottom + 1))
+        });
+        Viewport {
+            transcript: Transcript {
+                lines: visible.into(),
+                focused,
+                foldable,
+            },
+            below: scroll,
+        }
+    }
 }
 
 /// Style runs over one source line as `(end byte, style)`, in order.
@@ -50,6 +253,8 @@ pub(super) fn transcript<'a>(
         foldable: 0,
     };
     for message in messages {
+        #[cfg(test)]
+        PROJECTED_MESSAGES.with(|count| count.set(count.get() + 1));
         let target = focus
             .filter(|focus| focus.matches(message))
             .map(|focus| display_text(&message.text[..focus.offset]).len());
@@ -417,6 +622,121 @@ mod tests {
         let mut focus = Focus::message(message);
         focus.offset = message.text.find(needle).unwrap();
         focus
+    }
+
+    #[test]
+    fn cached_viewport_matches_full_transcript_for_scroll_resize_focus_and_folding() {
+        let mut messages = [
+            item("You", "First 中文 e\u{301} question"),
+            item(
+                "Agent",
+                "## Heading\n- long **answer** with `inline code` 中文\n```rust\nlet x = 42;\n```",
+            ),
+            item(
+                "Tool",
+                "▸ done · a\n▸ running · b\n▸ failed · c\n▸ done · d\n▸ done · e\n▸ running · f",
+            ),
+            item(
+                "Agent",
+                &"Last answer with emoji 👋 and 中文 words.\n".repeat(10),
+            ),
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.id = index.to_string();
+        }
+        let mut cache = ProjectionCache::default();
+        let focus = focus_at(&messages[1], "answer");
+        let tool_focus = focus_at(&messages[2], "done · d");
+        for width in [12, 40, 80, 40] {
+            for height in [1, 7, 25, 100] {
+                for expanded in [false, true] {
+                    for focus in [None, Some(&focus), Some(&tool_focus)] {
+                        let full = transcript(messages.iter(), focus, width, expanded);
+                        for scroll in [0, 1, 13, 10000] {
+                            let max_scroll = full.lines.len().saturating_sub(height);
+                            let start = full.focused.map_or_else(
+                                || max_scroll.saturating_sub(scroll.min(max_scroll)),
+                                |row| row.saturating_sub(height / 3).min(max_scroll),
+                            );
+                            let expected =
+                                &full.lines[start..(start + height).min(full.lines.len())];
+                            let view = cache.viewport(
+                                messages.iter(),
+                                focus,
+                                width,
+                                height,
+                                scroll,
+                                expanded,
+                            );
+                            assert_eq!(
+                                view.transcript.lines, expected,
+                                "width={width} height={height} scroll={scroll} focus={focus:?}"
+                            );
+                            assert_eq!(view.below, max_scroll.saturating_sub(start));
+                            assert_eq!(
+                                view.transcript.focused,
+                                full.focused.and_then(|row| row
+                                    .checked_sub(start)
+                                    .filter(|row| *row < height))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_only_rebuilds_the_changed_visible_message() {
+        let mut messages = vec![item("You", "question"), item("Agent", "streaming")];
+        messages[1].complete = false;
+        let mut cache = ProjectionCache::default();
+        cache.viewport(messages.iter(), None, 80, 30, 0, false);
+        PROJECTED_MESSAGES.with(|count| count.set(0));
+        messages[1].text.push_str(" response 中文");
+        cache.viewport(messages.iter(), None, 80, 30, 0, false);
+        assert_eq!(PROJECTED_MESSAGES.with(|count| count.replace(0)), 1);
+        messages[1].complete = true;
+        messages[1].truncated = true;
+        let view = cache.viewport(messages.iter(), None, 80, 30, 0, false);
+        assert!(view
+            .transcript
+            .lines
+            .iter()
+            .any(|line| text(line).contains("[truncated]")));
+        messages.remove(0);
+        let view = cache.viewport(messages.iter(), None, 80, 30, 0, false);
+        assert_eq!(
+            view.transcript.lines,
+            transcript(messages.iter(), None, 80, false).lines
+        );
+    }
+
+    #[test]
+    fn cached_messages_follow_theme_language_and_thread_changes() {
+        let mut message = item("You", "same id, different conversation");
+        let mut cache = ProjectionCache::default();
+        let original_theme = theme::name();
+        cache.viewport(std::iter::once(&message), None, 80, 10, 0, false);
+        theme::set("light");
+        let view = cache.viewport(std::iter::once(&message), None, 80, 10, 0, false);
+        assert_eq!(
+            view.transcript.lines,
+            transcript(std::iter::once(&message), None, 80, false).lines
+        );
+        lang::with_zh(|| {
+            let view = cache.viewport(std::iter::once(&message), None, 80, 10, 0, false);
+            assert_eq!(text(&view.transcript.lines[0]), "你");
+        });
+        theme::set(original_theme);
+        message.thread_id = "child".into();
+        message.text = "Child output".into();
+        let view = cache.viewport(std::iter::once(&message), None, 80, 10, 0, false);
+        assert!(view
+            .transcript
+            .lines
+            .iter()
+            .any(|line| text(line).contains("Child output")));
     }
 
     #[test]

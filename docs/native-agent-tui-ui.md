@@ -275,6 +275,10 @@ Core facts → Arc<UiSnapshot> → local projection → visible rows → Termina
 
 日志采用分块存储和页索引：每代理 4 MiB、全局 32 MiB，单行和工具输出另有限额；只布局当前视口，换行/宽度变化只重建当前块。搜索、导出和上下文详情在独立任务中执行，不能阻塞 JSON-RPC reader。
 
+当前实时对话的投影缓存由 UI 的 `LocalState` 持有，按 thread/turn/item/role、消息内容、宽度、主题、语言、工具展开状态和搜索焦点校验。跟随最新输出时从末尾按需取得足够填满视口的消息；宽度变化只重排本次访问的消息，绘制时只复制可见行。缓存最多保留 64 条热消息和约 4 MiB 的派生数据；单条超预算布局允许独占缓存。单条正在变化的消息仍按消息重新排版，不保证逐字符增量排版；搜索定位及向上翻页需要计算目标与末尾之间的行数。普通快照按 33 ms 合并，输入、resize、审批、状态变化及消息完成立即请求绘制；无待处理变化时不绘制帧。Ratatui 每帧仍合成完整 buffer，通过相邻 buffer 的差异只向终端写入变化的单元格。
+
+性能回归通过 `cargo test --lib conversation_reuses_layout -- --nocapture` 检查真实 `draw` 路径：未变化消息不重复排版、尾部视口 resize 不加载整段历史、小段正文 delta 只改变对应单元格。测试的 500 条消息是超过 Core 当前保留条数的合成压力输入，输出耗时仅用于同机参考，不作为不稳定的时间断言。`ui::conversation` 的对比测试覆盖换宽、滚动越界、搜索定位、工具折叠、中文/emoji 和主题/语言切换；`ui::runtime` 检查普通 delta 合并与关键变化即时刷新。
+
 初始目标：输入到命令 p99 < 1 ms，snapshot 到状态 p99 < 5 ms，160×50 绘制 p99 < 8 ms，输入到可见反馈 p99 < 16 ms，空闲无固定 FPS，8 agent UI RSS < 128 MiB（不含 app-server）。记录 snapshot version、event-to-state、state-to-draw、draw、terminal bytes、frames、dropped snapshots、queue depth、page cache、search/export duration。
 
 ## 11. 复制、导出与脱敏

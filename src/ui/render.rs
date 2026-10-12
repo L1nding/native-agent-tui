@@ -16,8 +16,8 @@ use super::layout::{
 };
 use super::skills::draw_skills;
 use super::workflow_view;
-use super::{conversation, requests, theme};
 use super::{request_locked, selected_request, LocalState};
+use super::{requests, theme};
 use crate::interactions::RequestKind;
 use crate::observation::{AttentionLevel, ExecutionState};
 use crate::state::{display_text, CoreSnapshot, SessionPhase};
@@ -293,18 +293,21 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         );
     }
     let (width, height) = conversation_content_size(conversation_area);
-    let projected = conversation::transcript(
+    let projected = local.conversation_cache.borrow_mut().viewport(
         snapshot
             .messages
             .iter()
             .filter(|message| message.thread_id == selected_thread),
         local.conversation_focus.as_ref(),
         width,
+        height,
+        local.scroll_from_bottom,
         local.tools_expanded,
     );
-    let focused_row = projected.focused;
-    let foldable_tools = projected.foldable > 0;
-    let mut transcript = projected.lines;
+    let focused_row = projected.transcript.focused;
+    let foldable_tools = projected.transcript.foldable > 0;
+    let below = projected.below;
+    let mut transcript = projected.transcript.lines;
     if transcript.is_empty() {
         transcript.push(
             Line::from(if selected_agent.is_some() {
@@ -333,12 +336,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             }
         }
     }
-    let max_scroll = transcript.len().saturating_sub(height);
-    let scroll = local.scroll_from_bottom.min(max_scroll);
-    let start = focused_row.map_or_else(
-        || max_scroll.saturating_sub(scroll),
-        |row| row.saturating_sub(height / 3).min(max_scroll),
-    );
     let name = selected_agent
         .map(|agent| {
             agent
@@ -349,7 +346,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 .unwrap_or(&agent.info.id)
         })
         .unwrap_or("root");
-    let below = max_scroll.saturating_sub(start);
     let mut title = vec![
         Span::styled(format!(" {}", display_text(name)), theme.label()),
         Span::styled(tr(" · F3 switch", " · F3 切换"), theme.secondary()),
@@ -384,7 +380,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     let visible: Vec<_> = transcript
         .into_iter()
         .enumerate()
-        .skip(start)
         .take(height)
         .map(|(row, text)| {
             if Some(row) == focused_row {

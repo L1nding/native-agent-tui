@@ -106,6 +106,7 @@ struct LocalState {
     search: search::SearchPanel,
     timeline: timeline::TimelinePanel,
     conversation_focus: Option<search::Focus>,
+    conversation_cache: std::cell::RefCell<conversation::ProjectionCache>,
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
@@ -491,19 +492,17 @@ fn handle_key(
             .conversation;
             let (width, height) = conversation_content_size(area);
             // 与渲染共用同一份投影，翻页起点才会落在焦点所在的显示行。
-            let projected = conversation::transcript(
+            if let Some(scroll) = local.conversation_cache.borrow_mut().focused_scroll(
                 snapshot
                     .messages
                     .iter()
                     .filter(|m| m.thread_id == focus.thread()),
-                Some(focus),
+                focus,
                 width,
+                height,
                 local.tools_expanded,
-            );
-            let max_scroll = projected.lines.len().saturating_sub(height);
-            if let Some(row) = projected.focused {
-                local.scroll_from_bottom =
-                    max_scroll.saturating_sub(row.saturating_sub(height / 3).min(max_scroll));
+            ) {
+                local.scroll_from_bottom = scroll;
             }
         }
     }
@@ -1058,6 +1057,75 @@ mod tests {
 
     fn observed_snapshot() -> CoreSnapshot {
         observed_snapshot_with_requests(&[])
+    }
+
+    #[test]
+    fn conversation_reuses_layout_on_redraw_and_only_loads_visible_history_on_resize() {
+        let mut snapshot = CoreSnapshot::default();
+        for index in 0..500 {
+            snapshot.messages.push(ConversationItem {
+                id: index.to_string(),
+                thread_id: String::new(),
+                turn_id: "turn".into(),
+                role: "Agent".into(),
+                text: "## Output 中文\n- streamed response with `code` and **emphasis**\n"
+                    .repeat(12),
+                complete: true,
+                truncated: false,
+            });
+        }
+        let local = LocalState::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let initial = started.elapsed();
+        conversation::PROJECTED_MESSAGES.with(|count| count.set(0));
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let redraw = started.elapsed();
+        let unchanged = conversation::PROJECTED_MESSAGES.with(|count| count.replace(0));
+        let previous = terminal.backend().buffer().clone();
+        snapshot
+            .messages
+            .last_mut()
+            .unwrap()
+            .text
+            .push_str("next delta");
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        assert_eq!(
+            conversation::PROJECTED_MESSAGES.with(|count| count.replace(0)),
+            1
+        );
+        let changed = previous.diff(terminal.backend().buffer()).len();
+        assert!(
+            changed > 0 && changed <= 10,
+            "a small text delta changed {changed} terminal cells"
+        );
+        terminal.backend_mut().resize(100, 30);
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 100, 30))
+            .unwrap();
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let resize = started.elapsed();
+        let resized = conversation::PROJECTED_MESSAGES.with(|count| count.replace(0));
+        eprintln!("conversation performance: first={initial:?} unchanged={redraw:?} resize={resize:?}; laid out unchanged={unchanged} resized={resized}");
+        assert_eq!(
+            unchanged, 0,
+            "redrawing unchanged conversation reprocesses its history"
+        );
+        assert!(
+            resized <= 2,
+            "resizing the tail loads {resized} messages outside its viewport"
+        );
     }
 
     #[test]
