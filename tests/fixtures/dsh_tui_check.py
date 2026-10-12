@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify"], help="modeling scenario for --only domain")
     args = parser.parse_args()
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
@@ -645,6 +645,10 @@ def domain_checks(report, binary, common, args, workspace, root):
             return
         if case == "scan":
             tui.keys(CTRL_C)
+            return
+        if case == "clarify":
+            from domain_clarification_check import run_clarification_checks
+            run_clarification_checks(report, tui, send, finished, fact, context, root)
             return
         if case == "blocked":
             def blocked_proposal():

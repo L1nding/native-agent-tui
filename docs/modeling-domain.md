@@ -16,3 +16,14 @@ Core 从已校验线程／回合身份、带 registry-derived MCP identity 的 c
 
 
 复杂来源验收入口为 `tests/fixtures/dsh_tui_check.py --only domain`，只运行领域步骤和进程清理；`--domain-case chair`（或 `MODELING_COMPLEX_FULL=1`）增加单椅方案、局部反馈、具体批准和产物验证；`--domain-case mixed` 验证椅／柜／盆的候选、两轮局部反馈、部分采纳、批准和构建。需指定 `MODELING_COMPLEX_ROOT` 与 `MODELING_COMPLEX_CONTEXT`；完整运行必须使用 `repository/outputs` 下隔离的合成场景副本，脚本会拒绝直接修改跟踪夹具。验收等待每个回合终态后再发送意见，并滚动查看实际方案和阶段事实；结果保存为 `target/dsh-e2e-*/report.json`。领域程序测试、真实模型闭环、AI／人工视觉复核分别记录，不能相互替代。
+
+
+## C07 澄清交互验收
+
+来源：模型器 `docs/modeling-complex-cases-plan.md` 的 C07 要求。真实运行表明部分 dsh/provider 工具列表没有平台问答入口；Agent 会在普通对话中询问用户。此前默认建模页只展示领域事实，这类问题需要 F6 才能看到。
+
+建模页现在单独展示当前根线程、当前回合的 Agent 回复；默认显示回复末尾，Shift+PgUp/PgDn 浏览回复，普通 PgUp/PgDn 继续浏览方案事实，输入回复后恢复跟随末尾。回复是对话内容，不生成批准或执行事实；旧回合、子 Agent 回复不作为当前回复展示。平台问题请求仍使用原请求页面。
+
+`--domain-case clarify` 新增真实含糊来源指代、缺高度、允许示意高度、确认尺寸与 CAD 冲突、冲突澄清、具体批准及构建验收。仅通过键盘推进同一平台 Agent；读取领域记录作独立证据，不从验收脚本直接准备、授权或应用场景。场景仍必须位于模型器 `outputs/` 的隔离副本。
+
+验收同时保存每个阶段的场景／来源哈希、提案链、批准／应用记录与实际屏幕到 `clarification-stages.json` 及阶段文本。模型器 `scripts/verify_complex_clarification.py` 再核对未决阻塞、版本失效、来源与保护对象不变、具体授权绑定、assumed 保留、真实 Blender 重建及 GLB 回读。实际屏幕必须显示具体澄清问题，仅出现“待确认”不算问题可见。

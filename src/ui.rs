@@ -122,6 +122,7 @@ struct LocalState {
     evidence: bool,
     domain_visible: bool,
     domain_scroll: u16,
+    domain_reply_scroll_from_bottom: u16,
     displayed_domain_binding: Option<crate::domain::ProposalBinding>,
     evidence_scroll: usize,
     skills: bool,
@@ -637,6 +638,7 @@ fn handle_key(
     if key.code == KeyCode::F(6) && snapshot.domain.enabled {
         local.domain_visible = !local.domain_visible;
         local.domain_scroll = 0;
+        local.domain_reply_scroll_from_bottom = 0;
         local.workflow.visible = false;
         return false;
     }
@@ -644,6 +646,16 @@ fn handle_key(
         match key.code {
             KeyCode::Esc => {
                 local.domain_visible = false;
+                return false;
+            }
+            KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                local.domain_reply_scroll_from_bottom =
+                    local.domain_reply_scroll_from_bottom.saturating_add(8);
+                return false;
+            }
+            KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                local.domain_reply_scroll_from_bottom =
+                    local.domain_reply_scroll_from_bottom.saturating_sub(8);
                 return false;
             }
             KeyCode::PageUp => {
@@ -1023,6 +1035,7 @@ fn handle_key(
             ) {
                 local.editor.clear();
                 local.scroll_from_bottom = 0;
+                local.domain_reply_scroll_from_bottom = 0;
             }
         }
         KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {

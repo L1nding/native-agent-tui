@@ -3,8 +3,26 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::layout::wrap_text;
 use super::LocalState;
 use crate::state::{display_text, CoreSnapshot};
+
+// Reply text is conversation content, never an approval or execution fact.
+fn current_reply(snapshot: &CoreSnapshot) -> Option<&str> {
+    let thread = snapshot.thread_id.as_deref()?;
+    let turn = snapshot.turn_id.as_deref()?;
+    snapshot
+        .messages
+        .iter()
+        .rev()
+        .find(|item| {
+            item.thread_id == thread
+                && item.turn_id == turn
+                && item.role == "Agent"
+                && !item.text.trim().is_empty()
+        })
+        .map(|item| item.text.as_str())
+}
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -12,9 +30,16 @@ pub(super) fn draw(
     snapshot: &CoreSnapshot,
     local: &LocalState,
 ) {
+    let reply = current_reply(snapshot);
+    let reply_height = if reply.is_some() && area.height >= 20 {
+        (area.height / 3).clamp(6, 10)
+    } else {
+        0
+    };
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
+        Constraint::Length(reply_height),
         Constraint::Length(4),
         Constraint::Length(2),
     ])
@@ -106,6 +131,23 @@ pub(super) fn draw(
             .scroll((local.domain_scroll, 0)),
         chunks[1],
     );
+    if let Some(reply) = reply.filter(|_| reply_height > 0) {
+        let reply_lines = wrap_text(reply, usize::from(chunks[2].width.saturating_sub(2)));
+        let max_scroll = reply_lines
+            .len()
+            .saturating_sub(usize::from(reply_height - 2));
+        let scroll = max_scroll.saturating_sub(usize::from(local.domain_reply_scroll_from_bottom));
+        frame.render_widget(
+            Paragraph::new(reply_lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Agent 回复 · Shift+PgUp/PgDn 滚动 · F6 对话"),
+                )
+                .scroll((scroll.min(usize::from(u16::MAX)) as u16, 0)),
+            chunks[2],
+        );
+    }
     frame.render_widget(
         Paragraph::new(display_text(&local.editor.text))
             .block(
@@ -114,9 +156,9 @@ pub(super) fn draw(
                     .title("目标 / 自然语言反馈"),
             )
             .wrap(Wrap { trim: false }),
-        chunks[2],
+        chunks[3],
     );
-    frame.render_widget(Paragraph::new("Enter 发送反馈 · Ctrl+Y 批准已展示版本 · Ctrl+C 中断 · F6/Esc 返回会话 · PgUp/PgDn 滚动"), chunks[3]);
+    frame.render_widget(Paragraph::new("Enter 发送反馈 · Ctrl+Y 批准已展示版本 · Ctrl+C 中断 · F6/Esc 返回会话 · PgUp/PgDn 滚动"), chunks[4]);
 }
 
 #[cfg(test)]
@@ -145,6 +187,165 @@ mod tests {
             diagnostics: vec![],
             ready: true,
         }
+    }
+
+    fn message(thread: &str, turn: &str, text: &str) -> crate::state::ConversationItem {
+        crate::state::ConversationItem {
+            id: format!("{thread}-{turn}"),
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+            role: "Agent".into(),
+            text: text.into(),
+            complete: true,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn business_page_shows_current_root_clarification_and_keeps_natural_feedback() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Completed,
+            thread_id: Some("root".into()),
+            turn_id: Some("current".into()),
+            domain: DomainSnapshot {
+                enabled: true,
+                ..Default::default()
+            },
+            messages: vec![
+                message("root", "old", "OLD_QUESTION"),
+                message("root", "current", "请选择椅子 A、B 或 C；高度尚未确认。"),
+                message("child", "current", "CHILD_QUESTION"),
+            ],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            domain_visible: true,
+            ..Default::default()
+        };
+        for (width, height) in [(120, 34), (60, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw(f, f.area(), &snapshot, &local))
+                .unwrap();
+            use unicode_width::UnicodeWidthStr;
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..height {
+                let mut x = 0;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    screen.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+                screen.push('\n');
+            }
+            assert!(screen.contains("请选择椅子 A、B 或 C"), "{screen}");
+            assert!(screen.contains("目标 / 自然语言反馈"), "{screen}");
+            assert!(!screen.contains("OLD_QUESTION") && !screen.contains("CHILD_QUESTION"));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        // A model reply alone must not create business write authority.
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        local.editor.insert("选 C，高度允许示意0.9米");
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::SubmitRootInput {
+                text: "选 C，高度允许示意0.9米".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn long_reply_shows_the_final_question_and_scrolls_without_moving_domain_facts() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use unicode_width::UnicodeWidthStr;
+        let details = (0..20)
+            .map(|i| format!("DETAIL_{i:02}\n"))
+            .collect::<String>();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Completed,
+            thread_id: Some("root".into()),
+            turn_id: Some("current".into()),
+            domain: DomainSnapshot {
+                enabled: true,
+                ..Default::default()
+            },
+            messages: vec![message("root", "current", &(details + "请提供整体高度？"))],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            domain_visible: true,
+            ..Default::default()
+        };
+        let render = |local: &LocalState| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+            terminal
+                .draw(|f| draw(f, f.area(), &snapshot, local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..30 {
+                let mut x = 0;
+                while x < 80 {
+                    let symbol = buffer[(x, y)].symbol();
+                    screen.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+            }
+            screen
+        };
+        assert!(render(&local).contains("请提供整体高度？"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.domain_scroll, 0);
+        assert!(!render(&local).contains("请提供整体高度？"));
+        assert!(render(&local).contains("DETAIL_12"));
+        assert!(rx.try_recv().is_err());
+        local.editor.insert("允许示意高度0.9米");
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.domain_reply_scroll_from_bottom, 0);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::SubmitRootInput { .. }
+        ));
+    }
+
+    #[test]
+    fn a_new_turn_never_reuses_an_old_clarification_as_its_reply() {
+        let mut snapshot = CoreSnapshot {
+            thread_id: Some("root".into()),
+            turn_id: Some("new".into()),
+            messages: vec![message("root", "old", "请选择旧方案")],
+            ..Default::default()
+        };
+        assert_eq!(current_reply(&snapshot), None);
+        snapshot
+            .messages
+            .push(message("root", "new", "正在核对新意见"));
+        assert_eq!(current_reply(&snapshot), Some("正在核对新意见"));
     }
 
     #[test]
