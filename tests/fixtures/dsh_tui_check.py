@@ -28,6 +28,7 @@ from conpty import Console  # noqa: E402
 
 ENTER, ESC, TAB = "\r", "\x1b", "\t"
 UP, DOWN, RIGHT, LEFT = "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"
+F6 = "\x1b[17~"
 CTRL_C, CTRL_E, CTRL_N, CTRL_Q, CTRL_R, CTRL_S, CTRL_T, CTRL_U, CTRL_Y = (
     "\x03", "\x05", "\x0e", "\x11", "\x12", "\x13", "\x14", "\x15", "\x19")
 PROBE_PROVIDER = "zf-e2e"
@@ -607,11 +608,32 @@ def domain_checks(report, binary, common, args, workspace, root):
     try:
         def scan():
             tui.wait("modeling session ready", lambda s: "建模" in s and "Initializing" not in s, 120)
-            scan_prompt = ("开始八层医院隔离副本扫描。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances；每页明确使用 limit=100，按 next_offset 读完全部页面后再展示来源实例台账。保留 pending_confirmation、pending_addition、suspected_duplicate、capability_missing 等真实状态，不提交方案。" if hospital else
+            scan_prompt = ("开始八层医院隔离副本扫描。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances；每页明确使用 limit=20 以保持领域事实可读，按 next_offset 读完全部页面后再展示来源实例台账汇总。明确 total_objects、state_counts、scan_id 和未决状态，不读取临时文件，不提交方案。" if hospital else
                            "开始混合楼层建模。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances 分页扫描并展示来源实例对账；保留已有、待新增、疑似重复、待确认和缺能力状态，先不要提交构建方案。")
             tui.type(scan_prompt)
             tui.keys(ENTER, 0.5)
-            screen = fact("source ledger", lambda s: "来源实例对账" in s, 600 if hospital else 180)
+            approval_prompt_seen = False
+            domain_view_requested = False
+
+            def ledger_or_read_only_approval(s):
+                nonlocal approval_prompt_seen, domain_view_requested
+                # A completed request remains in transcript history; only the visible
+                # pending-request panel should trigger an approval response.
+                pending = "Pending request" in s and "Needs your approval" in s
+                if pending:
+                    if not approval_prompt_seen:
+                        tui.keys(CTRL_Y, 1.0)
+                    approval_prompt_seen = True
+                    return False
+                approval_prompt_seen = False
+                if ("Write a task" in s and "目标 / 自然语言反馈" not in s
+                        and not domain_view_requested):
+                    tui.keys(F6, 1.0)
+                    domain_view_requested = True
+                    return False
+                return "来源实例对账" in s
+
+            screen = fact("source ledger", ledger_or_read_only_approval, 600 if hospital else 180)
             if hospital:
                 expect("待确认" in screen or "pending_confirmation" in screen,
                        "hospital ledger did not expose unresolved source states")
