@@ -27,8 +27,44 @@ pub(crate) struct AcpProcess {
     pub bridge: JoinHandle<()>,
 }
 
+/// The end of what dsh wrote to stderr, kept only to explain a failed start.
+type StderrTail = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+const STDERR_TAIL_BYTES: usize = 8192;
+
+/// The one line of dsh's error output worth showing: its last `Error:` line,
+/// or else its last line that is not a stack frame. Control characters are
+/// dropped and the length is bounded; nothing else of the output is kept.
+fn startup_failure(tail: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(tail);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("Error:"))
+        .or_else(|| {
+            lines
+                .iter()
+                .rev()
+                .find(|line| !line.starts_with("at ") && !line.starts_with('^'))
+        })?;
+    let line = line.strip_prefix("Error:").unwrap_or(line).trim();
+    let clean: String = line.chars().filter(|c| !c.is_control()).take(300).collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
 /// One dsh process with its transport and stderr drain.
 fn launch(config: &Config) -> std::io::Result<(PipeTransport, Child, JoinHandle<()>)> {
+    launch_with_tail(config, None)
+}
+
+fn launch_with_tail(
+    config: &Config,
+    tail: Option<StderrTail>,
+) -> std::io::Result<(PipeTransport, Child, JoinHandle<()>)> {
     let mut command = Command::new(&config.dsh_executable);
     command
         .args(["--profile", config.acp_profile.as_str()])
@@ -47,8 +83,19 @@ fn launch(config: &Config) -> std::io::Result<(PipeTransport, Child, JoinHandle<
         .take()
         .ok_or_else(|| std::io::Error::other("missing ACP stderr"))?;
     let stderr = tokio::spawn(async move {
+        // Drain in fixed chunks; only a bounded tail is ever kept.
         let mut buffer = [0; 8192];
-        while matches!(stderr.read(&mut buffer).await, Ok(n) if n > 0) {}
+        while let Ok(read) = stderr.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            if let Some(tail) = &tail {
+                let mut kept = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                kept.extend_from_slice(&buffer[..read]);
+                let excess = kept.len().saturating_sub(STDERR_TAIL_BYTES);
+                kept.drain(..excess);
+            }
+        }
     });
     Ok((PipeTransport::new(stdout, stdin), child, stderr))
 }
@@ -150,7 +197,13 @@ async fn exercise_model(pipe: &mut PipeTransport, cwd: &str, model: &str) -> Res
 
 /// Tests `model` with a separate dsh process, so the running session and its
 /// conversation are untouched. Returns the elapsed milliseconds.
-pub(crate) async fn test_model(config: Config, model: String) -> Result<u64, String> {
+pub(crate) async fn test_model(mut config: Config, model: String) -> Result<u64, String> {
+    // The test needs a dsh session of its own. It lives in a directory kept for
+    // that purpose, so it never shows up among the workspace's sessions.
+    let scratch = std::env::temp_dir().join("native-agent-tui-model-test");
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| format!("the test directory could not be created: {error}"))?;
+    config.cwd = scratch;
     let (mut pipe, child, stderr) = launch(&config).map_err(|error| error.to_string())?;
     let started = std::time::Instant::now();
     let cwd = config.cwd.display().to_string();
@@ -170,7 +223,8 @@ pub(crate) async fn test_model(config: Config, model: String) -> Result<u64, Str
 type Respawn = Box<dyn FnMut() -> std::io::Result<(PipeTransport, Option<Replacement>)> + Send>;
 
 pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
-    let (process_pipe, child, stderr) = launch(config)?;
+    let tail = StderrTail::default();
+    let (process_pipe, child, stderr) = launch_with_tail(config, Some(tail.clone()))?;
 
     // The Core sees the same bounded JSONL transport it always used. A
     // duplex pair keeps ACP translation out of Core and preserves writer
@@ -181,6 +235,7 @@ pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
     let core_pipe = PipeTransport::new(core_read, core_write);
     let bridge_pipe = PipeTransport::new(bridge_read, bridge_write);
     let mut bridge = AcpBridge::new(bridge_pipe, process_pipe, config);
+    bridge.startup_stderr = Some(tail);
     let respawn_config = config.clone();
     bridge.respawn = Some(Box::new(move || {
         let (pipe, child, stderr) = launch(&respawn_config)?;
@@ -299,6 +354,8 @@ struct AcpBridge {
     current: Option<String>,
     respawn: Option<Respawn>,
     replacement: Option<Replacement>,
+    /// dsh 的错误输出末尾；只在会话建立之前进程就退出时用来说明原因。
+    startup_stderr: Option<StderrTail>,
     /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
     tool_inputs: HashMap<String, acp_protocol::ToolInput>,
 }
@@ -326,6 +383,7 @@ impl AcpBridge {
             current: None,
             respawn: None,
             replacement: None,
+            startup_stderr: None,
             tool_inputs: HashMap::new(),
         }
     }
@@ -351,7 +409,10 @@ impl AcpBridge {
                         Ok(message) => {
                             if self.handle_acp(message).await.is_err() { break; }
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            self.explain_failed_start().await;
+                            break;
+                        }
                     }
                 }
             }
@@ -361,6 +422,40 @@ impl AcpBridge {
         if let Some(replacement) = self.replacement.take() {
             replacement.stop().await;
         }
+    }
+
+    /// dsh ended before any session existed: answer the handshake Core is
+    /// waiting on with what dsh said, so the user sees the cause.
+    async fn explain_failed_start(&mut self) {
+        if self.session_id.is_some() {
+            return;
+        }
+        let waiting: Vec<RpcId> = self
+            .pending
+            .iter()
+            .filter(|(_, kind)| matches!(kind, Pending::Initialize | Pending::SessionNew))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        // The error text can arrive a moment after the output pipe closes.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let said = self.startup_stderr.as_ref().and_then(|tail| {
+            startup_failure(&tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        });
+        let message = match said {
+            Some(said) => format!("dsh exited before a session started: {said}"),
+            None => "dsh exited before a session started and reported no error".to_owned(),
+        };
+        for id in waiting {
+            self.pending.remove(&id);
+            let _ = self
+                .core
+                .send(Envelope::error_response(id, -32000, message.clone()));
+        }
+        // The bridge ends right after this; the answer must be written out first.
+        self.core.close_writer().await;
     }
 
     /// Replies to Core's thread/start, model/select or backend/reload with the
@@ -1274,6 +1369,57 @@ mod tests {
         let (ar, aw) = tokio::io::split(a);
         let (br, bw) = tokio::io::split(b);
         (PipeTransport::new(ar, aw), PipeTransport::new(br, bw))
+    }
+
+    #[test]
+    fn a_failed_start_is_explained_by_the_last_error_line_only() {
+        let output = b"file:///C:/x/lib/index.js:974\n\t\tif (x) throw new Error(`nope`);\n\t\t      ^\n\nError: dsh: profile \"zf\" does not exist; create it with 'dsh plugin --profile zf add <package>'\n    at loadProfile (file:///C:/x/lib/index.js:974:34)\n    at main (file:///C:/x/bin.js:1:1)\n\nNode.js v24.16.0\n";
+        assert_eq!(
+            super::startup_failure(output).as_deref(),
+            Some("dsh: profile \"zf\" does not exist; create it with 'dsh plugin --profile zf add <package>'")
+        );
+        // 没有 Error 行时取最后一行非堆栈内容；控制字符去掉，长度有上限。
+        assert_eq!(
+            super::startup_failure(
+                b"warming up\n\x1b[31mcannot bind port\x07\n    at listen (x.js:1:1)\n"
+            )
+            .as_deref(),
+            Some("[31mcannot bind port")
+        );
+        let long = format!("Error: {}", "x".repeat(1000));
+        assert_eq!(super::startup_failure(long.as_bytes()).unwrap().len(), 300);
+        assert_eq!(super::startup_failure(b""), None);
+        assert_eq!(super::startup_failure(b"\n   \n"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_that_exits_during_the_handshake_fails_the_handshake_with_its_own_words() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.startup_stderr = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            b"Error: dsh: profile \"zf\" does not exist\n    at loadProfile (x.js:1:1)\n".to_vec(),
+        )));
+        let bridge = tokio::spawn(bridge.run());
+        core_client
+            .send(Envelope::request(
+                RpcId::Number(1),
+                "initialize",
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        drop(acp_server);
+        let answer = tokio::time::timeout(Duration::from_secs(3), core_client.recv())
+            .await
+            .expect("the handshake was left unanswered")
+            .unwrap();
+        assert_eq!(answer.id, Some(RpcId::Number(1)));
+        assert_eq!(
+            answer.error.unwrap()["message"],
+            "dsh exited before a session started: dsh: profile \"zf\" does not exist"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
 
     #[test]
