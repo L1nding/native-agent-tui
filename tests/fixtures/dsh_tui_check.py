@@ -570,6 +570,7 @@ def domain_checks(report, binary, common, args, workspace, root):
                "--dsh", args.dsh, "--profile", args.profile]
     tui = Tui(command, repository, report.evidence)
     mixed = case == "mixed"
+    hospital = "floor.f08.trial" in context.read_text(encoding="utf-8")
     def finished():
         screen = tui.wait("domain turn completed", lambda s: any(state in s for state in
                           (" · Completed · ", " · Failed · ", " · Interrupted · "))
@@ -606,11 +607,17 @@ def domain_checks(report, binary, common, args, workspace, root):
     try:
         def scan():
             tui.wait("modeling session ready", lambda s: "建模" in s and "Initializing" not in s, 120)
-            tui.type("开始混合楼层建模。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances 分页扫描并展示来源实例对账；保留已有、待新增、疑似重复、待确认和缺能力状态，先不要提交构建方案。")
+            scan_prompt = ("开始八层医院隔离副本扫描。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances；每页明确使用 limit=100，按 next_offset 读完全部页面后再展示来源实例台账。保留 pending_confirmation、pending_addition、suspected_duplicate、capability_missing 等真实状态，不提交方案。" if hospital else
+                           "开始混合楼层建模。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances 分页扫描并展示来源实例对账；保留已有、待新增、疑似重复、待确认和缺能力状态，先不要提交构建方案。")
+            tui.type(scan_prompt)
             tui.keys(ENTER, 0.5)
-            screen = fact("source ledger", lambda s: "来源实例对账" in s, 180)
-            expect("pending_addition" in screen and "suspected_duplicate" in screen,
-                   "ledger did not expose expected mixed-floor states")
+            screen = fact("source ledger", lambda s: "来源实例对账" in s, 600 if hospital else 180)
+            if hospital:
+                expect("待确认" in screen or "pending_confirmation" in screen,
+                       "hospital ledger did not expose unresolved source states")
+            else:
+                expect("pending_addition" in screen and "suspected_duplicate" in screen,
+                       "ledger did not expose expected mixed-floor states")
         if not report.step("real dsh scans and shows the mixed-floor ledger", scan, tui):
             return
         if case == "scan":
