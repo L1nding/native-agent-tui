@@ -5,3 +5,8 @@
 - insert:
     - id: zf-tui-bridge
       name: 'zf-tui-bridge'
+      config:
+        # Route for a new session until the user picks a model; a profile patch
+        # can replace this row's config.
+        provider: deepseek-official
+        model: deepseek-v4-flash
