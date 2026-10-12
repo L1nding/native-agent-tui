@@ -54,6 +54,7 @@ def main():
     run([sys.executable, str(fixtures / "observation_consumer.py")], input=generated.stdout)
     if os.name == "nt":
         run([sys.executable, str(fixtures / "windows_terminal_input_check.py"), "--fixture", str(binary.parent / "examples/input_fixture.exe")])
+        run([sys.executable, str(fixtures / "conversation_stream_check.py"), "--binary", str(binary)])
         run([sys.executable, str(fixtures / "process_identity_check.py")])
         run([sys.executable, str(fixtures / "process_ownership_check.py"), "--fixture", str(binary.parent / "examples/process_fixture.exe")])
     if args.live:

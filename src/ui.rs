@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use thiserror::Error;
 
 use crate::client::Command;
@@ -102,12 +102,20 @@ pub enum UiError {
     Shutdown(String),
 }
 
+#[derive(Clone, Copy, Default)]
+struct ConversationViewport {
+    area: ratatui::layout::Rect,
+    scroll: usize,
+}
+
 #[derive(Default)]
 struct LocalState {
     viewport: ratatui::layout::Rect,
+    conversation_viewport: std::cell::Cell<ConversationViewport>,
     search: search::SearchPanel,
     timeline: timeline::TimelinePanel,
     conversation_focus: Option<search::Focus>,
+    conversation_cache: std::cell::RefCell<conversation::ProjectionCache>,
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
@@ -146,6 +154,46 @@ struct InputDraft {
     editor: Editor,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
+}
+
+/// Mouse browsing is local to the painted conversation, including a selected
+/// child agent. Use the displayed offset so overscroll and search stay coherent.
+fn handle_mouse(mouse: MouseEvent, local: &mut LocalState) -> bool {
+    let view = local.conversation_viewport.get();
+    if local.palette.visible
+        || local.models.visible
+        || local.settings.visible
+        || local.provider_form.visible
+        || local.search.visible
+        || local.timeline.visible
+        || local.skills
+        || local.context.visible
+        || local.workflow.visible
+        || local.evidence
+        || local.attention_editor.is_some()
+        || local.request_panel
+        || local.help
+        || !view
+            .area
+            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+    {
+        return false;
+    }
+    const WHEEL_ROWS: usize = 3;
+    let scroll = match mouse.kind {
+        MouseEventKind::ScrollUp => view.scroll.saturating_add(WHEEL_ROWS),
+        MouseEventKind::ScrollDown => view.scroll.saturating_sub(WHEEL_ROWS),
+        _ => return false,
+    };
+    if scroll == view.scroll && local.conversation_focus.is_none() {
+        return false;
+    }
+    local.conversation_focus = None;
+    local.scroll_from_bottom = scroll;
+    local
+        .conversation_viewport
+        .set(ConversationViewport { scroll, ..view });
+    true
 }
 
 fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
@@ -493,19 +541,17 @@ fn handle_key(
             .conversation;
             let (width, height) = conversation_content_size(area);
             // 与渲染共用同一份投影，翻页起点才会落在焦点所在的显示行。
-            let projected = conversation::transcript(
+            if let Some(scroll) = local.conversation_cache.borrow_mut().focused_scroll(
                 snapshot
                     .messages
                     .iter()
                     .filter(|m| m.thread_id == focus.thread()),
-                Some(focus),
+                focus,
                 width,
+                height,
                 local.tools_expanded,
-            );
-            let max_scroll = projected.lines.len().saturating_sub(height);
-            if let Some(row) = projected.focused {
-                local.scroll_from_bottom =
-                    max_scroll.saturating_sub(row.saturating_sub(height / 3).min(max_scroll));
+            ) {
+                local.scroll_from_bottom = scroll;
             }
         }
     }
@@ -1060,6 +1106,220 @@ mod tests {
 
     fn observed_snapshot() -> CoreSnapshot {
         observed_snapshot_with_requests(&[])
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_root_and_child_conversations_and_returns_to_latest() {
+        use crate::agents::{AgentInfo, AgentSnapshot};
+        for child in [false, true] {
+            let mut snapshot = CoreSnapshot {
+                thread_id: Some("root".into()),
+                ..Default::default()
+            };
+            snapshot.agents.push(AgentSnapshot {
+                info: AgentInfo {
+                    id: "child".into(),
+                    parent_id: "root".into(),
+                    path: None,
+                    nickname: None,
+                    role: None,
+                    model: None,
+                    confirmed: true,
+                },
+                generation: 1,
+                turn_id: Some("turn".into()),
+                outcome: None,
+                awaiting_turn: false,
+                usage: Default::default(),
+            });
+            for thread in ["root", "child"] {
+                snapshot.messages.push(ConversationItem {
+                    id: "message".into(),
+                    thread_id: thread.into(),
+                    turn_id: "turn".into(),
+                    role: "Agent".into(),
+                    text: (0..120)
+                        .map(|row| format!("{thread} row {row:03}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    complete: false,
+                    truncated: false,
+                });
+            }
+            let mut local = LocalState {
+                agent_id: child.then(|| "child".into()),
+                ..Default::default()
+            };
+            local.editor.insert("draft preserved");
+            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            let original = terminal.backend().buffer().clone();
+            let area = local.conversation_viewport.get().area;
+            // Drive the same VT -> InputEvent -> UI route used by terminal input.
+            for _ in 0..2 {
+                let event =
+                    input::fixture_events(&format!("\x1b[<64;{};{}M", area.x + 3, area.y + 4))
+                        .pop()
+                        .unwrap();
+                let InputEvent::Mouse(mouse) = event else {
+                    panic!("wheel was not decoded");
+                };
+                assert!(handle_mouse(mouse, &mut local));
+            }
+            assert_eq!(
+                local.scroll_from_bottom, 6,
+                "wheel events in one input batch must accumulate"
+            );
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            assert_ne!(terminal.backend().buffer(), &original);
+            assert_eq!(local.conversation_viewport.get().scroll, 6);
+            for _ in 0..2 {
+                assert!(handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: area.x + 2,
+                        row: area.y + 3,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &mut local
+                ));
+            }
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &local))
+                .unwrap();
+            assert_eq!(terminal.backend().buffer(), &original);
+            assert_eq!(local.editor.text, "draft preserved");
+            assert_eq!(local.agent_id.as_deref(), child.then_some("child"));
+        }
+    }
+
+    #[test]
+    fn wheel_uses_displayed_offset_after_search_and_overscroll_and_ignores_overlays() {
+        let mut snapshot = CoreSnapshot::default();
+        snapshot.messages.push(ConversationItem {
+            id: "message".into(),
+            thread_id: String::new(),
+            turn_id: "turn".into(),
+            role: "Agent".into(),
+            text: (0..100)
+                .map(|row| format!("line {row:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            complete: true,
+            truncated: false,
+        });
+        let mut local = LocalState::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        local.scroll_from_bottom = usize::MAX;
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let view = local.conversation_viewport.get();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: view.area.x + 2,
+            row: view.area.y + 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(handle_mouse(mouse, &mut local));
+        assert_eq!(local.scroll_from_bottom, view.scroll - 3);
+        local.conversation_focus = Some(search::Focus::message(&snapshot.messages[0]));
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let view = local.conversation_viewport.get();
+        assert!(handle_mouse(mouse, &mut local));
+        assert_eq!(local.scroll_from_bottom, view.scroll.saturating_sub(3));
+        assert!(local.conversation_focus.is_none());
+        let before = local.scroll_from_bottom;
+        assert!(!handle_mouse(MouseEvent { row: 0, ..mouse }, &mut local));
+        local.help = true;
+        assert!(!handle_mouse(mouse, &mut local));
+        local.help = false;
+        local.search.visible = true;
+        assert!(!handle_mouse(mouse, &mut local));
+        local.search.visible = false;
+        assert!(!handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                ..mouse
+            },
+            &mut local
+        ));
+        assert_eq!(local.scroll_from_bottom, before);
+    }
+
+    #[test]
+    fn conversation_reuses_layout_on_redraw_and_only_loads_visible_history_on_resize() {
+        let mut snapshot = CoreSnapshot::default();
+        for index in 0..500 {
+            snapshot.messages.push(ConversationItem {
+                id: index.to_string(),
+                thread_id: String::new(),
+                turn_id: "turn".into(),
+                role: "Agent".into(),
+                text: "## Output 中文\n- streamed response with `code` and **emphasis**\n"
+                    .repeat(12),
+                complete: true,
+                truncated: false,
+            });
+        }
+        let local = LocalState::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let initial = started.elapsed();
+        conversation::PROJECTED_MESSAGES.with(|count| count.set(0));
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let redraw = started.elapsed();
+        let unchanged = conversation::PROJECTED_MESSAGES.with(|count| count.replace(0));
+        let previous = terminal.backend().buffer().clone();
+        snapshot
+            .messages
+            .last_mut()
+            .unwrap()
+            .text
+            .push_str("next delta");
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        assert_eq!(
+            conversation::PROJECTED_MESSAGES.with(|count| count.replace(0)),
+            1
+        );
+        let changed = previous.diff(terminal.backend().buffer()).len();
+        assert!(
+            changed > 0 && changed <= 10,
+            "a small text delta changed {changed} terminal cells"
+        );
+        terminal.backend_mut().resize(100, 30);
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 100, 30))
+            .unwrap();
+        let started = std::time::Instant::now();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let resize = started.elapsed();
+        let resized = conversation::PROJECTED_MESSAGES.with(|count| count.replace(0));
+        eprintln!("conversation performance: first={initial:?} unchanged={redraw:?} resize={resize:?}; laid out unchanged={unchanged} resized={resized}");
+        assert_eq!(
+            unchanged, 0,
+            "redrawing unchanged conversation reprocesses its history"
+        );
+        assert!(
+            resized <= 2,
+            "resizing the tail loads {resized} messages outside its viewport"
+        );
     }
 
     #[test]

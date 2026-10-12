@@ -111,6 +111,7 @@ def main():
         ('overflow', frame('a' * 32769 + '\n\x03\x19\x0e\x11'), None, 0, 1, 0, 1, True),
         ('fragmented-body', [('\x1b[200~FIRST中文👋'.encode('utf-8'), .12), (b'\nSECOND', .12), (b'\x1b[201~\x11', 0)], 'exact_paste', 1, 1, 0, 0, True),
         ('incomplete', [('\x1b[200~secret中文👋\n\x11\x03\x19'.encode('utf-8'), 0)], None, 0, 0, 0, 0, False),
+        ('wheel', [(b'\x1b[<64;21;12M\x1b[<65;21;12M\x11', 0)], 'wheel_reports_match', 0, 1, 0, 0, True),
         ('keys', [(keys.encode('utf-8'), 0)], 'keys_match', 0, 30, 2, 0, True),
         ('physical-keys', [(physical.encode('utf-8'), 0)], 'physical_keys_match' if args.enter_modifiers else 'physical_records_decoded', 0, 4, 2, 0, True),
         ('portable-keys', [(b'\x0f\x13\x11', 0)], 'portable_keys_match', 0, 3, 0, 0, True),

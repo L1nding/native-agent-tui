@@ -48,6 +48,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("F11", "activity evidence"),
             ("F12", "history and export"),
             ("PgUp/PgDn", "scroll"),
+            ("Wheel", "scroll conversation"),
         ],
     ),
     (
@@ -102,6 +103,7 @@ const SECTIONS_ZH: &[(&str, &[(&str, &str)])] = &[
             ("F11", "活动证据"),
             ("F12", "历史与导出"),
             ("PgUp/PgDn", "滚动"),
+            ("Wheel", "鼠标滚轮滚动对话"),
         ],
     ),
     (
@@ -163,7 +165,21 @@ pub(super) fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         .width
         .saturating_sub(2)
         .min(if two_columns { 90 } else { 50 });
-    let height = area.height.min(if two_columns { 22 } else { 38 });
+    let sections = active_sections();
+    let section_height = |sections: &[Section]| {
+        sections
+            .iter()
+            .map(|(_, keys)| keys.len() + 1)
+            .sum::<usize>()
+            + sections.len().saturating_sub(1)
+    };
+    let content_height = if two_columns {
+        let (left, right) = sections.split_at(2);
+        section_height(left).max(section_height(right))
+    } else {
+        section_height(sections)
+    };
+    let height = area.height.min((content_height + 2) as u16);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,

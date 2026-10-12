@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use super::{InputEvent, PASTE_BYTES};
 
@@ -85,6 +85,14 @@ impl Decoder {
     #[cfg(windows)]
     pub(super) fn resize(&mut self, width: u16, height: u16) {
         self.events.push_back(InputEvent::Resize(width, height));
+    }
+
+    #[cfg(windows)]
+    pub(super) fn mouse(&mut self, event: MouseEvent) {
+        // A physical wheel event must not escape a bracketed paste frame.
+        if matches!(self.state, State::Ground) {
+            self.events.push_back(InputEvent::Mouse(event));
+        }
     }
 
     /// Physical Win32 keys retain modifiers, including Shift/Ctrl+Enter.
@@ -174,7 +182,9 @@ impl Decoder {
                             State::Paste(Paste::default())
                         } else {
                             if !overflow {
-                                if let Some(key) = sequence_key(&text) {
+                                if let Some(mouse) = sequence_mouse(&text) {
+                                    self.events.push_back(InputEvent::Mouse(mouse));
+                                } else if let Some(key) = sequence_key(&text) {
                                     self.events.push_back(InputEvent::Key(key));
                                 }
                             }
@@ -214,6 +224,40 @@ fn character_key(ch: char, mut modifiers: KeyModifiers) -> KeyEvent {
         _ => KeyCode::Char(ch),
     };
     KeyEvent::new(code, modifiers)
+}
+
+/// SGR mouse coordinates are one-based. Consume complete reports even when
+/// they are unsupported; their payload must never turn into editor keystrokes.
+fn sequence_mouse(text: &str) -> Option<MouseEvent> {
+    let body = text.strip_prefix("[<")?.strip_suffix('M')?;
+    let mut fields = body.split(';');
+    let button: u16 = fields.next()?.parse().ok()?;
+    let column = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+    let row = fields.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let kind = match button & !(4 | 8 | 16) {
+        64 => MouseEventKind::ScrollUp,
+        65 => MouseEventKind::ScrollDown,
+        _ => return None,
+    };
+    let mut modifiers = KeyModifiers::NONE;
+    if button & 4 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if button & 8 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if button & 16 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    Some(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers,
+    })
 }
 
 fn sequence_key(text: &str) -> Option<KeyEvent> {
@@ -296,6 +340,57 @@ mod tests {
 
     fn drain(decoder: &mut Decoder, now: Instant) -> Vec<InputEvent> {
         std::iter::from_fn(|| decoder.next(now)).collect()
+    }
+
+    #[test]
+    fn fragmented_sgr_wheel_reports_keep_coordinates_and_modifiers() {
+        let frame = "\x1b[<64;21;12M\x1b[<85;21;12M";
+        for split in 0..=frame.len() {
+            let mut decoder = Decoder::default();
+            let now = Instant::now();
+            feed(&mut decoder, &frame[..split], now);
+            feed(&mut decoder, &frame[split..], now);
+            assert_eq!(
+                drain(&mut decoder, now),
+                vec![
+                    InputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollUp,
+                        column: 20,
+                        row: 11,
+                        modifiers: KeyModifiers::NONE
+                    }),
+                    InputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 20,
+                        row: 11,
+                        modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                    }),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_reports_inside_paste_stay_literal_and_invalid_reports_are_consumed() {
+        let mut decoder = Decoder::default();
+        let now = Instant::now();
+        feed(&mut decoder, "\x1b[200~\x1b[<64;21;12M\x1b[201~", now);
+        assert_eq!(
+            drain(&mut decoder, now),
+            vec![InputEvent::Paste("\x1b[<64;21;12M".into())]
+        );
+        feed(
+            &mut decoder,
+            "\x1b[<64;0;1M\x1b[<65;1;999999M\x1b[<0;1;1M\x1b[<64;1;1mq",
+            now,
+        );
+        assert_eq!(
+            drain(&mut decoder, now),
+            vec![InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE
+            ))]
+        );
     }
 
     #[test]
