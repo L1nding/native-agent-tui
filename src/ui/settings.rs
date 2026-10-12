@@ -81,6 +81,14 @@ fn permission_value(snapshot: &CoreSnapshot) -> String {
 
 fn permission_detail(snapshot: &CoreSnapshot) -> String {
     let permission = &snapshot.permission;
+    // 面板盖住了主界面的状态栏；dsh 对切换的答复（包括拒绝）要在这里看得到。
+    if let Some(notice) = snapshot
+        .notice
+        .as_deref()
+        .filter(|notice| notice.to_ascii_lowercase().contains("permission preset"))
+    {
+        return notice.to_owned();
+    }
     if permission.current.is_empty() {
         return tr(
             "dsh has not reported a permission preset for this session.",
@@ -368,6 +376,11 @@ mod tests {
             panel.key(press(KeyCode::Right), &snapshot),
             SettingsEvent::Consumed
         );
+        // dsh 的答复（这里是拒绝）在面板里看得到。
+        snapshot.notice = Some("Permission preset was not changed: unknown preset".into());
+        assert!(screen(&panel, &snapshot, 100, 20)
+            .contains("Permission preset was not changed: unknown preset"));
+        snapshot.notice = None;
         // 与任何预设都不匹配的会话照实显示，切换从第一个预设开始。
         snapshot.permission.switching = None;
         snapshot.permission.current = "custom".into();
