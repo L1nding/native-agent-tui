@@ -94,6 +94,8 @@ pub enum Command {
     ResumeConversation {
         id: String,
     },
+    /// Create a fresh dsh conversation in the running agent process.
+    NewConversation,
     /// Store a `/setting` choice for the next start.
     SaveSetting {
         setting: crate::preferences::Setting,
@@ -333,6 +335,7 @@ impl ClientHandle {
 enum RpcKind {
     Initialize,
     ThreadStart,
+    NewThread,
     AgentRead,
     StartTurn {
         generation: u64,
@@ -758,6 +761,10 @@ impl Core {
                             self.state.view.notice = Some(
                                 "Resumed; its earlier messages were not loaded in time.".into(),
                             );
+                        } else if matches!(kind, RpcKind::NewThread) {
+                            self.state.view.creating_conversation = false;
+                            self.state.error(SessionPhase::Unknown,
+                                "New conversation was not confirmed in time; automatic retry is disabled");
                         } else if matches!(kind, RpcKind::ModelSelect) {
                             // 未确认的切换不改变已知模型；用户可以重新选择。
                             self.state.view.models.switching = None;
@@ -1155,6 +1162,7 @@ impl Core {
         let envelope = match kind {
             RpcKind::Initialize => app_server::initialize(id.clone()),
             RpcKind::ThreadStart => app_server::thread_start(id.clone(), &self.config),
+            RpcKind::NewThread => app_server::thread_new(id.clone(), &self.config),
             RpcKind::SkillsList { force_reload, .. } => {
                 app_server::skills_list(id.clone(), &self.config.cwd, force_reload)
             }
@@ -1411,6 +1419,12 @@ impl Core {
                         Some(format!("Conversation was not resumed: {reason}"));
                 }
             }
+            Command::NewConversation => {
+                if let Err(reason) = self.start_new_conversation() {
+                    self.state.view.notice =
+                        Some(format!("New conversation was not started: {reason}"));
+                }
+            }
             Command::ReloadBackend => {
                 self.state.view.notice = Some(match self.reload_backend() {
                     Ok(()) => "Reloading dsh configuration...".into(),
@@ -1587,7 +1601,8 @@ impl Core {
         self.state.view.notice = Some(format!("Provider was not saved: {reason}"));
     }
 
-    /// Switches this session to another dsh session; dsh keeps both.
+    /// Switches this session to another dsh session; the ACP bridge releases
+    /// the previous active session after the target has been confirmed.
     fn resume_conversation(&mut self, id: &str) -> Result<(), String> {
         if id.is_empty() || id.len() > 1024 {
             return Err("no session was named.".into());
@@ -1617,6 +1632,20 @@ impl Core {
             return Err(error.to_string());
         }
         self.state.view.notice = Some("Resuming the conversation...".into());
+        Ok(())
+    }
+
+    fn start_new_conversation(&mut self) -> Result<(), String> {
+        if self.state.view.creating_conversation {
+            return Err("another new conversation is already starting.".into());
+        }
+        if !self.idle_for_backend_change() || self.scheduler.snapshot().queued_roots > 0 {
+            return Err("wait for the current turn and queued tasks to finish first.".into());
+        }
+        self.send_rpc(RpcKind::NewThread)
+            .map_err(|error| error.to_string())?;
+        self.state.view.creating_conversation = true;
+        self.state.view.notice = Some("Starting a new conversation...".into());
         Ok(())
     }
 
@@ -1677,6 +1706,7 @@ impl Core {
             && self.state.view.models.switching.is_none()
             && !self.state.view.models.reloading
             && self.state.view.resuming.is_none()
+            && !self.state.view.creating_conversation
     }
 
     fn reload_backend(&mut self) -> Result<(), String> {
@@ -1802,6 +1832,7 @@ impl Core {
             || self.state.view.models.switching.is_some()
             || self.state.view.models.reloading
             || self.state.view.resuming.is_some()
+            || self.state.view.creating_conversation
         {
             return;
         }
@@ -2191,7 +2222,40 @@ impl Core {
                         ));
                         return;
                     }
+                    if matches!(pending.kind, RpcKind::NewThread) {
+                        self.state.view.creating_conversation = false;
+                        if error
+                            .pointer("/data/sessionUnavailable")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            self.session_ready = false;
+                            self.state.error(
+                                SessionPhase::Failed,
+                                message.chars().take(400).collect::<String>(),
+                            );
+                        } else {
+                            self.state.view.notice = Some(format!(
+                                "New conversation was not started: {}",
+                                message.chars().take(400).collect::<String>()
+                            ));
+                        }
+                        return;
+                    }
                     if matches!(pending.kind, RpcKind::ThreadResume) {
+                        if error
+                            .pointer("/data/sessionUnavailable")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            self.state.view.resuming = None;
+                            self.resuming = None;
+                            self.state.error(
+                                SessionPhase::Failed,
+                                message.chars().take(400).collect::<String>(),
+                            );
+                            return;
+                        }
                         // 没能恢复：当前对话原样保留。
                         self.state.view.resuming = None;
                         self.resuming = None;
@@ -2293,7 +2357,8 @@ impl Core {
                 }
                 Some(RpcKind::ThreadStart)
             }
-            RpcKind::ThreadStart => {
+            RpcKind::ThreadStart | RpcKind::NewThread => {
+                let new_session = matches!(kind, RpcKind::NewThread);
                 let Some(id) = result
                     .pointer("/thread/id")
                     .and_then(Value::as_str)
@@ -2301,10 +2366,31 @@ impl Core {
                 else {
                     self.state.error(
                         SessionPhase::Failed,
-                        "thread/start response is missing thread.id",
+                        if new_session {
+                            "thread/new response is missing thread.id"
+                        } else {
+                            "thread/start response is missing thread.id"
+                        },
                     );
+                    self.state.view.creating_conversation = false;
+                    self.session_ready = false;
                     return;
                 };
+                if new_session {
+                    self.session_ready = false;
+                    self.state.view.phase = SessionPhase::Initializing;
+                    self.state.view.creating_conversation = false;
+                    self.state.view.messages.clear();
+                    self.state.view.requests.clear();
+                    self.state.view.permission = Default::default();
+                    self.state.view.turn_id = None;
+                    self.state.view.last_error = None;
+                    self.state.view.last_headless_action = None;
+                    self.state.view.history_truncated = false;
+                    self.state.view.usage = Default::default();
+                    self.state.usage_facts.clear();
+                    self.state.tool_lines.clear();
+                }
                 self.state.view.thread_id = Some(id.into());
                 self.state.view.model = result
                     .get("model")
@@ -2339,7 +2425,10 @@ impl Core {
                     return;
                 }
                 self.session_started();
-                None
+                if new_session {
+                    self.state.view.notice = Some("New conversation started.".into());
+                }
+                new_session.then_some(RpcKind::PermissionDescribe)
             }
             RpcKind::StartTurn { .. } => {
                 let Some(id) = result.pointer("/turn/id").and_then(Value::as_str) else {
@@ -6580,6 +6669,176 @@ mod tests {
         let skills = next(server).await;
         assert_eq!(skills["method"], "skills/list");
         send(server, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
+    }
+
+    #[tokio::test]
+    async fn new_conversation_waits_for_confirmation_then_dispatches_to_the_new_thread() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::NewConversation)
+            .await
+            .unwrap();
+        let create = next(&mut server).await;
+        assert_eq!(create["method"], "thread/new");
+        client
+            .snapshots
+            .wait_for(|s| s.creating_conversation)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().thread_id.as_deref(), Some("root"));
+        // A duplicate and an input while creating cannot start a second session or a turn.
+        client
+            .commands
+            .send(Command::NewConversation)
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "first message".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"id":create["id"],"result":{
+            "thread":{"id":"fresh"},"model":"test-model"}}),
+        )
+        .await;
+        let mut turn = None;
+        for _ in 0..3 {
+            let request = next(&mut server).await;
+            match request["method"].as_str().unwrap() {
+                "permission/describe" => {
+                    send(&mut server, json!({"id":request["id"],"result":{}})).await
+                }
+                "skills/list" => {
+                    send(
+                        &mut server,
+                        json!({"id":request["id"],"error":{"code":-32601,"message":"unsupported"}}),
+                    )
+                    .await
+                }
+                "turn/start" => {
+                    turn = Some(request);
+                    break;
+                }
+                other => panic!("unexpected request: {other}"),
+            }
+        }
+        let turn = turn.unwrap();
+        assert_eq!(turn["params"]["threadId"], "fresh");
+        assert_eq!(turn["params"]["input"][0]["text"], "first message");
+        assert!(!client.snapshots.borrow().creating_conversation);
+        // Creating a new conversation during a live turn is rejected by Core.
+        client
+            .commands
+            .send(Command::NewConversation)
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|s| s.contains("wait for the current turn"))
+            })
+            .await
+            .unwrap();
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_with_an_unavailable_session_cannot_dispatch_into_the_old_thread() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::NewConversation)
+            .await
+            .unwrap();
+        let create = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":create["id"],"error":{
+            "code":-32000,"message":"model restore refused after session change",
+            "data":{"sessionUnavailable":true}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Failed).await;
+        assert!(!client.snapshots.borrow().creating_conversation);
+        assert!(client.snapshots.borrow().startup_blocked);
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "do not send".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_conversation_keeps_the_current_thread_available() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::NewConversation)
+            .await
+            .unwrap();
+        let create = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":create["id"],"error":{
+            "code":-32000,"message":"cannot create session"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                !s.creating_conversation
+                    && s.notice
+                        .as_deref()
+                        .is_some_and(|n| n.contains("cannot create session"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().thread_id.as_deref(), Some("root"));
+        assert_eq!(
+            client.snapshots.borrow().model.as_deref(),
+            Some("test-model")
+        );
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "continue old session".into(),
+            })
+            .await
+            .unwrap();
+        let turn = next(&mut server).await;
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(turn["params"]["threadId"], "root");
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

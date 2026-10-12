@@ -19,6 +19,20 @@ pub(super) fn selected_request<'a>(
 }
 
 pub(super) fn sync_local_requests(local: &mut LocalState, snapshot: &CoreSnapshot) {
+    if local
+        .displayed_thread
+        .as_ref()
+        .zip(snapshot.thread_id.as_ref())
+        .is_some_and(|(old, new)| old != new)
+    {
+        local.editor.clear();
+        local.task_draft = None;
+        local.agent_id = None;
+        local.conversation_focus = None;
+        local.scroll_from_bottom = 0;
+        local.notice = None;
+    }
+    local.displayed_thread.clone_from(&snapshot.thread_id);
     if local.request_selection.is_none() {
         local.request_selection = selected_request(snapshot, local).map(RequestView::reference);
     } else if snapshot.requests.is_empty() && !local.request_panel {

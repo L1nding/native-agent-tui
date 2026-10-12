@@ -115,6 +115,11 @@ pub async fn run_tasks_with_history(
                                         SessionsEvent::Quit => return Ok(()),
                                         SessionsEvent::Resume(id) => { let _ = client.commands.try_send(Command::ResumeConversation { id }); }
                                         SessionsEvent::Refresh => { let _ = client.commands.try_send(Command::ListConversations); }
+                                        SessionsEvent::New => {
+                                            if super::send(Command::NewConversation, &client.commands, &mut local) {
+                                                sessions_panel.visible = false;
+                                            }
+                                        }
                                         SessionsEvent::Close | SessionsEvent::Consumed => {}
                                     }
                                 } else if history_panel.visible {

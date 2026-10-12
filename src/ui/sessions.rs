@@ -50,6 +50,8 @@ pub(super) enum SessionsEvent {
     Resume(String),
     /// Ask Core to list the sessions again.
     Refresh,
+    /// Start a fresh conversation in the running agent process.
+    New,
     Quit,
     Consumed,
 }
@@ -137,6 +139,7 @@ impl SessionsPanel {
     pub fn key(&mut self, key: KeyEvent, snapshot: &CoreSnapshot) -> SessionsEvent {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let rows = self.rows(snapshot);
+        self.selected = self.selected.min(rows.len());
         match key.code {
             KeyCode::Char('q' | 'd') if control => return SessionsEvent::Quit,
             KeyCode::Esc | KeyCode::Right => {
@@ -144,12 +147,16 @@ impl SessionsPanel {
                 return SessionsEvent::Close;
             }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(rows.len().saturating_sub(1)),
+            KeyCode::Down => self.selected = (self.selected + 1).min(rows.len()),
             KeyCode::Home => self.selected = 0,
-            KeyCode::End => self.selected = rows.len().saturating_sub(1),
+            KeyCode::End => self.selected = rows.len(),
             KeyCode::Char('r') if !control => return SessionsEvent::Refresh,
+            KeyCode::Char('n') if !control => return SessionsEvent::New,
             KeyCode::Enter => {
-                if let Some(row) = rows.get(self.selected.min(rows.len().saturating_sub(1))) {
+                if self.selected == 0 {
+                    return SessionsEvent::New;
+                }
+                if let Some(row) = rows.get(self.selected.min(rows.len()) - 1) {
                     self.visible = false;
                     // 当前对话就在主页面，回去即可。
                     return if row.live {
@@ -189,7 +196,26 @@ impl SessionsPanel {
         let body = (inner.height as usize)
             .saturating_sub(lines.len() + 2)
             .max(1);
-        let mut listed: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+        let selected = self.selected.min(rows.len());
+        let button = vec![Span::styled(
+            format!(
+                "{}[ + {} ]",
+                if selected == 0 { "> " } else { "  " },
+                tr("New session", "新建会话")
+            ),
+            theme.key(),
+        )];
+        let mut listed: Vec<(Line<'static>, Option<usize>)> = vec![
+            (
+                if selected == 0 {
+                    selected_line(button, width)
+                } else {
+                    Line::from(clip_spans(button, width))
+                },
+                Some(0),
+            ),
+            (Line::from(""), None),
+        ];
         if rows.is_empty() {
             listed.push((
                 Line::from(Span::styled(
@@ -203,7 +229,6 @@ impl SessionsPanel {
             ));
         }
         let now = now_ms();
-        let selected = self.selected.min(rows.len().saturating_sub(1));
         // 时间和状态各占固定宽度，标题用剩下的空间。
         let time_width = 12;
         let state_width = rows
@@ -229,7 +254,7 @@ impl SessionsPanel {
                     None,
                 ));
             }
-            let marker = if index == selected { "> " } else { "  " };
+            let marker = if index + 1 == selected { "> " } else { "  " };
             let time = elapsed(row.updated_at_ms, now);
             let fixed = marker.width() + time_width + 1 + state_width + 2;
             let title = truncate_display_label(&row.title, width.saturating_sub(fixed).max(8));
@@ -254,12 +279,12 @@ impl SessionsPanel {
                 ),
             ];
             listed.push((
-                if index == selected {
+                if index + 1 == selected {
                     selected_line(spans, width)
                 } else {
                     Line::from(clip_spans(spans, width))
                 },
-                Some(index),
+                Some(index + 1),
             ));
         }
         // 让选中的行留在可见范围内。
@@ -288,8 +313,8 @@ impl SessionsPanel {
         )));
         lines.push(hint_row(
             tr(
-                "↑/↓ select | Enter resume | r refresh | → or Esc back",
-                "↑/↓ 选择 | Enter 恢复对话 | r 刷新 | → 或 Esc 返回",
+                "↑/↓ select | Enter resume | n new session | r refresh | → or Esc back",
+                "↑/↓ 选择 | Enter 恢复对话 | n 新建会话 | r 刷新 | → 或 Esc 返回",
             ),
             width,
         ));
@@ -313,6 +338,7 @@ mod tests {
     fn fixture() -> (SessionsPanel, CoreSnapshot) {
         let panel = SessionsPanel {
             visible: true,
+            selected: 1,
             ..Default::default()
         };
         let snapshot = CoreSnapshot {
@@ -374,6 +400,7 @@ mod tests {
             "1d ago",
             "Sessions are dsh's own.",
             "Enter resume",
+            "n new session",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
@@ -414,6 +441,13 @@ mod tests {
             ),
             SessionsEvent::Refresh
         );
+        assert_eq!(
+            panel.key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                &snapshot
+            ),
+            SessionsEvent::New
+        );
         // 恢复之后，“当前”跟着 Core 报告的会话走。
         let mut resumed = snapshot.clone();
         resumed.thread_id = Some("done-1".into());
@@ -423,6 +457,25 @@ mod tests {
         for (width, height) in [(1, 1), (4, 3), (20, 6), (60, 10)] {
             screen(&panel, &snapshot, width, height);
         }
+    }
+
+    #[test]
+    fn new_session_button_works_with_an_empty_list_and_with_existing_conversations() {
+        let (mut panel, snapshot) = fixture();
+        panel.open();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(screen(&panel, &snapshot, 100, 20).contains("> [ + New session ]"));
+        assert_eq!(panel.key(enter, &snapshot), SessionsEvent::New);
+        panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &snapshot);
+        assert_eq!(panel.key(enter, &snapshot), SessionsEvent::Close);
+        panel.visible = true;
+        panel.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &snapshot);
+        // A refreshed list may be empty while the old selection points past it.
+        assert_eq!(
+            panel.key(enter, &CoreSnapshot::default()),
+            SessionsEvent::New
+        );
+        assert!(screen(&panel, &CoreSnapshot::default(), 40, 8).contains("New session"));
     }
 
     #[test]

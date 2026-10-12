@@ -197,6 +197,8 @@ pub struct CoreSnapshot {
     pub conversations: Vec<crate::conversations::ConversationSummary>,
     /// Title of the dsh session this one is switching to.
     pub resuming: Option<String>,
+    /// A fresh dsh conversation is awaiting backend confirmation.
+    pub creating_conversation: bool,
     /// Choices stored for the next start; empty for a setting never saved.
     pub saved_settings: BTreeMap<crate::preferences::Setting, String>,
     pub history_truncated: bool,

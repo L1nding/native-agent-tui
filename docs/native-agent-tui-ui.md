@@ -304,3 +304,10 @@ Core facts → Arc<UiSnapshot> → local projection → visible rows → Termina
 UI 要完整实现，Core 至少提供：稳定的 thread/turn/item/ingressSeq；父子 thread 关系和 agent path；request 所属 thread/turn 与合法选项；delta/final 去重；tool call/result 关联；subAgentActivity；compaction 前后统计/摘要（如 schema 提供）；usage 与上下文 source；skill inventory/call 状态（如 schema 提供）；可分页 timeline/log reader；单调 snapshot version；历史加载状态；停止/断连后的 pending 状态；以及 command accepted/rejected 结果。
 
 如果当前 app-server 没有某项事实，UI 显示 unknown/unavailable，并保留证据来源，不扫描日志或本地文件补齐。Alpha 还必须覆盖可控时钟的静默/恢复、审批 requires_action、关闭提醒不影响 Core、宽窄终端无颜色显示，以及与 Python 消费者相同的 attention 和 progress_seq。
+
+### 新建对话
+
+主输入框输入 `/new` 并按 Enter 新建 dsh 会话，命令补全列表也会提示该命令。
+输入框为空时按 Left 打开会话页；顶部的 `[ + 新建会话 ]` 可用上下键选择并按 Enter 执行，也可按 `n`。
+Core 只在当前轮次和排队任务结束后接受新建；创建期间保留原对话，确认后清空当前对话显示并切到新会话。
+ACP 桥接器创建目标会话后释放旧 active 会话，使旧对话仍可从列表恢复；创建被拒绝时原对话继续可用。
