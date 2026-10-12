@@ -41,7 +41,7 @@ impl Local {
 pub async fn run_modeling(options: Options, target: Option<String>) -> Result<(), UiError> {
     let mut terminal = TerminalGuard::enter()?;
     let mut local = Local::default();
-    let mut verified = true;
+    let mut verified = options.component.is_none();
     let mut handle = target.map(|target| Handle::start(options.clone(), target, verified));
     let result = async {
         let mut tick = tokio::time::interval(Duration::from_millis(40));
@@ -99,12 +99,14 @@ pub async fn run_modeling(options: Options, target: Option<String>) -> Result<()
                                 }
                             }
                             KeyCode::F(2)
-                                if snapshot.as_ref().is_none_or(|s| s.phase.terminal()) =>
+                                if options.component.is_none()
+                                    && snapshot.as_ref().is_none_or(|s| s.phase.terminal()) =>
                             {
                                 verified = !verified
                             }
                             KeyCode::F(5)
-                                if snapshot.as_ref().is_some_and(|s| s.phase.terminal()) =>
+                                if options.component.is_none()
+                                    && snapshot.as_ref().is_some_and(|s| s.phase.terminal()) =>
                             {
                                 if let Some(run_id) =
                                     snapshot.as_ref().and_then(|s| s.run_id.clone())
@@ -123,6 +125,31 @@ pub async fn run_modeling(options: Options, target: Option<String>) -> Result<()
                             }
                             KeyCode::PageUp => local.scroll = local.scroll.saturating_sub(5),
                             KeyCode::PageDown => local.scroll = local.scroll.saturating_add(5),
+                            KeyCode::Enter
+                                if !local.sent
+                                    && snapshot.as_ref().is_some_and(|s| {
+                                        s.question.as_ref().is_some_and(|q| q.proposal.is_some())
+                                    }) =>
+                            {
+                                let text = local.editor.text.trim().to_owned();
+                                if !text.is_empty() {
+                                    if let (Some(h), Some(s)) = (&handle, &snapshot) {
+                                        let q = s.question.as_ref().unwrap();
+                                        if h.commands
+                                            .try_send(Command::Revise {
+                                                run_id: s.run_id.clone().unwrap(),
+                                                request_id: q.request_id.clone(),
+                                                text,
+                                            })
+                                            .is_ok()
+                                        {
+                                            local.sent = true;
+                                            local.notice = "修改意见已发送，等待修订方案……".into();
+                                            local.editor = Editor::default();
+                                        }
+                                    }
+                                }
+                            }
                             KeyCode::Enter
                                 if snapshot.as_ref().is_none_or(|s| s.phase.terminal()) =>
                             {
@@ -185,7 +212,9 @@ fn draw(
         ])
         .split(frame.area());
     let phase = snapshot.map_or("输入楼层即可开始", |s| s.phase.label());
-    let policy = if verified {
+    let policy = if options.component.is_some() {
+        "方案逐版确认；文字意见将生成新方案"
+    } else if verified {
         "有依据且无待定项的补丁自动采纳"
     } else {
         "补丁逐项确认"
@@ -276,11 +305,13 @@ fn draw(
                 local.scroll.min(max_scroll.min(u16::MAX as usize) as u16),
                 0,
             ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("必要确认 · Ctrl+Y 采纳 / Ctrl+N 拒绝 · PgUp/PgDn 查看"),
-            ),
+            .block(Block::default().borders(Borders::ALL).title(
+                if pending.is_some_and(|q| q.proposal.is_some()) {
+                    "方案反馈 · Ctrl+Y 采纳 / Ctrl+N 拒绝"
+                } else {
+                    "必要确认 · Ctrl+Y 采纳 / Ctrl+N 拒绝 · PgUp/PgDn 查看"
+                },
+            )),
         sections[2],
     );
     let artifact = snapshot
@@ -306,15 +337,23 @@ fn draw(
     );
     frame.render_widget(
         Paragraph::new(if local.editor.text.is_empty() {
-            "输入建模八层、整栋，或复核上次"
+            if pending.is_some_and(|q| q.proposal.is_some()) {
+                "输入修改意见，例如移到右侧并保留墙体，Enter 提交"
+            } else if options.component.is_some() {
+                "输入新增两张床等建模目标"
+            } else {
+                "输入建模八层、整栋，或复核上次"
+            }
         } else {
             local.editor.text.as_str()
         })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("目标 · Enter 启动 · Ctrl+C 取消 · Ctrl+Q 退出"),
-        ),
+        .block(Block::default().borders(Borders::ALL).title(
+            if pending.is_some_and(|q| q.proposal.is_some()) {
+                "修改意见 · Enter 修订 · Ctrl+C 取消 · Ctrl+Q 退出"
+            } else {
+                "目标 · Enter 启动 · Ctrl+C 取消 · Ctrl+Q 退出"
+            },
+        )),
         sections[4],
     );
 }
@@ -337,6 +376,7 @@ mod tests {
                     &Options {
                         repository: ".".into(),
                         project: "医院项目".into(),
+                        component: None,
                     },
                     None,
                     &local,
@@ -369,10 +409,13 @@ mod tests {
                 request_id: "q1".into(),
                 title: "层高".into(),
                 lines: vec![],
+                proposal: None,
+                can_approve: true,
             }),
             artifacts: vec![],
             notes: Default::default(),
             sequence: 1,
+            protocol_version: 1,
             outcome: None,
         };
         let mut local = Local::default();
@@ -387,9 +430,60 @@ mod tests {
             request_id: "q2".into(),
             title: "门宽".into(),
             lines: vec![],
+            proposal: None,
+            can_approve: true,
         });
         local.scroll = 50;
         local.sync(Some(&state));
         assert_eq!(local.scroll, 0);
+    }
+    #[test]
+    fn feedback_view_displays_revision_and_natural_language_input() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let state = Snapshot {
+            run_id: Some("run".into()),
+            phase: modeling::Phase::Waiting,
+            target: "新增两张床".into(),
+            stages: vec![],
+            artifacts: vec![],
+            notes: Default::default(),
+            sequence: 3,
+            protocol_version: 2,
+            outcome: None,
+            question: Some(modeling::Question {
+                request_id: "q".into(),
+                title: "方案 v2：床移到右侧".into(),
+                lines: vec!["墙体未变".into()],
+                can_approve: true,
+                proposal: Some(modeling::feedback::ProposalBinding {
+                    proposal_id: "p".into(),
+                    proposal_revision: 2,
+                    base_scene_hash: "b".into(),
+                    prepare_token: "t".into(),
+                }),
+            }),
+        };
+        let options = Options {
+            repository: ".".into(),
+            project: "demo".into(),
+            component: None,
+        };
+        let mut local = Local::default();
+        local.editor.insert("移到右侧并保留墙体");
+        terminal
+            .draw(|f| draw(f, &options, Some(&state), &local, false))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        let text = text.replace(' ', "");
+        assert!(text.contains("方案v2"));
+        assert!(text.contains("墙体未变"));
+        assert!(text.contains("移到右侧并保留墙体"));
+        assert!(text.contains("Enter修订"));
     }
 }

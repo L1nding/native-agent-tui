@@ -14,6 +14,11 @@ use tokio::task::JoinHandle;
 use crate::owned_process;
 use crate::state::display_text;
 
+pub mod feedback;
+#[cfg(test)]
+mod feedback_tests;
+use feedback::{ComponentContext, ProposalBinding};
+
 const FRAME_BYTES: usize = 64 * 1024;
 const HISTORY: usize = 160;
 
@@ -21,6 +26,7 @@ const HISTORY: usize = 160;
 pub struct Options {
     pub repository: PathBuf,
     pub project: String,
+    pub component: Option<ComponentContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +60,8 @@ pub struct Question {
     pub request_id: String,
     pub title: String,
     pub lines: Vec<String>,
+    pub proposal: Option<ProposalBinding>,
+    pub can_approve: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -76,6 +84,7 @@ pub struct Snapshot {
     pub artifacts: Vec<Artifact>,
     pub notes: VecDeque<String>,
     pub sequence: u64,
+    pub protocol_version: u32,
     pub outcome: Option<String>,
 }
 impl Snapshot {
@@ -89,6 +98,7 @@ impl Snapshot {
             artifacts: vec![],
             notes: VecDeque::new(),
             sequence: 0,
+            protocol_version: 1,
             outcome: None,
         }
     }
@@ -99,7 +109,7 @@ impl Snapshot {
         self.notes.push_back(display_text(text.as_ref()));
     }
     fn apply(&mut self, frame: Frame) -> Result<(), String> {
-        if frame.version != 1
+        if frame.version != self.protocol_version
             || frame.seq != self.sequence + 1
             || self.outcome.is_some()
             || self.run_id.as_ref().is_some_and(|id| id != &frame.run_id)
@@ -147,9 +157,50 @@ impl Snapshot {
                     request_id,
                     title,
                     lines,
+                    proposal: None,
+                    can_approve: true,
                 });
                 self.phase = Phase::Waiting;
             }
+            Event::FeedbackRequested {
+                request_id,
+                title,
+                lines,
+                binding,
+                can_approve,
+            } => {
+                if self.question.is_some() || self.protocol_version != 2 {
+                    return Err("收到重叠或不支持的方案反馈请求".into());
+                }
+                self.question = Some(Question {
+                    request_id,
+                    title,
+                    lines,
+                    proposal: Some(binding),
+                    can_approve,
+                });
+                self.phase = Phase::Waiting;
+            }
+            Event::FeedbackReceived { request_id, action } => {
+                if self.question.as_ref().map(|q| &q.request_id) != Some(&request_id) {
+                    return Err("反馈回执不匹配".into());
+                }
+                self.question = None;
+                self.phase = Phase::Running;
+                self.note(format!("反馈已接收：{action}；等待修订或应用结果"));
+            }
+            Event::ProposalPrepared {
+                revision,
+                summary,
+                state,
+            } => {
+                self.note(format!("方案 v{revision} · {state}：{summary}"));
+            }
+            Event::ProposalSuperseded {} => self.note("旧方案已被修订替代，旧批准失效"),
+            Event::ChangeApplied { scene_sha256 } => {
+                self.note(format!("已应用并构建：{scene_sha256}"))
+            }
+            Event::ChangeRolledBack {} => self.note("构建未完成，检查领域执行记录"),
             Event::Answered {
                 request_id,
                 accepted,
@@ -231,6 +282,28 @@ enum Event {
         title: String,
         lines: Vec<String>,
     },
+    FeedbackRequested {
+        request_id: String,
+        title: String,
+        lines: Vec<String>,
+        #[serde(flatten)]
+        binding: ProposalBinding,
+        can_approve: bool,
+    },
+    FeedbackReceived {
+        request_id: String,
+        action: String,
+    },
+    ProposalPrepared {
+        revision: u64,
+        summary: String,
+        state: String,
+    },
+    ProposalSuperseded {},
+    ChangeApplied {
+        scene_sha256: String,
+    },
+    ChangeRolledBack {},
     Answered {
         request_id: String,
         accepted: bool,
@@ -250,6 +323,11 @@ enum Event {
 }
 #[derive(Debug)]
 pub enum Command {
+    Revise {
+        run_id: String,
+        request_id: String,
+        text: String,
+    },
     Answer {
         run_id: String,
         request_id: String,
@@ -260,6 +338,7 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 enum Operation {
+    Component { context: ComponentContext },
     Model { verified: bool },
     RetryReview { source_run_id: Option<String> },
 }
@@ -267,6 +346,8 @@ enum Operation {
 impl Operation {
     fn frame(&self, project: &str, target: &str) -> serde_json::Value {
         match self {
+            Self::Component { context } => json!({"version":2,"command":"start_change",
+                "target":target,"scene":context.scene,"scope":context.scope,"max_revisions":3}),
             Self::Model { verified } => json!({"version":1,"command":"start","target":target,
                 "project":project,"policy":if *verified {"verified"} else {"manual"},"max_repairs":1}),
             Self::RetryReview { source_run_id } => json!({"version":1,"command":"retry_review",
@@ -282,7 +363,9 @@ pub struct Handle {
 }
 impl Handle {
     pub fn start(options: Options, target: String, verified: bool) -> Self {
-        let operation = if target.trim() == "复核上次" {
+        let operation = if let Some(context) = options.component.clone() {
+            Operation::Component { context }
+        } else if target.trim() == "复核上次" {
             Operation::RetryReview {
                 source_run_id: None,
             }
@@ -367,7 +450,11 @@ async fn execute(
         "-u",
         "-m",
         "blender_agent.cli.main",
-        "workflow-stdio",
+        if matches!(operation, Operation::Component { .. }) {
+            "change-stdio"
+        } else {
+            "workflow-stdio"
+        },
     ]);
     let child = owned_process::spawn(command, owned_process::Input::Pipe)?;
     run_child(child, &options.project, operation, state, updates, commands).await
@@ -408,6 +495,7 @@ async fn run_child(
     });
     let result = async {
         let start = operation.frame(project, &state.target);
+        state.protocol_version = start["version"].as_u64().unwrap() as u32;
         input.write_all(format!("{start}\n").as_bytes()).await?;
         input.flush().await?;
         let mut answered = false;
@@ -433,7 +521,34 @@ async fn run_child(
                             updates.send_replace(Arc::new(state.clone()));
                             continue;
                         }
-                        let answer = json!({"command":"answer","run_id":run_id,"request_id":request_id,"accepted":accepted});
+                        let question = state.question.as_ref().unwrap();
+                        if accepted && !question.can_approve {
+                            state.note("方案有阻塞项，请填写修改意见或拒绝");
+                            updates.send_replace(Arc::new(state.clone()));
+                            continue;
+                        }
+                        let answer = if let Some(binding) = &question.proposal {
+                            binding.frame(&run_id, &request_id, state.sequence,
+                                if accepted { "approve" } else { "reject" }, "")
+                        } else { json!({"command":"answer","run_id":run_id,"request_id":request_id,"accepted":accepted}) };
+                        tokio::time::timeout(Duration::from_secs(3), input.write_all(format!("{answer}\n").as_bytes())).await??;
+                        input.flush().await?;
+                        answered = true;
+                    }
+                    Some(Command::Revise { run_id, request_id, text }) => {
+                        if answered || state.run_id.as_ref() != Some(&run_id)
+                            || state.question.as_ref().map(|q| &q.request_id) != Some(&request_id)
+                            || text.trim().is_empty() || text.chars().count() > 4000 {
+                            state.note("忽略失效、重复或过长的修改意见");
+                            updates.send_replace(Arc::new(state.clone()));
+                            continue;
+                        }
+                        let Some(binding) = state.question.as_ref().and_then(|q| q.proposal.as_ref()) else {
+                            state.note("此确认不支持文字修订");
+                            updates.send_replace(Arc::new(state.clone()));
+                            continue;
+                        };
+                        let answer = binding.frame(&run_id, &request_id, state.sequence, "revise", &text);
                         tokio::time::timeout(Duration::from_secs(3), input.write_all(format!("{answer}\n").as_bytes())).await??;
                         input.flush().await?;
                         answered = true;
@@ -666,7 +781,7 @@ mod tests {
             .as_path()
     }
 
-    async fn wait_for_question(updates: &mut watch::Receiver<Arc<Snapshot>>) {
+    pub(super) async fn wait_for_question(updates: &mut watch::Receiver<Arc<Snapshot>>) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while updates.borrow().question.is_none() {
                 updates.changed().await.unwrap();

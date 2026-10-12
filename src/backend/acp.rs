@@ -389,6 +389,7 @@ struct AcpBridge {
     startup_stderr: Option<StderrTail>,
     /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
     tool_inputs: HashMap<String, acp_protocol::ToolInput>,
+    mcp_calls: HashMap<String, acp_protocol::McpCall>,
 }
 
 impl AcpBridge {
@@ -416,6 +417,7 @@ impl AcpBridge {
             replacement: None,
             startup_stderr: None,
             tool_inputs: HashMap::new(),
+            mcp_calls: HashMap::new(),
         }
     }
 
@@ -574,6 +576,7 @@ impl AcpBridge {
         self.session_id = Some(session.clone());
         self.message_text.clear();
         self.tool_inputs.clear();
+        self.mcp_calls.clear();
         self.last_message_id = None;
         self.reloaded(core_id, session, result)
     }
@@ -669,6 +672,7 @@ impl AcpBridge {
                     .unwrap_or("");
                 self.message_text.clear();
                 self.tool_inputs.clear();
+                self.mcp_calls.clear();
                 self.last_message_id = None;
                 self.turn_id = Some(format!("acp-turn-{}", id_text(&id)));
                 self.turn_started = true;
@@ -939,6 +943,16 @@ impl AcpBridge {
             _ => {}
         }
         Ok(())
+    }
+
+    fn acp_tool_item(&self, item_id: &str, status: &str, output: Option<String>) -> Value {
+        if let Some(call) = self.mcp_calls.get(item_id) {
+            let result =
+                output.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)));
+            json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"status":status,"result":result})
+        } else {
+            json!({"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output})
+        }
     }
 
     async fn response(&mut self, id: RpcId, message: Envelope) -> Result<(), TransportError> {
@@ -1367,11 +1381,17 @@ impl AcpBridge {
                 title,
                 kind,
                 input,
+                mcp,
             } => {
                 if self.tool_inputs.len() < 256 {
                     self.tool_inputs.insert(item_id.clone(), input);
                 }
-                self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","command":title,"kind":kind}}))))?;
+                let item = if let Some(call) = mcp {
+                    let item = json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"arguments":call.arguments,"status":"inProgress"});
+                    if self.mcp_calls.len() < 256 { self.mcp_calls.insert(item_id.clone(), *call); }
+                    item
+                } else { json!({"id":item_id,"type":"commandExecution","command":title,"kind":kind}) };
+                self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
             }
             Update::ToolCallUpdate { item_id, status, output } => {
                 match status {
@@ -1382,10 +1402,12 @@ impl AcpBridge {
                             ToolStatus::Cancelled => "cancelled",
                             _ => unreachable!(),
                         };
-                        self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output}}))))?;
+                        let item = self.acp_tool_item(&item_id, status, output);
+                        self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                     ToolStatus::InProgress | ToolStatus::Unknown => {
-                        self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":{"id":item_id,"type":"commandExecution","status":"inProgress","aggregatedOutput":output}}))))?;
+                        let item = self.acp_tool_item(&item_id, "inProgress", output);
+                        self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                 }
             }
@@ -2884,6 +2906,45 @@ mod tests {
             "执行用户指定的命令 (requests danger-full-access)"
         );
         assert_eq!(params["cwd"], "D:\\ws");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_calls_retain_typed_identity_arguments_and_structured_results() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
+            "sessionUpdate":"tool_call", "toolCallId":"call", "title":"mcp__modeling_domain__prepare_change", "rawInput":{"plan":{}}, "kind":"other"}})))).unwrap();
+        let event = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(event["item"]["type"], "mcpToolCall");
+        assert_eq!(event["item"]["server"], "modeling_domain");
+        assert_eq!(event["item"]["arguments"], json!({"plan":{}}));
+        let result = json!({"contract":"modeling-domain/v2","kind":"proposal","ok":true});
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
+            "sessionUpdate":"tool_call_update", "toolCallId":"call", "status":"completed", "rawOutput":result.to_string()}})))).unwrap();
+        let event = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(event["item"]["type"], "mcpToolCall");
+        assert_eq!(event["item"]["tool"], "prepare_change");
+        assert_eq!(event["item"]["result"], result);
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }

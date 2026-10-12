@@ -33,6 +33,16 @@ pub enum Command {
     SubmitRootInput {
         text: String,
     },
+    ApproveDomainChange {
+        binding: crate::domain::ProposalBinding,
+    },
+    DomainAuthorizationFinished {
+        attempt_id: u64,
+        generation: u64,
+        root_turn_count: u64,
+        binding: crate::domain::ProposalBinding,
+        outcome: Result<String, String>,
+    },
     QueueRootTasks {
         tasks: Vec<RootTaskSpec>,
     },
@@ -237,6 +247,7 @@ impl ClientHandle {
             },
             observation: observer.snapshot_at(0, Instant::now()),
             timeline: observer.timeline_snapshot(),
+            domain: crate::domain::DomainFacts::new(config.domain_setup.clone()).snapshot,
             ..Default::default()
         }
     }
@@ -279,6 +290,9 @@ impl ClientHandle {
                 outbox_error: None,
                 root_attempt: None,
                 root_observed: None,
+                domain: crate::domain::DomainFacts::new(config.domain_setup.clone()),
+                domain_authorization_task: None,
+                domain_generation: 0,
                 config,
                 server,
                 command_rx,
@@ -431,6 +445,9 @@ struct Core {
     ingress_seq: u64,
     file_previews: FilePreviews,
     tool_details: ToolDetails,
+    domain: crate::domain::DomainFacts,
+    domain_authorization_task: Option<JoinHandle<()>>,
+    domain_generation: u64,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -798,6 +815,11 @@ impl Core {
             }
         }
 
+        if let Some(task) = self.domain_authorization_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.domain.snapshot.authorizing = false;
         self.unknown_pending_outbox();
         let outcome = self.state.view.phase;
         self.scheduler.disconnected();
@@ -900,6 +922,10 @@ impl Core {
             self.state.finish_all_reasoning();
         }
         self.state.view.tool_details = self.tool_details.snapshot();
+        self.domain.observe(&self.state.view.tool_details);
+        self.state.view.domain = self.domain.snapshot.clone();
+        self.domain
+            .project_control_messages(&mut self.state.view.messages);
         let transport = self.pipe.stats();
         self.state.view.diagnostics.transport_bytes_in = transport.bytes_in;
         self.state.view.diagnostics.transport_bytes_out = transport.bytes_out;
@@ -1298,7 +1324,44 @@ impl Core {
                     },
                 );
             }
+            Command::ApproveDomainChange { binding } => {
+                self.approve_domain_change(binding);
+            }
+            Command::DomainAuthorizationFinished {
+                attempt_id,
+                generation,
+                root_turn_count,
+                binding,
+                outcome,
+            } => {
+                if attempt_id != self.domain_generation || !self.domain.snapshot.authorizing {
+                    return;
+                }
+                self.domain_authorization_task.take();
+                self.domain.snapshot.authorizing = false;
+                if generation != self.generation
+                    || root_turn_count != self.state.view.root_turn_count
+                    || !self.idle_for_backend_change()
+                    || !self.domain.can_authorize(&binding)
+                {
+                    self.domain.snapshot.notice = Some("批准结果已过期；请核对当前方案".into());
+                    return;
+                }
+                match outcome {
+                    Ok(text) => {
+                        self.domain.remember_control(&text);
+                        self.domain.snapshot.notice =
+                            Some("具体版本已批准，交给平台 Agent 应用和构建".into());
+                        self.command(Command::SubmitRootInput { text });
+                    }
+                    Err(reason) => self.domain.snapshot.notice = Some(reason),
+                }
+            }
             Command::SubmitRootInput { text } => {
+                if self.domain.snapshot.authorizing {
+                    self.state.view.notice = Some("正在记录具体版本批准，请等待结果或取消".into());
+                    return;
+                }
                 if text.trim().is_empty() || text.len() > MESSAGE_BYTES {
                     self.state.view.notice =
                         Some(format!("Enter a task of 1-{MESSAGE_BYTES} UTF-8 bytes."));
@@ -1398,6 +1461,11 @@ impl Core {
                 }
             }
             Command::SetPermission { preset } => {
+                if self.config.domain_setup.is_some() && preset != "read-only" {
+                    self.state.view.notice =
+                        Some("领域建模会话的通用工具保持只读；写入通过领域工具执行".into());
+                    return;
+                }
                 if let Err(reason) = self.set_permission(&preset, true) {
                     self.state.view.notice =
                         Some(format!("Permission preset was not changed: {reason}"));
@@ -1474,6 +1542,13 @@ impl Core {
                 self.schedule(command);
             }
             Command::Interrupt => {
+                if let Some(task) = self.domain_authorization_task.take() {
+                    task.abort();
+                    self.domain_generation = self.domain_generation.wrapping_add(1);
+                    self.domain.snapshot.authorizing = false;
+                    self.domain.snapshot.notice =
+                        Some("批准已中断，外部记录结果未知；未提交场景应用".into());
+                }
                 if matches!(
                     self.state.view.phase,
                     SessionPhase::StartingTurn | SessionPhase::Running | SessionPhase::GatePending
@@ -1558,6 +1633,42 @@ impl Core {
 
     /// A confirmed session is the readiness fact; the sandbox is dsh's own and
     /// is first exercised when the agent runs a command.
+    fn reset_domain_session(&mut self) {
+        if self.config.domain_setup.is_none() {
+            return;
+        }
+        if let Some(task) = self.domain_authorization_task.take() {
+            task.abort();
+        }
+        self.domain_generation = self.domain_generation.wrapping_add(1);
+        self.domain = crate::domain::DomainFacts::new(self.config.domain_setup.clone());
+        self.session_ready = false;
+        self.state.view.phase = SessionPhase::Initializing;
+    }
+
+    fn confirm_configured_permission(&mut self) -> bool {
+        if let Some(preset) = self.config.permission.clone() {
+            // `--permission`：会话在 dsh 确认这个预设之前不算就绪，
+            // 任务不会在别的预设下开始。只改这个会话，不改 dsh 的默认值。
+            let id = self.next_rpc_id();
+            match self.send_effect(app_server::permission_set(id.clone(), &preset, false), None) {
+                Ok(outbox_id) => {
+                    self.expect_response(id, outbox_id, PendingRpc::new(RpcKind::PermissionSet));
+                    self.state.view.permission.switching = Some(preset);
+                    self.startup_permission = true;
+                    self.state.view.notice =
+                        Some("Waiting for dsh to confirm the permission preset".into());
+                }
+                Err(error) => self.state.error(
+                    SessionPhase::Failed,
+                    format!("--permission {preset} could not be requested: {error}"),
+                ),
+            }
+            return true;
+        }
+        false
+    }
+
     fn session_started(&mut self) {
         self.state.view.phase = SessionPhase::Ready;
         self.state.view.notice = None;
@@ -1694,6 +1805,45 @@ impl Core {
                     .await;
             }
         });
+    }
+
+    fn approve_domain_change(&mut self, binding: crate::domain::ProposalBinding) {
+        if !self.idle_for_backend_change()
+            || !self.domain.can_authorize(&binding)
+            || self
+                .state
+                .view
+                .requests
+                .iter()
+                .any(|r| self.request_is_live(r))
+        {
+            self.domain.snapshot.notice =
+                Some("当前方案或执行状态不允许批准；请等待当前轮完成并核对版本".into());
+            return;
+        }
+        let Some(setup) = self.config.domain_setup.clone() else {
+            return;
+        };
+        self.domain_generation = self.domain_generation.wrapping_add(1);
+        let attempt_id = self.domain_generation;
+        let generation = self.generation;
+        let root_turn_count = self.state.view.root_turn_count;
+        self.domain.snapshot.authorizing = true;
+        let commands = self.command_tx.clone();
+        self.domain_authorization_task = Some(tokio::spawn(async move {
+            let outcome = crate::domain::authorize(setup, binding.clone()).await;
+            if let Some(commands) = commands.upgrade() {
+                let _ = commands
+                    .send(Command::DomainAuthorizationFinished {
+                        attempt_id,
+                        generation,
+                        root_turn_count,
+                        binding,
+                        outcome,
+                    })
+                    .await;
+            }
+        }));
     }
 
     /// No turn, gate or task is active, so the model or backend can change.
@@ -2378,6 +2528,7 @@ impl Core {
                     return;
                 };
                 if new_session {
+                    self.reset_domain_session();
                     self.session_ready = false;
                     self.state.view.phase = SessionPhase::Initializing;
                     self.state.view.creating_conversation = false;
@@ -2400,29 +2551,7 @@ impl Core {
                 if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
                     self.state.view.cwd = cwd.into();
                 }
-                if let Some(preset) = self.config.permission.clone() {
-                    // `--permission`：会话在 dsh 确认这个预设之前不算就绪，
-                    // 任务不会在别的预设下开始。只改这个会话，不改 dsh 的默认值。
-                    let id = self.next_rpc_id();
-                    match self
-                        .send_effect(app_server::permission_set(id.clone(), &preset, false), None)
-                    {
-                        Ok(outbox_id) => {
-                            self.expect_response(
-                                id,
-                                outbox_id,
-                                PendingRpc::new(RpcKind::PermissionSet),
-                            );
-                            self.state.view.permission.switching = Some(preset);
-                            self.startup_permission = true;
-                            self.state.view.notice =
-                                Some("Waiting for dsh to confirm the permission preset".into());
-                        }
-                        Err(error) => self.state.error(
-                            SessionPhase::Failed,
-                            format!("--permission {preset} could not be requested: {error}"),
-                        ),
-                    }
+                if self.confirm_configured_permission() {
                     return;
                 }
                 self.session_started();
@@ -2558,6 +2687,7 @@ impl Core {
                 }
                 // 界面换成恢复的会话；之前的会话仍在 dsh 里，可以再恢复回来。
                 // 权限预设属于会话，换了会话就要重新读取。
+                self.reset_domain_session();
                 self.state.view.permission = Default::default();
                 self.state.view.messages.clear();
                 self.state.tool_lines.clear();
@@ -2565,7 +2695,9 @@ impl Core {
                 self.state.view.thread_id = Some(thread);
                 self.state.view.turn_id = None;
                 self.state.view.last_error = None;
-                self.state.view.phase = SessionPhase::Ready;
+                if self.config.domain_setup.is_none() {
+                    self.state.view.phase = SessionPhase::Ready;
+                }
                 // 消息显示出来之前仍算恢复中，新一轮排在其后。
                 Some(RpcKind::ThreadHistory)
             }
@@ -2607,9 +2739,13 @@ impl Core {
                         ))
                     }
                 }
+                if self.config.domain_setup.is_some() {
+                    self.confirm_configured_permission();
+                }
                 Some(RpcKind::ModelList)
             }
             RpcKind::BackendReload => {
+                self.reset_domain_session();
                 self.state.view.models.reloading = false;
                 let resumed = match result.pointer("/thread/id").and_then(Value::as_str) {
                     Some(id) if self.state.view.thread_id.as_deref() != Some(id) => {
@@ -2627,6 +2763,9 @@ impl Core {
                 } else {
                     "dsh configuration reloaded in a new session; the agent no longer has the earlier conversation.".into()
                 });
+                if self.config.domain_setup.is_some() {
+                    self.confirm_configured_permission();
+                }
                 Some(RpcKind::ModelList)
             }
             RpcKind::ModelSelect => {
@@ -3701,6 +3840,7 @@ fn preserve_cumulative_total(previous: UsageSummary, mut current: UsageSummary) 
 
 #[cfg(test)]
 mod tests {
+    mod domain;
     mod file_progress;
     mod tool_details;
 

@@ -52,6 +52,7 @@ pub enum Update {
         kind: Option<String>,
         /// 保留给之后只带 toolCallId 的权限请求查回命令、理由和申请的权限。
         input: ToolInput,
+        mcp: Option<Box<McpCall>>,
     },
     ToolCallUpdate {
         item_id: String,
@@ -67,6 +68,13 @@ pub enum Update {
     Unknown {
         kind: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCall {
+    pub server: String,
+    pub tool: String,
+    pub arguments: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +360,7 @@ pub fn update(params: &Value) -> Result<(String, Update), AcpProtocolError> {
         "tool_call" => Update::ToolCall {
             item_id: item_id()?,
             input: tool_input(payload),
+            mcp: mcp_call(payload),
             // dsh 的 title 只是工具名（如 pwsh），真正的命令在 rawInput.command。
             title: {
                 let input = tool_input(payload);
@@ -392,6 +401,35 @@ pub fn update(params: &Value) -> Result<(String, Update), AcpProtocolError> {
         },
     };
     Ok((session, update))
+}
+
+fn mcp_call(payload: &Value) -> Option<Box<McpCall>> {
+    // Tool identity comes from ACP's registry title. A shell command cannot become
+    // an MCP fact by printing its name or a matching JSON envelope.
+    if payload.pointer("/rawInput/command").is_some() {
+        return None;
+    }
+    let name = payload["title"].as_str()?.strip_prefix("mcp__")?;
+    let (server, tool) = name.split_once("__")?;
+    if server.is_empty()
+        || tool.is_empty()
+        || server.len() > 256
+        || tool.len() > 256
+        || !server
+            .bytes()
+            .chain(tool.bytes())
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(Box::new(McpCall {
+        server: server.into(),
+        tool: tool.into(),
+        arguments: payload
+            .get("rawInput")
+            .filter(|v| v.to_string().len() <= MAX_TEXT_BYTES)
+            .cloned(),
+    }))
 }
 
 fn content_text(value: &Value) -> Result<Option<String>, AcpProtocolError> {
@@ -666,5 +704,19 @@ mod tests {
             panic!()
         };
         assert_eq!(output.as_deref(), Some("result"));
+    }
+    #[test]
+    fn mcp_identity_comes_from_registry_title_and_not_a_shell_command() {
+        let call = json!({"title":"mcp__modeling_domain__prepare_change", "rawInput":{"plan":{}}});
+        let metadata = mcp_call(&call).unwrap();
+        assert_eq!(metadata.server, "modeling_domain");
+        assert_eq!(metadata.tool, "prepare_change");
+        assert_eq!(metadata.arguments, Some(json!({"plan":{}})));
+        let shell = json!({"title":"mcp__modeling_domain__prepare_change", "rawInput":{"command":"echo fake"}});
+        assert!(mcp_call(&shell).is_none());
+        assert!(mcp_call(
+            &json!({"title":"pwsh", "rawInput":{"command":"mcp__modeling_domain__prepare_change"}})
+        )
+        .is_none());
     }
 }

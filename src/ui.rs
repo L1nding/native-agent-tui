@@ -15,6 +15,7 @@ mod attention;
 mod commands;
 mod context;
 mod conversation;
+mod domain;
 mod editor;
 mod help;
 mod history;
@@ -119,6 +120,9 @@ struct LocalState {
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
+    domain_visible: bool,
+    domain_scroll: u16,
+    displayed_domain_binding: Option<crate::domain::ProposalBinding>,
     evidence_scroll: usize,
     skills: bool,
     skills_scroll: usize,
@@ -630,6 +634,37 @@ fn handle_key(
     } else {
         key
     };
+    if key.code == KeyCode::F(6) && snapshot.domain.enabled {
+        local.domain_visible = !local.domain_visible;
+        local.domain_scroll = 0;
+        local.workflow.visible = false;
+        return false;
+    }
+    if local.domain_visible && snapshot.requests.is_empty() {
+        match key.code {
+            KeyCode::Esc => {
+                local.domain_visible = false;
+                return false;
+            }
+            KeyCode::PageUp => {
+                local.domain_scroll = local.domain_scroll.saturating_sub(8);
+                return false;
+            }
+            KeyCode::PageDown => {
+                local.domain_scroll = local.domain_scroll.saturating_add(8);
+                return false;
+            }
+            KeyCode::Char('y') if control => {
+                if let Some(binding) = local.displayed_domain_binding.clone() {
+                    send(Command::ApproveDomainChange { binding }, tx, local);
+                } else {
+                    local.notice = Some("当前尚无已展示的可批准方案".into());
+                }
+                return false;
+            }
+            _ => {}
+        }
+    }
     if control {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('d') => return true,

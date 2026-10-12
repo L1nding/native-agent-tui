@@ -44,6 +44,15 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.provider_form.draw(frame, area, &snapshot.models.test);
         return;
     }
+    if local.domain_visible
+        && snapshot.domain.enabled
+        && snapshot.requests.is_empty()
+        && area.width >= 24
+        && area.height >= 8
+    {
+        super::domain::draw(frame, area, snapshot, local);
+        return;
+    }
     if area.width < 24 || area.height < 8 {
         frame.render_widget(
             Paragraph::new(format!(

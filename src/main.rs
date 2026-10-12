@@ -29,7 +29,7 @@ Quick start:
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]
   native-agent-tui --run TASK [--json-events] [OPTIONS]
-  native-agent-tui --modeling MODELER_REPO [--target "建模八层"] [--modeling-project RELATIVE_PATH]
+  native-agent-tui --modeling MODELER_REPO [--target "建模八层"] [--modeling-project RELATIVE_PATH] [--change-context FILE]
   native-agent-tui --workflow FILE [--headless [--json-events]] [OPTIONS]
   native-agent-tui --sessions [--cwd PATH] [--journal-dir PATH]
   native-agent-tui --recovery SESSION_ID [OPTIONS]
@@ -45,6 +45,8 @@ Options:
   --model NAME     Requested model as provider/model; the last /model choice when omitted
   --permission PRESET  dsh permission preset for this session, e.g. read-only |
                    workspace-write | danger-full-access (default: dsh's own default)
+  --domain-context FILE  Attach pure modeling tools and the F6 modeling view to this dsh session
+  --modeling REPO    Legacy Python-controlled modeling workflow (separate from --domain-context)
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)
@@ -126,14 +128,28 @@ async fn execute() -> Result<(), (u8, String)> {
             repository,
             project,
             target,
+            change_context,
         } => {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err((2, "建模模式需要交互式终端".into()));
             }
+            let component = if let Some(path) = change_context {
+                let bytes = std::fs::read(path).map_err(|e| (2, e.to_string()))?;
+                if bytes.len() > 16 * 1024 {
+                    return Err((2, "建模上下文超过大小上限".into()));
+                }
+                Some(
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| (2, format!("建模上下文无效：{e}")))?,
+                )
+            } else {
+                None
+            };
             ui::run_modeling(
                 native_agent_tui::modeling::Options {
                     repository,
                     project,
+                    component,
                 },
                 target,
             )
@@ -506,6 +522,7 @@ async fn execute() -> Result<(), (u8, String)> {
 }
 
 async fn run_tui(config: Config, tasks: Vec<RootTaskSpec>) -> Result<(), (u8, String)> {
+    let config = native_agent_tui::domain::configure(config).map_err(|e| (2, e))?;
     let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
         .map_err(|error| (3, error.to_string()))?;
     let client = ClientHandle::spawn(config)
@@ -521,6 +538,7 @@ async fn run_headless(
     tasks: Vec<RootTaskSpec>,
     json_events: bool,
 ) -> Result<(), (u8, String)> {
+    let config = native_agent_tui::domain::configure(config).map_err(|e| (2, e))?;
     let journal = config.journal.clone();
     let cwd = config.cwd.clone();
     let client = ClientHandle::spawn(config).await.map_err(|error| {

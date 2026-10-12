@@ -27,7 +27,10 @@ def main():
     parser.add_argument("--live", action="store_true", help="Also run ignored tests requiring a local dsh installation")
     args = parser.parse_args()
     cargo = ["cargo"] + ([f"+{args.toolchain}"] if args.toolchain else [])
-    binary = REPO / "target/release" / ("native-agent-tui.exe" if os.name == "nt" else "native-agent-tui")
+    target = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
+    if not target.is_absolute():
+        target = REPO / target
+    binary = target / "release" / ("native-agent-tui.exe" if os.name == "nt" else "native-agent-tui")
     fixture = binary.parent / "examples" / ("observation_fixture.exe" if os.name == "nt" else "observation_fixture")
     nextest = False
     if not args.fixtures_only or args.live:
