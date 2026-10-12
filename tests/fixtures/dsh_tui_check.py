@@ -200,7 +200,7 @@ def main():
     parser.add_argument("--model", required=True, help="provider/model that answers")
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
-    parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run one half")
+    parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
     args = parser.parse_args()
     binary = args.binary.resolve()
     repo = Path(__file__).resolve().parents[2]
@@ -219,12 +219,17 @@ def main():
         return set(found)
 
     before = processes()
-    if args.only != "cli":
+    if args.only == "domain":
+        domain_checks(report, binary, common, args, workspace, root)
+        time.sleep(2)
+        report.step("no dsh process is left behind by the domain run",
+                    lambda: expect(processes() <= before, f"extra dsh processes: {sorted(processes() - before)}"))
+    if args.only in (None, "tui"):
         tui_checks(report, binary, common, args, workspace, code_word)
         time.sleep(2)
         report.step("no dsh process is left behind by the TUI runs",
                     lambda: expect(processes() <= before, f"extra dsh processes: {sorted(processes() - before)}"))
-    if args.only != "tui":
+    if args.only in (None, "cli"):
         cli_checks(report, binary, common, args, workspace, journal, root)
         time.sleep(2)
         report.step("no dsh process is left behind by the headless runs",
