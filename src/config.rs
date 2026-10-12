@@ -37,6 +37,7 @@ pub struct Config {
     pub mcp_servers: Vec<McpServerConfig>,
     pub domain_context: Option<PathBuf>,
     pub domain_setup: Option<crate::domain::DomainSetup>,
+    pub domain_preview: bool,
     pub model: Option<String>,
     /// `model` came from saved preferences, not `--model`: a backend that no
     /// longer offers it keeps its own default instead of failing startup.
@@ -67,6 +68,7 @@ impl Default for Config {
             mcp_servers: Vec::new(),
             domain_context: None,
             domain_setup: None,
+            domain_preview: false,
             model: None,
             model_is_preference: false,
             strict_outcome: false,
@@ -207,6 +209,7 @@ where
                     goal = Some(value(&args, &mut index, option)?);
                 }
             }
+            "--domain-preview" => config.domain_preview = true,
             "--domain-context" => {
                 config.domain_context = Some(PathBuf::from(value(&args, &mut index, option)?))
             }

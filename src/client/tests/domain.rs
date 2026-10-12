@@ -1,6 +1,53 @@
 use super::*;
 
 #[tokio::test]
+async fn preview_events_from_previous_session_epoch_do_not_project_or_submit() {
+    let (mut client, mut server) = harness().await;
+    initialized(&mut server).await;
+    phase(&mut client, SessionPhase::Ready).await;
+    client
+        .commands
+        .send(Command::PreviewEvent {
+            epoch: 0,
+            event: crate::preview::Event::Ready {
+                connection_file: "old-token-file".into(),
+            },
+        })
+        .await
+        .unwrap();
+    client
+        .commands
+        .send(Command::PreviewEvent {
+            epoch: 1,
+            event: crate::preview::Event::Ready {
+                connection_file: "current-file".into(),
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            client.snapshots.changed().await.unwrap();
+            if client
+                .snapshots
+                .borrow()
+                .domain
+                .preview_connection
+                .as_deref()
+                == Some("current-file")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
 async fn domain_sessions_reconfirm_read_only_after_resume_reload_and_new_conversation() {
     for transition in ["resume", "reload", "new"] {
         for granted in [true, false] {

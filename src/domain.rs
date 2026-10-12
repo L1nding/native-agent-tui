@@ -26,6 +26,9 @@ pub struct DomainSetup {
 }
 
 pub fn configure(mut config: Config) -> Result<Config, String> {
+    if config.domain_preview && config.domain_context.is_none() {
+        return Err("--domain-preview 需要 --domain-context".into());
+    }
     let Some(path) = config.domain_context.as_ref() else {
         return Ok(config);
     };
@@ -144,6 +147,7 @@ pub struct DomainSnapshot {
     pub artifact_validation: Option<String>,
     pub authorizing: bool,
     pub notice: Option<String>,
+    pub preview_connection: Option<String>,
 }
 
 impl std::fmt::Debug for DomainSnapshot {

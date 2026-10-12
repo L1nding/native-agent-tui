@@ -13,3 +13,7 @@
 平台对话缓存与重绘节流仍沿用最新基线；领域事实变化立即重绘，在真正 draw 后记录已展示版本。用户还没看到的新版不能通过旧界面批准。
 
 旧 --modeling/--change-context 功能、测试及医院证据保留为兼容入口。新旧控制者在 CLI 校验中互斥；仅床/盆单层示例不能等同整栋医院或全部构件支持。
+# Blender 实时预览
+
+`--domain-context FILE --domain-preview` 在同一会话挂接本地 Blender Extension 预览/所选对象反馈。
+Core 持有子进程和 session epoch，审批继续使用当前页实际渲染的 binding；详情见 [预览接入](blender-preview.md)。

@@ -46,6 +46,7 @@ Options:
   --permission PRESET  dsh permission preset for this session, e.g. read-only |
                    workspace-write | danger-full-access (default: dsh's own default)
   --domain-context FILE  Attach pure modeling tools and the F6 modeling view to this dsh session
+  --domain-preview   Start the local Blender preview/feedback child for this domain session
   --modeling REPO    Legacy Python-controlled modeling workflow (separate from --domain-context)
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)

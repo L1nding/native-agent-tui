@@ -30,6 +30,10 @@ use crate::transport::{PipeTransport, TransportError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    PreviewEvent {
+        epoch: u64,
+        event: crate::preview::Event,
+    },
     SubmitRootInput {
         text: String,
     },
@@ -293,6 +297,8 @@ impl ClientHandle {
                 domain: crate::domain::DomainFacts::new(config.domain_setup.clone()),
                 domain_authorization_task: None,
                 domain_generation: 0,
+                preview_bridge: None,
+                preview_epoch: 0,
                 config,
                 server,
                 command_rx,
@@ -448,6 +454,8 @@ struct Core {
     domain: crate::domain::DomainFacts,
     domain_authorization_task: Option<JoinHandle<()>>,
     domain_generation: u64,
+    preview_bridge: Option<crate::preview::Bridge>,
+    preview_epoch: u64,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -655,6 +663,7 @@ impl Core {
     }
 
     async fn run(mut self) -> ExitReport {
+        self.start_preview();
         if let Err(error) = self.send_rpc(RpcKind::Initialize) {
             self.state.error(SessionPhase::Failed, error.to_string());
         } else {
@@ -815,6 +824,7 @@ impl Core {
             }
         }
 
+        self.preview_bridge.take();
         if let Some(task) = self.domain_authorization_task.take() {
             task.abort();
             let _ = task.await;
@@ -1324,6 +1334,56 @@ impl Core {
                     },
                 );
             }
+            Command::PreviewEvent { epoch, event } => {
+                if epoch != self.preview_epoch {
+                    return;
+                }
+                match event {
+                    crate::preview::Event::Ready { connection_file } => {
+                        self.domain.snapshot.preview_connection = Some(connection_file);
+                    }
+                    crate::preview::Event::Closed => {
+                        self.domain.snapshot.preview_connection = None;
+                        self.domain.snapshot.notice =
+                            Some("Blender 预览已断开；场景与产物保持原状态".into());
+                    }
+                    crate::preview::Event::Feedback(feedback) => {
+                        let outcome = if !self.idle_for_backend_change()
+                            || self.domain.snapshot.authorizing
+                        {
+                            Err("平台正在执行或等待交互；请在 idle 后重新提交对象反馈".into())
+                        } else {
+                            crate::preview::feedback_text(&feedback, &self.domain.snapshot)
+                        };
+                        match outcome {
+                            Ok(text) => {
+                                self.domain.remember_control(&text);
+                                let before = self.state.view.root_start_requests;
+                                self.command(Command::SubmitRootInput { text });
+                                // Queue acceptance is not submission. Confirm the
+                                // normal scheduler's owned outbox write first.
+                                self.dispatch_root();
+                                let status = if self.state.view.root_start_requests > before {
+                                    "submitted"
+                                } else {
+                                    "unknown"
+                                };
+                                if let Some(bridge) = &self.preview_bridge {
+                                    bridge.receipt(&feedback.request_id, status, "Feedback passed to the owning platform session; approval remains in TUI");
+                                }
+                                self.domain.snapshot.notice =
+                                    Some("Blender 对象意见已送入同一平台会话，等待新候选".into());
+                            }
+                            Err(reason) => {
+                                if let Some(bridge) = &self.preview_bridge {
+                                    bridge.receipt(&feedback.request_id, "rejected", &reason);
+                                }
+                                self.domain.snapshot.notice = Some(reason);
+                            }
+                        }
+                    }
+                }
+            }
             Command::ApproveDomainChange { binding } => {
                 self.approve_domain_change(binding);
             }
@@ -1642,8 +1702,23 @@ impl Core {
         }
         self.domain_generation = self.domain_generation.wrapping_add(1);
         self.domain = crate::domain::DomainFacts::new(self.config.domain_setup.clone());
+        self.start_preview();
         self.session_ready = false;
         self.state.view.phase = SessionPhase::Initializing;
+    }
+
+    fn start_preview(&mut self) {
+        self.preview_bridge.take();
+        self.preview_epoch = self.preview_epoch.wrapping_add(1);
+        if self.config.domain_preview {
+            if let Some(setup) = self.config.domain_setup.clone() {
+                self.preview_bridge = Some(crate::preview::Bridge::start(
+                    setup,
+                    self.preview_epoch,
+                    self.command_tx.clone(),
+                ));
+            }
+        }
     }
 
     fn confirm_configured_permission(&mut self) -> bool {

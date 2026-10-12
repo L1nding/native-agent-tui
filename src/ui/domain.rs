@@ -30,6 +30,12 @@ pub(super) fn draw(
         chunks[0],
     );
     let mut lines = Vec::new();
+    if let Some(path) = &domain.preview_connection {
+        lines.push(Line::from(format!(
+            "Blender 连接文件：{}",
+            display_text(path)
+        )));
+    }
     if let Some(p) = &domain.proposal {
         lines.push(Line::from(format!(
             "方案 {} · 修订 {} · {}",
