@@ -697,7 +697,13 @@ impl Core {
                     match envelope {
                         Ok(envelope) => self.envelope(envelope),
                         Err(error) => {
-                            self.state.error(SessionPhase::Disconnected, format!("{error}; any active external outcome is unknown"));
+                            let disconnected = format!("{error}; any active external outcome is unknown");
+                            // 失败响应后紧接 EOF 时，保留已确认原因并照实标记断连。
+                            let message = match (&self.state.view.phase, &self.state.view.last_error) {
+                                (SessionPhase::Failed, Some(cause)) => format!("{cause}; {disconnected}"),
+                                _ => disconnected,
+                            };
+                            self.state.error(SessionPhase::Disconnected, message);
                             self.scheduler.disconnected();
                             self.publish();
                             break;
@@ -7997,6 +8003,29 @@ mod tests {
         drop(server);
         phase(&mut client, SessionPhase::Disconnected).await;
         assert!(client.join.await.unwrap().error.is_some());
+    }
+
+    #[tokio::test]
+    async fn disconnect_after_a_reload_failure_preserves_the_confirmed_cause() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client.commands.send(Command::ReloadBackend).await.unwrap();
+        let reload = next(&mut server).await;
+        assert_eq!(reload["method"], "backend/reload");
+        send(
+            &mut server,
+            json!({"id":reload["id"],"error":{"code":-32000,"message":"dsh exited while restarting the session: reload-launch-failure"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Failed).await;
+        drop(server);
+        phase(&mut client, SessionPhase::Disconnected).await;
+        let report = client.join.await.unwrap();
+        let error = report.error.unwrap();
+        assert!(error.contains("reload-launch-failure"));
+        assert!(error.contains("external outcome is unknown"));
+        assert_eq!(client.snapshots.borrow().root_turn_count, 0);
     }
 
     #[tokio::test]

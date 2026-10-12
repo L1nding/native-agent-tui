@@ -105,6 +105,7 @@ fn launch_with_tail(
 struct Replacement {
     child: Child,
     stderr: JoinHandle<()>,
+    stderr_tail: StderrTail,
 }
 
 impl Replacement {
@@ -215,7 +216,13 @@ pub(crate) async fn test_model(mut config: Config, model: String) -> Result<u64,
     .unwrap_or_else(|_| Err("no reply within 90 seconds".into()));
     let elapsed = started.elapsed().as_millis() as u64;
     let _ = pipe.close_writer().await;
-    Replacement { child, stderr }.stop().await;
+    Replacement {
+        child,
+        stderr,
+        stderr_tail: StderrTail::default(),
+    }
+    .stop()
+    .await;
     outcome.map(|()| elapsed)
 }
 
@@ -238,8 +245,16 @@ pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
     bridge.startup_stderr = Some(tail);
     let respawn_config = config.clone();
     bridge.respawn = Some(Box::new(move || {
-        let (pipe, child, stderr) = launch(&respawn_config)?;
-        Ok((pipe, Some(Replacement { child, stderr })))
+        let stderr_tail = StderrTail::default();
+        let (pipe, child, stderr) = launch_with_tail(&respawn_config, Some(stderr_tail.clone()))?;
+        Ok((
+            pipe,
+            Some(Replacement {
+                child,
+                stderr,
+                stderr_tail,
+            }),
+        ))
     }));
     let bridge = tokio::spawn(bridge.run());
     Ok(AcpProcess {
@@ -394,7 +409,10 @@ impl AcpBridge {
                 message = self.core.recv() => {
                     match message {
                         Ok(message) => {
-                            if self.handle_core(message).await.is_err() { break; }
+                            if self.handle_core(message).await.is_err() {
+                                self.explain_failed_start().await;
+                                break;
+                            }
                         }
                         Err(_) => {
                             if let Some(session) = &self.session_id {
@@ -407,7 +425,10 @@ impl AcpBridge {
                 message = self.acp.recv() => {
                     match message {
                         Ok(message) => {
-                            if self.handle_acp(message).await.is_err() { break; }
+                            if self.handle_acp(message).await.is_err() {
+                                self.explain_failed_start().await;
+                                break;
+                            }
                         }
                         Err(_) => {
                             self.explain_failed_start().await;
@@ -417,6 +438,8 @@ impl AcpBridge {
                 }
             }
         }
+        // send 仅入队；退出前排空 Core 响应，避免 Drop 中止 writer 丢失错误原因。
+        self.core.close_writer().await;
         // 只关闭一次：输入结束后 agent 自行退出，重载启动的进程由这里收尾。
         let _ = self.acp.close_writer().await;
         if let Some(replacement) = self.replacement.take() {
@@ -424,17 +447,18 @@ impl AcpBridge {
         }
     }
 
-    /// dsh ended before any session existed: answer the handshake Core is
-    /// waiting on with what dsh said, so the user sees the cause.
+    /// 启动或重载握手期间退出时，向 Core 原始请求返回当前进程的原因。
     async fn explain_failed_start(&mut self) {
-        if self.session_id.is_some() {
-            return;
-        }
-        let waiting: Vec<RpcId> = self
+        let waiting: Vec<(RpcId, RpcId, bool)> = self
             .pending
             .iter()
-            .filter(|(_, kind)| matches!(kind, Pending::Initialize | Pending::SessionNew))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, kind)| match kind {
+                Pending::Initialize | Pending::SessionNew => Some((id.clone(), id.clone(), false)),
+                Pending::ReloadInitialize { core_id }
+                | Pending::ReloadResume { core_id }
+                | Pending::ReloadNew { core_id } => Some((id.clone(), core_id.clone(), true)),
+                _ => None,
+            })
             .collect();
         if waiting.is_empty() {
             return;
@@ -444,15 +468,20 @@ impl AcpBridge {
         let said = self.startup_stderr.as_ref().and_then(|tail| {
             startup_failure(&tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
         });
-        let message = match said {
-            Some(said) => format!("dsh exited before a session started: {said}"),
-            None => "dsh exited before a session started and reported no error".to_owned(),
-        };
-        for id in waiting {
+        for (id, core_id, reload) in waiting {
+            let stage = if reload {
+                "while restarting the session"
+            } else {
+                "before a session started"
+            };
+            let message = match &said {
+                Some(said) => format!("dsh exited {stage}: {said}"),
+                None => format!("dsh exited {stage} and reported no error"),
+            };
             self.pending.remove(&id);
             let _ = self
                 .core
-                .send(Envelope::error_response(id, -32000, message.clone()));
+                .send(Envelope::error_response(core_id, -32000, message));
         }
         // The bridge ends right after this; the answer must be written out first.
         self.core.close_writer().await;
@@ -498,6 +527,9 @@ impl AcpBridge {
                 ));
             }
         };
+        if let Some(replacement) = &replacement {
+            self.startup_stderr = Some(replacement.stderr_tail.clone());
+        }
         let mut previous = std::mem::replace(&mut self.acp, pipe);
         let _ = previous.close_writer().await;
         if let Some(old) = std::mem::replace(&mut self.replacement, replacement) {
@@ -1400,7 +1432,7 @@ mod tests {
         assert_eq!(super::startup_failure(b"\n   \n"), None);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn an_agent_that_exits_during_the_handshake_fails_the_handshake_with_its_own_words() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();
@@ -1428,6 +1460,58 @@ mod tests {
             "dsh exited before a session started: dsh: profile \"zf\" does not exist"
         );
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_exits_during_the_handshake_answers_the_original_request() {
+        for stage in 0..3 {
+            let (mut core_client, core_bridge) = pair();
+            let (_first, acp_bridge) = pair();
+            let (mut restarted, restarted_bridge) = pair();
+            let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+            bridge.session_id = Some("saved-session".into());
+            bridge.startup_stderr = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                b"Error: dsh: profile no longer exists\n".to_vec(),
+            )));
+            let mut spare = Some(restarted_bridge);
+            bridge.respawn = Some(Box::new(move || Ok((spare.take().unwrap(), None))));
+            let bridge = tokio::spawn(bridge.run());
+            core_client
+                .send(crate::app_server::backend_reload(RpcId::Number(7)))
+                .unwrap();
+            let initialize = restarted.recv().await.unwrap();
+            if stage >= 1 {
+                restarted
+                    .send(Envelope::response(initialize.id.unwrap(), Some(json!({}))))
+                    .unwrap();
+                let resume = restarted.recv().await.unwrap();
+                if stage == 2 {
+                    restarted
+                        .send(Envelope::error_response(
+                            resume.id.unwrap(),
+                            -32002,
+                            "unknown session",
+                        ))
+                        .unwrap();
+                    let new_session = restarted.recv().await.unwrap();
+                    assert_eq!(new_session.method.as_deref(), Some("session/new"));
+                }
+            }
+            drop(restarted);
+            let answer = tokio::time::timeout(Duration::from_secs(3), core_client.recv())
+                .await
+                .expect("the reload was left unanswered")
+                .expect("the reload lost its failure response");
+            assert_eq!(answer.id, Some(RpcId::Number(7)));
+            assert_eq!(
+                answer.error.unwrap()["message"],
+                "dsh exited while restarting the session: dsh: profile no longer exists"
+            );
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
