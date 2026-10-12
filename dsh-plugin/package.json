@@ -1,0 +1,23 @@
+{
+  "name": "zf-tui-bridge",
+  "description": "dsh plugin that serves the native agent TUI over JSON-RPC stdio from inside the dsh host",
+  "version": "0.1.0-alpha.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

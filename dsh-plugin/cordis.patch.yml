@@ -1,0 +1,7 @@
+# The native agent TUI's bridge over dsh-base. Stdout belongs to the bridge's
+# JSON-RPC frames; the terminal UI itself runs in the Rust process that
+# launched this profile.
+
+- insert:
+    - id: zf-tui-bridge
+      name: 'zf-tui-bridge'
