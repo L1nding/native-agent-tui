@@ -62,6 +62,7 @@ A session is ready once dsh confirms it; nothing is executed at startup. Command
 | Ctrl+R in the `/model` list | Restart dsh without leaving the TUI, for changes dsh reads only at start (a newly installed plugin, a hand-edited profile file): a new dsh process resumes the same session, so the conversation continues. Saving a provider does not need it |
 | `/setting` | Language, theme, sandbox, approval and attention thresholds; each choice is saved to `.zf/preferences.json` in the user's home directory. Language and theme apply at once, sandbox and approval from the next start. `--sandbox`, `--approval` and the `NATIVE_AGENT_TUI_LANG` / `NATIVE_AGENT_TUI_THEME` variables take precedence |
 | `/search` `/timeline` `/context` `/skills` `/requests` `/workflow` `/evidence` `/attention` `/help` `/agent` `/tools` `/quit` | Typed in the task input and sent with Enter; each opens the same panel as its key. A single `/word` is never sent to the model |
+| `/SKILL-NAME [request]` | dsh's skills (built in, yours, and this project's, including those installed plugins provide) are listed in the same hint popup after the commands. Enter sends a task asking the agent to use that skill for the request. The agent loads the skill itself: dsh's protocol gives a client no direct way to run one, so this is a request to the model, not a guaranteed invocation |
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
 | Escape | Close help, panels, and notices; the draft is kept (Ctrl+U clears it) |
 

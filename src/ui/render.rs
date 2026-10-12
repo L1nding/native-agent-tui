@@ -571,7 +571,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         chunks[3],
     );
     if !answering {
-        let hints = super::commands::slash_hints(&local.editor.text);
+        let hints = super::commands::slash_hints(&local.editor.text, &snapshot.skills.entries);
         super::commands::draw_slash_hints(frame, chunks[3], &hints, local.slash_selected);
     }
     if input_height > 0 && chunks[3].width > 2 {

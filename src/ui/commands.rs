@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use crate::skills::SkillEntry;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -226,6 +227,11 @@ pub(super) enum Slash<'a> {
     Tools,
     Settings,
     Quit,
+    /// `/skill-name [request]`: ask the agent to use one of dsh's skills.
+    Skill {
+        name: &'a str,
+        request: &'a str,
+    },
     Unknown,
 }
 
@@ -243,19 +249,39 @@ const SLASH_ACTIONS: &[(&str, PaletteAction)] = &[
 ];
 
 /// One row of the hint list shown above the task input while a `/name` is typed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SlashHint {
-    pub name: &'static str,
-    pub detail: &'static str,
+    pub name: String,
+    pub detail: String,
+    /// A dsh skill, which takes a request after its name.
+    pub skill: bool,
 }
 
-/// Commands whose name starts with what follows the `/`; empty unless `text`
-/// is a single `/word` still being typed.
-pub(super) fn slash_hints(text: &str) -> Vec<SlashHint> {
+const BUILT_IN: [&str; 4] = ["model", "setting", "tools", "quit"];
+
+fn built_in(name: &str) -> bool {
+    name == "settings"
+        || BUILT_IN.contains(&name)
+        || SLASH_ACTIONS.iter().any(|(known, _)| *known == name)
+}
+
+/// Skills that can be named after a `/`: enabled ones whose name is not a command's.
+fn usable_skills(skills: &[SkillEntry]) -> impl Iterator<Item = &SkillEntry> {
+    skills
+        .iter()
+        .filter(|skill| skill.enabled && !skill.name.is_empty() && !built_in(&skill.name))
+}
+
+/// Commands, then dsh skills, whose name starts with what follows the `/`;
+/// empty unless `text` is a single `/word` still being typed.
+pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
     let Some(typed) = text.strip_prefix('/') else {
         return Vec::new();
     };
-    if !typed.chars().all(|c| c.is_ascii_alphabetic()) {
+    if !typed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
         return Vec::new();
     }
     let typed = typed.to_ascii_lowercase();
@@ -265,35 +291,53 @@ pub(super) fn slash_hints(text: &str) -> Vec<SlashHint> {
             .find(|item| item.action == action)
             .map_or("", CommandItem::shown_detail)
     };
+    let command = |name: &str, detail: &str| SlashHint {
+        name: name.to_owned(),
+        detail: detail.to_owned(),
+        skill: false,
+    };
     SLASH_ACTIONS
         .iter()
-        .map(|(name, action)| SlashHint {
-            name,
-            detail: detail(*action),
-        })
+        .map(|(name, action)| command(name, detail(*action)))
         .chain([
-            SlashHint {
-                name: "model",
-                detail: detail(PaletteAction::Model),
-            },
-            SlashHint {
-                name: "setting",
-                detail: tr(
+            command("model", detail(PaletteAction::Model)),
+            command(
+                "setting",
+                tr(
                     "Language, theme, sandbox, approval, reminders",
                     "语言、主题、沙箱、审批、提醒阈值",
                 ),
-            },
-            SlashHint {
-                name: "tools",
-                detail: tr("Fold or unfold tool groups", "折叠或展开工具组"),
-            },
-            SlashHint {
-                name: "quit",
-                detail: tr("Quit", "退出"),
-            },
+            ),
+            command(
+                "tools",
+                tr("Fold or unfold tool groups", "折叠或展开工具组"),
+            ),
+            command("quit", tr("Quit", "退出")),
         ])
-        .filter(|hint| hint.name.starts_with(typed.as_str()))
+        .chain(usable_skills(skills).map(|skill| {
+            SlashHint {
+                name: skill.name.clone(),
+                detail: match skill.scope.as_str() {
+                    "repo" => tr("dsh skill (this project)", "dsh 技能（本项目）"),
+                    "user" => tr("dsh skill (yours)", "dsh 技能（用户）"),
+                    _ => tr("dsh skill (built in)", "dsh 技能（内置）"),
+                }
+                .to_owned(),
+                skill: true,
+            }
+        }))
+        .filter(|hint| hint.name.to_ascii_lowercase().starts_with(typed.as_str()))
         .collect()
+}
+
+/// The task sent for `/skill-name request`. The agent loads the skill itself;
+/// dsh's protocol has no direct way for a client to run one.
+pub(super) fn skill_task(name: &str, request: &str) -> String {
+    if request.is_empty() {
+        format!("Use the \"{name}\" skill.")
+    } else {
+        format!("Use the \"{name}\" skill for this request:\n\n{request}")
+    }
 }
 
 /// Draws the hint list directly above `input`, growing upward.
@@ -346,7 +390,7 @@ pub(super) fn draw_slash_hints(
                 Span::raw(marker),
                 Span::styled(name, theme.key()),
                 Span::raw(" "),
-                Span::styled(hint.detail, theme.secondary()),
+                Span::styled(hint.detail.clone(), theme.secondary()),
             ];
             if index == selected {
                 selected_line(spans, width)
@@ -363,19 +407,26 @@ pub(super) fn slash_names() -> String {
     SLASH_ACTIONS
         .iter()
         .map(|(name, _)| *name)
-        .chain(["model", "setting", "tools", "quit"])
+        .chain(BUILT_IN)
         .map(|name| format!("/{name}"))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Only a single `/word` is a command, so a task that starts with a path is still a task.
-pub(super) fn parse_slash(text: &str) -> Option<Slash<'_>> {
+/// Only a single `/word` is a command, so a task that starts with a path is
+/// still a task. A dsh skill's name may be followed by a request.
+pub(super) fn parse_slash<'a>(text: &'a str, skills: &'a [SkillEntry]) -> Option<Slash<'a>> {
     let rest = text.trim().strip_prefix('/')?;
     let (name, argument) = match rest.split_once(char::is_whitespace) {
         Some((name, argument)) => (name, argument.trim()),
         None => (rest, ""),
     };
+    if let Some(skill) = usable_skills(skills).find(|skill| skill.name == name) {
+        return Some(Slash::Skill {
+            name: &skill.name,
+            request: argument,
+        });
+    }
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
         return None;
     }
@@ -766,21 +817,21 @@ mod tests {
     #[test]
     fn slash_lines_name_commands_and_leave_paths_and_sentences_as_tasks() {
         assert_eq!(
-            parse_slash("/timeline"),
+            parse_slash("/timeline", &[]),
             Some(Slash::Action(PaletteAction::Timeline))
         );
         assert_eq!(
-            parse_slash("  /Agent "),
+            parse_slash("  /Agent ", &[]),
             Some(Slash::Action(PaletteAction::NextAgent))
         );
-        assert_eq!(parse_slash("/model"), Some(Slash::Model(None)));
+        assert_eq!(parse_slash("/model", &[]), Some(Slash::Model(None)));
         assert_eq!(
-            parse_slash("/model hi/gpt-6-luna "),
+            parse_slash("/model hi/gpt-6-luna ", &[]),
             Some(Slash::Model(Some("hi/gpt-6-luna")))
         );
-        assert_eq!(parse_slash("/tools"), Some(Slash::Tools));
-        assert_eq!(parse_slash("/quit"), Some(Slash::Quit));
-        assert_eq!(parse_slash("/nope"), Some(Slash::Unknown));
+        assert_eq!(parse_slash("/tools", &[]), Some(Slash::Tools));
+        assert_eq!(parse_slash("/quit", &[]), Some(Slash::Quit));
+        assert_eq!(parse_slash("/nope", &[]), Some(Slash::Unknown));
         for task in [
             "/",
             "/etc/hosts",
@@ -790,15 +841,71 @@ mod tests {
             "model",
             "/v2",
         ] {
-            assert_eq!(parse_slash(task), None, "{task}");
+            assert_eq!(parse_slash(task, &[]), None, "{task}");
         }
         let names = slash_names();
         for (name, _) in SLASH_ACTIONS {
             assert!(names.contains(&format!("/{name}")), "{names}");
         }
         assert!(names.ends_with("/model /setting /tools /quit"), "{names}");
-        assert_eq!(parse_slash("/setting"), Some(Slash::Settings));
-        assert_eq!(parse_slash("/settings"), Some(Slash::Settings));
+        assert_eq!(parse_slash("/setting", &[]), Some(Slash::Settings));
+        assert_eq!(parse_slash("/settings", &[]), Some(Slash::Settings));
+    }
+
+    #[test]
+    fn dsh_skills_are_hinted_after_commands_and_take_a_request() {
+        let skill = |name: &str, scope: &str, enabled: bool| SkillEntry {
+            name: name.into(),
+            path: format!("C:/skills/{name}/SKILL.md"),
+            scope: scope.into(),
+            enabled,
+        };
+        let skills = [
+            skill("code-review", "system", true),
+            skill("commit", "user", true),
+            skill("disabled-one", "repo", false),
+            // 与界面命令同名的技能让位给命令。
+            skill("quit", "user", true),
+        ];
+        let names = |text: &str| -> Vec<String> {
+            slash_hints(text, &skills)
+                .into_iter()
+                .map(|hint| hint.name)
+                .collect()
+        };
+        assert_eq!(names("/co"), ["context", "code-review", "commit"]);
+        assert_eq!(names("/code-r"), ["code-review"]);
+        assert_eq!(names("/dis"), Vec::<String>::new());
+        assert_eq!(names("/q"), ["quit"]);
+        let hint = slash_hints("/commit", &skills).remove(0);
+        assert!(hint.skill);
+        assert_eq!(hint.detail, "dsh skill (yours)");
+        assert!(slash_hints("/co de", &skills).is_empty());
+        assert!(slash_hints("/", &[]).iter().all(|hint| !hint.skill));
+
+        assert_eq!(
+            parse_slash("/code-review", &skills),
+            Some(Slash::Skill {
+                name: "code-review",
+                request: ""
+            })
+        );
+        assert_eq!(
+            parse_slash(" /commit  the staged files ", &skills),
+            Some(Slash::Skill {
+                name: "commit",
+                request: "the staged files"
+            })
+        );
+        assert_eq!(parse_slash("/quit", &skills), Some(Slash::Quit));
+        assert_eq!(parse_slash("/disabled-one", &skills), None);
+        // 没有这个技能时，带连字符的一行仍是普通任务。
+        assert_eq!(parse_slash("/code-review", &[]), None);
+        assert_eq!(skill_task("commit", ""), "Use the \"commit\" skill.");
+        assert_eq!(
+            skill_task("commit", "the staged files"),
+            "Use the \"commit\" skill for this request:\n\nthe staged files"
+        );
     }
 
     #[test]

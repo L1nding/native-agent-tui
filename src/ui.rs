@@ -746,17 +746,21 @@ fn handle_key(
             local.scroll_from_bottom = 0;
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Tab
-            if !commands::slash_hints(&local.editor.text).is_empty() =>
+            if !commands::slash_hints(&local.editor.text, &snapshot.skills.entries).is_empty() =>
         {
-            let hints = commands::slash_hints(&local.editor.text);
+            let hints = commands::slash_hints(&local.editor.text, &snapshot.skills.entries);
             let selected = local.slash_selected.min(hints.len() - 1);
             match key.code {
                 KeyCode::Up => local.slash_selected = selected.saturating_sub(1),
                 KeyCode::Down => local.slash_selected = (selected + 1).min(hints.len() - 1),
                 _ => {
-                    // `/model` 可以带模型名，补全后留一个空格。
-                    let name = hints[selected].name;
-                    let tail = if name == "model" { " " } else { "" };
+                    // `/model` 可以带模型名、技能可以带要求，补全后留一个空格。
+                    let name = hints[selected].name.as_str();
+                    let tail = if name == "model" || hints[selected].skill {
+                        " "
+                    } else {
+                        ""
+                    };
                     local.editor.clear();
                     local.editor.insert(&format!("/{name}{tail}"));
                     local.slash_selected = 0;
@@ -779,7 +783,7 @@ fn handle_key(
         KeyCode::Enter if !local.editor.text.trim().is_empty() => {
             let mut text = local.editor.text.clone();
             // 提示列表可见时，Enter 执行选中的命令，不要求把名字打全。
-            let hints = commands::slash_hints(&text);
+            let hints = commands::slash_hints(&text, &snapshot.skills.entries);
             if !hints.is_empty()
                 && !selected_request(snapshot, local)
                     .is_some_and(|r| matches!(r.kind, RequestKind::UserInput { .. }))
@@ -828,8 +832,18 @@ fn handle_key(
                     return false;
                 }
             }
+            // `/技能名 要求` 作为任务发出，请 agent 使用这个 dsh 技能。
+            let skill_task = match commands::parse_slash(&text, &snapshot.skills.entries) {
+                Some(commands::Slash::Skill { name, request }) => {
+                    Some(commands::skill_task(name, request))
+                }
+                _ => None,
+            };
+            if let Some(task) = skill_task {
+                text = task;
+            }
             // `/名称` 是界面命令，不作为任务发给模型。
-            if let Some(slash) = commands::parse_slash(&text) {
+            else if let Some(slash) = commands::parse_slash(&text, &snapshot.skills.entries) {
                 use commands::{PaletteAction, Slash};
                 if slash == Slash::Unknown {
                     // 保留输入，方便改正拼写。
@@ -856,7 +870,7 @@ fn handle_key(
                         local.settings.open();
                     }
                     Slash::Quit => return true,
-                    Slash::Unknown => {}
+                    Slash::Skill { .. } | Slash::Unknown => {}
                 }
                 return false;
             }
