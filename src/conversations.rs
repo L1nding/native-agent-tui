@@ -25,8 +25,10 @@ pub struct ConversationSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedMessage {
-    /// `user` or `assistant`.
+    /// `user`, `assistant`, `reasoning` or `tool`.
     pub role: String,
+    pub id: Option<String>,
+    pub turn_id: Option<String>,
     pub text: String,
     pub truncated: bool,
 }
@@ -84,12 +86,20 @@ pub fn parse_history(result: &Value) -> Option<History> {
         .filter_map(|row| {
             let role = row.get("role")?.as_str()?;
             let text = row.get("text")?.as_str()?;
-            if !matches!(role, "user" | "assistant") || text.is_empty() {
+            if !matches!(role, "user" | "assistant" | "reasoning" | "tool") || text.is_empty() {
                 return None;
             }
             let (text, truncated) = cut(text, MAX_TEXT_BYTES);
+            let identity = |key| {
+                row.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= MAX_ID_BYTES)
+                    .map(str::to_owned)
+            };
             Some(SavedMessage {
                 role: role.to_owned(),
+                id: identity("id"),
+                turn_id: identity("turnId"),
                 text,
                 truncated: truncated || row.get("truncated").and_then(Value::as_bool) == Some(true),
             })
@@ -142,11 +152,28 @@ mod tests {
     }
 
     #[test]
+    fn history_keeps_reasoning_and_tools_with_their_server_identity() {
+        let history = parse_history(&json!({"messages":[
+            {"role":"reasoning","id":"shared","turnId":"turn","text":"thought"},
+            {"role":"tool","id":"tool-1","turnId":"turn","text":"▸ failed · cargo check"},
+            {"role":"assistant","id":"shared","turnId":"turn","text":"answer"},
+            {"role":"system","text":"unsupported"},
+        ]}))
+        .unwrap();
+        assert_eq!(history.messages.len(), 3);
+        assert_eq!(history.messages[0].role, "reasoning");
+        assert_eq!(history.messages[1].role, "tool");
+        assert_eq!(history.messages[1].id.as_deref(), Some("tool-1"));
+        assert_eq!(history.messages[1].turn_id.as_deref(), Some("turn"));
+        assert_eq!(history.messages[0].id, history.messages[2].id);
+    }
+
+    #[test]
     fn history_keeps_the_newest_messages_and_marks_cut_text() {
         let long = "界".repeat(MAX_TEXT_BYTES);
         let history = parse_history(&json!({"omitted":3,"messages":[
             {"role":"user","text":"hi","truncated":false},
-            {"role":"tool","text":"ignored"},
+            {"role":"system","text":"ignored"},
             {"role":"assistant","text":long},
             {"role":"assistant","text":""},
         ]}))

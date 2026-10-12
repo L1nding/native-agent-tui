@@ -135,6 +135,7 @@ struct LocalState {
     submitted: HashSet<RequestRef>,
     input_drafts: HashMap<RequestRef, InputDraft>,
     agent_id: Option<String>,
+    displayed_thread: Option<String>,
     answering: Option<RequestRef>,
     question_index: usize,
     answers: BTreeMap<String, Vec<String>>,
@@ -874,6 +875,9 @@ fn handle_key(
                         local.settings.open();
                         // 权限预设在 dsh 里；每次打开都读当前的。
                         send(Command::DescribePermission, tx, local);
+                    }
+                    Slash::New => {
+                        send(Command::NewConversation, tx, local);
                     }
                     Slash::Quit => return true,
                     Slash::Skill { .. } | Slash::Unknown => {}
@@ -3075,6 +3079,41 @@ mod tests {
         handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
         assert!(!local.settings.visible && local.attention_editor.is_some());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_new_sends_a_conversation_command_and_resets_navigation_after_confirmation() {
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("old".into()),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        sync_local_requests(&mut local, &snapshot);
+        local.editor.insert("/new");
+        assert_eq!(commands::slash_hints("/ne", &[])[0].name, "new");
+        assert!(!handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Command::NewConversation);
+        assert!(rx.try_recv().is_err());
+        // Draft and navigation remain unchanged until the backend confirms a new id.
+        local.editor.insert("draft for old session");
+        local.agent_id = Some("old-child".into());
+        local.scroll_from_bottom = 30;
+        snapshot.creating_conversation = true;
+        sync_local_requests(&mut local, &snapshot);
+        assert_eq!(local.editor.text, "draft for old session");
+        snapshot.thread_id = Some("new".into());
+        snapshot.creating_conversation = false;
+        sync_local_requests(&mut local, &snapshot);
+        assert!(local.editor.text.is_empty());
+        assert!(local.agent_id.is_none());
+        assert_eq!(local.scroll_from_bottom, 0);
     }
 
     #[test]

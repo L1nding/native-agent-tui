@@ -194,7 +194,7 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       return removeProvider(ctx, provider)
     },
 
-    /** User and assistant text of one session, for showing a resumed conversation. */
+    /** Conversation text, server reasoning and tool summaries for a resumed session. */
     'zf/session/history': (params) => {
       const sessionId = params['sessionId']
       if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')

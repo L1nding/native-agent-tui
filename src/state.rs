@@ -197,6 +197,8 @@ pub struct CoreSnapshot {
     pub conversations: Vec<crate::conversations::ConversationSummary>,
     /// Title of the dsh session this one is switching to.
     pub resuming: Option<String>,
+    /// A fresh dsh conversation is awaiting backend confirmation.
+    pub creating_conversation: bool,
     /// Choices stored for the next start; empty for a setting never saved.
     pub saved_settings: BTreeMap<crate::preferences::Setting, String>,
     pub history_truncated: bool,
@@ -405,7 +407,7 @@ impl SessionState {
             return false;
         }
         let thread = self.view.thread_id.clone().unwrap_or_default();
-        self.message_for(&thread, turn, id, text, complete)
+        self.message_for(&thread, turn, id, "Agent", text, complete)
     }
 
     pub fn child_message(
@@ -421,7 +423,47 @@ impl SessionState {
         {
             return false;
         }
-        self.message_for(thread, turn, id, text, complete)
+        self.message_for(thread, turn, id, "Agent", text, complete)
+    }
+
+    /// Only server-provided reasoning from the current root or child turn is shown.
+    pub fn reasoning(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        id: &str,
+        text: &str,
+        complete: bool,
+    ) -> bool {
+        let current = if self.view.thread_id.as_deref() == Some(thread) {
+            self.view.turn_id.as_deref() == Some(turn)
+                && (complete
+                    || matches!(
+                        self.view.phase,
+                        SessionPhase::Running | SessionPhase::GatePending
+                    ))
+        } else {
+            self.agents.current_turn(thread, turn)
+                && (complete || self.agents.active_turn(thread, turn))
+        };
+        current && self.message_for(thread, turn, id, "Reasoning", text, complete)
+    }
+
+    pub fn finish_reasoning(&mut self, thread: &str, turn: &str) {
+        for message in &mut self.view.messages {
+            if message.role == "Reasoning" && message.thread_id == thread && message.turn_id == turn
+            {
+                message.complete = true;
+            }
+        }
+    }
+
+    pub fn finish_all_reasoning(&mut self) {
+        for message in &mut self.view.messages {
+            if message.role == "Reasoning" {
+                message.complete = true;
+            }
+        }
     }
 
     fn message_for(
@@ -429,6 +471,7 @@ impl SessionState {
         thread: &str,
         turn: &str,
         id: &str,
+        role: &str,
         text: &str,
         complete: bool,
     ) -> bool {
@@ -440,7 +483,7 @@ impl SessionState {
         }
         let item =
             match self.view.messages.iter_mut().find(|m| {
-                m.thread_id == thread && m.turn_id == turn && m.id == id && m.role == "Agent"
+                m.thread_id == thread && m.turn_id == turn && m.id == id && m.role == role
             }) {
                 Some(item) => item,
                 None => {
@@ -448,7 +491,7 @@ impl SessionState {
                         id: id.into(),
                         thread_id: thread.into(),
                         turn_id: turn.into(),
-                        role: "Agent".into(),
+                        role: role.into(),
                         text: String::new(),
                         complete: false,
                         truncated: false,

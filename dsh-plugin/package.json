@@ -21,7 +21,8 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc -p .",
-    "check": "tsc -p . --noEmit"
+    "check": "tsc -p . --noEmit",
+    "test": "tsc -p . && node --test tests/*.test.mjs"
   },
   "dsh": {
     "bundle": {

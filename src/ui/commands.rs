@@ -226,6 +226,7 @@ pub(super) enum Slash<'a> {
     Model(Option<&'a str>),
     Tools,
     Settings,
+    New,
     Quit,
     /// `/skill-name [request]`: ask the agent to use one of dsh's skills.
     Skill {
@@ -257,7 +258,7 @@ pub(super) struct SlashHint {
     pub skill: bool,
 }
 
-const BUILT_IN: [&str; 4] = ["model", "setting", "tools", "quit"];
+const BUILT_IN: [&str; 5] = ["model", "setting", "tools", "new", "quit"];
 
 fn built_in(name: &str) -> bool {
     name == "settings"
@@ -308,6 +309,7 @@ pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
                     "语言、主题、权限预设、提醒阈值",
                 ),
             ),
+            command("new", tr("Start a new conversation", "新建会话")),
             command(
                 "tools",
                 tr("Fold or unfold tool groups", "折叠或展开工具组"),
@@ -440,6 +442,7 @@ pub(super) fn parse_slash<'a>(text: &'a str, skills: &'a [SkillEntry]) -> Option
     Some(match name.as_str() {
         "tools" => Slash::Tools,
         "setting" | "settings" => Slash::Settings,
+        "new" => Slash::New,
         "quit" => Slash::Quit,
         name => SLASH_ACTIONS
             .iter()
@@ -830,6 +833,7 @@ mod tests {
             Some(Slash::Model(Some("hi/gpt-6-luna")))
         );
         assert_eq!(parse_slash("/tools", &[]), Some(Slash::Tools));
+        assert_eq!(parse_slash("/new", &[]), Some(Slash::New));
         assert_eq!(parse_slash("/quit", &[]), Some(Slash::Quit));
         assert_eq!(parse_slash("/nope", &[]), Some(Slash::Unknown));
         for task in [
@@ -847,7 +851,10 @@ mod tests {
         for (name, _) in SLASH_ACTIONS {
             assert!(names.contains(&format!("/{name}")), "{names}");
         }
-        assert!(names.ends_with("/model /setting /tools /quit"), "{names}");
+        assert!(
+            names.ends_with("/model /setting /tools /new /quit"),
+            "{names}"
+        );
         assert_eq!(parse_slash("/setting", &[]), Some(Slash::Settings));
         assert_eq!(parse_slash("/settings", &[]), Some(Slash::Settings));
     }

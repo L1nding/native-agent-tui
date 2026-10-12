@@ -105,6 +105,7 @@ fn launch_with_tail(
 struct Replacement {
     child: Child,
     stderr: JoinHandle<()>,
+    stderr_tail: StderrTail,
 }
 
 impl Replacement {
@@ -215,7 +216,13 @@ pub(crate) async fn test_model(mut config: Config, model: String) -> Result<u64,
     .unwrap_or_else(|_| Err("no reply within 90 seconds".into()));
     let elapsed = started.elapsed().as_millis() as u64;
     let _ = pipe.close_writer().await;
-    Replacement { child, stderr }.stop().await;
+    Replacement {
+        child,
+        stderr,
+        stderr_tail: StderrTail::default(),
+    }
+    .stop()
+    .await;
     outcome.map(|()| elapsed)
 }
 
@@ -238,8 +245,16 @@ pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
     bridge.startup_stderr = Some(tail);
     let respawn_config = config.clone();
     bridge.respawn = Some(Box::new(move || {
-        let (pipe, child, stderr) = launch(&respawn_config)?;
-        Ok((pipe, Some(Replacement { child, stderr })))
+        let stderr_tail = StderrTail::default();
+        let (pipe, child, stderr) = launch_with_tail(&respawn_config, Some(stderr_tail.clone()))?;
+        Ok((
+            pipe,
+            Some(Replacement {
+                child,
+                stderr,
+                stderr_tail,
+            }),
+        ))
     }));
     let bridge = tokio::spawn(bridge.run());
     Ok(AcpProcess {
@@ -260,12 +275,14 @@ enum Pending {
         session: String,
         label: String,
         reasoning: Option<String>,
+        session_changed: bool,
     },
     /// 切换模型后 agent 可能把推理强度重置为空；恢复切换前的值。
     RestoreReasoning {
         core_id: RpcId,
         session: String,
         label: String,
+        session_changed: bool,
     },
     /// 重载配置：新进程已启动，等它的 initialize 响应。
     ReloadInitialize {
@@ -278,10 +295,24 @@ enum Pending {
     ReloadNew {
         core_id: RpcId,
     },
+    /// Create a second session in the current dsh process.
+    NewSession,
+    /// The new session exists; release the old active session before confirming it.
+    NewSessionRelease {
+        core_id: RpcId,
+        session: String,
+        result: Value,
+    },
     /// 在当前进程里改为继续另一个已保存的会话；失败时原会话不变。
     Switch {
         core_id: RpcId,
         session: String,
+    },
+    /// 目标已恢复，等旧会话释放后才确认切换，允许之后切回来。
+    SwitchRelease {
+        core_id: RpcId,
+        session: String,
+        result: Value,
     },
     Prompt,
     /// The plugin's skill catalog, to be reshaped into the inventory Core reads.
@@ -394,7 +425,10 @@ impl AcpBridge {
                 message = self.core.recv() => {
                     match message {
                         Ok(message) => {
-                            if self.handle_core(message).await.is_err() { break; }
+                            if self.handle_core(message).await.is_err() {
+                                self.explain_failed_start().await;
+                                break;
+                            }
                         }
                         Err(_) => {
                             if let Some(session) = &self.session_id {
@@ -407,7 +441,10 @@ impl AcpBridge {
                 message = self.acp.recv() => {
                     match message {
                         Ok(message) => {
-                            if self.handle_acp(message).await.is_err() { break; }
+                            if self.handle_acp(message).await.is_err() {
+                                self.explain_failed_start().await;
+                                break;
+                            }
                         }
                         Err(_) => {
                             self.explain_failed_start().await;
@@ -417,6 +454,8 @@ impl AcpBridge {
                 }
             }
         }
+        // send 仅入队；退出前排空 Core 响应，避免 Drop 中止 writer 丢失错误原因。
+        self.core.close_writer().await;
         // 只关闭一次：输入结束后 agent 自行退出，重载启动的进程由这里收尾。
         let _ = self.acp.close_writer().await;
         if let Some(replacement) = self.replacement.take() {
@@ -424,17 +463,23 @@ impl AcpBridge {
         }
     }
 
-    /// dsh ended before any session existed: answer the handshake Core is
-    /// waiting on with what dsh said, so the user sees the cause.
+    /// 启动或重载握手期间退出时，向 Core 原始请求返回当前进程的原因。
     async fn explain_failed_start(&mut self) {
-        if self.session_id.is_some() {
-            return;
-        }
-        let waiting: Vec<RpcId> = self
+        let waiting: Vec<(RpcId, RpcId, bool)> = self
             .pending
             .iter()
-            .filter(|(_, kind)| matches!(kind, Pending::Initialize | Pending::SessionNew))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, kind)| match kind {
+                Pending::Initialize | Pending::SessionNew | Pending::NewSession => {
+                    Some((id.clone(), id.clone(), false))
+                }
+                Pending::NewSessionRelease { core_id, .. } => {
+                    Some((id.clone(), core_id.clone(), false))
+                }
+                Pending::ReloadInitialize { core_id }
+                | Pending::ReloadResume { core_id }
+                | Pending::ReloadNew { core_id } => Some((id.clone(), core_id.clone(), true)),
+                _ => None,
+            })
             .collect();
         if waiting.is_empty() {
             return;
@@ -444,15 +489,20 @@ impl AcpBridge {
         let said = self.startup_stderr.as_ref().and_then(|tail| {
             startup_failure(&tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
         });
-        let message = match said {
-            Some(said) => format!("dsh exited before a session started: {said}"),
-            None => "dsh exited before a session started and reported no error".to_owned(),
-        };
-        for id in waiting {
+        for (id, core_id, reload) in waiting {
+            let stage = if reload {
+                "while restarting the session"
+            } else {
+                "before a session started"
+            };
+            let message = match &said {
+                Some(said) => format!("dsh exited {stage}: {said}"),
+                None => format!("dsh exited {stage} and reported no error"),
+            };
             self.pending.remove(&id);
             let _ = self
                 .core
-                .send(Envelope::error_response(id, -32000, message.clone()));
+                .send(Envelope::error_response(core_id, -32000, message));
         }
         // The bridge ends right after this; the answer must be written out first.
         self.core.close_writer().await;
@@ -498,6 +548,9 @@ impl AcpBridge {
                 ));
             }
         };
+        if let Some(replacement) = &replacement {
+            self.startup_stderr = Some(replacement.stderr_tail.clone());
+        }
         let mut previous = std::mem::replace(&mut self.acp, pipe);
         let _ = previous.close_writer().await;
         if let Some(old) = std::mem::replace(&mut self.replacement, replacement) {
@@ -510,6 +563,19 @@ impl AcpBridge {
         self.pending
             .insert(request_id.clone(), Pending::ReloadInitialize { core_id });
         self.acp.send(acp_protocol::initialize_request(request_id))
+    }
+
+    fn switched(
+        &mut self,
+        core_id: RpcId,
+        session: String,
+        result: &Value,
+    ) -> Result<(), TransportError> {
+        self.session_id = Some(session.clone());
+        self.message_text.clear();
+        self.tool_inputs.clear();
+        self.last_message_id = None;
+        self.reloaded(core_id, session, result)
     }
 
     /// The reloaded session's options are known: keep the model chosen before
@@ -538,6 +604,7 @@ impl AcpBridge {
                 session: session.clone(),
                 label: choice.label(),
                 reasoning: self.reasoning.clone(),
+                session_changed: true,
             },
         );
         self.acp.send(acp_protocol::session_set_config_option(
@@ -556,6 +623,21 @@ impl AcpBridge {
             }
             (Some("thread/start"), Some(id)) => {
                 self.pending.insert(id.clone(), Pending::SessionNew);
+                self.acp.send(acp_protocol::session_new_request(
+                    id,
+                    &self.cwd,
+                    self.mcp_servers.clone(),
+                ))?;
+            }
+            (Some("thread/new"), Some(id)) => {
+                if self.turn_id.is_some() || self.session_id.is_none() {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "ACP session is not ready for a new conversation",
+                    ));
+                }
+                self.pending.insert(id.clone(), Pending::NewSession);
                 self.acp.send(acp_protocol::session_new_request(
                     id,
                     &self.cwd,
@@ -646,6 +728,9 @@ impl AcpBridge {
                     return self.core.send(Envelope::error_response(id, -32000, reason));
                 }
                 let session = session.unwrap_or_default();
+                if self.session_id.as_ref() == Some(&session) {
+                    return self.confirm(id, &session, self.current.clone());
+                }
                 let request_id = RpcId::String(format!("acp-switch-{}", id_text(&id)));
                 self.pending.insert(
                     request_id.clone(),
@@ -751,6 +836,7 @@ impl AcpBridge {
                                 session: session.clone(),
                                 label: choice.label(),
                                 reasoning: self.reasoning.clone(),
+                                session_changed: false,
                             },
                         );
                         self.acp.send(acp_protocol::session_set_config_option(
@@ -871,18 +957,31 @@ impl AcpBridge {
         }
         if let (
             Some(error),
-            Pending::SelectModel { core_id, .. } | Pending::RestoreReasoning { core_id, .. },
+            Pending::SelectModel {
+                core_id,
+                session_changed,
+                ..
+            }
+            | Pending::RestoreReasoning {
+                core_id,
+                session_changed,
+                ..
+            },
         ) = (&message.error, &kind)
         {
             let text = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("ACP model selection failed");
-            self.core.send(Envelope::error_response(
+            let mut reply = Envelope::error_response(
                 core_id.clone(),
                 -32602,
                 format!("ACP model selection failed: {text}"),
-            ))?;
+            );
+            if *session_changed {
+                reply.error.as_mut().unwrap()["data"] = json!({"sessionUnavailable": true});
+            }
+            self.core.send(reply)?;
             return Ok(());
         }
         if let (Some(_), Pending::ReloadResume { core_id }) = (&message.error, &kind) {
@@ -899,6 +998,24 @@ impl AcpBridge {
                 &self.cwd,
                 self.mcp_servers.clone(),
             ));
+        }
+        if let (
+            Some(error),
+            Pending::SwitchRelease { core_id, .. } | Pending::NewSessionRelease { core_id, .. },
+        ) = (&message.error, &kind)
+        {
+            self.core.send(Envelope {
+                jsonrpc: None,
+                id: Some(core_id.clone()),
+                method: None,
+                params: None,
+                result: None,
+                error: Some(json!({"code":-32000,"message":format!(
+                    "Conversation change failed while releasing the previous session: {}",
+                    error.get("message").and_then(Value::as_str).unwrap_or("request failed")
+                ),"data":{"sessionUnavailable":true}})),
+            })?;
+            return Err(TransportError::Closed);
         }
         if let (Some(error), Pending::Switch { core_id, .. }) = (&message.error, &kind) {
             // dsh 把具体原因放在 data.details，例如会话正被另一个进程占用。
@@ -962,12 +1079,29 @@ impl AcpBridge {
                 self.reloaded(core_id, session, &result)?;
             }
             Pending::Switch { core_id, session } => {
-                self.session_id = Some(session.clone());
-                self.message_text.clear();
-                self.tool_inputs.clear();
-                self.last_message_id = None;
-                // 沿用当前选中的模型，和重载后的处理一致。
-                self.reloaded(core_id, session, &result)?;
+                if let Some(previous) = self.session_id.clone() {
+                    let request_id =
+                        RpcId::String(format!("acp-switch-close-{}", id_text(&core_id)));
+                    self.pending.insert(
+                        request_id.clone(),
+                        Pending::SwitchRelease {
+                            core_id,
+                            session,
+                            result,
+                        },
+                    );
+                    return self
+                        .acp
+                        .send(acp_protocol::session_close(request_id, &previous));
+                }
+                self.switched(core_id, session, &result)?;
+            }
+            Pending::SwitchRelease {
+                core_id,
+                session,
+                result,
+            } => {
+                self.switched(core_id, session, &result)?;
             }
             Pending::ReloadNew { core_id } => {
                 let Some(session) = acp_protocol::session_id(&result) else {
@@ -984,6 +1118,37 @@ impl AcpBridge {
                 self.core.send(Envelope::response(id, Some(json!({
                     "userAgent":"deepseek-acp", "codexHome":"unavailable", "platformFamily":"unavailable", "platformOs":"unavailable"
                 }))))?;
+            }
+            Pending::NewSession => {
+                let Some(session) = acp_protocol::session_id(&result) else {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32602,
+                        "ACP session/new response has no sessionId",
+                    ));
+                };
+                if let Some(previous) = self.session_id.clone() {
+                    let request_id = RpcId::String(format!("acp-new-close-{}", id_text(&id)));
+                    self.pending.insert(
+                        request_id.clone(),
+                        Pending::NewSessionRelease {
+                            core_id: id,
+                            session,
+                            result,
+                        },
+                    );
+                    self.acp
+                        .send(acp_protocol::session_close(request_id, &previous))?;
+                } else {
+                    self.switched(id, session, &result)?;
+                }
+            }
+            Pending::NewSessionRelease {
+                core_id,
+                session,
+                result,
+            } => {
+                self.switched(core_id, session, &result)?;
             }
             Pending::SessionNew => {
                 let Some(session) = acp_protocol::session_id(&result) else {
@@ -1014,6 +1179,7 @@ impl AcpBridge {
                                 session: session.clone(),
                                 label: choice.label(),
                                 reasoning: self.reasoning.clone(),
+                                session_changed: false,
                             },
                         );
                         self.acp.send(acp_protocol::session_set_config_option(
@@ -1038,6 +1204,7 @@ impl AcpBridge {
                 session,
                 label,
                 reasoning,
+                session_changed,
             } => {
                 let restore = reasoning.filter(|previous| {
                     acp_protocol::select_option(&result, "reasoning_effort").is_some_and(
@@ -1052,6 +1219,7 @@ impl AcpBridge {
                             core_id,
                             session: session.clone(),
                             label,
+                            session_changed,
                         },
                     );
                     self.acp.send(acp_protocol::session_set_config_option(
@@ -1068,6 +1236,7 @@ impl AcpBridge {
                 core_id,
                 session,
                 label,
+                ..
             } => self.confirm(core_id, &session, Some(label))?,
             Pending::Prompt => {
                 let status = match acp_protocol::stop_reason(&result) {
@@ -1400,7 +1569,7 @@ mod tests {
         assert_eq!(super::startup_failure(b"\n   \n"), None);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn an_agent_that_exits_during_the_handshake_fails_the_handshake_with_its_own_words() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();
@@ -1428,6 +1597,58 @@ mod tests {
             "dsh exited before a session started: dsh: profile \"zf\" does not exist"
         );
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_that_exits_during_the_handshake_answers_the_original_request() {
+        for stage in 0..3 {
+            let (mut core_client, core_bridge) = pair();
+            let (_first, acp_bridge) = pair();
+            let (mut restarted, restarted_bridge) = pair();
+            let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+            bridge.session_id = Some("saved-session".into());
+            bridge.startup_stderr = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                b"Error: dsh: profile no longer exists\n".to_vec(),
+            )));
+            let mut spare = Some(restarted_bridge);
+            bridge.respawn = Some(Box::new(move || Ok((spare.take().unwrap(), None))));
+            let bridge = tokio::spawn(bridge.run());
+            core_client
+                .send(crate::app_server::backend_reload(RpcId::Number(7)))
+                .unwrap();
+            let initialize = restarted.recv().await.unwrap();
+            if stage >= 1 {
+                restarted
+                    .send(Envelope::response(initialize.id.unwrap(), Some(json!({}))))
+                    .unwrap();
+                let resume = restarted.recv().await.unwrap();
+                if stage == 2 {
+                    restarted
+                        .send(Envelope::error_response(
+                            resume.id.unwrap(),
+                            -32002,
+                            "unknown session",
+                        ))
+                        .unwrap();
+                    let new_session = restarted.recv().await.unwrap();
+                    assert_eq!(new_session.method.as_deref(), Some("session/new"));
+                }
+            }
+            drop(restarted);
+            let answer = tokio::time::timeout(Duration::from_secs(3), core_client.recv())
+                .await
+                .expect("the reload was left unanswered")
+                .expect("the reload lost its failure response");
+            assert_eq!(answer.id, Some(RpcId::Number(7)));
+            assert_eq!(
+                answer.error.unwrap()["message"],
+                "dsh exited while restarting the session: dsh: profile no longer exists"
+            );
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2294,6 +2515,12 @@ mod tests {
                 Some(json!({"configOptions":options("")})),
             ))
             .unwrap();
+        let close = third.recv().await.unwrap();
+        assert_eq!(close.method.as_deref(), Some("session/close"));
+        assert_eq!(close.params.as_ref().unwrap()["sessionId"], "s2");
+        third
+            .send(Envelope::response(close.id.unwrap(), Some(json!({}))))
+            .unwrap();
         let select = third.recv().await.unwrap();
         assert_eq!(select.params.as_ref().unwrap()["sessionId"], "older");
         third
@@ -2318,6 +2545,146 @@ mod tests {
         assert!(core_client.recv().await.unwrap().result.is_some());
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_releases_the_previous_session_and_can_switch_back() {
+        let (mut core, core_bridge) = pair();
+        let (mut server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core.send(app_server::thread_start(RpcId::Number(1), &config))
+            .unwrap();
+        let start = server.recv().await.unwrap();
+        server
+            .send(Envelope::response(
+                start.id.unwrap(),
+                Some(json!({"sessionId":"a"})),
+            ))
+            .unwrap();
+        core.recv().await.unwrap();
+        // Failed creation never closes A.
+        core.send(app_server::thread_new(RpcId::Number(2), &config))
+            .unwrap();
+        let create = server.recv().await.unwrap();
+        assert_eq!(create.method.as_deref(), Some("session/new"));
+        server
+            .send(Envelope::error_response(
+                create.id.unwrap(),
+                -32000,
+                "creation refused",
+            ))
+            .unwrap();
+        assert!(core.recv().await.unwrap().error.is_some());
+        // Creation and close must both be confirmed before Core learns B's id.
+        core.send(app_server::thread_new(RpcId::Number(3), &config))
+            .unwrap();
+        let create = server.recv().await.unwrap();
+        assert_eq!(create.method.as_deref(), Some("session/new"));
+        server
+            .send(Envelope::response(
+                create.id.unwrap(),
+                Some(json!({"sessionId":"b"})),
+            ))
+            .unwrap();
+        let close = server.recv().await.unwrap();
+        assert_eq!(close.method.as_deref(), Some("session/close"));
+        assert_eq!(close.params.as_ref().unwrap()["sessionId"], "a");
+        assert!(tokio::time::timeout(Duration::from_millis(50), core.recv())
+            .await
+            .is_err());
+        server
+            .send(Envelope::response(close.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        assert_eq!(
+            core.recv().await.unwrap().result.unwrap()["thread"]["id"],
+            "b"
+        );
+        core.send(app_server::thread_resume(RpcId::Number(4), "a"))
+            .unwrap();
+        let resume = server.recv().await.unwrap();
+        assert_eq!(resume.method.as_deref(), Some("session/resume"));
+        assert_eq!(resume.params.as_ref().unwrap()["sessionId"], "a");
+        server
+            .send(Envelope::response(resume.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let close = server.recv().await.unwrap();
+        assert_eq!(close.method.as_deref(), Some("session/close"));
+        assert_eq!(close.params.as_ref().unwrap()["sessionId"], "b");
+        server
+            .send(Envelope::response(close.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        assert_eq!(
+            core.recv().await.unwrap().result.unwrap()["thread"]["id"],
+            "a"
+        );
+        drop(core);
+        bridge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn switching_back_releases_old_sessions_and_a_refused_target_keeps_the_current_session() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        let agent = tokio::spawn(async move {
+            let mut active = std::collections::HashSet::new();
+            while let Ok(request) = server.recv().await {
+                let Some(id) = request.id else { continue };
+                let params = request.params.unwrap_or_default();
+                let session = params["sessionId"].as_str().unwrap_or_default();
+                let reply = match request.method.as_deref() {
+                    Some("session/new") => {
+                        active.insert("a".to_owned());
+                        Envelope::response(id, Some(json!({"sessionId":"a"})))
+                    }
+                    Some("session/resume") if session == "missing" => {
+                        Envelope::error_response(id, -32602, "session is not resumable")
+                    }
+                    Some("session/resume") if !active.insert(session.to_owned()) => {
+                        Envelope::error_response(id, -32602, "session is already active")
+                    }
+                    Some("session/resume") => Envelope::response(id, Some(json!({}))),
+                    Some("session/close") => {
+                        assert!(
+                            active.remove(session),
+                            "closed a session that was not active"
+                        );
+                        Envelope::response(id, Some(json!({})))
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                server.send(reply).unwrap();
+            }
+            active
+        });
+        core_client
+            .send(crate::app_server::thread_start(RpcId::Number(1), &config))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        for (index, session) in ["b", "a", "b", "b", "missing", "a"].into_iter().enumerate() {
+            let id = RpcId::Number(index as i64 + 2);
+            core_client
+                .send(crate::app_server::thread_resume(id.clone(), session))
+                .unwrap();
+            let answer = tokio::time::timeout(Duration::from_secs(2), core_client.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(answer.id, Some(id));
+            if session == "missing" {
+                assert!(answer.error.unwrap()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not resumable"));
+            } else {
+                assert_eq!(answer.result.unwrap()["thread"]["id"], session);
+            }
+        }
+        drop(core_client);
+        bridge.await.unwrap();
+        assert!(agent.await.unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

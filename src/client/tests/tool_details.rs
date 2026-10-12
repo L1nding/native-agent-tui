@@ -539,3 +539,182 @@ async fn dynamic_tool_summary_shows_the_tool_name_not_the_category() {
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();
 }
+
+#[tokio::test]
+async fn reasoning_deltas_appear_in_the_conversation_without_mixing_with_the_answer() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    for (method, turn, text) in [
+        ("item/reasoning/textDelta", "root-turn", "First thought. "),
+        ("item/reasoning/textDelta", "stale-turn", "stale"),
+        ("item/reasoning/textDelta", "root-turn", "Second thought."),
+        ("item/agentMessage/delta", "root-turn", "Final answer."),
+    ] {
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":method,"params":{
+                "threadId":"root","turnId":turn,"itemId":"shared-id","delta":text
+            }}),
+        )
+        .await;
+    }
+    let snapshot = client.snapshots.borrow().clone();
+    let thought = snapshot
+        .messages
+        .iter()
+        .find(|m| m.role == "Reasoning")
+        .expect("reasoning must be visible in the conversation");
+    assert_eq!(thought.text, "First thought. Second thought.");
+    assert!(!thought.complete);
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .find(|m| m.role == "Agent")
+            .unwrap()
+            .text,
+        "Final answer."
+    );
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/completed","params":{
+            "threadId":"root","turn":{"id":"root-turn","status":"completed"}
+        }}),
+    )
+    .await;
+    let snapshot = client.snapshots.borrow().clone();
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .find(|m| m.role == "Reasoning")
+            .unwrap()
+            .complete
+    );
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
+async fn final_reasoning_summary_corrects_deltas_and_stays_separate_from_the_answer() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/reasoning/summaryTextDelta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"thought","delta":"Partial"
+        }}),
+    )
+    .await;
+    for _ in 0..2 {
+        observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{
+            "threadId":"root","turnId":"root-turn","item":{"id":"thought","type":"reasoning","summary":[{"type":"summaryText","text":"Corrected summary"}]}
+        }})).await;
+    }
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/reasoning/summaryTextDelta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"thought","delta":"late"
+        }}),
+    )
+    .await;
+    let snapshot = client.snapshots.borrow().clone();
+    let thoughts: Vec<_> = snapshot
+        .messages
+        .iter()
+        .filter(|m| m.role == "Reasoning")
+        .collect();
+    assert_eq!(thoughts.len(), 1);
+    assert_eq!(thoughts[0].text, "Corrected summary");
+    assert!(thoughts[0].complete);
+    assert!(!format!("{snapshot:?}").contains("Corrected summary"));
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
+async fn child_reasoning_follows_the_confirmed_turn_and_remains_in_its_own_conversation() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"thread/started","params":{
+            "thread":{"id":"a","parentThreadId":"root","source":{"subAgent":{}}}
+        }}),
+    )
+    .await;
+    observation_event(&mut client, &mut server, json!({"method":"item/started","params":{
+        "threadId":"root","turnId":"root-turn","item":{"id":"spawn-a","type":"subAgentActivity","agentThreadId":"a","agentPath":"/root/a","kind":"started"}
+    }})).await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/started","params":{
+            "threadId":"a","turn":{"id":"a-turn"}
+        }}),
+    )
+    .await;
+    let read = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":read["id"],"result":{"thread":{"id":"a","parentThreadId":"root"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Running).await;
+    for (thread, turn, text) in [
+        ("a", "a-turn", "Child thought"),
+        ("root", "root-turn", "Root thought"),
+        ("a", "old", "stale"),
+        ("foreign", "a-turn", "foreign"),
+    ] {
+        observation_event(
+            &mut client,
+            &mut server,
+            json!({"method":"item/reasoning/textDelta","params":{
+                "threadId":thread,"turnId":turn,"itemId":"same-id","delta":text
+            }}),
+        )
+        .await;
+    }
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/completed","params":{
+            "threadId":"a","turn":{"id":"a-turn","status":"completed"}
+        }}),
+    )
+    .await;
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/reasoning/textDelta","params":{
+            "threadId":"a","turnId":"a-turn","itemId":"same-id","delta":"late"
+        }}),
+    )
+    .await;
+    let snapshot = client.snapshots.borrow().clone();
+    let thoughts: Vec<_> = snapshot
+        .messages
+        .iter()
+        .filter(|m| m.role == "Reasoning")
+        .collect();
+    assert_eq!(thoughts.len(), 2);
+    let child = thoughts.iter().find(|m| m.thread_id == "a").unwrap();
+    assert_eq!(child.text, "Child thought");
+    assert!(child.complete);
+    assert_eq!(
+        thoughts
+            .iter()
+            .find(|m| m.thread_id == "root")
+            .unwrap()
+            .text,
+        "Root thought"
+    );
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}

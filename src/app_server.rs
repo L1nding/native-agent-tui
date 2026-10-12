@@ -189,6 +189,14 @@ pub(crate) fn thread_start(id: RpcId, config: &Config) -> Envelope {
     Envelope::request(id, "thread/start", Some(params))
 }
 
+/// Starts a second dsh session in the running ACP process. The bridge closes
+/// the previous active session after this one has been created.
+pub(crate) fn thread_new(id: RpcId, config: &Config) -> Envelope {
+    let mut request = thread_start(id, config);
+    request.method = Some("thread/new".into());
+    request
+}
+
 pub(crate) fn turn_start(id: RpcId, thread: &str, text: &str, model: Option<&str>) -> Envelope {
     let mut params = json!({
         "threadId":thread, "input":[{"type":"text","text":text}]

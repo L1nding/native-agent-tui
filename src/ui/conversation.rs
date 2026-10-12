@@ -119,11 +119,13 @@ fn header(message: &ConversationItem, theme: Theme) -> Line<'static> {
     let color = match message.role.as_str() {
         "You" => theme.accent,
         "Agent" => theme.agent,
+        "Reasoning" => theme.muted,
         _ => theme.foreground,
     };
     // 角色名由 Core 写入；这里只换成界面语言的称呼，不改消息内容。
     let role = match message.role.as_str() {
         "You" => tr("You", "你"),
+        "Reasoning" => tr("Thinking", "思考过程"),
         other => other,
     };
     let mut spans = vec![Span::styled(

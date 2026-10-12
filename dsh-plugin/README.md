@@ -20,6 +20,7 @@ native-agent-tui (Rust) ──stdio JSON-RPC──> dsh --profile zf-tui
 cd dsh-plugin
 pnpm install
 pnpm run build      # 输出到 lib/；pnpm run check 只做类型检查
+pnpm test           # 构建并验证历史中的思考、工具状态与身份关联
 ```
 
 `lib/` 和 `node_modules/` 不入库。改动源码后需要重新构建，再重启 profile。
@@ -55,7 +56,7 @@ dsh plugin --profile zf-tui add link:D:/project/native-agent-tui/dsh-plugin
 | `zf/provider/list` | `llm-pi-ai` 命名空间里可配置的供应商：`name`、`baseURL`、`api`、`apiKeyEnv`、`models[]`（`id`、`name`、`contextWindow`），以及设置是否可写 |
 | `zf/provider/save` | 参数 `provider`、`baseURL`、`api`、`model`、`credential`，可选 `modelName`、`contextWindow`、`apiKey`。新增供应商，或修改它并新增/修改其中一个模型；未提到的模型和字段保留。经设置服务写入，**立即生效**，不合法的值由 dsh 的 schema 拒绝。`apiKey` 交给 dsh 的凭据服务，不会回传 |
 | `zf/provider/remove` | 参数 `provider`。撤销用户对该供应商的修改；profile 自带的供应商仍在 |
-| `zf/session/history` | 参数 `sessionId`。返回 `messages[]`：`role`（`user` / `assistant`）、`text`、`truncated`，只含真人输入和助手的文本（不含注入的上下文、推理和工具调用）；最多 200 条，更早的计入 `omitted`。需要 dsh 的 `sessionQuery` 服务 |
+| `zf/session/history` | 参数 `sessionId`。返回 `messages[]`：`role`（`user` / `assistant` / `reasoning` / `tool`）、`text`、`truncated` 以及可用时的 `id`、`turnId`。保留真人输入、助手正文、服务端思考文本与工具状态摘要；不包含注入上下文和原始工具输出；最多 200 条，更早的计入 `omitted`。需要 dsh 的 `sessionQuery` 服务 |
 | 其他 | ACP v1，见 dsh 的 `@deepseek-ai/dsh-acp` |
 
 未知的 `zf/` 方法返回 `-32601`。输入流关闭时，ACP 连接随之关闭并排空它的 Agent，然后宿主正常退出。
