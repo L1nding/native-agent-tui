@@ -50,6 +50,8 @@ dsh plugin --profile zf-tui add link:D:/project/native-agent-tui/dsh-plugin
 | `zf/session/list` | 参数 `cwd`（可选，只列这个工作区）。返回根会话 `sessions[]`：`id`、`cwd`、`createdAt`、`updatedAt`、`title`（dsh 的标题，没有则缺省）、`live`（是否已在本进程加载），按时间倒序；子代理会话不列出。`titles` 说明标题服务是否可用 |
 | `zf/skills/list` | 参数 `cwd`（可选）。返回 dsh 技能注册表里所有已安装来源的技能 `skills[]`：`name`、`description`、`source`、`path`（由插件直接提供、没有文件的技能缺省）、`modelInvocable`、`userInvocable`；不加载技能正文 |
 | `zf/settings/describe` | dsh 设置服务的各命名空间：`ns`、`applies`、`revision`、`value`（密钥字段由宿主脱敏）；带参数 `ns` 时只返回该命名空间并附上 `schema` |
+| `zf/permission/describe` | 参数 `sessionId`（已在本进程加载的会话）。返回 `current`（该会话生效的权限预设，与任何预设都不匹配时为 `custom`）、`default`（新会话的默认预设）、`presets[]`（`value`、`name`、`description`） |
+| `zf/permission/set` | 参数 `sessionId`、`preset`，可选 `remember`。通过 dsh 的权限预设服务切换该会话的预设（沙箱模式 + 审批策略），立即生效；未知预设由 dsh 拒绝。`remember` 为真时同时写入设置，成为新会话的默认值，返回里的 `remembered` 说明是否写成 |
 | `zf/provider/list` | `llm-pi-ai` 命名空间里可配置的供应商：`name`、`baseURL`、`api`、`apiKeyEnv`、`models[]`（`id`、`name`、`contextWindow`），以及设置是否可写 |
 | `zf/provider/save` | 参数 `provider`、`baseURL`、`api`、`model`、`credential`，可选 `modelName`、`contextWindow`、`apiKey`。新增供应商，或修改它并新增/修改其中一个模型；未提到的模型和字段保留。经设置服务写入，**立即生效**，不合法的值由 dsh 的 schema 拒绝。`apiKey` 交给 dsh 的凭据服务，不会回传 |
 | `zf/provider/remove` | 参数 `provider`。撤销用户对该供应商的修改；profile 自带的供应商仍在 |

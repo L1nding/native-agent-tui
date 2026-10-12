@@ -181,8 +181,8 @@ pub struct CoreSnapshot {
     pub turn_id: Option<String>,
     pub model: Option<String>,
     pub cwd: String,
-    pub sandbox: String,
-    pub approval_policy: String,
+    /// dsh's permission preset of this session and the ones that can be chosen.
+    pub permission: crate::permission::PermissionSnapshot,
     pub messages: Vec<ConversationItem>,
     pub requests: Vec<RequestView>,
     pub last_headless_action: Option<crate::interactions::HeadlessAction>,

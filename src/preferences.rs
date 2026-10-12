@@ -16,19 +16,15 @@ const MAX_BYTES: u64 = 64 * 1024;
 pub enum Setting {
     Language,
     Theme,
-    Sandbox,
-    Approval,
 }
 
 impl Setting {
-    pub const ALL: [Self; 4] = [Self::Language, Self::Theme, Self::Sandbox, Self::Approval];
+    pub const ALL: [Self; 2] = [Self::Language, Self::Theme];
 
     pub fn key(self) -> &'static str {
         match self {
             Self::Language => "language",
             Self::Theme => "theme",
-            Self::Sandbox => "sandbox",
-            Self::Approval => "approval",
         }
     }
 
@@ -36,15 +32,7 @@ impl Setting {
         match self {
             Self::Language => &["zh", "en"],
             Self::Theme => &["dark", "light", "terminal", "mono"],
-            Self::Sandbox => &["read-only", "workspace-write", "danger-full-access"],
-            Self::Approval => &["untrusted", "on-request", "never"],
         }
-    }
-
-    /// Language and theme change the running interface; the execution policy
-    /// is fixed when the session starts.
-    pub fn applies_immediately(self) -> bool {
-        matches!(self, Self::Language | Self::Theme)
     }
 }
 
@@ -219,13 +207,12 @@ mod tests {
         assert_eq!(loaded.model("other"), None);
 
         save_setting(&path, Setting::Theme, "light").unwrap();
-        save_setting(&path, Setting::Sandbox, "read-only").unwrap();
-        assert!(save_setting(&path, Setting::Approval, "always").is_err());
+        save_setting(&path, Setting::Language, "en").unwrap();
+        assert!(save_setting(&path, Setting::Language, "fr").is_err());
         save_attention(&path, "Model", 1000, 2000).unwrap();
         let loaded = Preferences::load(&path);
         assert_eq!(loaded.setting(Setting::Theme), Some("light"));
-        assert_eq!(loaded.setting(Setting::Sandbox), Some("read-only"));
-        assert_eq!(loaded.setting(Setting::Approval), None);
+        assert_eq!(loaded.setting(Setting::Language), Some("en"));
         assert_eq!(loaded.attention("Model"), Some((1000, 2000)));
         assert_eq!(loaded.attention("Tool"), None);
         // 写设置不能丢掉已保存的模型。

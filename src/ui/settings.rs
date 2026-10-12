@@ -1,4 +1,5 @@
-//! `/setting`: choices that are saved and used again at the next start.
+//! `/setting`: interface choices saved for the next start, dsh's permission
+//! preset for this session, and the attention thresholds.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -22,6 +23,8 @@ pub(super) struct SettingsPanel {
 pub(super) enum SettingsEvent {
     Close,
     Change(Setting, &'static str),
+    /// Switch this session's dsh permission preset.
+    Permission(String),
     /// Open the existing threshold editor; its values are saved when applied.
     Attention,
     Interrupt,
@@ -29,15 +32,16 @@ pub(super) enum SettingsEvent {
     Consumed,
 }
 
-/// The four choices, then the row that opens the attention thresholds.
-const ROWS: usize = Setting::ALL.len() + 1;
+/// The interface choices, then the permission preset, then the row that opens
+/// the attention thresholds.
+const PERMISSION_ROW: usize = Setting::ALL.len();
+const ATTENTION_ROW: usize = PERMISSION_ROW + 1;
+const ROWS: usize = ATTENTION_ROW + 1;
 
 fn label(setting: Setting) -> &'static str {
     match setting {
         Setting::Language => tr("Language", "界面语言"),
         Setting::Theme => tr("Theme", "主题"),
-        Setting::Sandbox => tr("Sandbox", "沙箱模式"),
-        Setting::Approval => tr("Approval", "审批模式"),
     }
 }
 
@@ -48,34 +52,55 @@ fn detail(setting: Setting) -> &'static str {
             "Applies now. NO_COLOR still forces mono.",
             "立即生效。设置了 NO_COLOR 时仍为单色。",
         ),
-        Setting::Sandbox => tr(
-            "What commands may touch. Applies from the next start; --sandbox overrides it.",
-            "命令可以访问的范围。下次启动生效；--sandbox 参数优先。",
-        ),
-        Setting::Approval => tr(
-            "When the agent must ask first. Applies from the next start; --approval overrides it.",
-            "Agent 何时需要先征求同意。下次启动生效；--approval 参数优先。",
-        ),
     }
 }
 
-/// The value the panel shows: what is in effect, or what was saved for next time.
-fn shown(setting: Setting, snapshot: &CoreSnapshot) -> String {
+fn shown(setting: Setting) -> &'static str {
     match setting {
-        Setting::Language => lang::name().into(),
-        Setting::Theme => theme::name().into(),
-        Setting::Sandbox | Setting::Approval => snapshot
-            .saved_settings
-            .get(&setting)
-            .cloned()
-            .unwrap_or_else(|| running(setting, snapshot).to_owned()),
+        Setting::Language => lang::name(),
+        Setting::Theme => theme::name(),
     }
 }
 
-fn running(setting: Setting, snapshot: &CoreSnapshot) -> &str {
-    match setting {
-        Setting::Sandbox => &snapshot.sandbox,
-        _ => &snapshot.approval_policy,
+fn permission_label() -> &'static str {
+    tr("Permission preset", "权限预设")
+}
+
+/// What the permission row shows: the switch dsh has not confirmed yet, the
+/// preset in effect, or that nothing has been read.
+fn permission_value(snapshot: &CoreSnapshot) -> String {
+    let permission = &snapshot.permission;
+    if let Some(target) = &permission.switching {
+        return format!("{target}…");
+    }
+    if permission.current.is_empty() {
+        return tr("not available", "不可用").into();
+    }
+    permission.current.clone()
+}
+
+fn permission_detail(snapshot: &CoreSnapshot) -> String {
+    let permission = &snapshot.permission;
+    if permission.current.is_empty() {
+        return tr(
+            "dsh has not reported a permission preset for this session.",
+            "dsh 没有报告这个会话的权限预设。",
+        )
+        .into();
+    }
+    let described = permission
+        .presets
+        .iter()
+        .find(|preset| preset.value == permission.current)
+        .map(|preset| preset.description.as_str())
+        .filter(|description| !description.is_empty());
+    match described {
+        Some(description) => description.to_owned(),
+        None => tr(
+            "dsh's sandbox and approval bundle. Applies to this session now and to new sessions.",
+            "dsh 的沙箱与审批组合。立即作用于当前会话，并成为新会话的默认值。",
+        )
+        .into(),
     }
 }
 
@@ -112,12 +137,38 @@ impl SettingsPanel {
             KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => 1,
             _ => return SettingsEvent::Consumed,
         };
-        let Some(setting) = Setting::ALL.get(self.selected).copied() else {
+        if self.selected == ATTENTION_ROW {
             self.close();
             return SettingsEvent::Attention;
-        };
+        }
+        if self.selected == PERMISSION_ROW {
+            let permission = &snapshot.permission;
+            // 只在 dsh 给出的预设之间切换；等待确认时不再发第二次。
+            let choices: Vec<&str> = permission
+                .presets
+                .iter()
+                .map(|preset| preset.value.as_str())
+                .filter(|value| *value != "custom")
+                .collect();
+            if choices.is_empty() || permission.switching.is_some() {
+                return SettingsEvent::Consumed;
+            }
+            let next = match choices
+                .iter()
+                .position(|value| *value == permission.current)
+            {
+                Some(index) => (index as isize + step).rem_euclid(choices.len() as isize) as usize,
+                None => 0,
+            };
+            return if choices[next] == permission.current {
+                SettingsEvent::Consumed
+            } else {
+                SettingsEvent::Permission(choices[next].to_owned())
+            };
+        }
+        let setting = Setting::ALL[self.selected];
         let values = setting.values();
-        let current = shown(setting, snapshot);
+        let current = shown(setting);
         let index = values
             .iter()
             .position(|value| *value == current)
@@ -151,61 +202,63 @@ impl SettingsPanel {
                 rect.width,
             ));
         let inner = block.inner(rect).width as usize;
+        let attention_label = tr("Attention thresholds", "提醒阈值");
         let label_width = Setting::ALL
             .iter()
             .map(|setting| label(*setting).width())
-            .chain([tr("Attention thresholds", "提醒阈值").width()])
+            .chain([permission_label().width(), attention_label.width()])
             .max()
             .unwrap_or(0)
             + 2;
-        let mut lines = Vec::new();
-        for (index, setting) in Setting::ALL.iter().copied().enumerate() {
+        let row = |index: usize, name: &str, value: String| {
             let marker = if index == self.selected { "> " } else { "  " };
-            let name = label(setting);
-            let value = shown(setting, snapshot);
-            let mut spans = vec![
+            let spans = vec![
                 Span::raw(marker),
-                Span::raw(format!("{name}{}", " ".repeat(label_width - name.width()))),
+                Span::raw(format!(
+                    "{name}{}",
+                    " ".repeat(label_width.saturating_sub(name.width()))
+                )),
                 Span::styled(format!("‹ {value} ›"), theme.key()),
             ];
-            if !setting.applies_immediately() && value != running(setting, snapshot) {
-                spans.push(Span::styled(
-                    format!(
-                        "  {} {}",
-                        tr("next start; now", "下次启动生效；当前"),
-                        running(setting, snapshot)
-                    ),
-                    theme.secondary(),
-                ));
-            }
-            lines.push(if index == self.selected {
+            if index == self.selected {
                 selected_line(spans, inner)
             } else {
                 Line::from(clip_spans(spans, inner))
-            });
+            }
+        };
+        let mut lines = Vec::new();
+        for (index, setting) in Setting::ALL.iter().copied().enumerate() {
+            lines.push(row(index, label(setting), shown(setting).to_owned()));
         }
+        lines.push(row(
+            PERMISSION_ROW,
+            permission_label(),
+            permission_value(snapshot),
+        ));
         let attention = vec![
-            Span::raw(if self.selected == ROWS - 1 {
+            Span::raw(if self.selected == ATTENTION_ROW {
                 "> "
             } else {
                 "  "
             }),
-            Span::raw(tr("Attention thresholds", "提醒阈值")),
+            Span::raw(attention_label),
             Span::styled(tr("  Enter to edit", "  按 Enter 编辑"), theme.secondary()),
         ];
-        lines.push(if self.selected == ROWS - 1 {
+        lines.push(if self.selected == ATTENTION_ROW {
             selected_line(attention, inner)
         } else {
             Line::from(clip_spans(attention, inner))
         });
         lines.push(Line::from(""));
-        let help = Setting::ALL.get(self.selected).map_or(
-            tr(
+        let help = match self.selected {
+            PERMISSION_ROW => permission_detail(snapshot),
+            ATTENTION_ROW => tr(
                 "Quiet and reminder timing per activity; saved when applied.",
                 "各类活动的静默与提醒时间；应用后保存。",
-            ),
-            |setting| detail(*setting),
-        );
+            )
+            .to_owned(),
+            index => detail(Setting::ALL[index]).to_owned(),
+        };
         lines.push(Line::from(clip_spans(
             vec![Span::styled(help, theme.secondary())],
             inner,
@@ -217,6 +270,7 @@ impl SettingsPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permission::{PermissionPreset, PermissionSnapshot};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -241,13 +295,17 @@ mod tests {
             .join("\n")
     }
 
+    fn preset(value: &str, description: &str) -> PermissionPreset {
+        PermissionPreset {
+            value: value.into(),
+            name: value.into(),
+            description: description.into(),
+        }
+    }
+
     #[test]
-    fn rows_cycle_through_allowed_values_and_show_what_waits_for_the_next_start() {
-        let mut snapshot = CoreSnapshot {
-            sandbox: "workspace-write".into(),
-            approval_policy: "on-request".into(),
-            ..Default::default()
-        };
+    fn interface_rows_cycle_and_the_permission_row_offers_only_what_dsh_reported() {
+        let mut snapshot = CoreSnapshot::default();
         let mut panel = SettingsPanel::default();
         panel.open();
         let text = screen(&panel, &snapshot, 100, 20);
@@ -256,8 +314,8 @@ mod tests {
             "> Language",
             "‹ en ›",
             "‹ dark ›",
-            "‹ workspace-write ›",
-            "‹ on-request ›",
+            "Permission preset",
+            "‹ not available ›",
             "Attention thresholds",
             "←/→ change",
         ] {
@@ -272,24 +330,54 @@ mod tests {
             panel.key(press(KeyCode::Left), &snapshot),
             SettingsEvent::Change(Setting::Theme, "mono")
         );
+
+        // dsh 没有报告预设时，这一行不发出任何修改。
         panel.key(press(KeyCode::Down), &snapshot);
-        assert_eq!(
-            panel.key(press(KeyCode::Enter), &snapshot),
-            SettingsEvent::Change(Setting::Sandbox, "danger-full-access")
-        );
-        snapshot
-            .saved_settings
-            .insert(Setting::Sandbox, "read-only".into());
-        let text = screen(&panel, &snapshot, 100, 20);
-        assert!(text.contains("‹ read-only ›"), "{text}");
-        assert!(text.contains("next start; now workspace-write"), "{text}");
         assert_eq!(
             panel.key(press(KeyCode::Right), &snapshot),
-            SettingsEvent::Change(Setting::Sandbox, "workspace-write")
+            SettingsEvent::Consumed
+        );
+        assert!(
+            screen(&panel, &snapshot, 100, 20).contains("dsh has not reported a permission preset")
         );
 
-        panel.key(press(KeyCode::Down), &snapshot);
-        panel.key(press(KeyCode::Down), &snapshot);
+        snapshot.permission = PermissionSnapshot {
+            current: "workspace-write".into(),
+            presets: vec![
+                preset("read-only", ""),
+                preset("workspace-write", "Write inside the workspace."),
+                preset("danger-full-access", ""),
+            ],
+            switching: None,
+        };
+        let text = screen(&panel, &snapshot, 100, 20);
+        assert!(text.contains("‹ workspace-write ›"), "{text}");
+        assert!(text.contains("Write inside the workspace."), "{text}");
+        assert_eq!(
+            panel.key(press(KeyCode::Right), &snapshot),
+            SettingsEvent::Permission("danger-full-access".into())
+        );
+        assert_eq!(
+            panel.key(press(KeyCode::Left), &snapshot),
+            SettingsEvent::Permission("read-only".into())
+        );
+        // 等 dsh 确认期间显示目标，并且不再发第二次。
+        snapshot.permission.switching = Some("read-only".into());
+        assert!(screen(&panel, &snapshot, 100, 20).contains("‹ read-only… ›"));
+        assert_eq!(
+            panel.key(press(KeyCode::Right), &snapshot),
+            SettingsEvent::Consumed
+        );
+        // 与任何预设都不匹配的会话照实显示，切换从第一个预设开始。
+        snapshot.permission.switching = None;
+        snapshot.permission.current = "custom".into();
+        snapshot.permission.presets.push(preset("custom", ""));
+        assert!(screen(&panel, &snapshot, 100, 20).contains("‹ custom ›"));
+        assert_eq!(
+            panel.key(press(KeyCode::Right), &snapshot),
+            SettingsEvent::Permission("read-only".into())
+        );
+
         panel.key(press(KeyCode::Down), &snapshot);
         assert_eq!(
             panel.key(press(KeyCode::Enter), &snapshot),

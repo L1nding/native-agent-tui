@@ -311,10 +311,12 @@ fn handle_key(
                 match setting {
                     crate::preferences::Setting::Language => lang::set(value),
                     crate::preferences::Setting::Theme => theme::set(value),
-                    _ => {}
                 }
                 let value = value.to_owned();
                 send(Command::SaveSetting { setting, value }, tx, local);
+            }
+            SettingsEvent::Permission(preset) => {
+                send(Command::SetPermission { preset }, tx, local);
             }
             SettingsEvent::Attention => {
                 local.attention_editor = Some(AttentionEditor::new(snapshot, 0));
@@ -868,6 +870,8 @@ fn handle_key(
                     Slash::Settings => {
                         overlays::close_mutual_overlays(local);
                         local.settings.open();
+                        // 权限预设在 dsh 里；每次打开都读当前的。
+                        send(Command::DescribePermission, tx, local);
                     }
                     Slash::Quit => return true,
                     Slash::Skill { .. } | Slash::Unknown => {}
@@ -3016,8 +3020,18 @@ mod tests {
         let snapshot = CoreSnapshot {
             phase: SessionPhase::Ready,
             thread_id: Some("root".into()),
-            sandbox: "workspace-write".into(),
-            approval_policy: "on-request".into(),
+            permission: crate::permission::PermissionSnapshot {
+                current: "workspace-write".into(),
+                presets: ["read-only", "workspace-write", "danger-full-access"]
+                    .into_iter()
+                    .map(|value| crate::permission::PermissionPreset {
+                        value: value.into(),
+                        name: value.into(),
+                        description: String::new(),
+                    })
+                    .collect(),
+                switching: None,
+            },
             ..CoreSnapshot::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -3026,6 +3040,8 @@ mod tests {
         local.editor.insert("/setting");
         handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
         assert!(local.settings.visible && local.editor.text.is_empty());
+        // 打开时向 Core 要 dsh 当前的权限预设。
+        assert!(matches!(rx.try_recv(), Ok(Command::DescribePermission)));
 
         assert_eq!(lang::name(), "en");
         handle_key(press(KeyCode::Right), &snapshot, &mut local, &tx);
@@ -3049,13 +3065,11 @@ mod tests {
         handle_key(press(KeyCode::Left), &snapshot, &mut local, &tx);
         assert!(matches!(
             rx.try_recv(),
-            Ok(Command::SaveSetting { setting: Setting::Sandbox, value }) if value == "read-only"
+            Ok(Command::SetPermission { preset }) if preset == "read-only"
         ));
         // 提醒阈值沿用已有的编辑器。
         handle_key(press(KeyCode::End), &snapshot, &mut local, &tx);
-        for _ in 0..3 {
-            handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
-        }
+        handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
         handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
         assert!(!local.settings.visible && local.attention_editor.is_some());
         assert!(rx.try_recv().is_err());
@@ -5225,8 +5239,10 @@ mod tests {
         let mut snapshot = CoreSnapshot {
             phase: SessionPhase::Running,
             thread_id: Some("root".into()),
-            sandbox: "workspace-write".into(),
-            approval_policy: "never".into(),
+            permission: crate::permission::PermissionSnapshot {
+                current: "read-only".into(),
+                ..Default::default()
+            },
             cwd: "SESSION_DIRECTORY".into(),
             requests: vec![request],
             ..Default::default()
@@ -5263,7 +5279,8 @@ mod tests {
             for value in [
                 "SECOND_LINE",
                 "COMMAND_DIRECTORY",
-                "never",
+                "permission preset",
+                "read-only",
                 "acceptForSession",
                 "not applied",
                 "Ctrl+Y",

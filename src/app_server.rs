@@ -170,8 +170,6 @@ pub(crate) fn initialize(id: RpcId) -> Envelope {
 pub(crate) fn thread_start(id: RpcId, config: &Config) -> Envelope {
     let mut params = json!({
         "cwd":config.cwd.to_string_lossy(),
-        "approvalPolicy":config.approval_policy,
-        "sandbox":config.sandbox,
         "allowProviderModelFallback":false,
         "experimentalRawEvents":false
     });
@@ -209,6 +207,21 @@ pub(crate) fn model_list(id: RpcId) -> Envelope {
 /// edited provider configuration is read.
 pub(crate) fn backend_reload(id: RpcId) -> Envelope {
     Envelope::request(id, "backend/reload", Some(json!({})))
+}
+
+/// dsh's permission presets and the one this session runs under.
+pub(crate) fn permission_describe(id: RpcId) -> Envelope {
+    Envelope::request(id, "permission/describe", Some(json!({})))
+}
+
+/// Switches this session's permission preset. `remember` also makes it dsh's
+/// default for new sessions.
+pub(crate) fn permission_set(id: RpcId, preset: &str, remember: bool) -> Envelope {
+    Envelope::request(
+        id,
+        "permission/set",
+        Some(json!({"preset":preset,"remember":remember})),
+    )
 }
 
 /// Adds or changes a provider and one of its models through dsh's settings.

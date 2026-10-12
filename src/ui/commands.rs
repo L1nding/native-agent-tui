@@ -304,8 +304,8 @@ pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
             command(
                 "setting",
                 tr(
-                    "Language, theme, sandbox, approval, reminders",
-                    "语言、主题、沙箱、审批、提醒阈值",
+                    "Language, theme, permission preset, reminders",
+                    "语言、主题、权限预设、提醒阈值",
                 ),
             ),
             command(

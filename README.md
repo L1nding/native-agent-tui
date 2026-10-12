@@ -24,12 +24,13 @@ cargo run --locked
 cargo run --locked -- --tui "Inspect this repository"
 cargo run --locked -- --workflow docs/workflow-example.json
 cargo run --locked -- --run "Reply with exactly READY" --model PROVIDER/MODEL
+cargo run --locked -- --run "Summarize this repository" --permission read-only
 cargo run --locked -- --help
 ```
 
 The TUI requires an interactive terminal. `--run` prints streamed agent text and returns a nonzero exit code for failure, interruption, or an uncertain result. Headless runs decline approvals and interrupt when user input is required.
 
-A session is ready once dsh confirms it; nothing is executed at startup. Command execution and its isolation belong to dsh.
+A session is ready once dsh confirms it; nothing is executed at startup. Command execution and its isolation belong to dsh: a session runs under one of dsh's **permission presets** (a sandbox mode bundled with an approval policy, for example `read-only`, `workspace-write`, `danger-full-access`). `--permission PRESET` selects one for a run. The session is not ready, and no task starts, until dsh confirms exactly that preset; an unknown preset or a refusal ends the run with an error.
 
 ## Controls
 
@@ -60,7 +61,7 @@ A session is ready once dsh confirms it; nothing is executed at startup. Command
 | Ctrl+N / Ctrl+E in the `/model` list | Add a provider and model, or edit the highlighted one. Saved through dsh's settings service, the same store its own settings pages use; an entered API key goes to dsh's credential service and is not kept by this program. A saved provider is usable at once, without restarting dsh |
 | Ctrl+T in the `/model` list or the provider form | Test a model: a separate dsh process sends one short message through it and reports the reply time or the provider's error. The conversation is not touched. In the form, Ctrl+T saves first and keeps the form open |
 | Ctrl+R in the `/model` list | Restart dsh without leaving the TUI, for changes dsh reads only at start (a newly installed plugin, a hand-edited profile file): a new dsh process resumes the same session, so the conversation continues. Saving a provider does not need it |
-| `/setting` | Language, theme, sandbox, approval and attention thresholds; each choice is saved to `.zf/preferences.json` in the user's home directory. Language and theme apply at once, sandbox and approval from the next start. `--sandbox`, `--approval` and the `NATIVE_AGENT_TUI_LANG` / `NATIVE_AGENT_TUI_THEME` variables take precedence |
+| `/setting` | Language and theme (saved to `.zf/preferences.json` in the user's home directory, applied at once; the `NATIVE_AGENT_TUI_LANG` / `NATIVE_AGENT_TUI_THEME` variables take precedence), dsh's permission preset, and the attention thresholds. The permission row shows the preset dsh reports for this session and offers only the presets dsh lists; a change applies to the session as soon as dsh confirms it and becomes dsh's default for new sessions. The header shows the confirmed preset |
 | `/search` `/timeline` `/context` `/skills` `/requests` `/workflow` `/evidence` `/attention` `/help` `/agent` `/tools` `/quit` | Typed in the task input and sent with Enter; each opens the same panel as its key. A single `/word` is never sent to the model |
 | `/SKILL-NAME [request]` | dsh's skills (built in, yours, and this project's, including those installed plugins provide) are listed in the same hint popup after the commands. Enter sends a task asking the agent to use that skill for the request. The agent loads the skill itself: dsh's protocol gives a client no direct way to run one, so this is a request to the model, not a guaranteed invocation |
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |

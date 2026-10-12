@@ -84,6 +84,12 @@ pub enum Command {
     ReloadBackend,
     /// Read the saved conversations of this workspace for the sessions page.
     ListConversations,
+    /// Read dsh's permission presets and the one this session runs under.
+    DescribePermission,
+    /// Switch this session's permission preset and make it dsh's default.
+    SetPermission {
+        preset: String,
+    },
     /// Continue a saved conversation in this session; rejected while a turn is active.
     ResumeConversation {
         id: String,
@@ -138,22 +144,11 @@ impl ClientHandle {
             })
             .unwrap_or_default();
         {
-            use crate::preferences::Setting;
             if config.model.is_none() {
                 if let Some(model) = saved.model(crate::backend::PREFERENCE_KEY) {
                     config.model = Some(model.to_owned());
                     config.model_is_preference = true;
                 }
-            }
-            if let (false, Some(sandbox)) =
-                (config.sandbox_explicit, saved.setting(Setting::Sandbox))
-            {
-                config.sandbox = sandbox.into();
-            }
-            if let (false, Some(approval)) =
-                (config.approval_explicit, saved.setting(Setting::Approval))
-            {
-                config.approval_policy = approval.into();
             }
             for class in AttentionClass::ALL {
                 let default =
@@ -229,8 +224,6 @@ impl ClientHandle {
         CoreSnapshot {
             phase: SessionPhase::Launching,
             cwd: config.cwd.display().to_string(),
-            sandbox: config.sandbox.clone(),
-            approval_policy: config.approval_policy.clone(),
             scheduler: crate::scheduler::SchedulerSnapshot {
                 native_slot_capacity: Some(config.max_native_turns.max(1)),
                 ..Default::default()
@@ -322,6 +315,7 @@ impl ClientHandle {
                 skills_refresh_queued: false,
                 skills_refresh_force_reload: false,
                 skills_refresh_source: None,
+                startup_permission: false,
                 saving_provider: None,
                 resuming: None,
             }
@@ -355,6 +349,9 @@ enum RpcKind {
         source: SkillRefreshSource,
     },
     ModelList,
+    /// dsh's permission presets and this session's choice.
+    PermissionDescribe,
+    PermissionSet,
     /// Adds or changes a provider through dsh's settings.
     ProviderSave,
     /// Providers dsh holds, for the edit form.
@@ -440,6 +437,8 @@ struct Core {
     skills_refresh_queued: bool,
     skills_refresh_force_reload: bool,
     skills_refresh_source: Option<SkillRefreshSource>,
+    /// The session waits for dsh to confirm `--permission` before it is ready.
+    startup_permission: bool,
     /// `provider/model` of the save dsh has not answered yet, and whether to test it afterwards.
     saving_provider: Option<(String, bool)>,
     /// The dsh session a pending resume switches to, until its messages are shown.
@@ -718,6 +717,22 @@ impl Core {
                         } else if matches!(kind, RpcKind::ModelList) {
                             self.state.view.models.availability =
                                 crate::models::ModelsAvailability::TimedOut;
+                        } else if matches!(kind, RpcKind::PermissionDescribe) {
+                            // 没读到：界面照旧显示“未读取”。
+                        } else if matches!(kind, RpcKind::PermissionSet) && self.startup_permission {
+                            // 启动时要求的预设没有得到确认：不在未知的预设下执行任务。
+                            self.state.view.permission.switching = None;
+                            self.state.error(
+                                SessionPhase::Failed,
+                                "dsh did not confirm --permission in time; no task was started",
+                            );
+                        } else if matches!(kind, RpcKind::PermissionSet) {
+                            // 没有答复：不知道 dsh 是否已经切换，重新读取才算数。
+                            self.state.view.permission.switching = None;
+                            self.state.view.permission.current.clear();
+                            self.state.view.notice = Some(
+                                "The permission preset change was not confirmed in time; open /setting to read it again.".into(),
+                            );
                         } else if matches!(kind, RpcKind::ProviderList) {
                             // 只影响编辑表单的预填；清单本身照常可用。
                         } else if matches!(kind, RpcKind::ProviderSave) {
@@ -1151,6 +1166,7 @@ impl Core {
                     .map_or("", |conversation| conversation.id.as_str()),
             ),
             RpcKind::ProviderList => app_server::provider_list(id.clone()),
+            RpcKind::PermissionDescribe => app_server::permission_describe(id.clone()),
             RpcKind::ThreadList => app_server::thread_list(id.clone(), &self.config.cwd),
             RpcKind::ThreadHistory => app_server::thread_history(
                 id.clone(),
@@ -1160,6 +1176,7 @@ impl Core {
             | RpcKind::AgentRead
             | RpcKind::ChildInterrupt { .. }
             | RpcKind::ProviderSave
+            | RpcKind::PermissionSet
             | RpcKind::ModelSelect => {
                 return Err(TransportError::Failed(
                     "start-turn requires typed user input".into(),
@@ -1355,6 +1372,22 @@ impl Core {
                     Some(reason) => self.provider_not_saved(Some((label, test)), &reason),
                 }
             }
+            Command::DescribePermission => {
+                let reading = self
+                    .pending
+                    .values()
+                    .any(|rpc| matches!(rpc.kind, RpcKind::PermissionDescribe));
+                if !reading && self.session_ready {
+                    // 读不到只是不显示；设置面板会说明。
+                    let _ = self.send_rpc(RpcKind::PermissionDescribe);
+                }
+            }
+            Command::SetPermission { preset } => {
+                if let Err(reason) = self.set_permission(&preset, true) {
+                    self.state.view.notice =
+                        Some(format!("Permission preset was not changed: {reason}"));
+                }
+            }
             Command::ListConversations => {
                 let listing = self
                     .pending
@@ -1387,15 +1420,10 @@ impl Core {
                     || crate::preferences::path(&self.config.journal).is_some_and(|path| {
                         crate::preferences::save_setting(&path, setting, &value).is_ok()
                     });
-                self.state.view.notice = Some(if !stored {
-                    format!("{} could not be saved.", setting.key())
-                } else if setting.applies_immediately() {
+                self.state.view.notice = Some(if stored {
                     format!("{} set to {value} and saved.", setting.key())
                 } else {
-                    format!(
-                        "{} set to {value}; it applies from the next start.",
-                        setting.key()
-                    )
+                    format!("{} could not be saved.", setting.key())
                 });
                 if stored {
                     self.state.view.saved_settings.insert(setting, value);
@@ -1505,6 +1533,40 @@ impl Core {
         } else {
             " It could not be saved for the next start."
         }
+    }
+
+    /// A confirmed session is the readiness fact; the sandbox is dsh's own and
+    /// is first exercised when the agent runs a command.
+    fn session_started(&mut self) {
+        self.state.view.phase = SessionPhase::Ready;
+        self.state.view.notice = None;
+        self.session_ready = true;
+        self.skills_generation = self.skills_generation.wrapping_add(1);
+        self.queue_skills_refresh(SkillRefreshSource::Initial, false);
+    }
+
+    /// Asks dsh to switch this session's permission preset. Nothing is shown
+    /// as changed until dsh confirms it.
+    fn set_permission(&mut self, preset: &str, remember: bool) -> Result<(), String> {
+        if preset.is_empty() || preset.len() > 64 || preset.chars().any(char::is_control) {
+            return Err("name a preset.".into());
+        }
+        if !self.session_ready {
+            return Err("dsh is not ready.".into());
+        }
+        if self.state.view.permission.switching.is_some() {
+            return Err("another change is still waiting for dsh.".into());
+        }
+        let id = self.next_rpc_id();
+        let outbox_id = self
+            .send_effect(
+                app_server::permission_set(id.clone(), preset, remember),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        self.expect_response(id, outbox_id, PendingRpc::new(RpcKind::PermissionSet));
+        self.state.view.permission.switching = Some(preset.to_owned());
+        Ok(())
     }
 
     /// Reports a provider that was not saved; a test that was to follow fails with the same reason.
@@ -2078,7 +2140,27 @@ impl Core {
                         };
                         return;
                     }
-                    if matches!(pending.kind, RpcKind::ProviderList) {
+                    if matches!(
+                        pending.kind,
+                        RpcKind::ProviderList | RpcKind::PermissionDescribe
+                    ) {
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::PermissionSet) && self.startup_permission {
+                        self.state.view.permission.switching = None;
+                        let message: String = message.chars().take(400).collect();
+                        self.state.error(
+                            SessionPhase::Failed,
+                            format!("dsh refused --permission: {message}. No task was started."),
+                        );
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::PermissionSet) {
+                        // dsh 拒绝了：预设没有变。
+                        self.state.view.permission.switching = None;
+                        let message: String = message.chars().take(400).collect();
+                        self.state.view.notice =
+                            Some(format!("Permission preset was not changed: {message}"));
                         return;
                     }
                     if matches!(pending.kind, RpcKind::ProviderSave) {
@@ -2222,19 +2304,35 @@ impl Core {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                if let Some(policy) = result.get("approvalPolicy").and_then(Value::as_str) {
-                    self.state.view.approval_policy = policy.into();
-                }
                 if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
                     self.state.view.cwd = cwd.into();
                 }
-                // A confirmed session is the readiness fact; the sandbox is dsh's
-                // own and is first exercised when the agent runs a command.
-                self.state.view.phase = SessionPhase::Ready;
-                self.state.view.notice = None;
-                self.session_ready = true;
-                self.skills_generation = self.skills_generation.wrapping_add(1);
-                self.queue_skills_refresh(SkillRefreshSource::Initial, false);
+                if let Some(preset) = self.config.permission.clone() {
+                    // `--permission`：会话在 dsh 确认这个预设之前不算就绪，
+                    // 任务不会在别的预设下开始。只改这个会话，不改 dsh 的默认值。
+                    let id = self.next_rpc_id();
+                    match self
+                        .send_effect(app_server::permission_set(id.clone(), &preset, false), None)
+                    {
+                        Ok(outbox_id) => {
+                            self.expect_response(
+                                id,
+                                outbox_id,
+                                PendingRpc::new(RpcKind::PermissionSet),
+                            );
+                            self.state.view.permission.switching = Some(preset);
+                            self.startup_permission = true;
+                            self.state.view.notice =
+                                Some("Waiting for dsh to confirm the permission preset".into());
+                        }
+                        Err(error) => self.state.error(
+                            SessionPhase::Failed,
+                            format!("--permission {preset} could not be requested: {error}"),
+                        ),
+                    }
+                    return;
+                }
+                self.session_started();
                 None
             }
             RpcKind::StartTurn { .. } => {
@@ -2265,6 +2363,50 @@ impl Core {
                 models.options = listed.options;
                 models.truncated = listed.truncated;
                 Some(RpcKind::ProviderList)
+            }
+            RpcKind::PermissionSet if self.startup_permission => {
+                let requested = self.state.view.permission.switching.take();
+                match crate::permission::parse(&result) {
+                    // 只有 dsh 报告的正是所要求的预设，会话才就绪。
+                    Some((current, presets)) if Some(&current) == requested.as_ref() => {
+                        self.startup_permission = false;
+                        self.state.view.permission.current = current;
+                        self.state.view.permission.presets = presets;
+                        self.session_started();
+                    }
+                    _ => self.state.error(
+                        SessionPhase::Failed,
+                        "dsh did not confirm the preset --permission asked for; no task was started",
+                    ),
+                }
+                None
+            }
+            RpcKind::PermissionDescribe | RpcKind::PermissionSet => {
+                let switched = matches!(kind, RpcKind::PermissionSet);
+                let permission = &mut self.state.view.permission;
+                if switched {
+                    permission.switching = None;
+                }
+                match crate::permission::parse(&result) {
+                    Some((current, presets)) => {
+                        if switched {
+                            self.state.view.notice =
+                                Some(format!("Permission preset is now {current}."));
+                        }
+                        let permission = &mut self.state.view.permission;
+                        permission.current = current;
+                        permission.presets = presets;
+                    }
+                    None if switched => {
+                        // 答复读不懂：不知道现在是哪个预设。
+                        self.state.view.permission.current.clear();
+                        self.state.view.notice = Some(
+                            "dsh answered the permission change in an unexpected form; open /setting to read it again.".into(),
+                        );
+                    }
+                    None => {}
+                }
+                None
             }
             RpcKind::ProviderList => {
                 if let Some(providers) = crate::backend::dsh_config::parse_providers(&result) {
@@ -2319,6 +2461,8 @@ impl Core {
                     self.state.view.model = Some(model.into());
                 }
                 // 界面换成恢复的会话；之前的会话仍在 dsh 里，可以再恢复回来。
+                // 权限预设属于会话，换了会话就要重新读取。
+                self.state.view.permission = Default::default();
                 self.state.view.messages.clear();
                 self.state.tool_lines.clear();
                 self.state.view.history_truncated = false;
@@ -6724,6 +6868,189 @@ mod tests {
         assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_permission_preset_is_read_from_dsh_and_changes_only_when_dsh_confirms() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        let presets = json!([
+            {"value":"read-only","name":"read-only","description":""},
+            {"value":"workspace-write","name":"workspace-write","description":"Write inside the workspace."},
+        ]);
+        assert!(client.snapshots.borrow().permission.current.is_empty());
+
+        for _ in 0..2 {
+            client
+                .commands
+                .send(Command::DescribePermission)
+                .await
+                .unwrap();
+        }
+        let describe = next(&mut server).await;
+        assert_eq!(describe["method"], "permission/describe");
+        send(
+            &mut server,
+            json!({"id":describe["id"],"result":{"current":"workspace-write","default":"workspace-write","presets":presets}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| s.permission.current == "workspace-write")
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().permission.presets.len(), 2);
+
+        let set = |preset: &str| Command::SetPermission {
+            preset: preset.into(),
+        };
+        client.commands.send(set("read-only")).await.unwrap();
+        let request = next(&mut server).await;
+        // 重复的读取请求没有发出：下一条就是切换。
+        assert_eq!(request["method"], "permission/set");
+        assert_eq!(request["params"]["preset"], "read-only");
+        assert_eq!(request["params"]["remember"], true);
+        client
+            .snapshots
+            .wait_for(|s| s.permission.switching.as_deref() == Some("read-only"))
+            .await
+            .unwrap();
+        // 确认之前显示的仍是原来的预设，第二次切换不发出。
+        assert_eq!(
+            client.snapshots.borrow().permission.current,
+            "workspace-write"
+        );
+        client.commands.send(set("workspace-write")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|text| text.contains("another change is still waiting"))
+            })
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"current":"read-only","default":"read-only","remembered":true,"presets":presets}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| s.permission.current == "read-only" && s.permission.switching.is_none())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.snapshots.borrow().notice.as_deref(),
+            Some("Permission preset is now read-only.")
+        );
+
+        // dsh 拒绝：预设不变，会话照常可用。
+        client.commands.send(set("no-such")).await.unwrap();
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"error":{"code":-32603,"message":"permission: unknown preset \"no-such\""}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.permission.switching.is_none()
+                    && s.notice
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with("Permission preset was not changed"))
+            })
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.permission.current, "read-only");
+            assert_eq!(snapshot.phase, SessionPhase::Ready);
+        }
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_startup_permission_is_confirmed_before_any_task_and_a_refusal_starts_none() {
+        // 启动到 dsh 给出会话；随后应当先要求预设。
+        async fn started(
+            preset: &str,
+        ) -> (ClientHandle, BufReader<tokio::io::DuplexStream>, Value) {
+            let (client, mut server) = harness_with_config(Config {
+                permission: Some(preset.into()),
+                ..Default::default()
+            })
+            .await;
+            client
+                .commands
+                .send(Command::SubmitRootInput {
+                    text: "queued before ready".into(),
+                })
+                .await
+                .unwrap();
+            initialized(&mut server).await;
+            let set = next(&mut server).await;
+            assert_eq!(set["method"], "permission/set");
+            assert_eq!(set["params"]["preset"], preset);
+            // 只改这个会话，不改 dsh 的默认值。
+            assert_eq!(set["params"]["remember"], false);
+            (client, server, set)
+        }
+
+        let (client, mut server, set) = started("read-only").await;
+        // 确认之前既不就绪，也不发出任务。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert_ne!(client.snapshots.borrow().phase, SessionPhase::Ready);
+        send(
+            &mut server,
+            json!({"id":set["id"],"result":{"current":"read-only","default":"workspace-write","presets":[{"value":"read-only"}]}}),
+        )
+        .await;
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let request = next(&mut server).await;
+            methods.push(request["method"].as_str().unwrap().to_owned());
+            if request["method"] == "skills/list" {
+                send(
+                    &mut server,
+                    json!({"id":request["id"],"error":{"code":-32601,"message":"unavailable"}}),
+                )
+                .await;
+            }
+        }
+        methods.sort();
+        assert_eq!(methods, ["skills/list", "turn/start"]);
+        assert_eq!(client.snapshots.borrow().permission.current, "read-only");
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+
+        // dsh 拒绝，或确认的不是所要求的预设：会话失败，任务一个也不发。
+        for answer in [
+            json!({"error":{"code":-32603,"message":"permission: unknown preset \"strict\""}}),
+            json!({"result":{"current":"workspace-write","presets":[]}}),
+        ] {
+            let (mut client, mut server, set) = started("strict").await;
+            let mut answer = answer;
+            answer["id"] = set["id"].clone();
+            send(&mut server, answer).await;
+            phase(&mut client, SessionPhase::Failed).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                    .await
+                    .is_err()
+            );
+            let error = client.snapshots.borrow().last_error.clone().unwrap();
+            assert!(error.contains("--permission"), "{error}");
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+        }
     }
 
     #[tokio::test]

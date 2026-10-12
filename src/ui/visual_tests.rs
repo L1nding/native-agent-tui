@@ -15,8 +15,6 @@ fn fixture(phase: SessionPhase) -> CoreSnapshot {
         thread_id: Some("root".into()),
         model: Some("hi/luna".into()),
         cwd: "D:/workspace/native-agent".into(),
-        sandbox: "workspace-write".into(),
-        approval_policy: "on-request".into(),
         root_turn_count: 1,
         ..Default::default()
     };

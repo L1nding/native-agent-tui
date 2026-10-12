@@ -566,6 +566,29 @@ impl AcpBridge {
                     self.mcp_servers.clone(),
                 ))?;
             }
+            // dsh's permission presets belong to a session; the bridge names ours.
+            (Some(method @ ("permission/describe" | "permission/set")), Some(id)) => {
+                let Some(session) = self.session_id.clone() else {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "ACP session is not ready",
+                    ));
+                };
+                let mut params = match message.params {
+                    Some(Value::Object(map)) => Value::Object(map),
+                    _ => json!({}),
+                };
+                params["sessionId"] = json!(session);
+                let target = if method == "permission/set" {
+                    "zf/permission/set"
+                } else {
+                    "zf/permission/describe"
+                };
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp
+                    .send(with_jsonrpc(Envelope::request(id, target, Some(params))))?;
+            }
             // The bridge plugin answers these from dsh's settings service; the
             // parameters, which may hold an API key, are forwarded untouched.
             (Some(method @ ("provider/save" | "provider/list")), Some(id)) => {
@@ -1427,6 +1450,45 @@ mod tests {
                 ))
                 .unwrap();
         }
+        // 权限预设属于会话：桥接层补上自己的会话 id，其余参数原样转发。
+        core_client
+            .send(app_server::permission_set(
+                RpcId::Number(9),
+                "read-only",
+                true,
+            ))
+            .unwrap();
+        let set = acp_server.recv().await.unwrap();
+        assert_eq!(set.method.as_deref(), Some("zf/permission/set"));
+        assert_eq!(
+            set.params.unwrap(),
+            json!({"preset":"read-only","remember":true,"sessionId":"s"})
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(9),
+                Some(json!({"current":"read-only","presets":[]})),
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().result.unwrap()["current"],
+            "read-only"
+        );
+        core_client
+            .send(app_server::permission_describe(RpcId::Number(10)))
+            .unwrap();
+        let describe = acp_server.recv().await.unwrap();
+        assert_eq!(describe.method.as_deref(), Some("zf/permission/describe"));
+        assert_eq!(describe.params.unwrap(), json!({"sessionId":"s"}));
+        acp_server
+            .send(Envelope::error_response(
+                RpcId::Number(10),
+                -32603,
+                "this dsh profile mounts no permission presets",
+            ))
+            .unwrap();
+        assert!(core_client.recv().await.unwrap().error.is_some());
+
         core_client
             .send(app_server::provider_list(RpcId::Number(5)))
             .unwrap();

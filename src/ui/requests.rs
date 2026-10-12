@@ -429,15 +429,15 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
             format!("条目：{item}"),
             format!("服务端开始时间（ms）：{started}"),
         ];
+        let preset = match snapshot.permission.current.as_str() {
+            "" => "未读取（在 /setting 查看）",
+            preset => preset,
+        };
         if own_thread {
-            context.push(format!("生效的沙箱：\n{}", snapshot.sandbox));
-            context.push(format!("生效的审批策略：\n{}", snapshot.approval_policy));
+            context.push(format!("dsh 权限预设：\n{preset}"));
         } else {
-            context.push("子 Agent 生效的沙箱 / 审批策略：不可用".into());
-            context.push(format!(
-                "根 Agent 沙箱：{} | 审批策略：{}",
-                snapshot.sandbox, snapshot.approval_policy
-            ));
+            context.push("子 Agent 的权限预设：不可用".into());
+            context.push(format!("根 Agent 的 dsh 权限预设：{preset}"));
         }
         context.push(format!("会话工作目录：{}", snapshot.cwd));
         context.push("上下文来源：服务端请求".into());
@@ -455,18 +455,15 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
             format!("Item: {item}"),
             format!("Server start ms: {started}"),
         ];
+        let preset = match snapshot.permission.current.as_str() {
+            "" => "not read (see /setting)",
+            preset => preset,
+        };
         if own_thread {
-            context.push(format!("Effective sandbox:\n{}", snapshot.sandbox));
-            context.push(format!(
-                "Effective approval policy:\n{}",
-                snapshot.approval_policy
-            ));
+            context.push(format!("dsh permission preset:\n{preset}"));
         } else {
-            context.push("Child effective sandbox / approval policy: unavailable".into());
-            context.push(format!(
-                "Root sandbox: {} | approval policy: {}",
-                snapshot.sandbox, snapshot.approval_policy
-            ));
+            context.push("Child permission preset: unavailable".into());
+            context.push(format!("Root dsh permission preset: {preset}"));
         }
         context.push(format!("Session cwd: {}", snapshot.cwd));
         context.push("Context source: server request".into());

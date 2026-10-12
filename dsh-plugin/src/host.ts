@@ -97,6 +97,21 @@ export interface CredentialProvider {
   set(ref: string, value: string): Promise<void>
 }
 
+/** `ctx.permissionPresets`: sandbox-and-approval bundles and each session's choice. */
+export interface PermissionPresets {
+  readonly names: readonly string[]
+  readonly defaultPreset: string
+  optionOf(name: string): { value: string; name: string; description?: string }
+  /** `session` is the host's live session object, passed through untouched. */
+  current(session: unknown): string
+  set(session: unknown, name: string): void
+}
+
+/** `ctx.sessions`: sessions loaded in this process. */
+export interface LiveSessions {
+  get(id: string): unknown
+}
+
 /** `ctx.sessionQuery`: read-only views over live and stored sessions. */
 export interface SessionQuery {
   listSessions(signal?: AbortSignal): Promise<readonly { header: SessionHeader; live: boolean }[]>
@@ -145,6 +160,8 @@ export interface HostContext {
   get(name: 'skills'): SkillRegistry | undefined
   get(name: 'settings'): SettingsProvider | undefined
   get(name: 'credentials'): CredentialProvider | undefined
+  get(name: 'permissionPresets'): PermissionPresets | undefined
+  get(name: 'sessions'): LiveSessions | undefined
   get(name: string): unknown
 }
 

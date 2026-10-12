@@ -124,16 +124,19 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         status.push(tr("dispatch paused", "已暂停派发").into());
     }
     let status = status.join(" | ");
-    let settings = format!(
-        "{} | {} | {} | {}",
+    let mut settings = format!(
+        "{} | {}",
         snapshot
             .model
             .as_deref()
             .unwrap_or(tr("model pending", "模型待定")),
         snapshot.cwd,
-        snapshot.sandbox,
-        snapshot.approval_policy
     );
+    // 只显示 dsh 报告过的权限预设；没读到就不显示，不猜。
+    if !snapshot.permission.current.is_empty() {
+        settings.push_str(" | ");
+        settings.push_str(&snapshot.permission.current);
+    }
     let agent_id = selected_agent.map_or("root", |agent| agent.info.id.as_str());
     let selected_activity = header_activity(snapshot, local);
     let mut status_spans = vec![Span::styled("● ", theme.phase(snapshot.phase))];

@@ -42,11 +42,9 @@ pub struct Config {
     /// 会话汇总规则：工作流与 `--run` 要求所有根任务成功（严格）；
     /// 交互 TUI 以最后一轮结果为准，用户中断过的早期轮次不会让会话记为失败。
     pub strict_outcome: bool,
-    pub sandbox: String,
-    pub approval_policy: String,
-    /// `--sandbox` / `--approval` were given; saved settings do not replace them.
-    pub sandbox_explicit: bool,
-    pub approval_explicit: bool,
+    /// `--permission`: the dsh permission preset this session switches to once
+    /// it is ready. Without it the session keeps dsh's own default.
+    pub permission: Option<String>,
     pub max_native_children: usize,
     pub max_native_depth: usize,
     pub max_native_turns: usize,
@@ -68,10 +66,7 @@ impl Default for Config {
             model: None,
             model_is_preference: false,
             strict_outcome: false,
-            sandbox: "workspace-write".into(),
-            approval_policy: "on-request".into(),
-            sandbox_explicit: false,
-            approval_explicit: false,
+            permission: None,
             max_native_children: DEFAULT_MAX_NATIVE_CHILDREN,
             max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
             max_native_turns: DEFAULT_MAX_NATIVE_TURNS,
@@ -268,26 +263,19 @@ where
                 })?;
                 attention_overrides.push((class, quiet, attention));
             }
-            "--sandbox" | "--approval" => {
+            "--permission" => {
                 let val = value(&args, &mut index, option)?;
-                let allowed = if option == "--sandbox" {
-                    ["read-only", "workspace-write", "danger-full-access"]
-                } else {
-                    ["untrusted", "on-request", "never"]
-                };
-                if !allowed.contains(&val.as_str()) {
+                // dsh 决定有哪些预设；这里只挡住不可能是名字的值。
+                if val.is_empty()
+                    || val.len() > 64
+                    || val.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
                     return Err(CliError::InvalidValue {
                         option: option.clone(),
                         value: val,
                     });
                 }
-                if option == "--sandbox" {
-                    config.sandbox = val;
-                    config.sandbox_explicit = true;
-                } else {
-                    config.approval_policy = val;
-                    config.approval_explicit = true;
-                }
+                config.permission = Some(val);
             }
             _ => return Err(CliError::UnknownOption(option.clone())),
         }
@@ -654,7 +642,7 @@ mod tests {
             "a b",
             "--run",
             "检查项目",
-            "--sandbox",
+            "--permission",
             "read-only",
             "--model",
             "test-model",
@@ -664,7 +652,7 @@ mod tests {
         };
         assert_eq!(goal, "检查项目");
         assert_eq!(config.cwd, PathBuf::from("a b"));
-        assert_eq!(config.sandbox, "read-only");
+        assert_eq!(config.permission.as_deref(), Some("read-only"));
         assert_eq!(config.model.as_deref(), Some("test-model"));
     }
 
@@ -733,7 +721,9 @@ mod tests {
             vec!["--run", "--help"],
             vec!["--run", "hi", "--bogus"],
             vec!["--tui", "--run", "task"],
-            vec!["--sandbox", "invalid"],
+            vec!["--run", "hi", "--permission", "two words"],
+            vec!["--run", "hi", "--sandbox", "read-only"],
+            vec!["--run", "hi", "--approval", "never"],
             // 随 Codex 后端一起移除的选项不再被接受。
             vec!["--windows-sandbox", "unelevated"],
             vec!["--check-shell"],

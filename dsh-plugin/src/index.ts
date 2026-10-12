@@ -17,6 +17,7 @@
 
 import { createInterface } from 'node:readline'
 import { loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
+import { describePermission, setPermission } from './permission.js'
 import { listProviders, removeProvider, saveProvider } from './providers.js'
 import { listSessions, readHistory } from './sessions.js'
 
@@ -140,6 +141,22 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
           ...(only === undefined ? {} : { schema: descriptor.schema ?? null }),
         }))
       return { writable: settings.writable === true, hasDocument: settings.documentPath !== undefined, namespaces }
+    },
+
+    /** Permission presets and the one a live session runs under. */
+    'zf/permission/describe': (params) => {
+      const sessionId = params['sessionId']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      return describePermission(ctx, sessionId)
+    },
+
+    /** Switch a live session's permission preset; takes effect at once. */
+    'zf/permission/set': (params) => {
+      const sessionId = params['sessionId']
+      const preset = params['preset']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      if (typeof preset !== 'string' || preset === '') throw new Error('preset is required')
+      return setPermission(ctx, sessionId, preset, params['remember'] === true)
     },
 
     /** Configurable model providers and their models. */

@@ -42,8 +42,8 @@ Options:
   --dsh PATH       dsh launcher (or DSH_BIN)
   --profile NAME   dsh profile carrying the zf-tui-bridge plugin (default: zf-tui)
   --model NAME     Requested model as provider/model; the last /model choice when omitted
-  --sandbox MODE   read-only | workspace-write | danger-full-access
-  --approval MODE  untrusted | on-request | never (default: on-request)
+  --permission PRESET  dsh permission preset for this session, e.g. read-only |
+                   workspace-write | danger-full-access (default: dsh's own default)
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)
