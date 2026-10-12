@@ -322,6 +322,7 @@ impl ClientHandle {
                 skills_refresh_queued: false,
                 skills_refresh_force_reload: false,
                 skills_refresh_source: None,
+                saving_provider: None,
                 resuming: None,
             }
             .run(),
@@ -354,6 +355,10 @@ enum RpcKind {
         source: SkillRefreshSource,
     },
     ModelList,
+    /// Adds or changes a provider through dsh's settings.
+    ProviderSave,
+    /// Providers dsh holds, for the edit form.
+    ProviderList,
     /// dsh's sessions of this workspace, for the sessions page.
     ThreadList,
     /// Readable messages of the session just resumed.
@@ -435,6 +440,8 @@ struct Core {
     skills_refresh_queued: bool,
     skills_refresh_force_reload: bool,
     skills_refresh_source: Option<SkillRefreshSource>,
+    /// `provider/model` of the save dsh has not answered yet, and whether to test it afterwards.
+    saving_provider: Option<(String, bool)>,
     /// The dsh session a pending resume switches to, until its messages are shown.
     resuming: Option<crate::conversations::ConversationSummary>,
 }
@@ -711,6 +718,15 @@ impl Core {
                         } else if matches!(kind, RpcKind::ModelList) {
                             self.state.view.models.availability =
                                 crate::models::ModelsAvailability::TimedOut;
+                        } else if matches!(kind, RpcKind::ProviderList) {
+                            // 只影响编辑表单的预填；清单本身照常可用。
+                        } else if matches!(kind, RpcKind::ProviderSave) {
+                            // 没有答复：dsh 可能已经保存，也可能没有。
+                            let test = self.saving_provider.take();
+                            self.provider_not_saved(
+                                test,
+                                "dsh did not answer in time; check the model list before saving again",
+                            );
                         } else if matches!(kind, RpcKind::ThreadList) {
                             self.state.view.notice =
                                 Some("Sessions were not listed in time.".into());
@@ -1134,6 +1150,7 @@ impl Core {
                     .as_ref()
                     .map_or("", |conversation| conversation.id.as_str()),
             ),
+            RpcKind::ProviderList => app_server::provider_list(id.clone()),
             RpcKind::ThreadList => app_server::thread_list(id.clone(), &self.config.cwd),
             RpcKind::ThreadHistory => app_server::thread_history(
                 id.clone(),
@@ -1142,6 +1159,7 @@ impl Core {
             RpcKind::StartTurn { .. }
             | RpcKind::AgentRead
             | RpcKind::ChildInterrupt { .. }
+            | RpcKind::ProviderSave
             | RpcKind::ModelSelect => {
                 return Err(TransportError::Failed(
                     "start-turn requires typed user input".into(),
@@ -1309,52 +1327,32 @@ impl Core {
                 }
             }
             Command::AddModelProvider { spec, test } => {
-                use crate::backend::dsh_config;
-                // 只有真实启动的 dsh 会话才改用户的 dsh 配置。
-                let result = if self.journal.is_none() {
-                    Err("This session cannot change the dsh profile.".to_owned())
+                let label = format!("{}/{}", spec.provider, spec.model);
+                let refusal = if let Err(reason) = crate::backend::dsh_config::validate(&spec) {
+                    Some(reason.to_owned())
+                } else if !self.session_ready {
+                    Some("dsh is not ready.".to_owned())
+                } else if self.saving_provider.is_some() {
+                    Some("another save is still waiting for dsh.".to_owned())
                 } else {
-                    dsh_config::home()
-                        .ok_or_else(|| {
-                            "The dsh home directory is unknown; set DSH_HOME.".to_owned()
-                        })
-                        .and_then(|home| {
-                            dsh_config::add_provider(&home, &self.config.acp_profile, &spec)
-                        })
-                };
-                match result {
-                    Ok(added) => {
-                        let key = if added.key_stored {
-                            String::new()
-                        } else {
-                            format!(
-                                " No key was entered; dsh uses credential {}.",
-                                added.credential
+                    let id = self.next_rpc_id();
+                    let sent = self
+                        .send_effect(app_server::provider_save(id.clone(), &spec), None)
+                        .map(|outbox_id| {
+                            self.expect_response(
+                                id,
+                                outbox_id,
+                                PendingRpc::new(RpcKind::ProviderSave),
                             )
-                        };
-                        // 空闲时立即重载；否则等这一轮结束后在 /model 里按 Ctrl+R。
-                        let reload = match self.reload_backend() {
-                            Ok(()) => " Reloading dsh...".to_owned(),
-                            Err(reason) => format!(" Not reloaded yet: {reason}"),
-                        };
-                        self.state.view.notice = Some(format!(
-                            "Saved {} to dsh profile {}.{key}{reload}",
-                            added.label, self.config.acp_profile
-                        ));
-                        if test {
-                            // 测试用独立进程读取刚保存的配置，不依赖重载完成。
-                            self.test_model(added.label);
-                        }
+                        });
+                    sent.err().map(|error| error.to_string())
+                };
+                match refusal {
+                    None => {
+                        self.saving_provider = Some((label, test));
+                        self.state.view.notice = Some("Saving the provider to dsh...".into());
                     }
-                    Err(error) => {
-                        if test {
-                            self.state.view.models.test = crate::models::ModelTest::Failed {
-                                model: format!("{}/{}", spec.provider, spec.model),
-                                message: format!("not saved: {error}"),
-                            };
-                        }
-                        self.state.view.notice = Some(format!("Provider was not saved: {error}"))
-                    }
+                    Some(reason) => self.provider_not_saved(Some((label, test)), &reason),
                 }
             }
             Command::ListConversations => {
@@ -1507,6 +1505,18 @@ impl Core {
         } else {
             " It could not be saved for the next start."
         }
+    }
+
+    /// Reports a provider that was not saved; a test that was to follow fails with the same reason.
+    fn provider_not_saved(&mut self, saving: Option<(String, bool)>, reason: &str) {
+        let reason: String = reason.chars().take(400).collect();
+        if let Some((model, true)) = saving {
+            self.state.view.models.test = crate::models::ModelTest::Failed {
+                model,
+                message: format!("not saved: {reason}"),
+            };
+        }
+        self.state.view.notice = Some(format!("Provider was not saved: {reason}"));
     }
 
     /// Switches this session to another dsh session; dsh keeps both.
@@ -2068,6 +2078,15 @@ impl Core {
                         };
                         return;
                     }
+                    if matches!(pending.kind, RpcKind::ProviderList) {
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::ProviderSave) {
+                        // dsh 拒绝了（例如 schema 不接受）：什么都没有保存。
+                        let saving = self.saving_provider.take();
+                        self.provider_not_saved(saving, &message);
+                        return;
+                    }
                     if matches!(pending.kind, RpcKind::ThreadList) {
                         let message: String = message.chars().take(400).collect();
                         self.state.view.notice =
@@ -2245,14 +2264,36 @@ impl Core {
                 models.availability = listed.availability;
                 models.options = listed.options;
                 models.truncated = listed.truncated;
-                if self.journal.is_some() {
-                    self.state.view.models.providers = crate::backend::dsh_config::home()
-                        .map(|home| {
-                            crate::backend::dsh_config::providers(&home, &self.config.acp_profile)
-                        })
-                        .unwrap_or_default();
+                Some(RpcKind::ProviderList)
+            }
+            RpcKind::ProviderList => {
+                if let Some(providers) = crate::backend::dsh_config::parse_providers(&result) {
+                    self.state.view.models.providers = providers;
                 }
                 None
+            }
+            RpcKind::ProviderSave => {
+                let saving = self.saving_provider.take();
+                let Some(added) = crate::backend::dsh_config::parse_saved(&result) else {
+                    self.provider_not_saved(saving, "dsh answered in an unexpected form");
+                    return;
+                };
+                let key = if added.key_stored {
+                    String::new()
+                } else {
+                    format!(
+                        " No key was entered; dsh uses credential {}.",
+                        added.credential
+                    )
+                };
+                self.state.view.notice = Some(format!(
+                    "Saved {} to dsh; it is available now.{key}",
+                    added.label
+                ));
+                if saving.is_some_and(|(_, test)| test) {
+                    self.test_model(added.label);
+                }
+                Some(RpcKind::ModelList)
             }
             RpcKind::ThreadList => {
                 match crate::conversations::parse_list(&result) {
@@ -2914,6 +2955,14 @@ impl Core {
     }
 
     fn notification(&mut self, method: &str, params: Value) {
+        if method == "model/listChanged" {
+            // dsh 的可选模型变了；已经看过清单的界面跟着刷新。
+            if self.state.view.models.availability != crate::models::ModelsAvailability::NotQueried
+            {
+                self.list_models();
+            }
+            return;
+        }
         if method == "skills/changed" {
             self.skills_generation = self.skills_generation.wrapping_add(1);
             self.skills_refresh_force_reload |= self.pending.values().any(|rpc| {
@@ -6672,6 +6721,168 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_provider_is_saved_by_dsh_and_the_lists_refresh_without_a_restart() {
+        use crate::backend::dsh_config::{ProviderSpec, Secret};
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        let spec = ProviderSpec {
+            provider: "my-api".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api: "openai-completions".into(),
+            api_key: Secret("sk-test-1".into()),
+            model: "big".into(),
+            ..Default::default()
+        };
+        let notice = |client: &ClientHandle| client.snapshots.borrow().notice.clone();
+
+        // 表单校验不过的内容不会发给 dsh。
+        client
+            .commands
+            .send(Command::AddModelProvider {
+                spec: ProviderSpec {
+                    provider: "Bad Name".into(),
+                    ..spec.clone()
+                },
+                test: false,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("Provider was not saved: Provider name"))
+            })
+            .await
+            .unwrap();
+
+        client
+            .commands
+            .send(Command::AddModelProvider {
+                spec: spec.clone(),
+                test: false,
+            })
+            .await
+            .unwrap();
+        let save = next(&mut server).await;
+        assert_eq!(save["method"], "provider/save");
+        assert_eq!(save["params"]["provider"], "my-api");
+        assert_eq!(save["params"]["credential"], "MY_API_API_KEY");
+        assert_eq!(save["params"]["apiKey"], "sk-test-1");
+        // 答复之前的第二次保存不发出。
+        client
+            .commands
+            .send(Command::AddModelProvider {
+                spec: spec.clone(),
+                test: false,
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|text| text.contains("another save is still waiting"))
+            })
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"id":save["id"],"result":{"label":"my-api/big","credential":"MY_API_API_KEY","keyStored":true}}),
+        )
+        .await;
+        // 不重启：直接重新读取模型清单和供应商。
+        let models = next(&mut server).await;
+        assert_eq!(models["method"], "model/list");
+        send(
+            &mut server,
+            json!({"id":models["id"],"result":{"data":[{"model":"my-api/big","displayName":"big"}]}}),
+        )
+        .await;
+        let providers = next(&mut server).await;
+        assert_eq!(providers["method"], "provider/list");
+        send(
+            &mut server,
+            json!({"id":providers["id"],"result":{"providers":[
+                {"name":"my-api","baseURL":"https://api.example.com/v1","api":"openai-completions","models":[{"id":"big","contextWindow":1000}]}
+            ]}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| s.models.providers.len() == 1)
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(
+                snapshot.notice.as_deref(),
+                Some("Saved my-api/big to dsh; it is available now.")
+            );
+            assert_eq!(snapshot.models.options.len(), 1);
+            assert_eq!(
+                snapshot.models.providers[0].context_windows,
+                [("big".to_owned(), 1000)]
+            );
+            assert_eq!(snapshot.phase, SessionPhase::Ready);
+        }
+        // 快照和提示里都没有密钥。
+        assert!(!format!("{:?}", *client.snapshots.borrow()).contains("sk-test-1"));
+
+        // dsh 推送“可选模型变了”时，看过清单的界面跟着刷新。
+        send(
+            &mut server,
+            json!({"method":"model/listChanged","params":{}}),
+        )
+        .await;
+        let again = next(&mut server).await;
+        assert_eq!(again["method"], "model/list");
+        send(&mut server, json!({"id":again["id"],"result":{"data":[]}})).await;
+        let again = next(&mut server).await;
+        assert_eq!(again["method"], "provider/list");
+        send(
+            &mut server,
+            json!({"id":again["id"],"error":{"code":-32603,"message":"no settings provider"}}),
+        )
+        .await;
+
+        // dsh 拒绝保存：会话不受影响；要求随后测试的，测试以同样的原因失败。
+        client
+            .commands
+            .send(Command::AddModelProvider { spec, test: true })
+            .await
+            .unwrap();
+        let save = next(&mut server).await;
+        assert_eq!(save["method"], "provider/save");
+        send(
+            &mut server,
+            json!({"id":save["id"],"error":{"code":-32603,"message":"dsh settings are read-only in this profile"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.models.test
+                    == crate::models::ModelTest::Failed {
+                        model: "my-api/big".into(),
+                        message: "not saved: dsh settings are read-only in this profile".into(),
+                    }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            notice(&client).as_deref(),
+            Some("Provider was not saved: dsh settings are read-only in this profile")
+        );
         assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();

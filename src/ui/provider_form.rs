@@ -1,4 +1,4 @@
-//! Form opened from the model picker to add a provider and model to the dsh profile.
+//! Form opened from the model picker to add a provider and model to dsh's settings.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -102,7 +102,7 @@ impl ProviderForm {
     }
 
     /// Opens the form on a listed model (`provider/model`) with what the
-    /// profile stores for its provider. The key stays empty: empty keeps it.
+    /// dsh holds for its provider. The key stays empty: empty keeps it.
     pub fn open_edit(
         &mut self,
         model: &crate::models::ModelOption,
@@ -362,8 +362,8 @@ impl ProviderForm {
         let (status, style) = match test {
             _ if !self.tested => (
                 tr(
-                    "Saved to the dsh profile, then dsh reloads; no restart needed.",
-                    "写入 dsh profile 后自动刷新 dsh，无需重启。",
+                    "Saved to dsh's settings; usable at once, no restart.",
+                    "保存到 dsh 的设置，立即可用，无需重启。",
                 )
                 .to_owned(),
                 theme.secondary(),

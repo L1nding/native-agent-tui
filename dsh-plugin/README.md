@@ -49,6 +49,10 @@ dsh plugin --profile zf-tui add link:D:/project/native-agent-tui/dsh-plugin
 | `zf/hello` | 协议版本、插件版本、ACP 服务的状态（`loading` / `mounted` / `unavailable`）、本插件的方法列表 |
 | `zf/session/list` | 参数 `cwd`（可选，只列这个工作区）。返回根会话 `sessions[]`：`id`、`cwd`、`createdAt`、`updatedAt`、`title`（dsh 的标题，没有则缺省）、`live`（是否已在本进程加载），按时间倒序；子代理会话不列出。`titles` 说明标题服务是否可用 |
 | `zf/skills/list` | 参数 `cwd`（可选）。返回 dsh 技能注册表里所有已安装来源的技能 `skills[]`：`name`、`description`、`source`、`path`（由插件直接提供、没有文件的技能缺省）、`modelInvocable`、`userInvocable`；不加载技能正文 |
+| `zf/settings/describe` | dsh 设置服务的各命名空间：`ns`、`applies`、`revision`、`value`（密钥字段由宿主脱敏）；带参数 `ns` 时只返回该命名空间并附上 `schema` |
+| `zf/provider/list` | `llm-pi-ai` 命名空间里可配置的供应商：`name`、`baseURL`、`api`、`apiKeyEnv`、`models[]`（`id`、`name`、`contextWindow`），以及设置是否可写 |
+| `zf/provider/save` | 参数 `provider`、`baseURL`、`api`、`model`、`credential`，可选 `modelName`、`contextWindow`、`apiKey`。新增供应商，或修改它并新增/修改其中一个模型；未提到的模型和字段保留。经设置服务写入，**立即生效**，不合法的值由 dsh 的 schema 拒绝。`apiKey` 交给 dsh 的凭据服务，不会回传 |
+| `zf/provider/remove` | 参数 `provider`。撤销用户对该供应商的修改；profile 自带的供应商仍在 |
 | `zf/session/history` | 参数 `sessionId`。返回 `messages[]`：`role`（`user` / `assistant`）、`text`、`truncated`，只含真人输入和助手的文本（不含注入的上下文、推理和工具调用）；最多 200 条，更早的计入 `omitted`。需要 dsh 的 `sessionQuery` 服务 |
 | 其他 | ACP v1，见 dsh 的 `@deepseek-ai/dsh-acp` |
 

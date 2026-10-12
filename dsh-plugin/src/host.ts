@@ -70,6 +70,33 @@ export interface SkillRegistry {
   list(options?: { cwd?: string }): Promise<readonly SkillSummary[]>
 }
 
+/** One settings namespace as the host describes it; secret fields arrive redacted. */
+export interface SettingsDescriptor {
+  ns: string
+  value?: unknown
+  schema?: unknown
+  applies?: unknown
+  revision?: number
+}
+
+/** `ctx.settings`: the host's settings provider. Plugins register namespaces with it. */
+export interface SettingsProvider {
+  writable?: boolean
+  documentPath?: string
+  describe(options?: { redactSecrets?: boolean }): readonly SettingsDescriptor[]
+  /** Path-addressed edits of one namespace's user layer, applied in order. */
+  mutate(ns: string, ops: readonly SettingsPathOp[], expectedRevision?: number): Promise<void>
+}
+
+export type SettingsPathOp =
+  | { op: 'set'; path: readonly string[]; value: unknown }
+  | { op: 'unset'; path: readonly string[] }
+
+/** `ctx.credentials`: the host's secret store. Values go in; none come out. */
+export interface CredentialProvider {
+  set(ref: string, value: string): Promise<void>
+}
+
 /** `ctx.sessionQuery`: read-only views over live and stored sessions. */
 export interface SessionQuery {
   listSessions(signal?: AbortSignal): Promise<readonly { header: SessionHeader; live: boolean }[]>
@@ -116,6 +143,8 @@ export interface HostContext {
   get(name: 'appReady'): AppReady | undefined
   get(name: 'sessionQuery'): SessionQuery | undefined
   get(name: 'skills'): SkillRegistry | undefined
+  get(name: 'settings'): SettingsProvider | undefined
+  get(name: 'credentials'): CredentialProvider | undefined
   get(name: string): unknown
 }
 

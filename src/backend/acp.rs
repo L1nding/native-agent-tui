@@ -566,6 +566,18 @@ impl AcpBridge {
                     self.mcp_servers.clone(),
                 ))?;
             }
+            // The bridge plugin answers these from dsh's settings service; the
+            // parameters, which may hold an API key, are forwarded untouched.
+            (Some(method @ ("provider/save" | "provider/list")), Some(id)) => {
+                let target = if method == "provider/save" {
+                    "zf/provider/save"
+                } else {
+                    "zf/provider/list"
+                };
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp
+                    .send(with_jsonrpc(Envelope::request(id, target, message.params)))?;
+            }
             // The bridge plugin answers these from dsh's session services.
             (Some("thread/list"), Some(id)) => {
                 self.pending.insert(id.clone(), Pending::Passthrough);
@@ -1015,6 +1027,18 @@ impl AcpBridge {
         if self.session_id.as_deref() != Some(session.as_str()) {
             return Ok(());
         }
+        // dsh 的设置改了（例如保存了供应商）：可选模型跟着换，并告诉 Core。
+        if let Some(changed) = params.get("update").filter(|update| {
+            update.get("sessionUpdate").and_then(Value::as_str) == Some("config_option_update")
+        }) {
+            let models = acp_protocol::model_choices(changed);
+            if !models.is_empty() && models != self.models {
+                self.models = models;
+                self.core
+                    .send(Envelope::notification("model/listChanged", Some(json!({}))))?;
+            }
+            return Ok(());
+        }
         let Some(turn) = self.turn_id.clone() else {
             return Ok(());
         };
@@ -1304,6 +1328,119 @@ mod tests {
         assert_eq!(refused.id, Some(RpcId::Number(8)));
         assert!(refused.result.is_none());
         assert_eq!(refused.error.unwrap()["code"], -32603);
+
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_is_saved_through_the_plugin_and_changed_models_reach_the_core() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let bridge =
+            tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &Config::default()).run());
+        let options = |models: &[&str]| {
+            json!([{"id":"model","currentValue":"[\"hi\",\"luna\"]","options": models
+                .iter()
+                .map(|model| json!({"value":format!("[\"hi\",\"{model}\"]"),"name":model}))
+                .collect::<Vec<_>>()}])
+        };
+        core_client
+            .send(Envelope::request(
+                RpcId::Number(1),
+                "initialize",
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(1),
+                Some(json!({"protocolVersion": 1})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::thread_start(
+                RpcId::Number(2),
+                &Config::default(),
+            ))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s","configOptions":options(&["luna"])})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+
+        let spec = crate::backend::dsh_config::ProviderSpec {
+            provider: "my-api".into(),
+            base_url: "https://api.example.com/v1".into(),
+            api: "openai-completions".into(),
+            api_key: crate::backend::dsh_config::Secret("sk-test-1".into()),
+            model: "big".into(),
+            ..Default::default()
+        };
+        core_client
+            .send(app_server::provider_save(RpcId::Number(3), &spec))
+            .unwrap();
+        let save = tokio::time::timeout(Duration::from_secs(2), acp_server.recv())
+            .await
+            .expect("bridge did not forward the save")
+            .unwrap();
+        assert_eq!(save.method.as_deref(), Some("zf/provider/save"));
+        let params = save.params.unwrap();
+        assert_eq!(params["provider"], "my-api");
+        assert_eq!(params["credential"], "MY_API_API_KEY");
+        assert_eq!(params["apiKey"], "sk-test-1");
+        // dsh 先推送新的可选模型，再答复保存。
+        acp_server
+            .send(Envelope::notification(
+                "session/update",
+                Some(json!({"sessionId":"s","update":{"sessionUpdate":"config_option_update","configOptions":options(&["luna","big"])}})),
+            ))
+            .unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(3),
+                Some(json!({"label":"my-api/big","credential":"MY_API_API_KEY","keyStored":true})),
+            ))
+            .unwrap();
+        let changed = core_client.recv().await.unwrap();
+        assert_eq!(changed.method.as_deref(), Some("model/listChanged"));
+        let saved = core_client.recv().await.unwrap();
+        assert_eq!(saved.result.unwrap()["label"], "my-api/big");
+
+        core_client
+            .send(app_server::model_list(RpcId::Number(4)))
+            .unwrap();
+        let listed = core_client.recv().await.unwrap().result.unwrap();
+        assert_eq!(listed["data"].as_array().unwrap().len(), 2);
+        // 内容没变的推送不再打扰 Core；别的会话的推送不算数。
+        for session in ["s", "other"] {
+            acp_server
+                .send(Envelope::notification(
+                    "session/update",
+                    Some(json!({"sessionId":session,"update":{"sessionUpdate":"config_option_update","configOptions":options(&["luna","big"])}})),
+                ))
+                .unwrap();
+        }
+        core_client
+            .send(app_server::provider_list(RpcId::Number(5)))
+            .unwrap();
+        assert_eq!(
+            acp_server.recv().await.unwrap().method.as_deref(),
+            Some("zf/provider/list")
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(5),
+                Some(json!({"providers":[]})),
+            ))
+            .unwrap();
+        assert_eq!(core_client.recv().await.unwrap().id, Some(RpcId::Number(5)));
 
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;

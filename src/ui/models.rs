@@ -30,7 +30,7 @@ pub(super) enum ModelPickerEvent {
     /// Open the provider form empty, or on the highlighted model.
     AddProvider,
     EditProvider(ModelOption),
-    /// Restart the backend so edited configuration is read; the picker stays open.
+    /// Restart dsh so newly installed plugins and edited files are read; the picker stays open.
     Reload,
     /// Send one short message through the highlighted model; the picker stays open.
     Test(String),

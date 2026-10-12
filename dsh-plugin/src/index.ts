@@ -17,6 +17,7 @@
 
 import { createInterface } from 'node:readline'
 import { loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
+import { listProviders, removeProvider, saveProvider } from './providers.js'
 import { listSessions, readHistory } from './sessions.js'
 
 export const name = 'zf-tui-bridge'
@@ -117,6 +118,63 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
           ...(skill.path === undefined ? {} : { path: skill.path }),
         })),
       }
+    },
+
+    /**
+     * dsh's settings as its own settings pages read them: one view per
+     * namespace, secret fields redacted by the host. `ns` narrows to one
+     * namespace and includes its schema.
+     */
+    'zf/settings/describe': (params) => {
+      const settings = ctx.get('settings')
+      if (settings === undefined) throw new Error('this dsh profile mounts no settings provider')
+      const only = typeof params['ns'] === 'string' ? params['ns'] : undefined
+      const namespaces = settings
+        .describe({ redactSecrets: true })
+        .filter((descriptor) => only === undefined || String(descriptor.ns) === only)
+        .map((descriptor) => ({
+          ns: String(descriptor.ns),
+          applies: descriptor.applies ?? null,
+          revision: descriptor.revision ?? null,
+          value: descriptor.value ?? null,
+          ...(only === undefined ? {} : { schema: descriptor.schema ?? null }),
+        }))
+      return { writable: settings.writable === true, hasDocument: settings.documentPath !== undefined, namespaces }
+    },
+
+    /** Configurable model providers and their models. */
+    'zf/provider/list': () => listProviders(ctx),
+
+    /** Add or change a provider and one of its models; applies without a restart. */
+    'zf/provider/save': (params) => {
+      const required = (field: string): string => {
+        const value = params[field]
+        if (typeof value !== 'string' || value.trim() === '') throw new Error(`${field} is required`)
+        return value.trim()
+      }
+      const modelName = params['modelName']
+      const contextWindow = params['contextWindow']
+      const apiKey = params['apiKey']
+      if (contextWindow !== undefined && !(typeof contextWindow === 'number' && Number.isSafeInteger(contextWindow) && contextWindow > 0)) {
+        throw new Error('contextWindow must be a positive integer')
+      }
+      return saveProvider(ctx, {
+        provider: required('provider'),
+        baseURL: required('baseURL'),
+        api: required('api'),
+        model: required('model'),
+        credential: required('credential'),
+        ...(typeof modelName === 'string' && modelName.trim() !== '' ? { modelName: modelName.trim() } : {}),
+        ...(typeof contextWindow === 'number' ? { contextWindow } : {}),
+        ...(typeof apiKey === 'string' && apiKey !== '' ? { apiKey } : {}),
+      })
+    },
+
+    /** Drop the user's edits of one provider. */
+    'zf/provider/remove': (params) => {
+      const provider = params['provider']
+      if (typeof provider !== 'string' || provider === '') throw new Error('provider is required')
+      return removeProvider(ctx, provider)
     },
 
     /** User and assistant text of one session, for showing a resumed conversation. */

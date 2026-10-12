@@ -211,6 +211,23 @@ pub(crate) fn backend_reload(id: RpcId) -> Envelope {
     Envelope::request(id, "backend/reload", Some(json!({})))
 }
 
+/// Adds or changes a provider and one of its models through dsh's settings.
+pub(crate) fn provider_save(
+    id: RpcId,
+    spec: &crate::backend::dsh_config::ProviderSpec,
+) -> Envelope {
+    Envelope::request(
+        id,
+        "provider/save",
+        Some(crate::backend::dsh_config::save_params(spec)),
+    )
+}
+
+/// Providers dsh holds, for the edit form.
+pub(crate) fn provider_list(id: RpcId) -> Envelope {
+    Envelope::request(id, "provider/list", Some(json!({})))
+}
+
 /// dsh's sessions of one workspace; answered by the bridge plugin.
 pub(crate) fn thread_list(id: RpcId, cwd: &std::path::Path) -> Envelope {
     Envelope::request(
