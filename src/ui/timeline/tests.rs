@@ -732,3 +732,192 @@ fn all_view_collapses_streamed_output_but_output_category_keeps_every_chunk() {
     panel.category = Category::Output;
     assert_eq!(ids(&panel), vec![1, 2, 3, 4, 5, 7, 8]);
 }
+
+/// Screen rows of a rendered panel; fixtures here use single-width characters.
+fn screen(
+    panel: &TimelinePanel,
+    current: &CoreSnapshot,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, Vec<String>) {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| panel.draw(frame, frame.area(), current))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows = (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    (buffer, rows)
+}
+
+/// Position of the first cell showing `needle`.
+fn cell_of(rows: &[String], needle: &str) -> (u16, u16) {
+    for (y, row) in rows.iter().enumerate() {
+        if let Some(index) = row.find(needle) {
+            return (row[..index].chars().count() as u16, y as u16);
+        }
+    }
+    panic!("{needle:?} not rendered in {rows:#?}");
+}
+
+/// The parts of a cell style that carry hierarchy.
+fn look(
+    cell: &ratatui::buffer::Cell,
+) -> (
+    ratatui::style::Color,
+    ratatui::style::Color,
+    ratatui::style::Modifier,
+) {
+    (cell.fg, cell.bg, cell.modifier)
+}
+
+fn selected_look() -> (
+    ratatui::style::Color,
+    ratatui::style::Color,
+    ratatui::style::Modifier,
+) {
+    let style = theme::current().selected();
+    (
+        style.fg.unwrap_or_default(),
+        style.bg.unwrap_or_default(),
+        style.add_modifier,
+    )
+}
+
+fn kind_event(id: u64, kind: EvidenceKind, state: ExecutionState) -> Arc<TimelineEntry> {
+    let mut entry = (*event(id, "root", "one", &format!("item-{id}"))).clone();
+    entry.evidence.kind = kind;
+    entry.execution_state = state;
+    Arc::new(entry)
+}
+
+#[test]
+fn list_selection_bookmarks_and_evidence_kinds_share_one_visual_hierarchy() {
+    use ratatui::style::Modifier;
+    let theme = theme::current();
+    let current = source(vec![
+        kind_event(1, EvidenceKind::Output, ExecutionState::Running),
+        kind_event(2, EvidenceKind::RequestCreated, ExecutionState::Waiting),
+        kind_event(3, EvidenceKind::TurnFailed, ExecutionState::Failed),
+        kind_event(4, EvidenceKind::TurnStarted, ExecutionState::Running),
+        kind_event(5, EvidenceKind::ExecutionUnknown, ExecutionState::Unknown),
+    ]);
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+    panel.selected = Some(2);
+    key(&mut panel, KeyCode::Char('b'), &current);
+    panel.selected = Some(4);
+    panel.notice = None;
+    let (buffer, rows) = screen(&panel, &current, 120, 24);
+
+    // Selection: a marker plus one full-width selected row.
+    let (x, y) = cell_of(&rows, ">  #4 TurnStarted");
+    let list_end = rows[y as usize]
+        .chars()
+        .skip(1)
+        .position(|c| c == '│')
+        .unwrap() as u16;
+    for column in [x, x + 8, list_end] {
+        assert_eq!(look(&buffer[(column, y)]), selected_look(), "{column}");
+    }
+    // Bookmark: a `*` marker, emphasized like other key markers.
+    let (x, y) = cell_of(&rows, " * #2 RequestCreated");
+    assert!(buffer[(x + 1, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(x + 1, y)].fg, theme.accent);
+    // Evidence kinds: restrained semantic color, never the selection style.
+    for (text, offset, color) in [
+        ("#2 RequestCreated", 3, theme.warning),
+        ("#3 TurnFailed", 3, theme.error),
+        ("#5 ExecutionUnknown", 3, theme.warning),
+        ("#1 Output", 3, theme.muted),
+        ("#1 Output", 0, theme.muted),
+    ] {
+        let (x, y) = cell_of(&rows, text);
+        let cell = &buffer[(x + offset, y)];
+        assert_eq!(cell.fg, color, "{text}");
+        assert!(!cell.modifier.contains(Modifier::BOLD), "{text}");
+        assert!(!cell.modifier.contains(Modifier::REVERSED), "{text}");
+        assert_ne!(look(cell), selected_look(), "{text}");
+    }
+
+    // Header: the title leads, counters recede.
+    let (x, y) = cell_of(&rows, "Evidence timeline 4/5 | 1 bookmarks");
+    assert_eq!(buffer[(x, y)].style().fg, theme.heading().fg);
+    assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+    assert!(!buffer[(x + 18, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(x + 18, y)].fg, theme.muted);
+
+    // Details: bold labels, plain values.
+    let (x, y) = cell_of(
+        &rows,
+        "Evidence: #4 TurnStarted | scope: Turn | execution: Running",
+    );
+    assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(x, y)].fg, theme.foreground);
+    assert!(!buffer[(x + 10, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(x + 10, y)].fg, theme.foreground);
+    let scope = x + "Evidence: #4 TurnStarted | ".len() as u16;
+    assert!(buffer[(scope, y)].modifier.contains(Modifier::BOLD));
+
+    // Footer: shared hint style, keys emphasized.
+    assert_eq!(
+        rows[23].trim_end(),
+        "Enter locate  ·  b bookmark  ·  / filter  ·  Esc close  ·  F1 help"
+    );
+    assert!(buffer[(0, 23)].modifier.contains(Modifier::BOLD));
+    assert!(!buffer[(6, 23)].modifier.contains(Modifier::BOLD));
+
+    // Failed and unknown execution are stated in text and emphasized.
+    for (id, word, color) in [(3, "Failed", theme.error), (5, "Unknown", theme.warning)] {
+        panel.selected = Some(id);
+        let (buffer, rows) = screen(&panel, &current, 120, 24);
+        let (x, y) = cell_of(&rows, &format!("execution: {word}"));
+        assert_eq!(buffer[(x + 11, y)].fg, color);
+        assert!(buffer[(x + 11, y)].modifier.contains(Modifier::BOLD));
+    }
+}
+
+#[test]
+fn wrapped_detail_rows_keep_label_and_value_styles_and_hints_fit_narrow_widths() {
+    use ratatui::style::Modifier;
+    let theme = theme::current();
+    let current = source(vec![kind_event(
+        1,
+        EvidenceKind::TurnStarted,
+        ExecutionState::Running,
+    )]);
+    let mut panel = TimelinePanel::default();
+    panel.open("root".into(), &current);
+    let (buffer, rows) = screen(&panel, &current, 40, 20);
+
+    // "Agent: root | task: None | attempt: Some(1) | generation: Some(1)" wraps
+    // inside a value; the continuation row keeps value and label styles.
+    let (x, y) = cell_of(&rows, "(1) | generation: Some(1)");
+    assert_eq!(x, 0);
+    assert!(rows[y as usize - 1].starts_with("Agent: root | task: None | attempt: Some"));
+    assert!(!buffer[(0, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(0, y)].fg, theme.foreground);
+    assert!(buffer[(6, y)].modifier.contains(Modifier::BOLD));
+    assert!(!buffer[(18, y)].modifier.contains(Modifier::BOLD));
+
+    for (width, expected) in [
+        (40, "Enter locate  ·  Esc close  ·  F1 help"),
+        (30, "Esc close  ·  F1 help"),
+    ] {
+        let (_, rows) = screen(&panel, &current, width, 10);
+        assert_eq!(rows[9].trim_end(), expected, "{width}");
+    }
+
+    // Help rows separate keys from their action; notes stay quiet.
+    key(&mut panel, KeyCode::F(1), &current);
+    let (buffer, rows) = screen(&panel, &current, 100, 30);
+    let (x, y) = cell_of(&rows, "F6: event category");
+    assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+    assert!(!buffer[(x + 4, y)].modifier.contains(Modifier::BOLD));
+    let (x, y) = cell_of(&rows, "Metadata only: no prompts");
+    assert!(!buffer[(x, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(x, y)].fg, theme.muted);
+}

@@ -34,12 +34,22 @@ pub struct Config {
     pub acp_profile: String,
     pub mcp_servers: Vec<McpServerConfig>,
     pub model: Option<String>,
+    /// `model` came from saved preferences, not `--model`: a backend that no
+    /// longer offers it keeps its own default instead of failing startup.
+    pub model_is_preference: bool,
     /// 会话汇总规则：工作流与 `--run` 要求所有根任务成功（严格）；
     /// 交互 TUI 以最后一轮结果为准，用户中断过的早期轮次不会让会话记为失败。
     pub strict_outcome: bool,
     pub sandbox: String,
     pub approval_policy: String,
+    /// `--sandbox` / `--approval` were given; saved settings do not replace them.
+    pub sandbox_explicit: bool,
+    pub approval_explicit: bool,
     pub windows_sandbox: Option<String>,
+    /// Run the sandbox shell check before the session becomes Ready. The CLI
+    /// leaves it off unless `--startup-shell-check` is given, so the sandbox is
+    /// first used when the model executes a command.
+    pub startup_shell_check: bool,
     pub max_native_children: usize,
     pub max_native_depth: usize,
     pub max_native_turns: usize,
@@ -65,10 +75,14 @@ impl Default for Config {
             acp_profile: "acp".into(),
             mcp_servers: Vec::new(),
             model: None,
+            model_is_preference: false,
             strict_outcome: false,
             sandbox: "workspace-write".into(),
             approval_policy: "on-request".into(),
+            sandbox_explicit: false,
+            approval_explicit: false,
             windows_sandbox: None,
+            startup_shell_check: true,
             max_native_children: DEFAULT_MAX_NATIVE_CHILDREN,
             max_native_depth: DEFAULT_MAX_NATIVE_DEPTH,
             max_native_turns: DEFAULT_MAX_NATIVE_TURNS,
@@ -160,7 +174,14 @@ where
     S: Into<String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    let mut config = Config::default();
+    let mut config = Config {
+        startup_shell_check: false,
+        ..Default::default()
+    };
+    // The CLI defaults to dsh. Naming a Codex executable or asking for the Codex
+    // shell check selects Codex unless --backend says otherwise.
+    let mut backend = None;
+    let mut codex_requested = false;
     let mut mode = None;
     let mut goal = None;
     let mut headless = false;
@@ -197,16 +218,20 @@ where
                 }
             }
             "--headless" if !headless => headless = true,
+            "--startup-shell-check" => config.startup_shell_check = true,
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
-            "--codex" => config.executable = value(&args, &mut index, option)?.into(),
+            "--codex" => {
+                config.executable = value(&args, &mut index, option)?.into();
+                codex_requested = true;
+            }
             "--backend" => {
                 let raw = value(&args, &mut index, option)?;
-                config.backend =
-                    raw.parse::<BackendKind>()
-                        .map_err(|expected| CliError::InvalidValue {
-                            option: option.clone(),
-                            value: expected.into(),
-                        })?;
+                backend = Some(raw.parse::<BackendKind>().map_err(|expected| {
+                    CliError::InvalidValue {
+                        option: option.clone(),
+                        value: expected.into(),
+                    }
+                })?);
             }
             "--dsh" => config.dsh_executable = value(&args, &mut index, option)?.into(),
             "--profile" => config.acp_profile = value(&args, &mut index, option)?,
@@ -301,13 +326,20 @@ where
                 }
                 if option == "--sandbox" {
                     config.sandbox = val;
+                    config.sandbox_explicit = true;
                 } else {
                     config.approval_policy = val;
+                    config.approval_explicit = true;
                 }
             }
             _ => return Err(CliError::UnknownOption(option.clone())),
         }
     }
+    config.backend = backend.unwrap_or(if codex_requested || mode == Some("--check-shell") {
+        BackendKind::Codex
+    } else {
+        BackendKind::DeepSeekAcp
+    });
     if headless && mode != Some("--workflow") {
         return Err(CliError::ConflictingModes);
     }
@@ -789,6 +821,35 @@ mod tests {
     }
 
     #[test]
+    fn cli_defaults_to_dsh_unless_codex_is_named() {
+        let backend = |args: &[&str]| match parse_args(args.iter().copied()).unwrap() {
+            CliCommand::Run { config, .. } | CliCommand::CheckShell(config) => config.backend,
+            _ => panic!(),
+        };
+        assert_eq!(backend(&["--run", "hello"]), BackendKind::DeepSeekAcp);
+        assert_eq!(
+            backend(&["--run", "hello", "--codex", "custom-codex"]),
+            BackendKind::Codex
+        );
+        assert_eq!(backend(&["--check-shell"]), BackendKind::Codex);
+        assert_eq!(
+            backend(&["--run", "hello", "--backend", "codex"]),
+            BackendKind::Codex
+        );
+        assert_eq!(
+            backend(&[
+                "--run",
+                "hello",
+                "--codex",
+                "custom-codex",
+                "--backend",
+                "deepseek-acp"
+            ]),
+            BackendKind::DeepSeekAcp
+        );
+    }
+
+    #[test]
     fn workflow_modes_are_explicit_and_cannot_mix_with_single_task_modes() {
         assert!(matches!(
             parse_args(["--workflow", "plan.json"]).unwrap(),
@@ -822,5 +883,19 @@ mod tests {
         };
         assert_eq!(config.windows_sandbox.as_deref(), Some("unelevated"));
         assert_eq!(Config::default().windows_sandbox, None);
+    }
+
+    #[test]
+    fn startup_shell_check_is_off_unless_requested() {
+        let CliCommand::CheckShell(config) = parse_args(["--check-shell"]).unwrap() else {
+            panic!()
+        };
+        assert!(!config.startup_shell_check);
+        let CliCommand::CheckShell(config) =
+            parse_args(["--check-shell", "--startup-shell-check"]).unwrap()
+        else {
+            panic!()
+        };
+        assert!(config.startup_shell_check);
     }
 }

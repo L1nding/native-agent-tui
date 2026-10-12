@@ -1,11 +1,15 @@
 //! Palette overlay transitions and mutual overlay cleanup.
 
 use super::commands::PaletteAction;
+use super::lang;
 use super::workflow_view;
 use super::{selected_request, sync_local_requests, AttentionEditor, LocalState};
 use crate::state::CoreSnapshot;
 
-fn close_mutual_overlays(local: &mut LocalState) {
+pub(super) fn close_mutual_overlays(local: &mut LocalState) {
+    local.models.close();
+    local.settings.close();
+    local.provider_form.close();
     local.search.close();
     local.timeline.close();
     local.skills = false;
@@ -36,7 +40,7 @@ pub(super) fn open_palette_action(
         PaletteAction::Evidence => local.evidence,
         PaletteAction::Attention => local.attention_editor.is_some(),
         PaletteAction::Help => local.help,
-        PaletteAction::NextAgent => false,
+        PaletteAction::NextAgent | PaletteAction::Model => false,
     };
     close_mutual_overlays(local);
     if already_visible {
@@ -75,7 +79,7 @@ pub(super) fn open_palette_action(
                 sync_local_requests(local, snapshot);
                 local.notice = None;
             } else {
-                local.notice = Some("No pending requests.".into());
+                local.notice = Some(lang::tr("No pending requests.", "没有待处理的请求。").into());
             }
         }
         PaletteAction::Workflow => {
@@ -91,6 +95,8 @@ pub(super) fn open_palette_action(
         PaletteAction::Help => {
             local.help = true;
         }
+        // 模型选择器需要向 Core 发命令，由按键处理处打开。
+        PaletteAction::Model => {}
         PaletteAction::NextAgent => {
             local.conversation_focus = None;
             local.agent_id = workflow_view::next_agent_id(snapshot, local.agent_id.as_deref());

@@ -10,11 +10,12 @@ use crate::scheduler::RootTaskSpec;
 
 use super::history::HistoryPanel;
 use super::input::InputEvent;
+use super::lang;
 use super::search::SearchHandle;
 use super::terminal::TerminalGuard;
 use super::{
-    draw, handle_key, handle_paste, reject_paste, sync_local_requests, LocalState, UiError,
-    PASTE_REJECTED,
+    draw, handle_key, handle_paste, paste_rejected, reject_paste, sync_local_requests, LocalState,
+    UiError,
 };
 pub async fn run_tasks_with_history(
     mut client: ClientHandle,
@@ -22,9 +23,27 @@ pub async fn run_tasks_with_history(
     mut history: HistoryHandle,
 ) -> Result<(), UiError> {
     let mut history_panel = HistoryPanel::default();
+    let mut sessions_panel = super::sessions::SessionsPanel::default();
     let mut history_open = true;
     let mut search = SearchHandle::spawn();
     let mut search_open = true;
+    {
+        // 环境变量优先；否则沿用上次在 /setting 里保存的语言和主题。
+        use crate::preferences::Setting;
+        let snapshot = client.snapshots.borrow();
+        if let (None, Some(value)) = (
+            lang::from_environment(),
+            snapshot.saved_settings.get(&Setting::Language),
+        ) {
+            lang::set(value);
+        }
+        if let (None, Some(value)) = (
+            super::theme::from_environment(),
+            snapshot.saved_settings.get(&Setting::Theme),
+        ) {
+            super::theme::set(value);
+        }
+    }
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
         let mut local = LocalState::default();
@@ -46,6 +65,7 @@ pub async fn run_tasks_with_history(
                 local.timeline.sync(&snapshot);
                 terminal.terminal.draw(|frame| {
                     if local.palette.visible { draw(frame, &snapshot, &local); }
+                    else if sessions_panel.visible { sessions_panel.draw(frame, &snapshot); }
                     else if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
                 })?;
@@ -68,11 +88,12 @@ pub async fn run_tasks_with_history(
                         if is_search {
                             history_panel.search_updated(&history);
                         } else {
+                            sessions_panel.updated(&history);
                             history_panel.updated(&mut history);
                         }
                     } else {
                         history_open = false;
-                        history_panel.notice = Some("History reader closed; return to live execution.".into());
+                        history_panel.notice = Some(lang::tr("History reader closed; return to live execution.", "历史读取已关闭，已回到实时会话。").into());
                     }
                     dirty = true;
                 }
@@ -89,12 +110,23 @@ pub async fn run_tasks_with_history(
                                 let snapshot = client.snapshots.borrow().clone();
                                 if local.palette.visible {
                                     if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
+                                } else if sessions_panel.visible {
+                                    use super::sessions::SessionsEvent;
+                                    match sessions_panel.key(key, &mut history, &snapshot) {
+                                        SessionsEvent::Quit => return Ok(()),
+                                        SessionsEvent::Resume(id) => { let _ = client.commands.try_send(Command::ResumeConversation { id }); }
+                                        SessionsEvent::Refresh => { let _ = client.commands.try_send(Command::ListConversations); }
+                                        SessionsEvent::Close | SessionsEvent::Consumed => {}
+                                    }
                                 } else if history_panel.visible {
                                     if history_panel.key(key, &mut history, false) { return Ok(()); }
                                 } else if key.code == KeyCode::F(12) {
                                     local.search.close();
                                     local.timeline.close();
                                     history_panel.open(&mut history, None);
+                                } else if super::left_opens_sessions(key, &snapshot, &local) {
+                                    sessions_panel.open(&mut history);
+                                    let _ = client.commands.try_send(Command::ListConversations);
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 dirty = true;
                             }
@@ -104,6 +136,7 @@ pub async fn run_tasks_with_history(
                                     dirty = true;
                                     continue;
                                 }
+                                if sessions_panel.visible { continue; }
                                 if history_panel.visible { history_panel.paste(&text); dirty = true; continue; }
                                 let snapshot = client.snapshots.borrow().clone();
                                 handle_paste(&text, &snapshot, &mut local);
@@ -113,7 +146,7 @@ pub async fn run_tasks_with_history(
                                 if local.palette.visible {
                                     local.palette.reject_paste();
                                 } else if history_panel.visible {
-                                    history_panel.notice = Some(PASTE_REJECTED.into());
+                                    history_panel.notice = Some(paste_rejected().into());
                                 } else {
                                     reject_paste(&mut local);
                                 }
@@ -172,7 +205,7 @@ pub async fn run_history(
                         else { panel.updated(&mut service); }
                     } else {
                         reader_open = false;
-                        panel.notice = Some("History reader closed. Ctrl+Q exits.".into());
+                        panel.notice = Some(lang::tr("History reader closed. Ctrl+Q exits.", "历史读取已关闭。Ctrl+Q 退出。").into());
                     }
                     dirty = true;
                 }
@@ -186,7 +219,7 @@ pub async fn run_history(
                             }
                             InputEvent::Paste(text) => { panel.paste(&text); dirty = true; }
                             InputEvent::PasteRejected => {
-                                panel.notice = Some(PASTE_REJECTED.into());
+                                panel.notice = Some(paste_rejected().into());
                                 dirty = true;
                             }
                             InputEvent::Resize(_, _) => dirty = true,

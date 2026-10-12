@@ -3,6 +3,9 @@ import argparse
 import codecs
 import json
 import os
+
+# 夹具断言的是英文界面文案；界面默认中文，这里固定为英文。
+os.environ["NATIVE_AGENT_TUI_LANG"] = "en"
 import re
 from pathlib import Path
 import subprocess

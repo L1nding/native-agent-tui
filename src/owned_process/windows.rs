@@ -22,6 +22,26 @@ use windows_sys::Win32::System::Threading::*;
 
 use super::{Command, Input};
 
+/// Whether a process with this id may still be running; unknown counts as running.
+// The standalone native fixture includes this module and does not call it.
+#[allow(dead_code)]
+pub(crate) fn process_alive(pid: u32) -> bool {
+    // SAFETY: OpenProcess takes plain values; a null result is handled below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // 没有这个进程号时是参数错误；其他失败（例如拒绝访问）说明进程存在。
+        // SAFETY: reads the calling thread's last error value.
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+    let mut code = 0;
+    // SAFETY: the handle was just opened and `code` is a valid output location.
+    let running =
+        unsafe { GetExitCodeProcess(handle, &mut code) } == 0 || code == STILL_ACTIVE as u32;
+    // SAFETY: the handle is owned here and closed exactly once.
+    unsafe { CloseHandle(handle) };
+    running
+}
+
 pub(crate) struct Child {
     process: OwnedHandle,
     job: Option<OwnedHandle>,

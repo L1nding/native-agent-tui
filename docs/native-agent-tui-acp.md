@@ -1,7 +1,9 @@
 # DeepSeek Harness ACP backend
 
-The first ACP backend is selected with `--backend deepseek-acp`. Codex remains
-the default and keeps its pinned `0.161.0` compatibility checks.
+The ACP backend `deepseek-acp` is the CLI default since 2026-10-12. Codex is
+selected with `--backend codex`; naming an executable with `--codex PATH` or
+running `--check-shell` also selects Codex unless `--backend` is given. Codex
+is no longer pinned to one release.
 
 ## Process boundary
 

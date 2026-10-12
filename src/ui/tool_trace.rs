@@ -1,10 +1,27 @@
 //! 从 Core 保留的时间线投影实时工具生命周期元数据。
-use crate::observation::{ActivityScope, EvidenceKind};
+use super::lang;
+use super::tool_detail::execution_text;
+use crate::observation::{ActivityScope, EvidenceKind, ExecutionState};
 use crate::state::CoreSnapshot;
 use crate::tool_details::ToolDetailLocator;
 use std::sync::Arc;
 
+/// One metadata row of the trace. `uncertain` restates a Core fact (unknown
+/// execution) so the view can emphasize it without parsing the text.
+pub(super) struct TraceRow {
+    pub text: String,
+    pub uncertain: bool,
+}
+
+#[cfg(test)]
 pub(super) fn lines(locator: &ToolDetailLocator, current: &CoreSnapshot) -> Vec<String> {
+    rows(locator, current)
+        .into_iter()
+        .map(|row| row.text)
+        .collect()
+}
+
+pub(super) fn rows(locator: &ToolDetailLocator, current: &CoreSnapshot) -> Vec<TraceRow> {
     let mut entries = matching_entries(locator, current);
     if entries.is_empty() {
         return unavailable(current);
@@ -21,17 +38,37 @@ pub(super) fn lines(locator: &ToolDetailLocator, current: &CoreSnapshot) -> Vec<
                 EvidenceKind::ExecutionUnknown => "ExecutionUnknown",
                 _ => unreachable!("filtered to tool trace evidence"),
             };
-            format!(
-                "Evidence #{} · {} · state={:?} · output_bytes={} · recorded_at_ms={}",
-                entry.evidence.id,
-                kind,
-                entry.execution_state,
-                entry.evidence.output_bytes,
-                entry
-                    .evidence
-                    .recorded_at_ms
-                    .map_or_else(|| "unavailable".into(), |time| time.to_string())
-            )
+            // 证据种类是 Core 的标识符，时间线列表也按原名显示，这里保持一致。
+            let text = if lang::zh() {
+                format!(
+                    "证据 #{} · {} · 状态：{} · 输出 {} 字节 · 记录时间：{}",
+                    entry.evidence.id,
+                    kind,
+                    execution_text(entry.execution_state),
+                    entry.evidence.output_bytes,
+                    entry
+                        .evidence
+                        .recorded_at_ms
+                        .map_or_else(|| "不可用".into(), |time| format!("{time} ms"))
+                )
+            } else {
+                format!(
+                    "Evidence #{} · {} · state={:?} · output_bytes={} · recorded_at_ms={}",
+                    entry.evidence.id,
+                    kind,
+                    entry.execution_state,
+                    entry.evidence.output_bytes,
+                    entry
+                        .evidence
+                        .recorded_at_ms
+                        .map_or_else(|| "unavailable".into(), |time| time.to_string())
+                )
+            };
+            TraceRow {
+                text,
+                uncertain: entry.evidence.kind == EvidenceKind::ExecutionUnknown
+                    || entry.execution_state == ExecutionState::Unknown,
+            }
         })
         .collect()
 }
@@ -68,21 +105,32 @@ fn matching_entries<'a>(
         .collect()
 }
 
-fn unavailable(current: &CoreSnapshot) -> Vec<String> {
-    let reason = if current.timeline.dropped_entries > 0 {
-        "unavailable: matching evidence is absent or evicted from the retained timeline"
+fn unavailable(current: &CoreSnapshot) -> Vec<TraceRow> {
+    let evicted = current.timeline.dropped_entries > 0;
+    let text = if lang::zh() {
+        if evicted {
+            "工具轨迹不可用：匹配的证据不存在，或已被清出保留的时间线。".to_owned()
+        } else {
+            "工具轨迹不可用：保留的时间线里没有匹配的证据。".to_owned()
+        }
     } else {
-        "unavailable: no matching evidence in the retained timeline"
+        let reason = if evicted {
+            "unavailable: matching evidence is absent or evicted from the retained timeline"
+        } else {
+            "unavailable: no matching evidence in the retained timeline"
+        };
+        format!("Tool trace: {reason}.")
     };
-    vec![format!("Tool trace: {reason}.")]
+    vec![TraceRow {
+        text,
+        uncertain: false,
+    }]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observation::{
-        ActivityIdentity, ActivityKind, Evidence, EvidenceSource, ExecutionState,
-    };
+    use crate::observation::{ActivityIdentity, ActivityKind, Evidence, EvidenceSource};
     use crate::timeline::{TimelineEntry, TimelineSnapshot};
     use crate::tool_details::ToolDetailLocator;
     use std::sync::Arc;

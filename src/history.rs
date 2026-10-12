@@ -58,9 +58,67 @@ pub struct ExportPreview {
     pub excerpt: String,
 }
 
+/// One retained session with the facts the sessions page groups by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOverview {
+    pub info: SessionInfo,
+    /// Requests waiting for an answer in the last committed state; `None`
+    /// when that state was not read.
+    pub pending_requests: Option<usize>,
+    /// Phase of the last committed state, for sessions that are not closed.
+    pub phase: Option<crate::state::SessionPhase>,
+}
+
+/// Unclosed sessions whose last state is read for an overview; older ones stay unknown.
+const OVERVIEW_OPEN_SESSIONS: usize = 16;
+const OVERVIEW_SESSIONS: usize = 200;
+
+fn overview(
+    settings: &JournalSettings,
+    cwd: &std::path::Path,
+) -> Result<Vec<SessionOverview>, HistoryError> {
+    let mut opened = 0;
+    Ok(journal::sessions(settings, cwd)?
+        .into_iter()
+        .take(OVERVIEW_SESSIONS)
+        .map(|info| {
+            if info.session_closed {
+                return SessionOverview {
+                    pending_requests: Some(0),
+                    phase: info.execution_result,
+                    info,
+                };
+            }
+            // 未关闭的会话要看最后一次提交的状态，才知道是否在等输入。
+            let latest = (opened < OVERVIEW_OPEN_SESSIONS)
+                .then(|| {
+                    opened += 1;
+                    Replay::open(settings, cwd, &info.session_id, 0).ok()
+                })
+                .flatten()
+                .and_then(|replay| match replay.latest.payload {
+                    journal::Payload::Snapshot(snapshot) => Some(snapshot),
+                    journal::Payload::ReplayEnd(_) => None,
+                });
+            SessionOverview {
+                pending_requests: latest.as_ref().map(|snapshot| {
+                    snapshot
+                        .tasks
+                        .iter()
+                        .map(|task| task.pending_requests)
+                        .sum()
+                }),
+                phase: latest.map(|snapshot| snapshot.phase),
+                info,
+            }
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone)]
 pub enum HistoryResult {
     Sessions(Vec<SessionInfo>),
+    Overview(Vec<SessionOverview>),
     Loaded(Box<HistoricalView>),
     Preview(ExportPreview),
     Exported { bytes: u64 },
@@ -69,6 +127,8 @@ pub enum HistoryResult {
 #[derive(Debug)]
 pub enum HistoryRequest {
     List,
+    /// Sessions of this workspace with whether each one waits for input.
+    Overview,
     Open {
         session: String,
         sequence: Option<u64>,
@@ -121,6 +181,10 @@ impl HistoryHandle {
                             journal::sessions(&settings, &cwd)
                                 .map(HistoryResult::Sessions)
                                 .map_err(HistoryError::from)
+                        }
+                        HistoryRequest::Overview => {
+                            prepared = None;
+                            overview(&settings, &cwd).map(HistoryResult::Overview)
                         }
                         HistoryRequest::Open { session, sequence } => {
                             prepared = None;

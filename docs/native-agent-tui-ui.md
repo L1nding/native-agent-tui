@@ -249,6 +249,18 @@ Ctrl+P 命令面板        Ctrl+Q 请求退出并清理
 Esc 关闭 overlay       F3 当前已有的根/child 会话切换
 ```
 
+`Ctrl+E` 整体展开或折叠对话中的长工具组（一个轮次超过 4 次调用时折叠）；这只是本地显示状态。
+
+界面语言与主题由环境变量选择，启动后不变：
+
+| 变量 | 取值 | 默认 |
+| --- | --- | --- |
+| `NATIVE_AGENT_TUI_LANG` | `zh`、`en` | `zh`（中文界面） |
+| `NATIVE_AGENT_TUI_THEME` | `dark`、`light`、`terminal`、`mono` | `dark` |
+| `NO_COLOR` | 任意非空值 | 未设置；设置后等同 `mono` |
+
+只有界面文案随语言切换。消息正文、命令、工具摘要与输出、Core 和服务端给出的提示与错误、标识符都按原文显示。`src/ui/lang.rs` 的 `tr(英文, 中文)` 让两种文案留在调用处；渲染测试默认英文，中文用 `lang::with_zh`。
+
 输入文本时普通字符不触发全局快捷键。根输入在 Ready 或允许 follow-up 时提交，GatePending 时排队，Stopping/Disconnected 时禁止执行。UI 不提供任意 child `turn/start`；子代理交互必须通过 Core 的合法请求或明确命令。
 
 ## 10. 渲染、背压和性能

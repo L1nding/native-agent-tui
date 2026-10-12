@@ -105,6 +105,68 @@ fn completed(session: &str) -> StoredSnapshot {
     snapshot
 }
 
+#[tokio::test]
+async fn legacy_sessions_move_whole_and_only_when_nothing_can_still_write_them() {
+    let old = Fixture::new();
+    let new = Fixture::new();
+    let destination = new.root.join("journal");
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let closed = Journal::open(&old.settings(), &cwd, snapshot("closed-session")).unwrap();
+    closed.finish(completed("closed-session")).await.unwrap();
+    // 没有关闭的会话：可能还有进程在写。
+    let open = Journal::open(&old.settings(), &cwd, snapshot("4242-open-1")).unwrap();
+    drop(open);
+    let names = |root: &Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    // 目录自己的锁文件不属于任何会话。
+                    .filter(|name| name != ".catalog.lock")
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let before = names(&old.root);
+    let of = |session: &str| -> Vec<String> {
+        before
+            .iter()
+            .filter(|name| name.contains(session))
+            .cloned()
+            .collect()
+    };
+    assert!(of("closed-session").len() >= 2, "{before:?}");
+
+    // 进程还在：只搬已关闭的那个，文件一个不落。
+    assert_eq!(move_sessions(&old.root, &destination, |pid| pid == 4242), 1);
+    assert_eq!(names(&destination), of("closed-session"));
+    assert_eq!(names(&old.root), of("4242-open-1"));
+    let settings = JournalSettings {
+        root: Some(destination.clone()),
+        ..Default::default()
+    };
+    let listed = sessions(&settings, &cwd).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, "closed-session");
+    assert!(Replay::open(&settings, &cwd, "closed-session", 0).is_ok());
+
+    // 新目录里已有同名文件时不覆盖，这个会话整个留在原处。
+    let blocker = destination.join(&of("4242-open-1")[0]);
+    fs::write(&blocker, b"existing").unwrap();
+    assert_eq!(move_sessions(&old.root, &destination, |_| false), 0);
+    assert_eq!(names(&old.root), of("4242-open-1"));
+    assert_eq!(fs::read(&blocker).unwrap(), b"existing");
+    fs::remove_file(&blocker).unwrap();
+
+    // 进程不在了：没关闭的会话也可以搬，搬空的旧目录被清掉。
+    assert_eq!(move_sessions(&old.root, &destination, |_| false), 1);
+    assert_eq!(sessions(&settings, &cwd).unwrap().len(), 2);
+    assert!(!old.root.exists());
+    assert_eq!(move_sessions(&old.root, &destination, |_| false), 0);
+}
+
 #[test]
 fn cleanup_and_journal_uncertainty_cannot_be_retained_as_safe_closed_history() {
     let mut snapshot = completed("uncertain-close");

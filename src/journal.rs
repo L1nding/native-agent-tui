@@ -46,21 +46,12 @@ impl JournalSettings {
         if let Some(root) = &self.root {
             return Ok(root.clone());
         }
-        let base = if cfg!(windows) {
-            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-        } else if cfg!(target_os = "macos") {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join("Library/Application Support"))
-        } else {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-                })
-        }
-        .ok_or(JournalError::Directory)?;
-        Ok(base.join("native-agent-tui").join("journal"))
+        // 和设置、对话放在一起：用户目录下的 .zf。
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .map(|home| home.join(".zf").join("journal"))
+            .ok_or(JournalError::Directory)
     }
 
     /// Return the side-effect outbox path paired with a journal session.
@@ -1161,6 +1152,103 @@ fn entries(root: &Path) -> Result<Vec<PathBuf>, JournalError> {
         entries.push(entry?.path());
     }
     Ok(entries)
+}
+
+/// Where the journal was kept before it moved to `.zf`: the platform's
+/// application data directory.
+pub fn legacy_directory() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+    }?;
+    Some(base.join("native-agent-tui").join("journal"))
+}
+
+/// Moves sessions from the old journal directory into the current one and
+/// returns how many moved. A session moves as a whole or not at all, and only
+/// when nothing can still be writing it: it is closed, or the process that
+/// owned it is gone. The rest stay where they are and are tried again later.
+pub fn migrate_legacy(settings: &JournalSettings) -> usize {
+    if settings.root.is_some() {
+        return 0;
+    }
+    match (legacy_directory(), settings.directory()) {
+        (Some(old), Ok(new)) if old != new => {
+            move_sessions(&old, &new, crate::owned_process::process_alive)
+        }
+        _ => 0,
+    }
+}
+
+fn move_sessions(old: &Path, new: &Path, alive: impl Fn(u32) -> bool) -> usize {
+    let Ok(files) = entries(old) else {
+        return 0;
+    };
+    let mut moved = 0;
+    for cursor in files.iter().filter(|path| {
+        owned(path) && path.extension().and_then(|extension| extension.to_str()) == Some("cursor")
+    }) {
+        let Ok(info) = metadata(cursor) else {
+            continue;
+        };
+        // 会话 id 以创建它的进程号开头。
+        let owner_alive = info
+            .session_id
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_none_or(&alive);
+        if !info.session_closed && owner_alive {
+            continue;
+        }
+        let stem = cursor.file_stem();
+        let group: Vec<&PathBuf> = files
+            .iter()
+            .filter(|path| path.file_stem() == stem && path.is_file())
+            .collect();
+        let target = |path: &Path| path.file_name().map(|name| new.join(name));
+        if fs::create_dir_all(new).is_err()
+            || group
+                .iter()
+                .any(|path| target(path).is_none_or(|target| target.exists()))
+        {
+            continue;
+        }
+        // 游标最后搬：只有它到位了，会话才会出现在新目录里。
+        let mut order = group.clone();
+        order.sort_by_key(|path| *path == cursor);
+        let mut done: Vec<(&PathBuf, PathBuf)> = Vec::new();
+        let complete = order.iter().all(|path| {
+            let target = target(path).expect("checked above");
+            let renamed = fs::rename(path, &target).is_ok();
+            if renamed {
+                done.push((path, target));
+            }
+            renamed
+        });
+        if complete {
+            moved += 1;
+        } else {
+            for (source, target) in done.into_iter().rev() {
+                let _ = fs::rename(target, source);
+            }
+        }
+    }
+    // 只剩目录自己的锁文件时，旧目录一并清掉；还有会话时保留。
+    let lock = old.join(".catalog.lock");
+    if entries(old).is_ok_and(|left| left.iter().all(|path| *path == lock)) {
+        let _ = fs::remove_file(&lock);
+        let _ = fs::remove_dir(old);
+    }
+    moved
 }
 
 fn owned(path: &Path) -> bool {

@@ -375,3 +375,152 @@ fn session_list_marks_the_running_session_as_live_not_review_required() {
     assert!(!live_row.contains("REVIEW REQUIRED"), "{live_row}");
     assert!(row("crashed-session").contains("REVIEW REQUIRED"));
 }
+
+fn screen_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+    crate::ui::activity::buffer_rows(terminal.backend().buffer())
+}
+
+/// 带边框的行宽度不变，右边框仍在最后一列。
+fn assert_rows_inside_borders(rows: &[String], width: u16) {
+    for row in rows {
+        assert_eq!(row.width(), width as usize, "{row}");
+        if row.starts_with('│') {
+            assert!(row.ends_with('│'), "{row}");
+        }
+    }
+}
+
+#[test]
+fn chinese_history_view_renders_read_only_and_review_wording_inside_borders() {
+    for (width, height) in [(44u16, 30u16), (100, 30)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut panel = panel();
+        lang::with_zh(|| terminal.draw(|frame| panel.draw(frame, None)).unwrap());
+        let rows = screen_rows(&terminal);
+        let screen = rows.join("\n");
+        for text in [
+            "历史 | 只读",
+            "离线 | 没有 Codex 执行",
+            "历史观察",
+            "结果: 状态未知 | 需要复核",
+            "操作",
+            "Left/Right 事件",
+        ] {
+            assert!(screen.contains(text), "{width}: {text}\n{screen}");
+        }
+        assert!(!screen.contains("REVIEW REQUIRED"), "{screen}");
+        assert!(!screen.contains("read-only"), "{screen}");
+        assert_rows_inside_borders(&rows, width);
+        let joined: String = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .filter(|ch| *ch != '│' && *ch != ' ')
+            .collect();
+        for text in [
+            "会话history-session|当前事件1/1|schema2",
+            "最近记录的结果:状态未知|已关闭:否|待复核:是|未提交尾部:是",
+            "搜索元数据:\"\"|类别全部|/或Ctrl+F编辑；F6切换类别",
+        ] {
+            assert!(joined.contains(text), "{width}: {text}\n{screen}");
+        }
+
+        // 导出表单：标题、预览说明和输入内容都在边框内。
+        panel.preview = Some(ExportPreview {
+            manifest: serde_json::json!({"since":0,"high_watermark":1,"execution_result":"unknown"}),
+            excerpt: "中文 🦀 stable aliases".into(),
+        });
+        let mut editor = Editor::default();
+        editor.insert("target/中文导出.jsonl");
+        panel.form = Some(Form::Destination(editor));
+        lang::with_zh(|| terminal.draw(|frame| panel.draw(frame, None)).unwrap());
+        let rows = screen_rows(&terminal);
+        let screen = rows.join("\n");
+        for text in [
+            "导出预览",
+            "新导出文件",
+            "target/中文导出.jsonl",
+            "Enter 确认",
+        ] {
+            assert!(screen.contains(text), "{width}: {text}\n{screen}");
+        }
+        // 清单里的值来自导出内容，不翻译。
+        assert!(screen.contains("unknown"), "{screen}");
+        assert_rows_inside_borders(&rows, width);
+    }
+}
+
+#[test]
+fn chinese_session_list_marks_live_and_review_required_sessions() {
+    let info = |id: &str| SessionInfo {
+        schema_version: 2,
+        workspace_id: "workspace".into(),
+        session_id: id.into(),
+        committed_seq: 7,
+        committed_bytes: 1,
+        snapshot_version: 0,
+        recorded_at: None,
+        session_closed: false,
+        needs_recovery: true,
+        execution_result: None,
+    };
+    let panel = HistoryPanel {
+        visible: true,
+        sessions: vec![info("live-session"), info("crashed-session")],
+        ..Default::default()
+    };
+    let live = CoreSnapshot {
+        phase: SessionPhase::Running,
+        journal: Some(crate::journal::JournalView {
+            session_id: "live-session".into(),
+            submitted_seq: 7,
+            committed_seq: 7,
+            committed_version: 1,
+            error: None,
+        }),
+        ..CoreSnapshot::default()
+    };
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    lang::with_zh(|| {
+        terminal
+            .draw(|frame| panel.draw(frame, Some(&live)))
+            .unwrap()
+    });
+    let rows = screen_rows(&terminal);
+    let screen = rows.join("\n");
+    let row = |id: &str| rows.iter().find(|row| row.contains(id)).cloned().unwrap();
+    assert!(
+        row("live-session").contains("当前会话（实时：运行中） | 事件 7"),
+        "{screen}"
+    );
+    assert!(!row("live-session").contains("需要复核"), "{screen}");
+    assert!(
+        row("crashed-session").contains("状态未知 | 事件 7 | 需要复核"),
+        "{screen}"
+    );
+    for text in [
+        "实时: 运行中 | 请求: 0 | F12 返回",
+        "Up/Down 选择",
+        "Esc 返回",
+    ] {
+        assert!(screen.contains(text), "{text}\n{screen}");
+    }
+    assert_rows_inside_borders(&rows, 80);
+}
+
+#[test]
+fn history_notices_follow_the_interface_language() {
+    let mut panel = panel();
+    panel.search_query = "x".repeat(FIELD_BYTES);
+    panel.search_cursor = FIELD_BYTES;
+    panel.search_editing = true;
+    panel.paste("y");
+    assert_eq!(
+        panel.notice.as_deref(),
+        Some(format!("Historical search field limited to {FIELD_BYTES} UTF-8 bytes.").as_str())
+    );
+    lang::with_zh(|| panel.paste("y"));
+    assert_eq!(
+        panel.notice.as_deref(),
+        Some(format!("历史搜索内容最多 {FIELD_BYTES} 个 UTF-8 字节。").as_str())
+    );
+}

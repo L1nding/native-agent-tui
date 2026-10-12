@@ -124,7 +124,8 @@ impl AppServer {
             pipe.close_writer().await;
         }
         if let Some(mut bridge) = self.bridge.take() {
-            if tokio::time::timeout(Duration::from_secs(1), &mut bridge)
+            // 桥接可能还持有重载时启动的进程；留出它正常收尾的时间。
+            if tokio::time::timeout(Duration::from_secs(4), &mut bridge)
                 .await
                 .is_err()
             {
@@ -393,14 +394,35 @@ pub(crate) fn thread_start(id: RpcId, config: &Config) -> Envelope {
     Envelope::request(id, "thread/start", Some(params))
 }
 
-pub(crate) fn turn_start(id: RpcId, thread: &str, text: &str) -> Envelope {
-    Envelope::request(
-        id,
-        "turn/start",
-        Some(json!({
-            "threadId":thread, "input":[{"type":"text","text":text}]
-        })),
-    )
+pub(crate) fn turn_start(id: RpcId, thread: &str, text: &str, model: Option<&str>) -> Envelope {
+    let mut params = json!({
+        "threadId":thread, "input":[{"type":"text","text":text}]
+    });
+    if let Some(model) = model {
+        params["model"] = Value::String(model.into());
+    }
+    Envelope::request(id, "turn/start", Some(params))
+}
+
+pub(crate) fn model_list(id: RpcId) -> Envelope {
+    Envelope::request(id, "model/list", Some(json!({"limit":100})))
+}
+
+/// Understood by the ACP bridge only: restart dsh and resume the session so
+/// edited provider configuration is read.
+pub(crate) fn backend_reload(id: RpcId) -> Envelope {
+    Envelope::request(id, "backend/reload", Some(json!({})))
+}
+
+/// Understood by the ACP bridge only: continue another saved session in the
+/// running agent process.
+pub(crate) fn thread_resume(id: RpcId, thread: &str) -> Envelope {
+    Envelope::request(id, "thread/resume", Some(json!({"threadId":thread})))
+}
+
+/// Understood by the ACP bridge only; Codex takes the model with `turn/start`.
+pub(crate) fn model_select(id: RpcId, model: &str) -> Envelope {
+    Envelope::request(id, "model/select", Some(json!({"model":model})))
 }
 
 pub(crate) fn interrupt(id: RpcId, thread: &str, turn: &str) -> Envelope {

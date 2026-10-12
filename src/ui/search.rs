@@ -5,15 +5,20 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Borders, Clear, Paragraph};
 use tokio::sync::watch;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::layout::wrap;
+use super::lang::{self, tr};
 use super::scope::Scope;
+use super::theme::{self, Theme};
+use super::tool_detail::{
+    field_segments, fit_hints, help_parts, lifecycle_zh, scope_text, wrap_segments, Field, Segment,
+    Tone,
+};
 use super::tool_search::{self, CategoryFilter, LifecycleFilter};
 use super::Editor;
 use crate::state::{display_text, ConversationItem, CoreSnapshot};
@@ -29,6 +34,26 @@ enum Role {
     Agent,
 }
 
+impl Role {
+    /// Name shown in the filter row; English is the variant name.
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => tr("All", "全部"),
+            Self::You => tr("You", "你"),
+            Self::Agent => "Agent",
+        }
+    }
+}
+
+/// Core labels a message `You` or `Agent`; only the display name is translated.
+fn role_text(role: &str) -> &str {
+    if role == "You" {
+        tr("You", "你")
+    } else {
+        role
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
@@ -36,6 +61,18 @@ enum State {
     Streaming,
     Complete,
     Truncated,
+}
+
+impl State {
+    /// Name shown in the filter row; English is the variant name.
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => tr("All", "全部"),
+            Self::Streaming => tr("Streaming", "输出中"),
+            Self::Complete => tr("Complete", "已完成"),
+            Self::Truncated => tr("Truncated", "已截断"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -139,33 +176,6 @@ impl Focus {
 
     pub fn thread(&self) -> &str {
         &self.key.thread
-    }
-
-    pub fn row(&self, width: usize) -> usize {
-        let text = display_text(&self.text);
-        let offset = display_text(&self.text[..self.offset]).len();
-        let mut row = 0;
-        let mut cells = 0;
-        for (index, grapheme) in text.grapheme_indices(true) {
-            if grapheme == "\n" {
-                if index >= offset {
-                    return row;
-                }
-                row += 1;
-                cells = 0;
-            } else {
-                let count = grapheme.width();
-                if cells + count > width.max(1) && cells > 0 {
-                    row += 1;
-                    cells = 0;
-                }
-                if index + grapheme.len() > offset {
-                    return row;
-                }
-                cells += count;
-            }
-        }
-        row
     }
 }
 
@@ -437,7 +447,13 @@ impl SearchPanel {
     pub fn unavailable(&mut self) {
         self.pending = None;
         self.results = None;
-        self.notice = Some("Search worker closed; Esc returns to live execution.".into());
+        self.notice = Some(
+            tr(
+                "Search worker closed; Esc returns to live execution.",
+                "搜索后台已关闭；按 Esc 返回实时执行。",
+            )
+            .into(),
+        );
     }
 
     pub fn updated(&mut self, service: &SearchHandle) {
@@ -517,7 +533,7 @@ impl SearchPanel {
     }
 
     pub fn reject_paste(&mut self) {
-        self.notice = Some(super::PASTE_REJECTED.into());
+        self.notice = Some(super::paste_rejected().into());
     }
 
     fn insert(&mut self, text: &str) {
@@ -526,7 +542,13 @@ impl SearchPanel {
             self.editor().insert(&text);
             self.invalidate();
         } else {
-            self.notice = Some("Search field limited to 1024 UTF-8 bytes.".into());
+            self.notice = Some(
+                tr(
+                    "Search field limited to 1024 UTF-8 bytes.",
+                    "搜索框最多 1024 个 UTF-8 字节。",
+                )
+                .into(),
+            );
         }
     }
 
@@ -700,8 +722,11 @@ impl SearchPanel {
                     let hit = results.tool_hits.get(self.selected - message_hits)?;
                     if !tool_search::valid(hit, &current.tool_details) {
                         self.notice = Some(
-                            "Selected tool content changed or was evicted. Press r to refresh."
-                                .into(),
+                            tr(
+                                "Selected tool content changed or was evicted. Press r to refresh.",
+                                "所选工具内容已变化或已被清出，按 r 刷新。",
+                            )
+                            .into(),
                         );
                         return None;
                     }
@@ -722,8 +747,13 @@ impl SearchPanel {
                     text: message.text.clone(),
                 };
                 if !current.messages.iter().any(|m| focus.matches(m)) {
-                    self.notice =
-                        Some("Selected content changed or was evicted. Press r to refresh.".into());
+                    self.notice = Some(
+                        tr(
+                            "Selected content changed or was evicted. Press r to refresh.",
+                            "所选内容已变化或已被清出，按 r 刷新。",
+                        )
+                        .into(),
+                    );
                     return None;
                 }
                 self.close();
@@ -736,6 +766,7 @@ impl SearchPanel {
 
     pub fn draw(&self, frame: &mut ratatui::Frame<'_>, area: Rect, current: &CoreSnapshot) {
         frame.render_widget(Clear, area);
+        let theme = theme::current();
         if let Some(opened) = &self.opened_tool {
             let hit = tool_search::Hit {
                 locator: opened.locator.clone(),
@@ -753,15 +784,30 @@ impl SearchPanel {
                     self.notice.as_deref(),
                 );
             } else {
-                frame.render_widget(Clear, area);
                 frame.render_widget(
-                    Paragraph::new("Selected tool search hit changed or was evicted. Press Esc to return to results.")
-                        .block(Block::default().borders(Borders::ALL).title(" Tool search hit expired ")),
+                    Paragraph::new(wrap_segments(
+                        &[(
+                            tr(
+                                "Selected tool search hit changed or was evicted. Press Esc to return to results.",
+                                "所选的工具搜索命中已变化或已被清出，按 Esc 返回结果。",
+                            )
+                            .to_owned(),
+                            Tone::Warning.style(theme),
+                        )],
+                        area.width.saturating_sub(2) as usize,
+                    ))
+                    .block(
+                        theme::panel()
+                            .borders(Borders::ALL)
+                            .title(tr(" Tool search hit expired ", " 工具搜索命中已失效 ")),
+                    ),
                     area,
                 );
             }
             return;
         }
+        // One themed surface, so the panel matches the framed panels around it.
+        frame.render_widget(theme::panel(), area);
         let query_height = area.height.min(3);
         let editor = if self.turn_field {
             &self.turn
@@ -777,15 +823,24 @@ impl SearchPanel {
         let cursor = left.width();
         frame.render_widget(
             Paragraph::new(format!("{left}{}", &editor.text[editor.cursor..])).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(if self.turn_field {
-                        " Search: exact turn ID "
-                    } else if self.filter.content != ContentScope::Messages {
-                        " Search: retained tool details "
-                    } else {
-                        " Search: literal text "
-                    }),
+                // The accent frame follows keyboard focus: typing goes here only
+                // while editing; in result mode keys move through the hits.
+                if self.editing {
+                    theme::focus_panel()
+                } else {
+                    theme::panel()
+                }
+                .borders(Borders::ALL)
+                .title(if self.turn_field {
+                    tr(" Search: exact turn ID ", " 搜索：精确轮次 ID ")
+                } else if self.filter.content != ContentScope::Messages {
+                    tr(
+                        " Search: retained tool details ",
+                        " 搜索：已保留的工具详情 ",
+                    )
+                } else {
+                    tr(" Search: literal text ", " 搜索：字面文本 ")
+                }),
             ),
             Rect {
                 height: query_height,
@@ -800,60 +855,83 @@ impl SearchPanel {
             height: area.height.saturating_sub(query_height + 1),
             ..area
         };
-        let filters = vec![
-            format!(
-                "mode={} | {:?} | role={:?} | state={:?} | tool={:?}/{:?}",
-                match self.filter.content {
-                    ContentScope::Messages => "messages",
-                    ContentScope::Tools => "tools",
-                    ContentScope::Both => "messages + tools",
-                },
-                self.filter.scope,
-                self.filter.role,
-                self.filter.state,
-                self.filter.tool_category,
-                self.filter.tool_lifecycle
-            ),
-            format!(
-                "Thread: {} | turn: {}",
-                self.filter.thread,
-                if self.turn.text.is_empty() {
-                    "all"
-                } else {
-                    &self.turn.text
-                }
-            ),
-        ];
-        let mut rows = Vec::new();
+        let body_width = body.width as usize;
+        let value = Style::default().fg(theme.foreground);
+        let quiet = |text: String| vec![(text, theme.secondary())];
+        let warning = |text: &str| vec![(text.to_owned(), Tone::Warning.style(theme))];
+        let row = |segments: Vec<Segment>| wrap_segments(&segments, body_width);
+        let zh = lang::zh();
+        let mode = match self.filter.content {
+            ContentScope::Messages => tr("messages", "消息"),
+            ContentScope::Tools => tr("tools", "工具"),
+            ContentScope::Both => tr("messages + tools", "消息 + 工具"),
+        };
+        let turn_filter = if self.turn.text.is_empty() {
+            tr("all", "全部")
+        } else {
+            &self.turn.text
+        };
+        let filters = if zh {
+            [
+                format!(
+                    "模式={mode} | 范围={} | 角色={} | 状态={} | 工具={}/{}",
+                    scope_text(self.filter.scope),
+                    self.filter.role.label(),
+                    self.filter.state.label(),
+                    self.filter.tool_category.label(),
+                    self.filter.tool_lifecycle.label()
+                ),
+                format!("线程：{} | 轮次：{turn_filter}", self.filter.thread),
+            ]
+        } else {
+            [
+                format!(
+                    "mode={mode} | {:?} | role={:?} | state={:?} | tool={:?}/{:?}",
+                    self.filter.scope,
+                    self.filter.role,
+                    self.filter.state,
+                    self.filter.tool_category,
+                    self.filter.tool_lifecycle
+                ),
+                format!("Thread: {} | turn: {turn_filter}", self.filter.thread),
+            ]
+        };
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(notice) = &self.notice {
+            lines.extend(row(warning(notice)));
+        }
         if self.help {
-            rows.extend(
-                [
-                    "Ctrl+F or /: edit query",
-                    "Ctrl+T: exact turn filter",
-                    "Enter: search/open; Esc: close (drafts kept)",
-                    "Tab: thread/subtree/path/all agents",
-                    "F6: role filter",
-                    "F7: state filter",
-                    "F5: messages/tools/both; F8 category; F9 lifecycle",
-                    "Up/Down or N/n: previous/next retained hit",
-                    "PgUp/Dn: scroll one row",
-                    "Ctrl+Home/End: first/last",
-                    "r: refresh retained messages",
-                    "F2: pending requests",
-                    "Ctrl+C: interrupt root",
-                    "Ctrl+Q: quit",
-                    "Literal, case-sensitive Unicode; no regex",
-                    "Only retained messages or live tool details are searched",
-                    "Queries and results are never saved to journal",
-                ]
-                .into_iter()
-                .map(String::from),
-            );
+            let help = if zh { HELP_ZH } else { HELP };
+            for (index, line) in help.iter().enumerate() {
+                // Key rows read `keys: action`; the remaining rows are notes.
+                lines.extend(row(
+                    match help_parts(line).filter(|_| index < HELP_KEY_ROWS) {
+                        Some((keys, action)) => {
+                            vec![(keys.to_owned(), theme.key()), (action.to_owned(), value)]
+                        }
+                        None => quiet((*line).to_owned()),
+                    },
+                ));
+            }
         } else if self.editing {
-            rows.push("Enter searches. F1 shows controls.".into());
-            rows.extend(filters.clone());
+            lines.extend(row(quiet(
+                tr(
+                    "Enter searches. F1 shows controls.",
+                    "按 Enter 搜索，F1 查看按键说明。",
+                )
+                .into(),
+            )));
+            for filter in filters {
+                lines.extend(row(quiet(filter)));
+            }
         } else if self.pending.is_some() || self.submit || self.cancel {
-            rows.push("Searching; old results disabled.".into());
+            lines.extend(row(quiet(
+                tr(
+                    "Searching; old results disabled.",
+                    "搜索中，旧结果暂不可用。",
+                )
+                .into(),
+            )));
         } else if let Some(results) = &self.results {
             let message_count = results.message_hits();
             let tool_count = results.tool_hits();
@@ -867,138 +945,181 @@ impl SearchPanel {
             } else {
                 results.tool_total
             });
-            rows.push(format!(
-                "Hit {}/{} | {} total",
-                if total_count == 0 {
-                    0
-                } else {
-                    self.selected + 1
-                },
-                total_count,
-                total
-            ));
-            rows.extend(filters);
-            rows.push(format!(
-                "Snapshot {}{}",
+            let position = if total_count == 0 {
+                0
+            } else {
+                self.selected + 1
+            };
+            lines.extend(row(quiet(if zh {
+                format!("命中 {position}/{total_count} | 共 {total} 条")
+            } else {
+                format!("Hit {position}/{total_count} | {total} total")
+            })));
+            for filter in filters {
+                lines.extend(row(quiet(filter)));
+            }
+            lines.extend(row(quiet(format!(
+                "{} {}{}",
+                tr("Snapshot", "快照"),
                 results.snapshot_version,
                 if results.snapshot_version != current.version {
-                    " (fixed; r refreshes)"
+                    tr(" (fixed; r refreshes)", "（已固定，按 r 刷新）")
                 } else {
                     ""
                 }
-            ));
+            ))));
+            // The hit list carries the `before⟦match⟧after` preview of each hit.
+            lines.extend(self.hit_list(results, current, body_width, theme));
             if self.selected >= message_count && tool_count > 0 {
                 let hit = &results.tool_hits[self.selected - message_count];
-                rows.push(format!(
-                    "Tool {:?} | UTF-8 bytes {}..{} | revision {}",
-                    hit.field, hit.range.start, hit.range.end, hit.revision
-                ));
-                let detail = current.tool_details.get(&hit.locator);
-                if tool_search::valid(hit, &current.tool_details) {
-                    if let Some(detail) = detail {
-                        let text = hit.field.text(&detail).unwrap_or_default();
-                        let before: String = text[..hit.range.start]
-                            .graphemes(true)
-                            .rev()
-                            .take(6)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        let after: String =
-                            text[hit.range.end..].graphemes(true).take(32).collect();
-                        rows.push(format!("{before}⟦{}⟧{after}", results.filter.text));
-                        rows.push(format!(
-                            "Category: {:?} | lifecycle: {:?}",
-                            detail.category, detail.lifecycle
-                        ));
-                    }
-                    rows.push(format!(
-                        "Thread: {} | turn: {} | item: {}",
-                        hit.locator
-                            .identity
-                            .thread_id
-                            .as_deref()
-                            .unwrap_or("unavailable"),
-                        hit.locator
-                            .identity
-                            .turn_id
-                            .as_deref()
-                            .unwrap_or("unavailable"),
-                        hit.locator.item_id
-                    ));
-                    rows.push("Enter opens this retained tool detail.".into());
+                lines.extend(row(quiet(if zh {
+                    format!(
+                        "工具 {} | UTF-8 字节 {}..{} | 修订 {}",
+                        hit.field.label(),
+                        hit.range.start,
+                        hit.range.end,
+                        hit.revision
+                    )
                 } else {
-                    rows.push(
-                        "Live tool content changed/evicted; opening disabled until refresh.".into(),
-                    );
+                    format!(
+                        "Tool {:?} | UTF-8 bytes {}..{} | revision {}",
+                        hit.field, hit.range.start, hit.range.end, hit.revision
+                    )
+                })));
+                if tool_search::valid(hit, &current.tool_details) {
+                    if let Some(detail) = current.tool_details.get(&hit.locator) {
+                        lines.extend(row(field_segments(
+                            theme,
+                            &[
+                                Field::new("Category", format!("{:?}", detail.category)).zh("类别"),
+                                Field::new("lifecycle", format!("{:?}", detail.lifecycle))
+                                    .zh("生命周期")
+                                    .zh_value(lifecycle_zh(detail.lifecycle))
+                                    .tone(Tone::Lifecycle(detail.lifecycle)),
+                            ],
+                            " | ",
+                        )));
+                    }
+                    lines.extend(row(field_segments(
+                        theme,
+                        &[
+                            Field::optional("Thread", hit.locator.identity.thread_id.as_deref())
+                                .zh("线程"),
+                            Field::optional("turn", hit.locator.identity.turn_id.as_deref())
+                                .zh("轮次"),
+                            Field::new("item", hit.locator.item_id.clone()).zh("条目"),
+                        ],
+                        " | ",
+                    )));
+                    lines.extend(row(quiet(
+                        tr(
+                            "Enter opens this retained tool detail.",
+                            "按 Enter 打开这条已保留的工具详情。",
+                        )
+                        .into(),
+                    )));
+                } else {
+                    lines.extend(row(warning(tr(
+                        "Live tool content changed/evicted; opening disabled until refresh.",
+                        "工具内容已变化或已被清出，刷新前不能打开。",
+                    ))));
                 }
             } else if self.selected < message_count {
                 let hit = &results.hits[self.selected];
                 let message = &results.source.as_ref().unwrap().messages[hit.message];
-                let before: String = message.text[..hit.range.start]
-                    .graphemes(true)
-                    .rev()
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                let after: String = message.text[hit.range.end..]
-                    .graphemes(true)
-                    .take(32)
-                    .collect();
-                rows.push(format!("{before}⟦{}⟧{after}", results.filter.text));
-                rows.push(format!(
-                    "Hit {} | {} | {}",
+                lines.extend(row(quiet(format!(
+                    "{} {} | {} | {}",
+                    tr("Hit", "命中"),
                     self.selected + 1,
-                    message.role,
+                    role_text(&message.role),
                     if message.complete {
-                        "complete"
+                        tr("complete", "已完成")
                     } else {
-                        "streaming"
+                        tr("streaming", "输出中")
                     }
-                ));
-                rows.push(format!(
-                    "Thread: {}\nTurn: {}\nItem: {}\nUTF-8 bytes: {}..{}",
-                    message.thread_id,
+                ))));
+                for field in [
+                    Field::new("Thread", message.thread_id.clone()).zh("线程"),
                     if message.turn_id.is_empty() {
-                        "unbound"
+                        Field::new("Turn", "unbound").zh_value("未绑定")
                     } else {
-                        &message.turn_id
-                    },
-                    message.id,
-                    hit.range.start,
-                    hit.range.end
-                ));
+                        Field::new("Turn", message.turn_id.clone())
+                    }
+                    .zh("轮次"),
+                    Field::new("Item", message.id.clone()).zh("条目"),
+                    Field::new(
+                        "UTF-8 bytes",
+                        format!("{}..{}", hit.range.start, hit.range.end),
+                    )
+                    .zh("UTF-8 字节")
+                    .tone(Tone::Quiet),
+                ] {
+                    lines.extend(row(field_segments(theme, &[field], " | ")));
+                }
                 if !current
                     .messages
                     .iter()
                     .any(|m| MessageKey::of(message).matches(m) && m.text == message.text)
                 {
-                    rows.push(
-                        "Live content changed/evicted; opening disabled until refresh.".into(),
-                    );
+                    lines.extend(row(warning(tr(
+                        "Live content changed/evicted; opening disabled until refresh.",
+                        "内容已变化或已被清出，刷新前不能打开。",
+                    ))));
                 }
-                rows.push(format!("Match: {}", results.filter.text));
-                rows.push("--- retained message ---".into());
-                rows.push(message.text.clone());
+                lines.extend(row(field_segments(
+                    theme,
+                    &[Field::new("Match", results.filter.text.clone()).zh("命中")],
+                    " | ",
+                )));
+                lines.push(Line::default());
+                lines.extend(row(vec![(
+                    tr("--- retained message ---", "--- 已保留的消息 ---").to_owned(),
+                    theme.heading(),
+                )]));
+                // The message stays verbatim; only the located match is emphasized.
+                lines.extend(row(vec![
+                    (message.text[..hit.range.start].to_owned(), value),
+                    (
+                        message.text[hit.range.clone()].to_owned(),
+                        match_style(theme),
+                    ),
+                    (message.text[hit.range.end..].to_owned(), value),
+                ]));
             } else {
-                rows.push("No matches in the selected retained content.".into());
+                lines.extend(row(vec![(
+                    tr(
+                        "No matches in the selected retained content.",
+                        "所选的已保留内容里没有命中。",
+                    )
+                    .to_owned(),
+                    value,
+                )]));
+                let mut next = quiet(tr("Next: ", "接下来：").into());
+                next.extend(
+                    theme::hints(tr(
+                        "/ edit query | Tab widen scope | F5 switch mode | r refresh",
+                        "/ 编辑查询 | Tab 扩大范围 | F5 切换模式 | r 刷新",
+                    ))
+                    .spans
+                    .into_iter()
+                    .map(|span| (span.content.into_owned(), span.style)),
+                );
+                lines.extend(row(next));
             }
             if total > HIT_LIMIT {
-                rows.push("Result limit reached: narrow query or filters.".into());
+                lines.extend(row(warning(tr(
+                    "Result limit reached: narrow query or filters.",
+                    "已达结果上限：请缩小查询或筛选条件。",
+                ))));
             }
             if results.source.as_ref().is_some_and(|source| {
                 source.history_truncated || source.messages.iter().any(|m| m.truncated)
             }) {
-                rows.push("Older content unavailable.".into());
+                lines.extend(row(quiet(
+                    tr("Older content unavailable.", "更早的内容不可用。").into(),
+                )));
             }
         }
-        if let Some(notice) = &self.notice {
-            rows.insert(0, notice.clone());
-        }
-        let lines: Vec<_> = rows.iter().flat_map(|row| wrap(row, width)).collect();
         let height = body.height as usize;
         let start = self.scroll.min(lines.len().saturating_sub(height));
         frame.render_widget(
@@ -1007,21 +1128,39 @@ impl SearchPanel {
                     .into_iter()
                     .skip(start)
                     .take(height)
-                    .map(Line::from)
                     .collect::<Vec<_>>(),
-            )
-            .style(Style::default().fg(Color::Cyan)),
+            ),
             body,
         );
         if area.height > query_height {
+            let hints: Vec<&str> = if self.editing {
+                vec![
+                    tr(
+                        "Enter search | Esc close | F1 help",
+                        "Enter 搜索 | Esc 关闭 | F1 帮助",
+                    ),
+                    tr("Enter search | Esc close", "Enter 搜索 | Esc 关闭"),
+                    tr("Esc close", "Esc 关闭"),
+                ]
+            } else {
+                vec![
+                    tr(
+                        "Enter open | F5 mode | Esc close | F1 help",
+                        "Enter 打开 | F5 模式 | Esc 关闭 | F1 帮助",
+                    ),
+                    tr(
+                        "Enter open | Esc close | F1 help",
+                        "Enter 打开 | Esc 关闭 | F1 帮助",
+                    ),
+                    tr("Enter open | Esc close", "Enter 打开 | Esc 关闭"),
+                    tr("Esc close", "Esc 关闭"),
+                ]
+            };
             frame.render_widget(
-                Paragraph::new(if self.editing {
-                    "Enter search  Esc close  F1 help"
-                } else if self.opened_tool.is_some() {
-                    "Esc back  PgUp/PgDn scroll"
-                } else {
-                    "Enter open  F5 mode  Esc close  F1 help"
-                }),
+                Paragraph::new(
+                    fit_hints(&hints, area.width as usize)
+                        .unwrap_or_else(|| theme::hints(hints[hints.len() - 1])),
+                ),
                 Rect {
                     y: area.y + area.height - 1,
                     height: 1,
@@ -1030,7 +1169,183 @@ impl SearchPanel {
             );
         }
     }
+
+    /// A short window of hits around the selection. Each row is
+    /// `marker number origin  before⟦match⟧after`; the prefix width is taken
+    /// out of the wrap width so no preview is cut by the right edge.
+    fn hit_list(
+        &self,
+        results: &Results,
+        current: &CoreSnapshot,
+        width: usize,
+        theme: Theme,
+    ) -> Vec<Line<'static>> {
+        let count = results.count();
+        let message_count = results.message_hits();
+        let digits = count.to_string().len();
+        let first = self
+            .selected
+            .saturating_sub(HIT_WINDOW / 2)
+            .min(count.saturating_sub(HIT_WINDOW));
+        let value = Style::default().fg(theme.foreground);
+        let mut lines = Vec::new();
+        for index in first..(first + HIT_WINDOW).min(count) {
+            let selected = index == self.selected;
+            // `>` marks the selection without color.
+            let prefix = format!(
+                "{} {:>digits$} ",
+                if selected { ">" } else { " " },
+                index + 1
+            );
+            let room = width.saturating_sub(prefix.width()).max(1);
+            let (origin, context) = if index < message_count {
+                let hit = &results.hits[index];
+                let Some(message) = results
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.messages.get(hit.message))
+                else {
+                    continue;
+                };
+                (
+                    role_text(&message.role).to_owned(),
+                    Some(hit_context(&message.text, &hit.range)),
+                )
+            } else {
+                let hit = &results.tool_hits[index - message_count];
+                let context = tool_search::valid(hit, &current.tool_details)
+                    .then(|| current.tool_details.get(&hit.locator))
+                    .flatten()
+                    .and_then(|detail| {
+                        hit.field
+                            .text(&detail)
+                            .map(|text| hit_context(text, &hit.range))
+                    });
+                (
+                    format!("{} {}", tr("Tool", "工具"), hit.field.label()),
+                    context,
+                )
+            };
+            let found = format!("⟦{}⟧", results.filter.text);
+            let preview: Vec<Segment> = match context {
+                Some((before, after)) => vec![
+                    (format!("{origin}  "), theme.secondary()),
+                    (before, value),
+                    (found, match_style(theme)),
+                    (after, value),
+                ],
+                None => vec![(
+                    format!("{origin}  {}", tr("changed or evicted", "已变化或已被清出")),
+                    theme.secondary(),
+                )],
+            };
+            if selected {
+                let text: String = preview.iter().map(|(text, _)| text.as_str()).collect();
+                let rows = wrap_segments(&[(text, theme.selected())], room);
+                for (row, line) in rows.into_iter().enumerate() {
+                    let lead = if row == 0 {
+                        prefix.clone()
+                    } else {
+                        " ".repeat(prefix.width())
+                    };
+                    let fill = width.saturating_sub(prefix.width() + line.width());
+                    let mut spans = vec![Span::styled(lead, theme.selected())];
+                    spans.extend(line.spans);
+                    // Padding makes the selection read as a full row.
+                    spans.push(Span::styled(" ".repeat(fill), theme.selected()));
+                    lines.push(Line::from(spans));
+                }
+            } else {
+                // Other hits stay on one row; `…` says the preview continues.
+                let flat: Vec<Segment> = preview
+                    .into_iter()
+                    .map(|(text, style)| (text.replace(['\n', '\t'], " "), style))
+                    .collect();
+                let mut rows = wrap_segments(&flat, room);
+                let clipped = rows.len() > 1;
+                if clipped {
+                    rows = wrap_segments(&flat, room.saturating_sub(1).max(1));
+                }
+                let mut spans = vec![Span::styled(prefix, theme.secondary())];
+                spans.extend(rows.swap_remove(0).spans);
+                if clipped {
+                    spans.push(Span::styled("…", theme.secondary()));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        lines
+    }
 }
+
+/// Hits listed around the selection.
+const HIT_WINDOW: usize = 5;
+
+/// The located match inside retained text; brackets or underline keep it
+/// visible without color.
+fn match_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+}
+
+/// Up to 6 graphemes before and 32 after a hit, for a one-line preview.
+fn hit_context(text: &str, range: &Range<usize>) -> (String, String) {
+    let before: String = text[..range.start]
+        .graphemes(true)
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after: String = text[range.end..].graphemes(true).take(32).collect();
+    (before, after)
+}
+
+/// The first rows of `HELP` are `keys: action`; the rest are notes.
+const HELP_KEY_ROWS: usize = 14;
+
+const HELP: &[&str] = &[
+    "Ctrl+F or /: edit query",
+    "Ctrl+T: exact turn filter",
+    "Enter: search/open; Esc: close (drafts kept)",
+    "Tab: thread/subtree/path/all agents",
+    "F6: role filter",
+    "F7: state filter",
+    "F5: messages/tools/both; F8 category; F9 lifecycle",
+    "Up/Down or N/n: previous/next retained hit",
+    "PgUp/Dn: scroll one row",
+    "Ctrl+Home/End: first/last",
+    "r: refresh retained messages",
+    "F2: pending requests",
+    "Ctrl+C: interrupt root",
+    "Ctrl+Q: quit",
+    "Literal, case-sensitive Unicode; no regex",
+    "Only retained messages or live tool details are searched",
+    "Queries and results are never saved to journal",
+];
+
+/// Same rows as `HELP`; key rows read `keys：action`.
+const HELP_ZH: &[&str] = &[
+    "Ctrl+F 或 /：编辑查询",
+    "Ctrl+T：按精确轮次筛选",
+    "Enter：搜索/打开；Esc：关闭（保留草稿）",
+    "Tab：线程/子树/路径/全部 Agent",
+    "F6：角色筛选",
+    "F7：状态筛选",
+    "F5：消息/工具/两者；F8 类别；F9 生命周期",
+    "Up/Down 或 N/n：上一个/下一个已保留的命中",
+    "PgUp/Dn：滚动一行",
+    "Ctrl+Home/End：到开头/到末尾",
+    "r：刷新已保留的消息",
+    "F2：待处理的请求",
+    "Ctrl+C：中断根 Agent",
+    "Ctrl+Q：退出",
+    "按字面匹配，区分大小写，支持 Unicode；不支持正则",
+    "只搜索已保留的消息和实时工具详情",
+    "查询和结果不会写入 journal",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1320,7 +1635,8 @@ mod tests {
                 offset: text.find(query).unwrap(),
                 text: text.into(),
             };
-            assert_eq!(focus.row(width), expected, "{text:?}");
+            // 焦点到显示行的映射由 `conversation::transcript` 负责并在那里测试。
+            let _ = (width, expected);
             assert!(focus.matches(&item));
             assert!(!focus.matches(&message("child", "one", "same", text)));
             assert!(!focus.matches(&message("root", "two", "same", text)));
@@ -1746,5 +2062,241 @@ mod tests {
             .collect();
         assert!(!text.contains("line 54"));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Screen rows of a rendered panel; fixtures here use single-width characters.
+    fn screen(
+        panel: &SearchPanel,
+        current: &CoreSnapshot,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, Vec<String>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| panel.draw(frame, frame.area(), current))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (buffer, rows)
+    }
+
+    /// Position of the first cell showing `needle`.
+    fn cell_of(rows: &[String], needle: &str) -> (u16, u16) {
+        for (y, row) in rows.iter().enumerate() {
+            if let Some(index) = row.find(needle) {
+                return (row[..index].chars().count() as u16, y as u16);
+            }
+        }
+        panic!("{needle:?} not rendered in {rows:#?}");
+    }
+
+    /// The parts of a cell style that carry hierarchy.
+    fn look(
+        cell: &ratatui::buffer::Cell,
+    ) -> (
+        ratatui::style::Color,
+        ratatui::style::Color,
+        ratatui::style::Modifier,
+    ) {
+        (cell.fg, cell.bg, cell.modifier)
+    }
+
+    fn selected_look() -> (
+        ratatui::style::Color,
+        ratatui::style::Color,
+        ratatui::style::Modifier,
+    ) {
+        let style = theme::current().selected();
+        (
+            style.fg.unwrap_or_default(),
+            style.bg.unwrap_or_default(),
+            style.add_modifier,
+        )
+    }
+
+    async fn result_panel(source: &Arc<CoreSnapshot>, query: &str, selected: usize) -> SearchPanel {
+        let filter = Filter {
+            text: query.into(),
+            thread: "root".into(),
+            ..Default::default()
+        };
+        SearchPanel {
+            visible: true,
+            filter: filter.clone(),
+            selected,
+            results: Some(Arc::new(found(source.clone(), filter).await)),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn query_box_frame_follows_focus_and_hints_fit_the_width() {
+        let theme = theme::current();
+        let source = Arc::new(CoreSnapshot {
+            thread_id: Some("root".into()),
+            messages: vec![message("root", "turn", "item", "needle")],
+            ..Default::default()
+        });
+        let mut panel = SearchPanel::default();
+        panel.open("root".into());
+        let (buffer, rows) = screen(&panel, &source, 60, 12);
+        // Editing: the rounded accent frame marks where typing goes.
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(0, 0)].fg, theme.accent);
+        assert!(rows[0].contains(" Search: literal text "));
+        assert_eq!(
+            rows[11].trim_end(),
+            "Enter search  ·  Esc close  ·  F1 help"
+        );
+        assert!(buffer[(0, 11)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(6, 11)].modifier.contains(Modifier::BOLD));
+        let (x, y) = cell_of(&rows, "Enter searches. F1 shows controls.");
+        assert_eq!(buffer[(x, y)].fg, theme.muted);
+
+        // Result mode: keys move through hits, so the box drops the focus frame.
+        let panel = result_panel(&source, "needle", 0).await;
+        let (buffer, rows) = screen(&panel, &source, 60, 12);
+        assert_eq!(buffer[(0, 0)].symbol(), "┌");
+        assert_eq!(buffer[(0, 0)].fg, theme.border);
+        assert_eq!(
+            rows[11].trim_end(),
+            "Enter open  ·  F5 mode  ·  Esc close  ·  F1 help"
+        );
+        for (width, expected) in [
+            (40, "Enter open  ·  Esc close  ·  F1 help"),
+            (30, "Enter open  ·  Esc close"),
+        ] {
+            let (_, rows) = screen(&panel, &source, width, 12);
+            assert_eq!(rows[11].trim_end(), expected, "{width}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hit_list_marks_the_selection_and_counters_stay_secondary() {
+        let theme = theme::current();
+        let source = Arc::new(CoreSnapshot {
+            thread_id: Some("root".into()),
+            messages: vec![
+                message("root", "turn", "a", "first needle here"),
+                message("root", "turn", "b", "second needle there"),
+                message("root", "turn", "c", "third needle\nnext line"),
+            ],
+            ..Default::default()
+        });
+        let panel = result_panel(&source, "needle", 1).await;
+        let (buffer, rows) = screen(&panel, &source, 80, 24);
+
+        // Counters and filters are metadata.
+        for text in ["Hit 2/3 | 3 total", "mode=messages", "Snapshot 0"] {
+            let (x, y) = cell_of(&rows, text);
+            assert_eq!(buffer[(x, y)].fg, theme.muted, "{text}");
+            assert!(!buffer[(x, y)].modifier.contains(Modifier::BOLD), "{text}");
+        }
+
+        // The selected hit: `>` marker and one full-width selected row.
+        let (x, y) = cell_of(&rows, "> 2 Agent  econd ⟦needle⟧ there");
+        assert_eq!(x, 0);
+        for column in [0, 12, 40, 79] {
+            assert_eq!(look(&buffer[(column, y)]), selected_look(), "{column}");
+        }
+        // Other hits: one row each, match emphasized, never the selected style.
+        for (text, bracket) in [
+            ("  1 Agent  first ⟦needle⟧ here", 17),
+            ("  3 Agent  third ⟦needle⟧ next line", 17),
+        ] {
+            let (x, y) = cell_of(&rows, text);
+            assert_eq!(x, 0);
+            assert_eq!(buffer[(4, y)].fg, theme.muted, "{text}");
+            assert_eq!(buffer[(11, y)].fg, theme.foreground, "{text}");
+            let found = &buffer[(bracket, y)];
+            assert_eq!(found.symbol(), "⟦");
+            assert_eq!(found.fg, theme.accent);
+            assert!(found.modifier.contains(Modifier::UNDERLINED));
+            assert!(!buffer[(11, y)].modifier.contains(Modifier::REVERSED));
+            assert_ne!(look(&buffer[(0, y)]), selected_look(), "{text}");
+            assert_ne!(look(&buffer[(79, y)]), selected_look(), "{text}");
+        }
+
+        // Details: labels lead, values are plain, the section heading stands out.
+        let (x, y) = cell_of(&rows, "Turn: turn");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(x + 6, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(x + 6, y)].fg, theme.foreground);
+        let (x, y) = cell_of(&rows, "--- retained message ---");
+        assert!(rows[y as usize - 1].trim().is_empty());
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+        // The retained message is plain text with only the match emphasized.
+        let (x, y) = cell_of(&rows, "second needle there");
+        assert_eq!(buffer[(x, y)].fg, theme.foreground);
+        assert!(!buffer[(x, y)].modifier.contains(Modifier::BOLD));
+        assert!(buffer[(x + 7, y)]
+            .modifier
+            .contains(Modifier::UNDERLINED | Modifier::BOLD));
+        assert!(!buffer[(x + 14, y)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[tokio::test]
+    async fn selected_hit_wraps_inside_its_prefix_without_losing_text() {
+        let source = Arc::new(CoreSnapshot {
+            thread_id: Some("root".into()),
+            messages: vec![message(
+                "root",
+                "turn",
+                "a",
+                "0123456789 needle abcdefghijklmnopqrstuvwxyz0123456789",
+            )],
+            ..Default::default()
+        });
+        let panel = result_panel(&source, "needle", 0).await;
+        let (buffer, rows) = screen(&panel, &source, 30, 24);
+        let (_, y) = cell_of(&rows, "> 1 Agent  ");
+        let y = y as usize;
+        // 26 cells remain after the 4-cell prefix; continuation rows are indented.
+        assert_eq!(rows[y], "> 1 Agent  56789 ⟦needle⟧ abcd");
+        assert_eq!(rows[y + 1], "    efghijklmnopqrstuvwxyz0123");
+        assert_eq!(rows[y + 2].trim_end(), "    4");
+        let shown: String = rows[y..y + 3]
+            .iter()
+            .map(|row| row.chars().skip(4).collect::<String>())
+            .collect();
+        assert_eq!(
+            shown.trim_end(),
+            "Agent  56789 ⟦needle⟧ abcdefghijklmnopqrstuvwxyz01234"
+        );
+        for row in y..y + 3 {
+            assert_eq!(look(&buffer[(29, row as u16)]), selected_look());
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_results_name_the_next_steps() {
+        let theme = theme::current();
+        let source = Arc::new(CoreSnapshot {
+            thread_id: Some("root".into()),
+            messages: vec![message("root", "turn", "a", "nothing relevant")],
+            ..Default::default()
+        });
+        let panel = result_panel(&source, "absent", 0).await;
+        let (buffer, rows) = screen(&panel, &source, 100, 16);
+        let text = rows.join("\n");
+        assert!(text.contains("Hit 0/0 | 0 total"), "{text}");
+        let (x, y) = cell_of(&rows, "No matches in the selected retained content.");
+        assert_eq!(buffer[(x, y)].fg, theme.foreground);
+        let (x, next) = cell_of(
+            &rows,
+            "Next: / edit query  ·  Tab widen scope  ·  F5 switch mode  ·  r refresh",
+        );
+        assert_eq!(next, y + 1);
+        assert_eq!(buffer[(x, next)].fg, theme.muted);
+        // Keys are emphasized; their labels stay quiet.
+        assert!(buffer[(x + 6, next)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(x + 8, next)].modifier.contains(Modifier::BOLD));
+        // Narrow widths wrap the hint instead of cutting it.
+        let (_, rows) = screen(&panel, &source, 30, 16);
+        let text = rows.join("");
+        assert!(text.contains("r refresh"), "{rows:#?}");
     }
 }

@@ -35,7 +35,7 @@ if stage == "version":
     if mode == "peer_version_bad" and stages.count('version') > 1:
         print("PRIVATE_PEER_BANNER")
     elif mode == "version_bad":
-        print("codex-cli 0.161.00")
+        print("codex-cli")
     elif mode == "version_private":
         print("PRIVATE_BANNER 0.161.0")
     elif mode == "version_large":
@@ -109,7 +109,7 @@ try:
                 response["result"] = {"userAgent": "PRIVATE_METADATA"}
             send(response)
         elif method == "thread/start":
-            send({"id": message["id"], "result": {"thread": {"id": "root", "cliVersion": "PRIVATE_VERSION" if mode == "thread_version_bad" else "0.161.0"}, "model": "fixture-model"}})
+            send({"id": message["id"], "result": {"thread": {"id": " " if mode == "thread_identity_bad" else "root", "cliVersion": "0.161.0"}, "model": "fixture-model"}})
         elif method == "command/exec":
             send({"id": message["id"], "result": {"exitCode": 1 if mode == "peer_shell_bad" and is_peer else 0, "stdout": "native-agent-tui-shell-ok"}})
         elif method == "turn/start":

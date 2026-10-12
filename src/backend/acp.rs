@@ -27,7 +27,8 @@ pub(crate) struct AcpProcess {
     pub bridge: JoinHandle<()>,
 }
 
-pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
+/// One dsh process with its transport and stderr drain.
+fn launch(config: &Config) -> std::io::Result<(PipeTransport, Child, JoinHandle<()>)> {
     let mut command = Command::new(&config.dsh_executable);
     command
         .args(["--profile", config.acp_profile.as_str()])
@@ -49,17 +50,143 @@ pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
         let mut buffer = [0; 8192];
         while matches!(stderr.read(&mut buffer).await, Ok(n) if n > 0) {}
     });
+    Ok((PipeTransport::new(stdout, stdin), child, stderr))
+}
+
+/// A dsh process started by a configuration reload. The bridge owns it; the
+/// first process stays with `AppServer` and exits when its input closes.
+struct Replacement {
+    child: Child,
+    stderr: JoinHandle<()>,
+}
+
+impl Replacement {
+    /// The transport writer is already closed; wait briefly, then end the tree.
+    async fn stop(mut self) {
+        let exited =
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await;
+        #[cfg(windows)]
+        let _ = self.child.shutdown_tree().await;
+        if exited.is_err() {
+            let _ = self.child.kill().await;
+        }
+        self.stderr.abort();
+    }
+}
+
+/// Waits for the response to `id`, declining anything the agent asks meanwhile.
+async fn test_reply(pipe: &mut PipeTransport, id: &RpcId) -> Result<Value, String> {
+    loop {
+        let message = pipe
+            .recv()
+            .await
+            .map_err(|_| "dsh closed the connection".to_owned())?;
+        match (message.method.as_deref(), &message.id) {
+            (None, Some(reply)) if reply == id => {
+                return match message.error {
+                    Some(error) => Err(error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request failed")
+                        .chars()
+                        .take(400)
+                        .collect()),
+                    None => Ok(message.result.unwrap_or(Value::Null)),
+                };
+            }
+            // 测试不批准任何操作。
+            (Some(acp_protocol::SESSION_REQUEST_PERMISSION), Some(request)) => {
+                let _ = pipe.send(with_jsonrpc(Envelope::response(
+                    request.clone(),
+                    Some(json!({"outcome":{"outcome":"cancelled"}})),
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Sends one short prompt through `model` in a session of its own. It proves
+/// that the provider's address, API type and credential work together.
+async fn exercise_model(pipe: &mut PipeTransport, cwd: &str, model: &str) -> Result<(), String> {
+    let failed = |_| "dsh closed the connection".to_owned();
+    let id = |name: &str| RpcId::String(format!("model-test-{name}"));
+    pipe.send(acp_protocol::initialize_request(id("initialize")))
+        .map_err(failed)?;
+    test_reply(pipe, &id("initialize")).await?;
+    pipe.send(acp_protocol::session_new_request(
+        id("session"),
+        cwd,
+        json!([]),
+    ))
+    .map_err(failed)?;
+    let created = test_reply(pipe, &id("session")).await?;
+    let session = acp_protocol::session_id(&created).ok_or("dsh returned no session")?;
+    let choice = acp_protocol::match_model(&acp_protocol::model_choices(&created), model)?;
+    pipe.send(acp_protocol::session_set_config_option(
+        id("model"),
+        &session,
+        "model",
+        Value::String(choice.value),
+    ))
+    .map_err(failed)?;
+    test_reply(pipe, &id("model")).await?;
+    pipe.send(acp_protocol::session_prompt_request(
+        id("prompt"),
+        &session,
+        "Reply with the single word OK.",
+    ))
+    .map_err(failed)?;
+    let finished = test_reply(pipe, &id("prompt")).await?;
+    let _ = pipe.send(acp_protocol::session_close(id("close"), &session));
+    match acp_protocol::stop_reason(&finished) {
+        Some("end_turn" | "completed") => Ok(()),
+        reason => Err(format!(
+            "the model did not finish its reply ({})",
+            reason.unwrap_or("no stop reason")
+        )),
+    }
+}
+
+/// Tests `model` with a separate dsh process, so the running session and its
+/// conversation are untouched. Returns the elapsed milliseconds.
+pub(crate) async fn test_model(config: Config, model: String) -> Result<u64, String> {
+    let (mut pipe, child, stderr) = launch(&config).map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    let cwd = config.cwd.display().to_string();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        exercise_model(&mut pipe, &cwd, &model),
+    )
+    .await
+    .unwrap_or_else(|_| Err("no reply within 90 seconds".into()));
+    let elapsed = started.elapsed().as_millis() as u64;
+    let _ = pipe.close_writer().await;
+    Replacement { child, stderr }.stop().await;
+    outcome.map(|()| elapsed)
+}
+
+/// Starts another agent process for a reload; `None` when it has no child to own.
+type Respawn = Box<dyn FnMut() -> std::io::Result<(PipeTransport, Option<Replacement>)> + Send>;
+
+pub(crate) fn spawn(config: &Config) -> Result<AcpProcess, AcpError> {
+    let (process_pipe, child, stderr) = launch(config)?;
 
     // The Core sees the same bounded JSONL transport it uses for Codex. A
     // duplex pair keeps ACP translation out of Core and preserves writer
     // ownership, queue limits, and EOF semantics at both boundaries.
-    let process_pipe = PipeTransport::new(stdout, stdin);
     let (core_io, bridge_io) = tokio::io::duplex(64 * 1024);
     let (core_read, core_write) = tokio::io::split(core_io);
     let (bridge_read, bridge_write) = tokio::io::split(bridge_io);
     let core_pipe = PipeTransport::new(core_read, core_write);
     let bridge_pipe = PipeTransport::new(bridge_read, bridge_write);
-    let bridge = tokio::spawn(AcpBridge::new(bridge_pipe, process_pipe, config).run());
+    let mut bridge = AcpBridge::new(bridge_pipe, process_pipe, config);
+    let respawn_config = config.clone();
+    bridge.respawn = Some(Box::new(move || {
+        let (pipe, child, stderr) = launch(&respawn_config)?;
+        Ok((pipe, Some(Replacement { child, stderr })))
+    }));
+    let bridge = tokio::spawn(bridge.run());
     Ok(AcpProcess {
         core_pipe,
         child,
@@ -85,6 +212,22 @@ enum Pending {
         session: String,
         label: String,
     },
+    /// 重载配置：新进程已启动，等它的 initialize 响应。
+    ReloadInitialize {
+        core_id: RpcId,
+    },
+    /// 新进程恢复原会话；失败时改为新建会话。
+    ReloadResume {
+        core_id: RpcId,
+    },
+    ReloadNew {
+        core_id: RpcId,
+    },
+    /// 在当前进程里改为继续另一个已保存的会话；失败时原会话不变。
+    Switch {
+        core_id: RpcId,
+        session: String,
+    },
     Prompt,
     Passthrough,
 }
@@ -107,6 +250,16 @@ struct AcpBridge {
     message_text: HashMap<String, String>,
     last_message_id: Option<String>,
     model: Option<String>,
+    /// `model` 来自保存的偏好：agent 不再提供它时沿用 agent 当前模型，不让启动失败。
+    model_is_preference: bool,
+    /// session/new 给出的可选模型；`model/list` 与 `model/select` 只读这份清单。
+    models: Vec<acp_protocol::ModelChoice>,
+    /// 最近一次确认的推理强度；切换模型后用它恢复。
+    reasoning: Option<String>,
+    /// 最近一次确认的模型标签；重载后用它恢复选择。
+    current: Option<String>,
+    respawn: Option<Respawn>,
+    replacement: Option<Replacement>,
     /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
     tool_inputs: HashMap<String, acp_protocol::ToolInput>,
 }
@@ -128,6 +281,12 @@ impl AcpBridge {
             message_text: HashMap::new(),
             last_message_id: None,
             model: config.model.clone(),
+            model_is_preference: config.model_is_preference,
+            models: Vec::new(),
+            reasoning: None,
+            current: None,
+            respawn: None,
+            replacement: None,
             tool_inputs: HashMap::new(),
         }
     }
@@ -144,7 +303,6 @@ impl AcpBridge {
                             if let Some(session) = &self.session_id {
                                 let _ = self.acp.send(acp_protocol::session_close(RpcId::String("shutdown".into()), session));
                             }
-                            let _ = self.acp.close_writer().await;
                             break;
                         }
                     }
@@ -159,6 +317,101 @@ impl AcpBridge {
                 }
             }
         }
+        // 只关闭一次：输入结束后 agent 自行退出，重载启动的进程由这里收尾。
+        let _ = self.acp.close_writer().await;
+        if let Some(replacement) = self.replacement.take() {
+            replacement.stop().await;
+        }
+    }
+
+    /// Replies to Core's thread/start, model/select or backend/reload with the
+    /// session and the model now in effect.
+    fn confirm(
+        &mut self,
+        core_id: RpcId,
+        session: &str,
+        model: Option<String>,
+    ) -> Result<(), TransportError> {
+        self.current = model.clone();
+        self.core.send(Envelope::response(
+            core_id,
+            Some(json!({"thread":{"id":session},"model":model})),
+        ))
+    }
+
+    /// Starts a fresh agent process so edited configuration is read, then
+    /// resumes the session in it. Nothing changes when the new process cannot start.
+    async fn reload(&mut self, core_id: RpcId) -> Result<(), TransportError> {
+        let refusal = if self.session_id.is_none() {
+            Some("ACP session is not ready".to_owned())
+        } else if self.turn_id.is_some() {
+            Some("ACP session has an active prompt".to_owned())
+        } else {
+            None
+        };
+        let started = match (refusal, self.respawn.as_mut()) {
+            (Some(message), _) => Err(message),
+            (None, None) => Err("this ACP connection cannot be restarted".to_owned()),
+            (None, Some(respawn)) => respawn().map_err(|error| error.to_string()),
+        };
+        let (pipe, replacement) = match started {
+            Ok(started) => started,
+            Err(message) => {
+                return self.core.send(Envelope::error_response(
+                    core_id,
+                    -32000,
+                    format!("dsh was not restarted: {message}"),
+                ));
+            }
+        };
+        let mut previous = std::mem::replace(&mut self.acp, pipe);
+        let _ = previous.close_writer().await;
+        if let Some(old) = std::mem::replace(&mut self.replacement, replacement) {
+            tokio::spawn(old.stop());
+        }
+        // 旧进程的未决请求不会再有响应。
+        self.pending.clear();
+        self.permissions.clear();
+        let request_id = RpcId::String(format!("acp-reload-{}", id_text(&core_id)));
+        self.pending
+            .insert(request_id.clone(), Pending::ReloadInitialize { core_id });
+        self.acp.send(acp_protocol::initialize_request(request_id))
+    }
+
+    /// The reloaded session's options are known: keep the model chosen before
+    /// the reload when the agent still offers it.
+    fn reloaded(
+        &mut self,
+        core_id: RpcId,
+        session: String,
+        result: &Value,
+    ) -> Result<(), TransportError> {
+        self.models = acp_protocol::model_choices(result);
+        let offered = acp_protocol::current_model(result);
+        let wanted = self
+            .current
+            .clone()
+            .filter(|wanted| Some(wanted) != offered.as_ref())
+            .and_then(|wanted| acp_protocol::match_model(&self.models, &wanted).ok());
+        let Some(choice) = wanted else {
+            return self.confirm(core_id, &session, offered);
+        };
+        let request_id = RpcId::String(format!("acp-model-{}", id_text(&core_id)));
+        self.pending.insert(
+            request_id.clone(),
+            Pending::SelectModel {
+                core_id,
+                session: session.clone(),
+                label: choice.label(),
+                reasoning: self.reasoning.clone(),
+            },
+        );
+        self.acp.send(acp_protocol::session_set_config_option(
+            request_id,
+            &session,
+            "model",
+            Value::String(choice.value),
+        ))
     }
 
     async fn handle_core(&mut self, message: Envelope) -> Result<(), TransportError> {
@@ -240,6 +493,86 @@ impl AcpBridge {
                         "exitCode": 0, "stdout": "native-agent-tui-shell-ok", "stderr": ""
                     })),
                 ))?;
+            }
+            (Some("backend/reload"), Some(id)) => self.reload(id).await?,
+            (Some("thread/resume"), Some(id)) => {
+                let session = message
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .filter(|session| !session.is_empty() && session.len() <= 1024)
+                    .map(str::to_owned);
+                let refusal = match (&session, self.turn_id.is_some()) {
+                    (None, _) => Some("no session to resume was named"),
+                    (_, true) => Some("ACP session has an active prompt"),
+                    _ => None,
+                };
+                if let Some(reason) = refusal {
+                    return self.core.send(Envelope::error_response(id, -32000, reason));
+                }
+                let session = session.unwrap_or_default();
+                let request_id = RpcId::String(format!("acp-switch-{}", id_text(&id)));
+                self.pending.insert(
+                    request_id.clone(),
+                    Pending::Switch {
+                        core_id: id,
+                        session: session.clone(),
+                    },
+                );
+                self.acp.send(acp_protocol::session_resume_request(
+                    request_id,
+                    &session,
+                    &self.cwd,
+                    self.mcp_servers.clone(),
+                ))?;
+            }
+            (Some("model/list"), Some(id)) => {
+                let data: Vec<Value> = self
+                    .models
+                    .iter()
+                    .map(|choice| json!({"model": choice.label(), "displayName": choice.name}))
+                    .collect();
+                self.core
+                    .send(Envelope::response(id, Some(json!({"data": data}))))?;
+            }
+            (Some("model/select"), Some(id)) => {
+                let requested = message
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("model"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let choice = match (&self.session_id, self.turn_id.is_some()) {
+                    (None, _) => Err("ACP session is not ready".to_owned()),
+                    (_, true) => Err("ACP session has an active prompt".to_owned()),
+                    (Some(_), false) => acp_protocol::match_model(&self.models, requested),
+                };
+                match choice {
+                    Ok(choice) => {
+                        let session = self.session_id.clone().unwrap_or_default();
+                        let request_id = RpcId::String(format!("acp-model-{}", id_text(&id)));
+                        self.pending.insert(
+                            request_id.clone(),
+                            Pending::SelectModel {
+                                core_id: id,
+                                session: session.clone(),
+                                label: choice.label(),
+                                reasoning: self.reasoning.clone(),
+                            },
+                        );
+                        self.acp.send(acp_protocol::session_set_config_option(
+                            request_id,
+                            &session,
+                            "model",
+                            Value::String(choice.value),
+                        ))?;
+                    }
+                    Err(message) => {
+                        self.core
+                            .send(Envelope::error_response(id, -32602, &message))?;
+                    }
+                }
             }
             (Some("skills/list"), Some(id)) => {
                 self.core.send(Envelope::error_response(
@@ -343,6 +676,53 @@ impl AcpBridge {
             ))?;
             return Ok(());
         }
+        if let (Some(_), Pending::ReloadResume { core_id }) = (&message.error, &kind) {
+            // 新进程无法恢复原会话：改为新建，Core 会得知会话已更换。
+            let request_id = RpcId::String(format!("acp-reload-new-{}", id_text(core_id)));
+            self.pending.insert(
+                request_id.clone(),
+                Pending::ReloadNew {
+                    core_id: core_id.clone(),
+                },
+            );
+            return self.acp.send(acp_protocol::session_new_request(
+                request_id,
+                &self.cwd,
+                self.mcp_servers.clone(),
+            ));
+        }
+        if let (Some(error), Pending::Switch { core_id, .. }) = (&message.error, &kind) {
+            // dsh 把具体原因放在 data.details，例如会话正被另一个进程占用。
+            let detail = error
+                .pointer("/data/details")
+                .or_else(|| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("request failed");
+            let text = if detail.contains("owned by an active") {
+                "it is open in another terminal; continue it there or close that one first"
+                    .to_owned()
+            } else {
+                detail.chars().take(300).collect()
+            };
+            return self
+                .core
+                .send(Envelope::error_response(core_id.clone(), -32000, text));
+        }
+        if let (
+            Some(error),
+            Pending::ReloadInitialize { core_id } | Pending::ReloadNew { core_id },
+        ) = (&message.error, &kind)
+        {
+            let text = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("request failed");
+            return self.core.send(Envelope::error_response(
+                core_id.clone(),
+                -32000,
+                format!("dsh restarted but no session is available: {text}"),
+            ));
+        }
         if let Some(error) = message.error {
             self.core.send(Envelope {
                 jsonrpc: None,
@@ -356,6 +736,41 @@ impl AcpBridge {
         }
         let result = message.result.unwrap_or(Value::Null);
         match kind {
+            Pending::ReloadInitialize { core_id } => {
+                let session = self.session_id.clone().unwrap_or_default();
+                let request_id = RpcId::String(format!("acp-reload-resume-{}", id_text(&core_id)));
+                self.pending
+                    .insert(request_id.clone(), Pending::ReloadResume { core_id });
+                self.acp.send(acp_protocol::session_resume_request(
+                    request_id,
+                    &session,
+                    &self.cwd,
+                    self.mcp_servers.clone(),
+                ))?;
+            }
+            Pending::ReloadResume { core_id } => {
+                let session = self.session_id.clone().unwrap_or_default();
+                self.reloaded(core_id, session, &result)?;
+            }
+            Pending::Switch { core_id, session } => {
+                self.session_id = Some(session.clone());
+                self.message_text.clear();
+                self.tool_inputs.clear();
+                self.last_message_id = None;
+                // 沿用当前选中的模型，和重载后的处理一致。
+                self.reloaded(core_id, session, &result)?;
+            }
+            Pending::ReloadNew { core_id } => {
+                let Some(session) = acp_protocol::session_id(&result) else {
+                    return self.core.send(Envelope::error_response(
+                        core_id,
+                        -32000,
+                        "dsh restarted but session/new returned no sessionId",
+                    ));
+                };
+                self.session_id = Some(session.clone());
+                self.reloaded(core_id, session, &result)?;
+            }
             Pending::Initialize => {
                 self.core.send(Envelope::response(id, Some(json!({
                     "userAgent":"deepseek-acp", "codexHome":"unavailable", "platformFamily":"unavailable", "platformOs":"unavailable"
@@ -372,13 +787,13 @@ impl AcpBridge {
                 };
                 self.session_id = Some(session.clone());
                 let models = acp_protocol::model_choices(&result);
+                self.models = models.clone();
+                self.reasoning = acp_protocol::select_option(&result, "reasoning_effort")
+                    .map(|(current, _)| current)
+                    .filter(|current| !current.is_empty());
                 let Some(requested) = self.model.clone() else {
                     let current = acp_protocol::current_model(&result);
-                    self.core.send(Envelope::response(
-                        id,
-                        Some(json!({"thread":{"id":session},"model":current})),
-                    ))?;
-                    return Ok(());
+                    return self.confirm(id, &session, current);
                 };
                 match acp_protocol::match_model(&models, &requested) {
                     Ok(choice) => {
@@ -389,9 +804,7 @@ impl AcpBridge {
                                 core_id: id,
                                 session: session.clone(),
                                 label: choice.label(),
-                                reasoning: acp_protocol::select_option(&result, "reasoning_effort")
-                                    .map(|(current, _)| current)
-                                    .filter(|current| !current.is_empty()),
+                                reasoning: self.reasoning.clone(),
                             },
                         );
                         self.acp.send(acp_protocol::session_set_config_option(
@@ -400,6 +813,10 @@ impl AcpBridge {
                             "model",
                             Value::String(choice.value),
                         ))?;
+                    }
+                    Err(_) if self.model_is_preference => {
+                        let current = acp_protocol::current_model(&result);
+                        self.confirm(id, &session, current)?;
                     }
                     Err(message) => {
                         self.core
@@ -435,22 +852,14 @@ impl AcpBridge {
                         Value::String(previous),
                     ))?;
                 } else {
-                    self.core.send(Envelope::response(
-                        core_id,
-                        Some(json!({"thread":{"id":session},"model":label})),
-                    ))?;
+                    self.confirm(core_id, &session, Some(label))?;
                 }
             }
             Pending::RestoreReasoning {
                 core_id,
                 session,
                 label,
-            } => {
-                self.core.send(Envelope::response(
-                    core_id,
-                    Some(json!({"thread":{"id":session},"model":label})),
-                ))?;
-            }
+            } => self.confirm(core_id, &session, Some(label))?,
             Pending::Prompt => {
                 let status = match acp_protocol::stop_reason(&result) {
                     Some("end_turn" | "completed") => "completed",
@@ -824,6 +1233,7 @@ mod tests {
                 RpcId::Number(3),
                 "session-1",
                 "hello",
+                None,
             ))
             .unwrap();
         assert_eq!(
@@ -918,6 +1328,7 @@ mod tests {
                 RpcId::Number(3),
                 "session-1",
                 "hello",
+                None,
             ))
             .unwrap();
         assert_eq!(
@@ -998,6 +1409,341 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_models_are_listed_and_switched_on_request() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s","configOptions":[
+                    {"id":"model","currentValue":"[\"deepseek-official\",\"flash\"]","options":[
+                        {"group":"official","options":[{"value":"[\"deepseek-official\",\"flash\"]","name":"Flash"}]},
+                        {"group":"hi","options":[{"value":"[\"hi\",\"gpt-6-luna\"]","name":"GPT-6 Luna"}]}]}]})),
+            ))
+            .unwrap();
+        let started = core_client.recv().await.unwrap().result.unwrap();
+        assert_eq!(started["model"], "deepseek-official/flash");
+
+        core_client
+            .send(app_server::model_list(RpcId::Number(3)))
+            .unwrap();
+        let listed = core_client.recv().await.unwrap().result.unwrap();
+        assert_eq!(
+            listed["data"],
+            json!([
+                {"model":"deepseek-official/flash","displayName":"Flash"},
+                {"model":"hi/gpt-6-luna","displayName":"GPT-6 Luna"}
+            ])
+        );
+
+        core_client
+            .send(app_server::model_select(RpcId::Number(4), "missing"))
+            .unwrap();
+        let rejected = core_client.recv().await.unwrap();
+        assert_eq!(rejected.id, Some(RpcId::Number(4)));
+        assert!(rejected.error.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("available: deepseek-official/flash, hi/gpt-6-luna"));
+
+        core_client
+            .send(app_server::model_select(RpcId::Number(5), "hi/gpt-6-luna"))
+            .unwrap();
+        let select = acp_server.recv().await.unwrap();
+        assert_eq!(select.method.as_deref(), Some("session/set_config_option"));
+        let params = select.params.unwrap();
+        assert_eq!(params["configId"], "model");
+        assert_eq!(params["value"], "[\"hi\",\"gpt-6-luna\"]");
+        acp_server
+            .send(Envelope::response(select.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let switched = core_client.recv().await.unwrap();
+        assert_eq!(switched.id, Some(RpcId::Number(5)));
+        assert_eq!(switched.result.unwrap()["model"], "hi/gpt-6-luna");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_moves_the_session_to_a_new_process_and_keeps_the_chosen_model() {
+        let options = |extra: &str| {
+            let mut hi = vec![json!({"value":"[\"hi\",\"luna\"]","name":"Luna"})];
+            if !extra.is_empty() {
+                hi.push(json!({"value":format!("[\"hi\",\"{extra}\"]"),"name":extra}));
+            }
+            json!([{"id":"model","currentValue":"[\"official\",\"flash\"]","options":[
+                {"group":"official","options":[{"value":"[\"official\",\"flash\"]","name":"Flash"}]},
+                {"group":"hi","options":hi}]}])
+        };
+        let (mut core_client, core_bridge) = pair();
+        let (mut first, acp_bridge) = pair();
+        // 每次重载交出一条新的连接，代表新启动的进程。
+        let (second, second_bridge) = pair();
+        let (third, third_bridge) = pair();
+        let mut spare = vec![third_bridge, second_bridge];
+        let config = Config {
+            model: Some("hi/luna".into()),
+            ..Config::default()
+        };
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &config);
+        bridge.respawn = Some(Box::new(move || {
+            spare
+                .pop()
+                .map(|pipe| (pipe, None))
+                .ok_or_else(|| std::io::Error::other("no more processes"))
+        }));
+        let bridge = tokio::spawn(bridge.run());
+
+        core_client
+            .send(app_server::backend_reload(RpcId::Number(1)))
+            .unwrap();
+        let early = core_client.recv().await.unwrap();
+        assert!(early.error.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("dsh was not restarted: ACP session is not ready"));
+
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        first.recv().await.unwrap();
+        first
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s","configOptions":options("")})),
+            ))
+            .unwrap();
+        let select = first.recv().await.unwrap();
+        first
+            .send(Envelope::response(select.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().result.unwrap()["model"],
+            "hi/luna"
+        );
+
+        // 重载：新进程 initialize → session/resume → 恢复之前选的模型。
+        let mut second = second;
+        core_client
+            .send(app_server::backend_reload(RpcId::Number(3)))
+            .unwrap();
+        let initialize = second.recv().await.unwrap();
+        assert_eq!(initialize.method.as_deref(), Some("initialize"));
+        second
+            .send(Envelope::response(initialize.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let resume = second.recv().await.unwrap();
+        assert_eq!(resume.method.as_deref(), Some("session/resume"));
+        assert_eq!(resume.params.as_ref().unwrap()["sessionId"], "s");
+        second
+            .send(Envelope::response(
+                resume.id.unwrap(),
+                Some(json!({"configOptions":options("sol")})),
+            ))
+            .unwrap();
+        let select = second.recv().await.unwrap();
+        assert_eq!(select.method.as_deref(), Some("session/set_config_option"));
+        assert_eq!(
+            select.params.as_ref().unwrap()["value"],
+            "[\"hi\",\"luna\"]"
+        );
+        second
+            .send(Envelope::response(select.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let reloaded = core_client.recv().await.unwrap();
+        assert_eq!(reloaded.id, Some(RpcId::Number(3)));
+        let result = reloaded.result.unwrap();
+        assert_eq!(result["thread"]["id"], "s");
+        assert_eq!(result["model"], "hi/luna");
+        // 旧进程的输入已关闭；新清单里有重载后才出现的模型。
+        assert!(first.recv().await.is_err());
+        core_client
+            .send(app_server::model_list(RpcId::Number(4)))
+            .unwrap();
+        let listed = core_client.recv().await.unwrap().result.unwrap();
+        assert_eq!(listed["data"][2]["model"], "hi/sol");
+
+        // 新进程不能恢复会话时改为新建，并把新的会话 id 告诉 Core。
+        let mut third = third;
+        core_client
+            .send(app_server::backend_reload(RpcId::Number(5)))
+            .unwrap();
+        let initialize = third.recv().await.unwrap();
+        third
+            .send(Envelope::response(initialize.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let resume = third.recv().await.unwrap();
+        third
+            .send(Envelope::error_response(
+                resume.id.unwrap(),
+                -32002,
+                "unknown session",
+            ))
+            .unwrap();
+        let created = third.recv().await.unwrap();
+        assert_eq!(created.method.as_deref(), Some("session/new"));
+        third
+            .send(Envelope::response(
+                created.id.unwrap(),
+                Some(json!({"sessionId":"s2","configOptions":options("")})),
+            ))
+            .unwrap();
+        let select = third.recv().await.unwrap();
+        assert_eq!(select.params.as_ref().unwrap()["sessionId"], "s2");
+        third
+            .send(Envelope::response(select.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let result = core_client.recv().await.unwrap().result.unwrap();
+        assert_eq!(result["thread"]["id"], "s2");
+        assert_eq!(result["model"], "hi/luna");
+
+        // 在当前进程里恢复另一个已保存的会话；被占用时原会话不变。
+        core_client
+            .send(app_server::thread_resume(RpcId::Number(20), "busy"))
+            .unwrap();
+        let resume = third.recv().await.unwrap();
+        assert_eq!(resume.method.as_deref(), Some("session/resume"));
+        assert_eq!(resume.params.as_ref().unwrap()["sessionId"], "busy");
+        third
+            .send(Envelope {
+                jsonrpc: None,
+                id: resume.id,
+                method: None,
+                params: None,
+                result: None,
+                error: Some(json!({"code":-32603,"message":"Internal error","data":{
+                    "details":"session \"busy\" is already owned by an active write handle"}})),
+            })
+            .unwrap();
+        let refused = core_client.recv().await.unwrap();
+        assert_eq!(refused.id, Some(RpcId::Number(20)));
+        assert!(refused.error.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("open in another terminal"));
+        core_client
+            .send(app_server::thread_resume(RpcId::Number(21), "older"))
+            .unwrap();
+        let resume = third.recv().await.unwrap();
+        assert_eq!(resume.params.as_ref().unwrap()["sessionId"], "older");
+        third
+            .send(Envelope::response(
+                resume.id.unwrap(),
+                Some(json!({"configOptions":options("")})),
+            ))
+            .unwrap();
+        let select = third.recv().await.unwrap();
+        assert_eq!(select.params.as_ref().unwrap()["sessionId"], "older");
+        third
+            .send(Envelope::response(select.id.unwrap(), Some(json!({}))))
+            .unwrap();
+        let resumed = core_client.recv().await.unwrap().result.unwrap();
+        assert_eq!(resumed["thread"]["id"], "older");
+        assert_eq!(resumed["model"], "hi/luna");
+
+        // 没有可启动的进程时，现有进程和会话保持不动。
+        core_client
+            .send(app_server::backend_reload(RpcId::Number(6)))
+            .unwrap();
+        let refused = core_client.recv().await.unwrap();
+        assert!(refused.error.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("no more processes"));
+        core_client
+            .send(app_server::model_list(RpcId::Number(7)))
+            .unwrap();
+        assert!(core_client.recv().await.unwrap().result.is_some());
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_test_sends_one_prompt_in_its_own_session_and_reports_the_agent_error() {
+        // 脚本化的 agent：按顺序回应一次测试；`fail` 决定 prompt 的结局。
+        async fn agent(mut server: PipeTransport, fail: Option<&'static str>) -> Vec<String> {
+            let mut seen = Vec::new();
+            while let Ok(message) = server.recv().await {
+                let method = message.method.clone().unwrap_or_default();
+                seen.push(method.clone());
+                let Some(id) = message.id else { continue };
+                let reply = match method.as_str() {
+                    "session/new" => json!({"sessionId":"test-session","configOptions":[
+                        {"id":"model","currentValue":"[\"official\",\"flash\"]","options":[
+                            {"value":"[\"official\",\"flash\"]","name":"Flash"},
+                            {"value":"[\"my\",\"model-x\"]","name":"Model X"}]}]}),
+                    "session/prompt" => {
+                        // 测试期间的权限请求必须被拒绝，而不是卡住。
+                        server
+                            .send(Envelope::request(
+                                RpcId::Number(900),
+                                "session/request_permission",
+                                Some(json!({"sessionId":"test-session"})),
+                            ))
+                            .unwrap();
+                        let answer = server.recv().await.unwrap();
+                        assert_eq!(answer.id, Some(RpcId::Number(900)));
+                        assert_eq!(answer.result.unwrap()["outcome"]["outcome"], "cancelled");
+                        if let Some(message) = fail {
+                            server
+                                .send(Envelope::error_response(id, -32603, message))
+                                .unwrap();
+                            continue;
+                        }
+                        json!({"stopReason":"end_turn"})
+                    }
+                    _ => json!({}),
+                };
+                server.send(Envelope::response(id, Some(reply))).unwrap();
+            }
+            seen
+        }
+
+        let (mut client, server) = pair();
+        let script = tokio::spawn(agent(server, None));
+        assert_eq!(
+            super::exercise_model(&mut client, "C:\\work", "my/model-x").await,
+            Ok(())
+        );
+        client.close_writer().await;
+        assert_eq!(
+            script.await.unwrap(),
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/prompt",
+                "session/close"
+            ]
+        );
+
+        let (mut client, server) = pair();
+        let script = tokio::spawn(agent(server, Some("401 invalid api key")));
+        assert_eq!(
+            super::exercise_model(&mut client, "C:\\work", "my/model-x").await,
+            Err("401 invalid api key".into())
+        );
+        client.close_writer().await;
+        script.await.unwrap();
+
+        // 清单里没有的模型不会发出 prompt。
+        let (mut client, server) = pair();
+        let script = tokio::spawn(agent(server, None));
+        let error = super::exercise_model(&mut client, "C:\\work", "my/missing")
+            .await
+            .unwrap_err();
+        assert!(error.contains("does not offer model my/missing"), "{error}");
+        client.close_writer().await;
+        assert!(!script.await.unwrap().contains(&"session/prompt".to_owned()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_model_fails_thread_start_and_lists_choices() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();
@@ -1033,6 +1779,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remembered_model_that_is_no_longer_offered_keeps_the_agent_default() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config {
+            model: Some("missing".into()),
+            model_is_preference: true,
+            ..Config::default()
+        };
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s","configOptions":[
+                    {"id":"model","currentValue":"[\"hi\",\"gpt-6-luna\"]","options":[
+                        {"value":"[\"hi\",\"gpt-6-luna\"]","name":"GPT-6 Luna"}]}]})),
+            ))
+            .unwrap();
+        let response = core_client.recv().await.unwrap();
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["thread"]["id"], "s");
+        assert_eq!(result["model"], "hi/gpt-6-luna");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn id_only_permission_shows_the_earlier_command_and_requested_sandbox() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();
@@ -1050,7 +1827,7 @@ mod tests {
             .unwrap();
         core_client.recv().await.unwrap();
         core_client
-            .send(app_server::turn_start(RpcId::Number(3), "s", "run"))
+            .send(app_server::turn_start(RpcId::Number(3), "s", "run", None))
             .unwrap();
         core_client.recv().await.unwrap(); // turn/started
         acp_server.recv().await.unwrap(); // session/prompt

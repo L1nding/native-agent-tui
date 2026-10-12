@@ -62,6 +62,40 @@ pub enum Command {
         request: RequestRef,
     },
     RefreshSkills,
+    /// Query the backend's model inventory for the picker.
+    ListModels,
+    /// Use `model` from the next root turn on; rejected while a turn is active.
+    SelectModel {
+        model: String,
+    },
+    /// Add or edit a provider and model in the dsh profile, then reload it.
+    /// With `test`, also send one short message through the saved model.
+    AddModelProvider {
+        spec: crate::backend::dsh_config::ProviderSpec,
+        test: bool,
+    },
+    /// Send one short message through `model` in a separate dsh process.
+    TestModel {
+        model: String,
+    },
+    /// Sent by Core's own test task when it finishes; not a user command.
+    ModelTestFinished {
+        model: String,
+        outcome: Result<u64, String>,
+    },
+    /// Restart dsh and resume the session so edited configuration is read.
+    ReloadBackend,
+    /// Read the saved conversations of this workspace for the sessions page.
+    ListConversations,
+    /// Continue a saved conversation in this session; rejected while a turn is active.
+    ResumeConversation {
+        id: String,
+    },
+    /// Store a `/setting` choice for the next start.
+    SaveSetting {
+        setting: crate::preferences::Setting,
+        value: String,
+    },
     OutputUnavailable,
     UnconfirmedHeadlessInteraction,
     Quit,
@@ -101,9 +135,56 @@ impl ClientHandle {
     }
 
     async fn launch(config: Config, check_only: bool) -> Result<Self, ClientError> {
-        let config = app_server::normalize_config(config)?;
+        let mut config = app_server::normalize_config(config)?;
+        // 命令行参数优先；否则沿用上次在 /model、/setting 里保存的选择。
+        let saved = crate::preferences::path(&config.journal)
+            .map(|path| {
+                // 设置原先放在 journal 目录旁边；第一次启动时挪到新位置。
+                crate::preferences::migrate(&config.journal, &path);
+                crate::preferences::Preferences::load(&path)
+            })
+            .unwrap_or_default();
+        if !check_only {
+            use crate::preferences::Setting;
+            if config.model.is_none() {
+                if let Some(model) = saved.model(config.backend.label()) {
+                    config.model = Some(model.to_owned());
+                    config.model_is_preference = true;
+                }
+            }
+            if let (false, Some(sandbox)) =
+                (config.sandbox_explicit, saved.setting(Setting::Sandbox))
+            {
+                config.sandbox = sandbox.into();
+            }
+            if let (false, Some(approval)) =
+                (config.approval_explicit, saved.setting(Setting::Approval))
+            {
+                config.approval_policy = approval.into();
+            }
+            for class in AttentionClass::ALL {
+                let default =
+                    config.attention.get(class).source == crate::observation::ConfigSource::Default;
+                if let (true, Some((quiet, attention))) =
+                    (default, saved.attention(&format!("{class:?}")))
+                {
+                    // 保存的值失效时保留默认阈值。
+                    let _ = config.attention.set(
+                        class,
+                        quiet,
+                        attention,
+                        crate::observation::ConfigSource::Global,
+                    );
+                }
+            }
+        }
         let observer = Observer::new(config.attention.clone());
         let mut initial = Self::initial(&config, &observer);
+        for setting in crate::preferences::Setting::ALL {
+            if let Some(value) = saved.setting(setting) {
+                initial.saved_settings.insert(setting, value.into());
+            }
+        }
         // Journal::open 已同步提交首个快照。
         initial.persistence = PersistenceState::Committed;
         let journal = Journal::open(
@@ -180,7 +261,7 @@ impl ClientHandle {
         check_only: bool,
         prepared: Option<(Observer, Journal, Outbox)>,
     ) -> Self {
-        let shell_source = if cfg!(windows) && !check_only {
+        let shell_source = if cfg!(windows) && !check_only && config.startup_shell_check {
             server
                 .as_ref()
                 .and_then(AppServer::shell_peer)
@@ -234,6 +315,7 @@ impl ClientHandle {
                 config,
                 server,
                 command_rx,
+                command_tx: commands.downgrade(),
                 snapshot_tx,
                 state: SessionState {
                     view: initial,
@@ -272,6 +354,11 @@ impl ClientHandle {
                 skills_refresh_queued: false,
                 skills_refresh_force_reload: false,
                 skills_refresh_source: None,
+                model_override: None,
+                conversation_id: String::new(),
+                conversation_written: HashMap::new(),
+                conversation_meta: None,
+                resuming: None,
             }
             .run(),
         );
@@ -303,6 +390,10 @@ enum RpcKind {
         force_reload: bool,
         source: SkillRefreshSource,
     },
+    ModelList,
+    ModelSelect,
+    BackendReload,
+    ThreadResume,
 }
 
 impl RpcKind {
@@ -344,6 +435,8 @@ struct Core {
     server: Option<AppServer>,
     config: Config,
     command_rx: mpsc::Receiver<Command>,
+    /// For Core's own background tasks; weak, so dropping the handle still ends Core.
+    command_tx: mpsc::WeakSender<Command>,
     snapshot_tx: watch::Sender<Arc<CoreSnapshot>>,
     state: SessionState,
     pending: HashMap<RpcId, PendingRpc>,
@@ -378,6 +471,18 @@ struct Core {
     skills_refresh_queued: bool,
     skills_refresh_force_reload: bool,
     skills_refresh_source: Option<SkillRefreshSource>,
+    /// A model chosen in this session; Codex receives it with each turn/start.
+    model_override: Option<String>,
+    /// Name of the saved conversation this session writes to; a resume adopts
+    /// the resumed conversation's name so later turns continue the same file.
+    conversation_id: String,
+    /// Text length last written for each message key, to append only what changed.
+    conversation_written: HashMap<String, usize>,
+    /// The backend session and model last written to the conversation's log;
+    /// None until this session has written its first record there.
+    conversation_meta: Option<(String, Option<String>)>,
+    /// The saved conversation a pending thread/resume will install.
+    resuming: Option<crate::conversations::SavedConversation>,
 }
 
 struct PendingTool {
@@ -696,6 +801,15 @@ impl Core {
                             if generation == self.skills_generation {
                                 self.skills_failed(crate::skills::SkillAvailability::TimedOut);
                             }
+                        } else if matches!(kind, RpcKind::ModelList) {
+                            self.state.view.models.availability =
+                                crate::models::ModelsAvailability::TimedOut;
+                        } else if matches!(kind, RpcKind::ModelSelect) {
+                            // 未确认的切换不改变已知模型；用户可以重新选择。
+                            self.state.view.models.switching = None;
+                            self.state.view.notice = Some(
+                                "Model switch was not confirmed in time; the current model is unchanged as far as known.".into(),
+                            );
                         } else {
                             let message = if matches!(kind, RpcKind::Preflight) {
                             self.shell_timeout_message()
@@ -717,6 +831,7 @@ impl Core {
                 self.scheduler.disconnected();
             }
             self.publish();
+            self.save_conversation(false);
             if self.state.view.phase == SessionPhase::Unknown {
                 // A late reply cannot turn an uncertain side effect into a fresh success.
                 self.unknown_pending_outbox();
@@ -725,6 +840,7 @@ impl Core {
             }
         }
 
+        self.save_conversation(true);
         self.unknown_pending_outbox();
         let outcome = self.state.view.phase;
         self.scheduler.disconnected();
@@ -1121,7 +1237,18 @@ impl Core {
                 self.state.view.thread_id.as_deref().unwrap_or(""),
                 self.state.view.turn_id.as_deref().unwrap_or(""),
             ),
-            RpcKind::StartTurn { .. } | RpcKind::AgentRead | RpcKind::ChildInterrupt { .. } => {
+            RpcKind::ModelList => app_server::model_list(id.clone()),
+            RpcKind::BackendReload => app_server::backend_reload(id.clone()),
+            RpcKind::ThreadResume => app_server::thread_resume(
+                id.clone(),
+                self.resuming
+                    .as_ref()
+                    .map_or("", |conversation| conversation.thread_id.as_str()),
+            ),
+            RpcKind::StartTurn { .. }
+            | RpcKind::AgentRead
+            | RpcKind::ChildInterrupt { .. }
+            | RpcKind::ModelSelect => {
                 return Err(TransportError::Failed(
                     "start-turn requires typed user input".into(),
                 ))
@@ -1206,7 +1333,28 @@ impl Core {
             } => {
                 self.state.view.notice = Some(
                     match self.observer.configure(class, quiet_ms, attention_ms) {
-                        Ok(()) => format!("{class:?} attention settings applied for this session."),
+                        Ok(()) => {
+                            let saved = self.journal.is_some()
+                                && crate::preferences::path(&self.config.journal).is_some_and(
+                                    |path| {
+                                        crate::preferences::save_attention(
+                                            &path,
+                                            &format!("{class:?}"),
+                                            quiet_ms,
+                                            attention_ms,
+                                        )
+                                        .is_ok()
+                                    },
+                                );
+                            format!(
+                                "{class:?} attention settings applied{}.",
+                                if saved {
+                                    " and saved"
+                                } else {
+                                    " for this session"
+                                }
+                            )
+                        }
                         Err(error) => error.to_string(),
                     },
                 );
@@ -1253,6 +1401,114 @@ impl Core {
                 self.skills_generation = self.skills_generation.wrapping_add(1);
                 self.state.view.skills.freshness = crate::skills::SkillFreshness::Stale;
                 self.queue_skills_refresh(SkillRefreshSource::Manual, true);
+            }
+            Command::ListModels => self.list_models(),
+            Command::SelectModel { model } => self.select_model(model),
+            Command::TestModel { model } => self.test_model(model),
+            Command::ModelTestFinished { model, outcome } => {
+                use crate::models::ModelTest;
+                // 只接受当前这次测试的结果。
+                if self.state.view.models.test
+                    == (ModelTest::Running {
+                        model: model.clone(),
+                    })
+                {
+                    self.state.view.models.test = match outcome {
+                        Ok(millis) => ModelTest::Passed { model, millis },
+                        Err(message) => ModelTest::Failed { model, message },
+                    };
+                }
+            }
+            Command::AddModelProvider { spec, test } => {
+                use crate::backend::dsh_config;
+                // 只有真实启动的 dsh 会话才改用户的 dsh 配置。
+                let result = if !self.config.backend.is_acp() {
+                    Err("Providers can be added for the dsh backend only; Codex reads them from its own config.toml.".to_owned())
+                } else if self.journal.is_none() {
+                    Err("This session cannot change the dsh profile.".to_owned())
+                } else {
+                    dsh_config::home()
+                        .ok_or_else(|| {
+                            "The dsh home directory is unknown; set DSH_HOME.".to_owned()
+                        })
+                        .and_then(|home| {
+                            dsh_config::add_provider(&home, &self.config.acp_profile, &spec)
+                        })
+                };
+                match result {
+                    Ok(added) => {
+                        let key = if added.key_stored {
+                            String::new()
+                        } else {
+                            format!(
+                                " No key was entered; dsh uses credential {}.",
+                                added.credential
+                            )
+                        };
+                        // 空闲时立即重载；否则等这一轮结束后在 /model 里按 Ctrl+R。
+                        let reload = match self.reload_backend() {
+                            Ok(()) => " Reloading dsh...".to_owned(),
+                            Err(reason) => format!(" Not reloaded yet: {reason}"),
+                        };
+                        self.state.view.notice = Some(format!(
+                            "Saved {} to dsh profile {}.{key}{reload}",
+                            added.label, self.config.acp_profile
+                        ));
+                        if test {
+                            // 测试用独立进程读取刚保存的配置，不依赖重载完成。
+                            self.test_model(added.label);
+                        }
+                    }
+                    Err(error) => {
+                        if test {
+                            self.state.view.models.test = crate::models::ModelTest::Failed {
+                                model: format!("{}/{}", spec.provider, spec.model),
+                                message: format!("not saved: {error}"),
+                            };
+                        }
+                        self.state.view.notice = Some(format!("Provider was not saved: {error}"))
+                    }
+                }
+            }
+            Command::ListConversations => {
+                if let Some(directory) = self.conversation_directory() {
+                    self.state.view.conversations = crate::conversations::list(&directory);
+                }
+            }
+            Command::ResumeConversation { id } => {
+                if let Err(reason) = self.resume_conversation(&id) {
+                    self.state.view.notice =
+                        Some(format!("Conversation was not resumed: {reason}"));
+                }
+            }
+            Command::ReloadBackend => {
+                self.state.view.notice = Some(match self.reload_backend() {
+                    Ok(()) => "Reloading dsh configuration...".into(),
+                    Err(reason) => format!("Configuration was not reloaded: {reason}"),
+                });
+            }
+            Command::SaveSetting { setting, value } => {
+                if !setting.values().contains(&value.as_str()) {
+                    self.state.view.notice = Some("Unsupported setting value.".into());
+                    return;
+                }
+                let stored = self.journal.is_none()
+                    || crate::preferences::path(&self.config.journal).is_some_and(|path| {
+                        crate::preferences::save_setting(&path, setting, &value).is_ok()
+                    });
+                self.state.view.notice = Some(if !stored {
+                    format!("{} could not be saved.", setting.key())
+                } else if setting.applies_immediately() {
+                    format!("{} set to {value} and saved.", setting.key())
+                } else {
+                    format!(
+                        "{} set to {value}; it applies from the next start.",
+                        setting.key()
+                    )
+                });
+                if stored {
+                    self.state.view.saved_settings.insert(setting, value);
+                }
             }
             Command::Schedule(command) => self.schedule(command),
             Command::ScheduleTask { attempt, command } => {
@@ -1323,6 +1579,276 @@ impl Core {
             Command::Quit
             | Command::OutputUnavailable
             | Command::UnconfirmedHeadlessInteraction => {}
+        }
+    }
+
+    fn list_models(&mut self) {
+        use crate::models::ModelsAvailability;
+        if self.check_only
+            || self.state.view.thread_id.is_none()
+            || self
+                .pending
+                .values()
+                .any(|rpc| matches!(rpc.kind, RpcKind::ModelList))
+        {
+            return;
+        }
+        match self.send_rpc(RpcKind::ModelList) {
+            Ok(()) => self.state.view.models.availability = ModelsAvailability::Loading,
+            Err(_) => {
+                self.state.view.models.availability = ModelsAvailability::TransportUnavailable
+            }
+        }
+    }
+
+    /// Remembers a confirmed model for the next start. Only launched sessions
+    /// write; a failure leaves the running session unaffected.
+    fn remember_model(&self, model: &str) -> &'static str {
+        if self.journal.is_none() {
+            return "";
+        }
+        let saved = crate::preferences::path(&self.config.journal).is_some_and(|path| {
+            crate::preferences::save_model(&path, self.config.backend.label(), model).is_ok()
+        });
+        if saved {
+            " Remembered for the next start."
+        } else {
+            " It could not be saved for the next start."
+        }
+    }
+
+    /// Where conversations are kept. A session that was not launched uses the
+    /// store only when its data directory was named explicitly, so it can
+    /// never write into the user's own.
+    fn conversation_directory(&self) -> Option<std::path::PathBuf> {
+        (self.journal.is_some() || self.config.journal.root.is_some())
+            .then(|| {
+                crate::conversations::directory(
+                    &self.config.journal,
+                    &self.config.cwd.display().to_string(),
+                )
+            })
+            .flatten()
+    }
+
+    /// Saves the root conversation when it changed and nothing is mid-stream:
+    /// between turns, while a request waits for the user, or at the end.
+    fn save_conversation(&mut self, closing: bool) {
+        let view = &self.state.view;
+        let Some(thread) = view.thread_id.as_deref() else {
+            return;
+        };
+        if !(closing || view.phase.can_submit() || !view.requests.is_empty()) {
+            return;
+        }
+        if !view
+            .messages
+            .iter()
+            .any(|message| message.thread_id == thread && message.role == "You")
+        {
+            return;
+        }
+        let Some(directory) = self.conversation_directory() else {
+            return;
+        };
+        let writer = view.observation.session_id.clone();
+        if self.conversation_id.is_empty() {
+            self.conversation_id = writer.clone();
+        }
+        let at_ms = crate::conversations::now_ms();
+        let mut records = Vec::new();
+        let meta = (thread.to_owned(), view.model.clone());
+        // 这个会话第一次写这段对话时先写身份；新对话还要先写首行。
+        if self.conversation_meta.as_ref() != Some(&meta) {
+            if self.conversation_meta.is_none() && self.conversation_id == writer {
+                records.push(crate::conversations::Record::Session {
+                    version: 1,
+                    id: self.conversation_id.clone(),
+                    cwd: self.config.cwd.display().to_string(),
+                    at_ms,
+                });
+            }
+            records.push(crate::conversations::Record::Meta {
+                backend: self.config.backend.label().into(),
+                thread_id: meta.0.clone(),
+                model: meta.1.clone(),
+                at_ms,
+            });
+        }
+        // 只追加新增或内容变了的消息；同一个 id 的后一条记录生效。
+        let mut written = Vec::new();
+        for message in &view.messages {
+            if message.thread_id != thread || message.text.is_empty() {
+                continue;
+            }
+            // 恢复来的消息沿用文件里的 id；本会话的消息加上会话前缀，避免和别的会话重名。
+            let key = if self.conversation_written.contains_key(&message.id) {
+                message.id.clone()
+            } else {
+                format!("{writer}:{}", message.id)
+            };
+            if self.conversation_written.get(&key) != Some(&message.text.len()) {
+                records.push(crate::conversations::Record::Message {
+                    id: key.clone(),
+                    role: message.role.clone(),
+                    text: message.text.clone(),
+                    at_ms,
+                });
+                written.push((key, message.text.len()));
+            }
+        }
+        if records.is_empty() {
+            return;
+        }
+        // 写失败时下次变化再试；对话保存不影响执行。
+        if crate::conversations::append(&directory, &self.conversation_id, &records).is_ok() {
+            self.conversation_meta = Some(meta);
+            self.conversation_written.extend(written);
+            self.state.view.conversation_id = self.conversation_id.clone();
+        }
+    }
+    fn resume_conversation(&mut self, id: &str) -> Result<(), String> {
+        let directory = self
+            .conversation_directory()
+            .ok_or("this session has no conversation store.")?;
+        let saved = crate::conversations::load(&directory, id)
+            .ok_or("its saved conversation could not be read.")?;
+        if id == self.conversation_id {
+            return Err("it is the conversation already open here.".into());
+        }
+        if saved.backend != self.config.backend.label() {
+            return Err(format!(
+                "it belongs to the {} backend; start with --backend {} to resume it.",
+                saved.backend, saved.backend
+            ));
+        }
+        if !self.config.backend.is_acp() {
+            return Err("resuming is available for the dsh backend only.".into());
+        }
+        if !self.idle_for_backend_change() || self.state.view.resuming.is_some() {
+            return Err("wait for the current turn to finish first.".into());
+        }
+        // 先存好当前对话，再切换。
+        self.save_conversation(true);
+        self.state.view.resuming = Some(saved.title());
+        self.resuming = Some(saved);
+        if let Err(error) = self.send_rpc(RpcKind::ThreadResume) {
+            self.state.view.resuming = None;
+            self.resuming = None;
+            return Err(error.to_string());
+        }
+        self.state.view.notice = Some("Resuming the conversation...".into());
+        Ok(())
+    }
+
+    /// Starts a model test in a task of its own; the result returns as a command.
+    fn test_model(&mut self, model: String) {
+        use crate::models::ModelTest;
+        let model = model.trim().to_owned();
+        let refusal = if model.is_empty() || model.len() > crate::models::MAX_MODEL_BYTES {
+            Some("name a model to test")
+        } else if !self.config.backend.is_acp() {
+            Some("only the dsh backend can test a model")
+        } else if self.journal.is_none() {
+            Some("this session cannot start a test process")
+        } else if matches!(self.state.view.models.test, ModelTest::Running { .. }) {
+            Some("another test is still running")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            if !matches!(self.state.view.models.test, ModelTest::Running { .. }) {
+                self.state.view.models.test = ModelTest::Failed {
+                    model,
+                    message: reason.into(),
+                };
+            }
+            self.state.view.notice = Some(format!("Model test was not started: {reason}."));
+            return;
+        }
+        self.state.view.models.test = ModelTest::Running {
+            model: model.clone(),
+        };
+        let config = self.config.clone();
+        let commands = self.command_tx.clone();
+        tokio::spawn(async move {
+            let outcome = crate::backend::acp::test_model(config, model.clone()).await;
+            if let Some(commands) = commands.upgrade() {
+                let _ = commands
+                    .send(Command::ModelTestFinished { model, outcome })
+                    .await;
+            }
+        });
+    }
+
+    /// No turn, gate or task is active, so the model or backend can change.
+    fn idle_for_backend_change(&self) -> bool {
+        let scheduler = self.scheduler.snapshot();
+        !self.check_only
+            && self.preflight_passed
+            && self.state.view.thread_id.is_some()
+            && self.wait.is_none()
+            && self.state.view.phase.can_submit()
+            && !scheduler.tasks.iter().any(|task| task.state.active())
+            && self.state.view.models.switching.is_none()
+            && !self.state.view.models.reloading
+            && self.state.view.resuming.is_none()
+    }
+
+    fn reload_backend(&mut self) -> Result<(), String> {
+        if !self.config.backend.is_acp() {
+            return Err("only the dsh backend can be reloaded; restart to reload Codex.".into());
+        }
+        if !self.idle_for_backend_change() {
+            return Err("wait for the current turn to finish, then press Ctrl+R in /model.".into());
+        }
+        self.send_rpc(RpcKind::BackendReload)
+            .map_err(|error| error.to_string())?;
+        self.state.view.models.reloading = true;
+        Ok(())
+    }
+
+    fn select_model(&mut self, model: String) {
+        let model = model.trim().to_owned();
+        if model.is_empty() || model.len() > crate::models::MAX_MODEL_BYTES {
+            self.state.view.notice = Some(format!(
+                "Enter a model name of 1-{} UTF-8 bytes.",
+                crate::models::MAX_MODEL_BYTES
+            ));
+            return;
+        }
+        if self.state.view.models.switching.is_some() || self.state.view.models.reloading {
+            self.state.view.notice =
+                Some("A model switch or reload is already waiting for the backend.".into());
+            return;
+        }
+        if !self.idle_for_backend_change() {
+            self.state.view.notice = Some(
+                "The model can be changed when no turn is running; wait for it to finish or interrupt with Ctrl+C.".into(),
+            );
+            return;
+        }
+        if !self.config.backend.is_acp() {
+            // Codex takes the model with turn/start; there is nothing to confirm yet.
+            self.model_override = Some(model.clone());
+            self.state.view.notice = Some(format!(
+                "Model set to {model} from the next turn.{}",
+                self.remember_model(&model)
+            ));
+            self.state.view.model = Some(model);
+            return;
+        }
+        let id = self.next_rpc_id();
+        let request = app_server::model_select(id.clone(), &model);
+        match self.send_effect(request, None) {
+            Ok(outbox_id) => {
+                self.state.view.notice = Some(format!("Switching model to {model}..."));
+                self.state.view.models.switching = Some(model);
+                self.expect_response(id, outbox_id, PendingRpc::new(RpcKind::ModelSelect));
+            }
+            Err(error) => {
+                self.state.view.notice = Some(format!("Model switch was not sent: {error}"));
+            }
         }
     }
 
@@ -1405,6 +1931,10 @@ impl Core {
             || self.wait.is_some()
             || !self.state.view.phase.can_submit()
             || self.state.view.thread_id.is_none()
+            // 模型切换或重载确认前不开始新一轮，避免这一轮落在未知的模型或进程上。
+            || self.state.view.models.switching.is_some()
+            || self.state.view.models.reloading
+            || self.state.view.resuming.is_some()
         {
             return;
         }
@@ -1518,7 +2048,8 @@ impl Core {
         let thread = self.state.view.thread_id.clone().unwrap();
         // 新 root turn 尚未收到 usage；旧 turn 事实不能重新绑定到这一代。
         self.state.clear_usage_fact(&thread);
-        let request = app_server::turn_start(id.clone(), &thread, text);
+        let request =
+            app_server::turn_start(id.clone(), &thread, text, self.model_override.as_deref());
         let outbox_id = match self.send_effect(request, self.root_attempt) {
             Ok(outbox_id) => outbox_id,
             Err(error) => {
@@ -1740,6 +2271,42 @@ impl Core {
                         self.skills_failed(reason);
                         return;
                     }
+                    if matches!(pending.kind, RpcKind::ModelList) {
+                        let unsupported = error.get("code").and_then(Value::as_i64) == Some(-32601);
+                        self.state.view.models.availability = if unsupported {
+                            crate::models::ModelsAvailability::Unsupported
+                        } else {
+                            crate::models::ModelsAvailability::RpcError
+                        };
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::ThreadResume) {
+                        // 没能恢复：当前对话原样保留。
+                        self.state.view.resuming = None;
+                        self.resuming = None;
+                        let message: String = message.chars().take(400).collect();
+                        self.state.view.notice =
+                            Some(format!("Conversation was not resumed: {message}"));
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::BackendReload) {
+                        self.state.view.models.reloading = false;
+                        let message: String = message.chars().take(400).collect();
+                        if message.starts_with("dsh was not restarted") {
+                            // 新进程没起来，原进程和会话都没动。
+                            self.state.view.notice = Some(message);
+                        } else {
+                            self.state.error(SessionPhase::Failed, message);
+                        }
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::ModelSelect) {
+                        // 被拒绝的切换不是会话错误：当前模型不变，用户可以再选。
+                        self.state.view.models.switching = None;
+                        let message: String = message.chars().take(400).collect();
+                        self.state.view.notice = Some(format!("Model was not changed: {message}"));
+                        return;
+                    }
                     let phase = if matches!(pending.kind, RpcKind::AgentRead)
                         || (matches!(pending.kind, RpcKind::StartTurn { .. })
                             && self.state.view.turn_id.is_some())
@@ -1857,6 +2424,15 @@ impl Core {
                     self.state.view.notice = None;
                     self.preflight_passed = true;
                     None
+                } else if !self.config.startup_shell_check {
+                    // Like Codex itself: the sandbox is first exercised when the
+                    // model runs a command, so a new thread is the readiness fact.
+                    self.state.view.phase = SessionPhase::Ready;
+                    self.state.view.notice = None;
+                    self.preflight_passed = true;
+                    self.skills_generation = self.skills_generation.wrapping_add(1);
+                    self.queue_skills_refresh(SkillRefreshSource::Initial, false);
+                    None
                 } else {
                     Some(RpcKind::Preflight)
                 }
@@ -1899,6 +2475,111 @@ impl Core {
             RpcKind::AgentRead => None, // The response is handled with its captured thread identity.
             RpcKind::ChildInterrupt { .. } => None,
             RpcKind::SkillsList { .. } => None,
+            RpcKind::ModelList => {
+                // 清单换新，进行中的切换、测试结果等状态保留。
+                let listed = crate::models::parse_result(&result).unwrap_or_else(|| {
+                    crate::models::ModelsSnapshot {
+                        availability: crate::models::ModelsAvailability::Malformed,
+                        ..Default::default()
+                    }
+                });
+                let models = &mut self.state.view.models;
+                models.availability = listed.availability;
+                models.options = listed.options;
+                models.truncated = listed.truncated;
+                if self.config.backend.is_acp() && self.journal.is_some() {
+                    self.state.view.models.providers = crate::backend::dsh_config::home()
+                        .map(|home| {
+                            crate::backend::dsh_config::providers(&home, &self.config.acp_profile)
+                        })
+                        .unwrap_or_default();
+                }
+                None
+            }
+            RpcKind::ThreadResume => {
+                self.state.view.resuming = None;
+                let Some(saved) = self.resuming.take() else {
+                    return;
+                };
+                let thread = result
+                    .pointer("/thread/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&saved.thread_id)
+                    .to_owned();
+                if let Some(model) = result.get("model").and_then(Value::as_str) {
+                    self.state.view.model = Some(model.into());
+                }
+                // 界面换成恢复的对话；之前的对话已经保存，可以再恢复回来。
+                self.state.view.messages = saved
+                    .messages
+                    .iter()
+                    .map(|message| crate::state::ConversationItem {
+                        id: message.id.clone(),
+                        thread_id: thread.clone(),
+                        turn_id: String::new(),
+                        role: message.role.clone(),
+                        text: message.text.clone(),
+                        complete: true,
+                        truncated: false,
+                    })
+                    .collect();
+                self.state.tool_lines.clear();
+                self.state.view.history_truncated = false;
+                self.state.view.thread_id = Some(thread);
+                self.state.view.turn_id = None;
+                self.state.view.last_error = None;
+                self.state.view.phase = SessionPhase::Ready;
+                // 已在文件里的消息不重写；身份记录等后端会话或模型变化时再追加。
+                self.conversation_written = saved
+                    .messages
+                    .iter()
+                    .map(|message| (message.id.clone(), message.text.len()))
+                    .collect();
+                self.conversation_meta = Some((saved.thread_id.clone(), saved.model.clone()));
+                self.state.view.notice = Some(format!("Resumed: {}", saved.title()));
+                self.state.view.conversation_id = saved.id.clone();
+                self.conversation_id = saved.id;
+                Some(RpcKind::ModelList)
+            }
+            RpcKind::BackendReload => {
+                self.state.view.models.reloading = false;
+                let resumed = match result.pointer("/thread/id").and_then(Value::as_str) {
+                    Some(id) if self.state.view.thread_id.as_deref() != Some(id) => {
+                        // dsh 无法恢复原会话：新会话没有之前的对话上下文。
+                        self.state.view.thread_id = Some(id.into());
+                        false
+                    }
+                    _ => true,
+                };
+                if let Some(model) = result.get("model").and_then(Value::as_str) {
+                    self.state.view.model = Some(model.into());
+                }
+                self.state.view.notice = Some(if resumed {
+                    "dsh configuration reloaded; the conversation continues.".into()
+                } else {
+                    "dsh configuration reloaded in a new session; the agent no longer has the earlier conversation.".into()
+                });
+                Some(RpcKind::ModelList)
+            }
+            RpcKind::ModelSelect => {
+                let requested = self.state.view.models.switching.take();
+                let confirmed = result
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| {
+                        !model.is_empty() && model.len() <= crate::models::MAX_MODEL_BYTES
+                    })
+                    .map(str::to_owned)
+                    .or(requested);
+                if let Some(model) = confirmed {
+                    self.state.view.notice = Some(format!(
+                        "Model switched to {model}.{}",
+                        self.remember_model(&model)
+                    ));
+                    self.state.view.model = Some(model);
+                }
+                None
+            }
         };
         if let Some(kind) = action {
             if let Err(error) = self.send_rpc(kind) {
@@ -6416,17 +7097,17 @@ mod tests {
     }
 
     async fn isolated_harness(
-        thread_version: &str,
+        thread_id: &str,
     ) -> (
         ClientHandle,
         BufReader<tokio::io::DuplexStream>,
         BufReader<tokio::io::DuplexStream>,
     ) {
-        isolated_harness_with_cleanup(thread_version, None).await
+        isolated_harness_with_cleanup(thread_id, None).await
     }
 
     async fn isolated_harness_with_cleanup(
-        thread_version: &str,
+        thread_id: &str,
         cleanup: Option<tokio::sync::oneshot::Receiver<bool>>,
     ) -> (
         ClientHandle,
@@ -6462,12 +7143,12 @@ mod tests {
         assert_eq!(start["method"], "thread/start");
         send(
             &mut main,
-            json!({"id":start["id"],"result":{"thread":{"id":"root","cliVersion":thread_version}}}),
+            json!({"id":start["id"],"result":{"thread":{"id":thread_id,"cliVersion":"0.161.0"}}}),
         )
         .await;
         phase(
             &mut client,
-            if thread_version == "0.161.0" {
+            if thread_id == "root" {
                 SessionPhase::CheckingShell
             } else {
                 SessionPhase::Failed
@@ -6495,7 +7176,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_preflight_keeps_main_rpc_ids_separate_and_blocks_queued_tasks_until_cleanup()
     {
-        let (client, mut main, mut peer) = isolated_harness("0.161.0").await;
+        let (client, mut main, mut peer) = isolated_harness("root").await;
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -6528,7 +7209,7 @@ mod tests {
 
     #[tokio::test]
     async fn incompatible_main_thread_cannot_launch_isolated_preflight() {
-        let (client, _main, mut peer) = isolated_harness("PRIVATE_VERSION").await;
+        let (client, _main, mut peer) = isolated_harness(" ").await;
         assert!(
             tokio::time::timeout(Duration::from_millis(30), next(&mut peer))
                 .await
@@ -6541,7 +7222,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_isolated_initialize_cannot_execute_shell_or_dispatch_model() {
-        let (mut client, _main, mut peer) = isolated_harness("0.161.0").await;
+        let (mut client, _main, mut peer) = isolated_harness("root").await;
         let initialize = next(&mut peer).await;
         send(
             &mut peer,
@@ -6565,7 +7246,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn isolated_preflight_timeout_remains_unknown_and_cannot_retry_queued_task() {
-        let (mut client, mut main, mut peer) = isolated_harness("0.161.0").await;
+        let (mut client, mut main, mut peer) = isolated_harness("root").await;
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -6602,7 +7283,7 @@ mod tests {
             json!({"id":2,"result":{"exitCode":"PRIVATE_CODE","stdout":"native-agent-tui-shell-ok"}}),
             json!({"id":"PRIVATE_REQUEST","method":"PRIVATE_INTERACTION","params":{}}),
         ] {
-            let (mut client, mut main, mut peer) = isolated_harness("0.161.0").await;
+            let (mut client, mut main, mut peer) = isolated_harness("root").await;
             client
                 .commands
                 .send(Command::SubmitRootInput {
@@ -6629,7 +7310,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_preflight_eof_preserves_unknown_shell_outcome() {
-        let (mut client, mut main, mut peer) = isolated_harness("0.161.0").await;
+        let (mut client, mut main, mut peer) = isolated_harness("root").await;
         initialize_peer(&mut peer).await;
         drop(peer);
         phase(&mut client, SessionPhase::Unknown).await;
@@ -6643,7 +7324,7 @@ mod tests {
     async fn isolated_preflight_success_cannot_release_tasks_after_cleanup_crosses_deadline() {
         let (confirmation, cleanup) = tokio::sync::oneshot::channel();
         let (mut client, mut main, mut peer) =
-            isolated_harness_with_cleanup("0.161.0", Some(cleanup)).await;
+            isolated_harness_with_cleanup("root", Some(cleanup)).await;
         let request = initialize_peer(&mut peer).await;
         send(&mut peer, json!({"id":request["id"],"result":{"exitCode":0,"stdout":"native-agent-tui-shell-ok"}})).await;
         // EOF confirms the worker has consumed success and entered its cleanup stage.
@@ -6661,7 +7342,7 @@ mod tests {
 
     #[tokio::test]
     async fn quitting_during_isolated_preflight_joins_its_cancelled_owner() {
-        let (client, _main, mut peer) = isolated_harness("0.161.0").await;
+        let (client, _main, mut peer) = isolated_harness("root").await;
         initialize_peer(&mut peer).await;
         client.commands.send(Command::Quit).await.unwrap();
         let report = tokio::time::timeout(Duration::from_secs(2), client.join)
@@ -6678,7 +7359,7 @@ mod tests {
     async fn isolated_preflight_cannot_become_ready_before_cleanup_or_after_uncertain_cleanup() {
         let (confirmation, cleanup) = tokio::sync::oneshot::channel();
         let (mut client, mut main, mut peer) =
-            isolated_harness_with_cleanup("0.161.0", Some(cleanup)).await;
+            isolated_harness_with_cleanup("root", Some(cleanup)).await;
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -6721,6 +7402,486 @@ mod tests {
         let skills = next(server).await;
         assert_eq!(skills["method"], "skills/list");
         send(server, json!({"id":skills["id"],"result":{"data":[{"cwd":skills["params"]["cwds"][0],"errors":[],"skills":[]}]}})).await;
+    }
+
+    #[tokio::test]
+    async fn codex_model_list_is_on_demand_and_a_selection_rides_the_next_turn_start() {
+        use crate::models::{ModelOption, ModelsAvailability};
+
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client.commands.send(Command::ListModels).await.unwrap();
+        let list = next(&mut server).await;
+        assert_eq!(list["method"], "model/list");
+        send(
+            &mut server,
+            json!({"id":list["id"],"error":{"code":-32601,"message":"PRIVATE_DETAIL"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| s.models.availability == ModelsAvailability::Unsupported)
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
+
+        client.commands.send(Command::ListModels).await.unwrap();
+        let list = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":list["id"],"result":{"data":[
+                {"id":"a","model":"model-a","displayName":"Model A"},
+                {"id":"b","model":"model-b","displayName":"Model B"}
+            ],"nextCursor":null}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| s.models.availability == ModelsAvailability::Available)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.snapshots.borrow().models.options[1],
+            ModelOption {
+                id: "model-b".into(),
+                name: "Model B".into()
+            }
+        );
+
+        client
+            .commands
+            .send(Command::SelectModel {
+                model: " model-b ".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.model.as_deref() == Some("model-b"))
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        assert_eq!(start["method"], "turn/start");
+        assert_eq!(start["params"]["model"], "model-b");
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"turn-1"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        // 运行中的轮次不接受切换；已知模型保持不变。
+        client
+            .commands
+            .send(Command::SelectModel {
+                model: "model-a".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("no turn is running"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().model.as_deref(), Some("model-b"));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_model_switch_is_confirmed_before_the_next_turn_starts() {
+        let (mut client, mut server) = harness_with_config(Config {
+            backend: crate::backend::BackendKind::DeepSeekAcp,
+            ..Default::default()
+        })
+        .await;
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "initialize");
+        send(&mut server, json!({"id":request["id"],"result":{}})).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "thread/start");
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"thread":{"id":"s"},"model":"official/flash"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+
+        let select = |model: &str| Command::SelectModel {
+            model: model.into(),
+        };
+        client.commands.send(select("missing")).await.unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "model/select");
+        assert_eq!(request["params"]["model"], "missing");
+        send(
+            &mut server,
+            json!({"id":request["id"],"error":{"code":-32602,"message":"not offered"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.models.switching.is_none()
+                    && s.notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("not offered"))
+            })
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.phase, SessionPhase::Ready);
+            assert_eq!(snapshot.model.as_deref(), Some("official/flash"));
+            assert!(snapshot.last_error.is_none());
+        }
+
+        client.commands.send(select("hi/gpt-6-luna")).await.unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "model/select");
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        // 确认前不能开始新一轮。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"thread":{"id":"s"},"model":"hi/gpt-6-luna"}}),
+        )
+        .await;
+        let start = next(&mut server).await;
+        assert_eq!(start["method"], "turn/start");
+        assert!(start["params"].get("model").is_none());
+        assert_eq!(
+            client.snapshots.borrow().model.as_deref(),
+            Some("hi/gpt-6-luna")
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_saved_conversation_is_listed_by_title_and_resumed_with_its_messages() {
+        let root =
+            std::env::temp_dir().join(format!("native-agent-tui-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = || Config {
+            backend: crate::backend::BackendKind::DeepSeekAcp,
+            journal: crate::journal::JournalSettings {
+                root: Some(root.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 启动到 Ready；`thread` 是后端给这次会话的 id。
+        async fn start(
+            config: Config,
+            thread: &str,
+        ) -> (ClientHandle, BufReader<tokio::io::DuplexStream>) {
+            let (mut client, mut server) = harness_with_config(config).await;
+            let request = next(&mut server).await;
+            send(&mut server, json!({"id":request["id"],"result":{}})).await;
+            assert_eq!(next(&mut server).await["method"], "initialized");
+            let request = next(&mut server).await;
+            send(
+                &mut server,
+                json!({"id":request["id"],"result":{"thread":{"id":thread},"model":"hi/luna"}}),
+            )
+            .await;
+            phase(&mut client, SessionPhase::Ready).await;
+            (client, server)
+        }
+        let submit = |text: &str| Command::SubmitRootInput { text: text.into() };
+
+        // 第一次会话：发一条消息后退出，对话被保存。
+        let (client, mut server) = start(config(), "thread-one").await;
+        let first_id = client.snapshots.borrow().observation.session_id.clone();
+        client
+            .commands
+            .send(submit("fix the parser\nmore detail"))
+            .await
+            .unwrap();
+        let turn = next(&mut server).await;
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(turn["params"]["threadId"], "thread-one");
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+
+        // 第二次会话：列表里按标题出现，Enter 对应的命令把它恢复回来。
+        let (mut client, mut server) = start(config(), "thread-two").await;
+        client
+            .commands
+            .send(Command::ResumeConversation {
+                id: "missing".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("could not be read"))
+            })
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::ListConversations)
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.conversations.len() == 1)
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.conversations[0].id, first_id);
+            assert_eq!(snapshot.conversations[0].title, "fix the parser");
+            assert_eq!(snapshot.conversations[0].turns, 1);
+        }
+        client
+            .commands
+            .send(Command::ResumeConversation {
+                id: first_id.clone(),
+            })
+            .await
+            .unwrap();
+        let resume = next(&mut server).await;
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "thread-one");
+        // 确认前不开始新一轮。
+        client
+            .commands
+            .send(submit("second question"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        send(
+            &mut server,
+            json!({"id":resume["id"],"result":{"thread":{"id":"thread-one"},"model":"hi/luna"}}),
+        )
+        .await;
+        let mut started = None;
+        for _ in 0..2 {
+            let request = next(&mut server).await;
+            if request["method"] == "model/list" {
+                send(
+                    &mut server,
+                    json!({"id":request["id"],"result":{"data":[]}}),
+                )
+                .await;
+            } else {
+                started = Some(request);
+            }
+        }
+        let started = started.expect("the queued turn starts after the resume");
+        assert_eq!(started["method"], "turn/start");
+        assert_eq!(started["params"]["threadId"], "thread-one");
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.thread_id.as_deref(), Some("thread-one"));
+            assert_eq!(snapshot.conversation_id, first_id);
+            assert!(snapshot.resuming.is_none());
+            let texts: Vec<&str> = snapshot.messages.iter().map(|m| m.text.as_str()).collect();
+            assert_eq!(texts, ["fix the parser\nmore detail", "second question"]);
+        }
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+
+        // 恢复后的新一轮接着写回同一个对话，而不是另存一份。
+        let directory =
+            crate::conversations::directory(&config().journal, &config().cwd.display().to_string())
+                .unwrap();
+        let saved = crate::conversations::load(&directory, &first_id).unwrap();
+        assert_eq!(saved.thread_id, "thread-one");
+        assert_eq!(saved.summary().turns, 2);
+        assert_eq!(crate::conversations::list(&directory).len(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_reload_holds_new_turns_until_confirmed_and_then_refreshes_the_model_list() {
+        let (mut client, mut server) = harness_with_config(Config {
+            backend: crate::backend::BackendKind::DeepSeekAcp,
+            ..Default::default()
+        })
+        .await;
+        let request = next(&mut server).await;
+        send(&mut server, json!({"id":request["id"],"result":{}})).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"thread":{"id":"s"},"model":"official/flash"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+
+        client.commands.send(Command::ReloadBackend).await.unwrap();
+        let reload = next(&mut server).await;
+        assert_eq!(reload["method"], "backend/reload");
+        client
+            .snapshots
+            .wait_for(|s| s.models.reloading)
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        // 会话被换成新的时，Core 采用新的会话 id 并说明上下文已重置。
+        send(
+            &mut server,
+            json!({"id":reload["id"],"result":{"thread":{"id":"s2"},"model":"hi/luna"}}),
+        )
+        .await;
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let request = next(&mut server).await;
+            if request["method"] == "model/list" {
+                send(
+                    &mut server,
+                    json!({"id":request["id"],"result":{"data":[{"model":"hi/luna","displayName":"Luna"}]}}),
+                )
+                .await;
+            } else {
+                assert_eq!(request["params"]["threadId"], "s2");
+            }
+            seen.push(request["method"].as_str().unwrap().to_owned());
+        }
+        seen.sort();
+        assert_eq!(seen, ["model/list", "turn/start"]);
+        let snapshot = client.snapshots.borrow().clone();
+        assert!(!snapshot.models.reloading);
+        assert_eq!(snapshot.thread_id.as_deref(), Some("s2"));
+        assert_eq!(snapshot.model.as_deref(), Some("hi/luna"));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_never_started_leaves_the_session_usable_and_codex_is_not_reloaded() {
+        let (mut client, mut server) = harness_with_config(Config {
+            backend: crate::backend::BackendKind::DeepSeekAcp,
+            ..Default::default()
+        })
+        .await;
+        let request = next(&mut server).await;
+        send(&mut server, json!({"id":request["id"],"result":{}})).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"thread":{"id":"s"},"model":"official/flash"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client.commands.send(Command::ReloadBackend).await.unwrap();
+        let reload = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":reload["id"],"error":{"code":-32000,"message":"dsh was not restarted: missing"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| {
+                !s.models.reloading
+                    && s.notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("was not restarted"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        // 测试只对 dsh 开放；没有在跑的测试时，迟到的结果被忽略。
+        client
+            .commands
+            .send(Command::TestModel {
+                model: "gpt-6-luna".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.models.test
+                    == crate::models::ModelTest::Failed {
+                        model: "gpt-6-luna".into(),
+                        message: "only the dsh backend can test a model".into(),
+                    }
+            })
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::ModelTestFinished {
+                model: "gpt-6-luna".into(),
+                outcome: Ok(5),
+            })
+            .await
+            .unwrap();
+        client.commands.send(Command::ReloadBackend).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("only the dsh backend"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            client.snapshots.borrow().models.test,
+            crate::models::ModelTest::Failed { .. }
+        ));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]
@@ -7293,7 +8454,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mismatched_new_thread_release_cannot_start_preflight_or_a_model_turn() {
+    async fn without_the_startup_shell_check_a_new_thread_is_ready_and_no_command_runs() {
+        let (mut client, mut server) = harness_with_config(Config {
+            startup_shell_check: false,
+            ..Default::default()
+        })
+        .await;
+        let request = next(&mut server).await;
+        let mut response: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.161.0/initialize.json"
+        ))
+        .unwrap();
+        response["id"] = request["id"].clone();
+        send(&mut server, response).await;
+        assert_eq!(next(&mut server).await["method"], "initialized");
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "thread/start");
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"thread":{"id":"root"},"model":"test-model"}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+        assert_eq!(next(&mut server).await["method"], "skills/list");
+        assert!(!client.snapshots.borrow().startup_blocked);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_thread_without_identity_cannot_start_preflight_or_a_model_turn() {
         let (mut client, mut server) = harness().await;
         let request = next(&mut server).await;
         let mut response: Value = serde_json::from_str(include_str!(
@@ -7312,7 +8502,7 @@ mod tests {
             })
             .await
             .unwrap();
-        send(&mut server, json!({"id":request["id"],"result":{"thread":{"id":"root","cliVersion":"PRIVATE_VERSION"}}})).await;
+        send(&mut server, json!({"id":request["id"],"result":{"thread":{"id":" ","cliVersion":"PRIVATE_VERSION"}}})).await;
         phase(&mut client, SessionPhase::Failed).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(30), next(&mut server))

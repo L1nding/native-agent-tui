@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::lang::{tr, zh};
 use crate::agents::AgentSnapshot;
 use crate::observation::ActivityScope;
-use crate::scheduler::{SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot};
+use crate::scheduler::{SchedulerCommand, TaskAttempt, TaskId, TaskSnapshot, TaskState};
 use crate::state::CoreSnapshot;
 
 #[derive(Debug, Default)]
@@ -185,7 +186,7 @@ fn open_conversation(snapshot: &CoreSnapshot, panel: &WorkflowPanel) -> Workflow
         return WorkflowKeyResult::handled();
     };
     if stale_gate_link(snapshot, panel.link_cursor, task) {
-        return stale_gate_notice("before opening it");
+        return stale_gate_notice(true);
     }
     let target = match workflow_conversation(snapshot, task) {
         ConversationTarget::Root => WorkflowConversation::Root,
@@ -203,7 +204,7 @@ fn task_command(key: KeyCode, snapshot: &CoreSnapshot, panel: &WorkflowPanel) ->
         return WorkflowKeyResult::handled();
     };
     if stale_gate_link(snapshot, panel.link_cursor, task) {
-        return stale_gate_notice("before changing it");
+        return stale_gate_notice(false);
     }
     let command = match key {
         KeyCode::F(6) if task.pause_requested => SchedulerCommand::Resume(task.id),
@@ -236,8 +237,11 @@ fn stop_confirmation(confirmed: bool) -> WorkflowKeyResult {
         WorkflowKeyResult {
             action: Some(WorkflowAction::ConfirmStop(true)),
             notice: Some(
-                "Press F9 again to cancel all workflow tasks. Any other key cancels this action."
-                    .into(),
+                tr(
+                    "Press F9 again to cancel all workflow tasks. Any other key cancels this action.",
+                    "再按一次 F9 取消全部工作流任务；按其他键放弃。",
+                )
+                .into(),
             ),
             ..WorkflowKeyResult::handled()
         }
@@ -272,7 +276,7 @@ fn change_priority(
         return WorkflowKeyResult::handled();
     };
     if stale_gate_link(snapshot, panel.link_cursor, task) {
-        return stale_gate_notice("before changing it");
+        return stale_gate_notice(false);
     }
     let priority = if key == KeyCode::Char('+') {
         task.priority.saturating_add(1)
@@ -294,11 +298,24 @@ fn change_priority(
     }
 }
 
-fn stale_gate_notice(action: &str) -> WorkflowKeyResult {
+fn stale_gate_notice(opening: bool) -> WorkflowKeyResult {
+    let notice = if zh() {
+        format!(
+            "捕获的 Gate 尝试已不是当前尝试；请先用 Up/Down 重新选择任务，再{}。",
+            if opening { "打开" } else { "修改" }
+        )
+    } else {
+        format!(
+            "The captured Gate attempt is no longer current; use Up/Down to reselect the task {}.",
+            if opening {
+                "before opening it"
+            } else {
+                "before changing it"
+            }
+        )
+    };
     WorkflowKeyResult {
-        notice: Some(format!(
-            "The captured Gate attempt is no longer current; use Up/Down to reselect the task {action}."
-        )),
+        notice: Some(notice),
         ..WorkflowKeyResult::handled()
     }
 }
@@ -382,7 +399,9 @@ pub(super) fn navigate_workflow_link(
         notice,
     };
     let Some(current) = selected_task(snapshot, selected_id) else {
-        return unchanged(Some("No workflow task is selected.".into()));
+        return unchanged(Some(
+            tr("No workflow task is selected.", "没有选中工作流任务。").into(),
+        ));
     };
     let cursor = current_cursor.filter(|cursor| {
         cursor.kind == kind
@@ -401,7 +420,13 @@ pub(super) fn navigate_workflow_link(
         .iter()
         .find(|task| task.id == origin)
     else {
-        return unchanged(Some("The workflow link source is unavailable.".into()));
+        return unchanged(Some(
+            tr(
+                "The workflow link source is unavailable.",
+                "工作流链接的来源任务不可用。",
+            )
+            .into(),
+        ));
     };
     let count = match kind {
         WorkflowLinkKind::Dependency => source.dependencies.len(),
@@ -412,8 +437,14 @@ pub(super) fn navigate_workflow_link(
             task_id: None,
             cursor: None,
             notice: Some(match kind {
-                WorkflowLinkKind::Dependency => "Selected task has no dependencies.".into(),
-                WorkflowLinkKind::Gate => "Selected task has no captured Gate wait targets.".into(),
+                WorkflowLinkKind::Dependency => {
+                    tr("Selected task has no dependencies.", "所选任务没有依赖。").into()
+                }
+                WorkflowLinkKind::Gate => tr(
+                    "Selected task has no captured Gate wait targets.",
+                    "所选任务没有捕获的 Gate 等待目标。",
+                )
+                .into(),
             }),
         };
     }
@@ -434,10 +465,11 @@ pub(super) fn navigate_workflow_link(
         return WorkflowLinkNavigation {
             task_id: None,
             cursor: None,
-            notice: Some(format!(
-                "Workflow link target #{} is unavailable.",
-                target.0
-            )),
+            notice: Some(if zh() {
+                format!("工作流链接目标 #{} 不可用。", target.0)
+            } else {
+                format!("Workflow link target #{} is unavailable.", target.0)
+            }),
         };
     }
     WorkflowLinkNavigation {
@@ -510,16 +542,18 @@ pub(super) fn workflow_conversation<'a>(
             {
                 ConversationTarget::Root
             } else {
-                ConversationTarget::Unavailable(
+                ConversationTarget::Unavailable(tr(
                     "This root task does not match the currently confirmed conversation turn.",
-                )
+                    "这个根任务与当前已确认的对话轮次不匹配。",
+                ))
             }
         }
         crate::scheduler::TaskKind::NativeChild => {
             let Some(thread_id) = task.child_thread_id.as_deref() else {
-                return ConversationTarget::Unavailable(
+                return ConversationTarget::Unavailable(tr(
                     "This child task has no confirmed thread identity.",
-                );
+                    "这个子任务还没有已确认的线程身份。",
+                ));
             };
             if task.external.as_ref().is_some_and(|turn| {
                 turn.thread_id != thread_id
@@ -527,18 +561,20 @@ pub(super) fn workflow_conversation<'a>(
                     || turn.generation == 0
                     || turn.turn_id.is_empty()
             }) {
-                return ConversationTarget::Unavailable(
+                return ConversationTarget::Unavailable(tr(
                     "The child task identity is stale or inconsistent.",
-                );
+                    "子任务的身份已过期或不一致。",
+                ));
             }
             let Some(agent) = snapshot
                 .agents
                 .iter()
                 .find(|agent| agent.info.id == thread_id)
             else {
-                return ConversationTarget::Unavailable(
+                return ConversationTarget::Unavailable(tr(
                     "No observed agent is available for this child thread.",
-                );
+                    "这个子线程还没有观察到对应的 Agent。",
+                ));
             };
             if let Some(turn) = &task.external {
                 if agent.turn_id.as_deref() == Some(turn.turn_id.as_str())
@@ -546,9 +582,10 @@ pub(super) fn workflow_conversation<'a>(
                 {
                     ConversationTarget::Child(agent)
                 } else {
-                    ConversationTarget::Unavailable(
+                    ConversationTarget::Unavailable(tr(
                         "The child task's observed agent turn is stale or unavailable.",
-                    )
+                        "子任务观察到的 Agent 轮次已过期或不可用。",
+                    ))
                 }
             } else if task.attempt == 0
                 && agent.generation == 0
@@ -557,9 +594,10 @@ pub(super) fn workflow_conversation<'a>(
             {
                 ConversationTarget::Child(agent)
             } else {
-                ConversationTarget::Unavailable(
+                ConversationTarget::Unavailable(tr(
                     "The child thread has started without a matching confirmed task turn.",
-                )
+                    "子线程已启动，但没有匹配的已确认任务轮次。",
+                ))
             }
         }
     }
@@ -567,7 +605,37 @@ pub(super) fn workflow_conversation<'a>(
 
 pub(super) fn task_reference(id: TaskId, tasks: &BTreeMap<TaskId, &TaskSnapshot>) -> String {
     tasks.get(&id).map_or_else(
-        || format!("#{} unavailable", id.0),
-        |task| format!("#{} {} [{:?}]", id.0, task.title, task.state),
+        || format!("#{} {}", id.0, tr("unavailable", "不可用")),
+        |task| {
+            format!(
+                "#{} {} [{}]",
+                id.0,
+                task.title,
+                task_state_label(task.state)
+            )
+        },
     )
+}
+
+/// Task state as shown in the workflow panel. English keeps the variant name.
+pub(super) fn task_state_label(state: TaskState) -> String {
+    if !zh() {
+        return format!("{state:?}");
+    }
+    match state {
+        TaskState::Queued => "排队",
+        TaskState::Ready => "就绪",
+        TaskState::Starting => "启动中",
+        TaskState::Running => "运行中",
+        TaskState::WaitingChildren => "等待子 Agent",
+        TaskState::WaitingApproval => "等待审批",
+        TaskState::Cancelling => "取消中",
+        TaskState::Succeeded => "已完成",
+        TaskState::Failed => "失败",
+        TaskState::Cancelled => "已取消",
+        TaskState::Unknown => "未知",
+        TaskState::Paused => "已暂停",
+        TaskState::Blocked => "受阻",
+    }
+    .to_owned()
 }

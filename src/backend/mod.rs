@@ -6,6 +6,7 @@
 
 pub(crate) mod acp;
 pub mod acp_protocol;
+pub mod dsh_config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {

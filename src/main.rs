@@ -22,8 +22,8 @@ fn print_help() {
     };
     println!("Native Agent TUI {}", env!("CARGO_PKG_VERSION"));
     println!(
-        "Default execution requires codex-cli {}; --backend deepseek-acp uses dsh --profile <name>.",
-        native_agent_tui::compatibility::SUPPORTED_CODEX_VERSION
+        "Default execution uses dsh --profile <name>; --backend codex or --codex PATH uses codex-cli (any release; verified against {}).",
+        native_agent_tui::compatibility::VERIFIED_CODEX_VERSION
     );
     println!(
         r#"
@@ -31,7 +31,7 @@ Quick start:
   native-agent-tui                     Open the TUI in the current directory; F1 lists keys
   native-agent-tui --check-shell       Check Codex and the sandbox without a model turn
   native-agent-tui --run "TASK"        Run one task and print the answer
-  If the shell check times out on Windows, add --windows-sandbox unelevated.
+  If the shell check fails on Windows, add --windows-sandbox unelevated.
 
 Usage:
   native-agent-tui [--tui [TASK]] [OPTIONS]
@@ -48,12 +48,14 @@ Usage:
 Options:
   --cwd PATH       Working directory (default: current directory)
   --codex PATH     Codex executable (or CODEX_BIN)
-  --backend NAME    codex (default) | deepseek-acp
+  --backend NAME    deepseek-acp (default) | codex; --codex and --check-shell imply codex
   --dsh PATH        DeepSeek Harness executable (or DSH_BIN)
   --profile NAME    DeepSeek ACP profile (default: acp)
   --model NAME     Requested model; uses Codex configuration when omitted
   --sandbox MODE   read-only | workspace-write | danger-full-access
   --approval MODE  untrusted | on-request | never (default: on-request)
+  --startup-shell-check  Verify the sandbox shell before the first task (default: off;
+                         the sandbox is first used when the model runs a command)
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)
@@ -88,6 +90,9 @@ TUI: Enter send, Ctrl+S/Ctrl+Enter queue, Ctrl+O/Shift+Enter newline, Ctrl+C int
      Ctrl+T opens the live evidence timeline with filters and local bookmarks.
      Ctrl+B cancels the selected approval and interrupts its owning turn when allowed.
      F10 attention thresholds, F11 activity evidence, F12 history/export.
+     Ctrl+E folds or unfolds long tool groups in the conversation.
+     The TUI is shown in Chinese; set NATIVE_AGENT_TUI_LANG=en for English.
+     NATIVE_AGENT_TUI_THEME=dark|light|terminal|mono selects colors; NO_COLOR is honored.
 Tasks: Up/Down select, F6 pause task, F7 cancel, F8 retry (may repeat
        side effects), +/- priority, F9 twice stop workflow.
 
@@ -110,6 +115,15 @@ async fn main() -> ExitCode {
 async fn execute() -> Result<(), (u8, String)> {
     let arguments: Vec<_> = env::args().skip(1).collect();
     let redact_errors = arguments.iter().any(|argument| argument == "--json-events");
+    // 日志原先在应用数据目录；默认位置下，把已经没有进程在写的会话搬到 .zf。
+    if !arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--journal-dir" | "--help" | "-h" | "--version" | "-V"
+        )
+    }) {
+        journal::migrate_legacy(&journal::JournalSettings::default());
+    }
     match config::parse_args(arguments).map_err(|error| {
         (
             2,

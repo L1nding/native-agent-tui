@@ -265,6 +265,48 @@ async fn export_cannot_replace_files_or_write_inside_the_managed_store() {
 }
 
 #[tokio::test]
+async fn overview_reports_what_unclosed_sessions_wait_for_and_how_closed_ones_ended() {
+    let fixture = Fixture::new();
+    let settings = fixture.settings();
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // 一个仍未关闭、有两个请求在等回答的会话。
+    let mut waiting = state(1);
+    waiting.observation.session_id = "WAITING-SESSION".into();
+    waiting.tasks[0].pending_requests = 2;
+    let open = Journal::open(&settings, &cwd, waiting).unwrap();
+    // 一个已经完成并关闭的会话。
+    let journal = Journal::open(&settings, &cwd, state(1)).unwrap();
+    let mut terminal = state(2);
+    terminal.close(SessionPhase::Completed, true);
+    journal.finish(terminal).await.unwrap();
+
+    let mut service = HistoryHandle::start(settings, cwd).unwrap();
+    let id = service.request(HistoryRequest::Overview).unwrap();
+    let HistoryResult::Overview(sessions) = service.response(id).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(sessions.len(), 2);
+    let find = |id: &str| {
+        sessions
+            .iter()
+            .find(|session| session.info.session_id == id)
+            .unwrap_or_else(|| panic!("{id} missing"))
+    };
+    let waiting = find("WAITING-SESSION");
+    assert!(!waiting.info.session_closed);
+    assert_eq!(waiting.pending_requests, Some(2));
+    assert_eq!(waiting.phase, Some(SessionPhase::Running));
+    let closed = find("PRIVATE-SESSION");
+    assert!(closed.info.session_closed);
+    assert_eq!(closed.pending_requests, Some(0));
+    // 关闭的会话用 journal 记录的执行结果，不重新推断。
+    assert!(closed.phase.is_some());
+    assert_eq!(closed.phase, closed.info.execution_result);
+    drop(open);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn history_service_reads_frozen_evidence_and_requires_an_explicit_export_preview() {
     let fixture = Fixture::new();
     let settings = fixture.settings();

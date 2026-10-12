@@ -40,12 +40,12 @@ def main():
         if os.name != 'nt':
             fake.chmod(0o700)
         for mode in ['version_bad', 'version_empty', 'version_private', 'version_large', 'version_failure',
-                     'version_hang', 'initialize_bad', 'thread_version_bad',
+                     'version_hang', 'initialize_bad', 'thread_identity_bad',
                      *(['peer_version_bad', 'peer_initialize_bad', 'peer_shell_bad'] if os.name == 'nt' else []), 'success']:
             root = base / mode
             root.mkdir()
             command = [str(binary), '--cwd', str(repo), '--codex', str(fake), '--journal-dir', str(root / 'journal'),
-                       '--run', 'PRIVATE_PROMPT', '--json-events']
+                       '--run', 'PRIVATE_PROMPT', '--json-events', '--startup-shell-check']
             process = subprocess.Popen(command, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        stdin=subprocess.DEVNULL, creationflags=flags,
                                        env=dict(os.environ, NATIVE_JSONL_FIXTURE_ROOT=str(root), NATIVE_JSONL_FIXTURE_MODE=mode))
@@ -68,7 +68,7 @@ def main():
                     assert stage == ['version'] and not methods, (mode, stage, methods)
                 elif mode == 'initialize_bad':
                     assert process.returncode == 3 and methods == ['initialize'], (mode, process.returncode, methods)
-                elif mode == 'thread_version_bad':
+                elif mode == 'thread_identity_bad':
                     assert process.returncode == 3 and methods == ['initialize', 'initialized', 'thread/start'], (mode, process.returncode, methods)
                 elif mode.startswith('peer_'):
                     assert process.returncode == 3 and 'turn/start' not in methods

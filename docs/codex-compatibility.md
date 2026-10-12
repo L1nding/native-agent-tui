@@ -4,13 +4,13 @@
 
 | 后端与环境 | 执行状态 | 证据与限制 |
 | --- | --- | --- |
-| Codex CLI 0.161.0 / 本机 Windows | 唯一允许的后端版本（2026-10-08 起） | schema 差异经人工审核；真实初始化、零模型 shell 预检、localhost Gate 和 CLI JSONL 见下方升级记录 |
-| Codex CLI 0.159.2 | 禁止执行（旧基线） | 2026-10-08 前的验证记录保留为历史证据 |
-| 其他 CLI 版本，包括 prerelease | 禁止执行 | 模型目录查询前拒绝，没有忽略门禁的 CLI 开关 |
+| Codex CLI 0.161.0 / 本机 Windows | 允许执行，已验证基线 | schema 差异经人工审核；真实初始化、零模型 shell 预检、localhost Gate 和 CLI JSONL 见下方升级记录 |
+| 其他 CLI 版本，包括 prerelease | 允许执行，未经验证（2026-10-12 起） | 不再比对版本号；协议差异由 initialize、thread/start 的形状检查和调用边缘的校验暴露 |
 | Linux/macOS、其他 Windows 环境 | 尚未获得发布验收 | 源码路径和版本判断不能替代原生验证 |
 | 历史会话 | 只读可用 | 列表、历史、回放和脱敏导出不查询或启动 Codex |
 
-0.161.0 是项目当前验证的固定基线（此前为 0.159.2），不表示最新版本。选择已有兼容安装：
+2026-10-12 起不再锁定 Codex 版本。0.161.0 只是协议夹具的录制基线，不是执行前提；
+其他版本可以运行，但没有对应的 schema 审核记录。选择执行文件：
 
 ```text
 cargo run --locked -- --codex PATH_TO_CODEX --check-shell
@@ -20,18 +20,24 @@ cargo run --locked -- --codex PATH_TO_CODEX --check-shell
 
 ## 启动边界
 
-1. `--version` 查询最多读取 4096 字节，等待五秒。只接受准确的
-   `codex-cli 0.161.0`，可带一个 LF 或 CRLF；相似版本、额外文本、空输出
-   和查询失败均拒绝。
+1. `--version` 查询最多读取 4096 字节，等待五秒。接受任意版本的
+   `codex-cli <版本>` 单行 banner，可带一个 LF 或 CRLF；版本部分为 1–64 个
+   ASCII 字母、数字、`.`、`-`、`+`。缺少前缀、额外文本、空输出和查询失败
+   均拒绝。该检查只确认执行文件是 Codex CLI，不比对版本号。
 2. 版本通过后读取有效模型目录，随后启动 app-server。
 3. `initialize` 必须提供有界、非空字符串 `userAgent`、`codexHome`、
    `platformFamily`、`platformOs`。缺失或类型错误时，不发送 `initialized`、
    `thread/start` 或 shell 预检。其他字段允许保留在协议响应中，但不会
    从初始化 metadata 写入 Core 快照或 journal。
-4. 新线程必须报告 `thread.cliVersion = 0.161.0` 和非空、有界的 `thread.id`。
-   不符时拒绝 shell 预检和任务。版本 banner 不能替代新线程返回的版本。
-5. 正常 Windows 启动在主线程通过上述门禁后，为 shell 预检启动独立
-   app-server。辅助进程重新核对准确版本和 initialize 必需字段，使用
+4. 新线程必须报告非空、有界的 `thread.id`，不符时拒绝 shell 预检和任务。
+   `thread.cliVersion` 不再检查。
+5. 2026-10-12 起，启动默认不再运行 shell 预检：新线程通过第 4 步后直接
+   进入 Ready，沙箱在模型首次执行命令时才被使用，与 Codex CLI 一致。
+   第 5、6 步的其余内容只在显式传入 `--startup-shell-check` 时生效；
+   `--check-shell` 仍可单独诊断沙箱。原因：elevated 沙箱的设置刷新会因
+   其他 Codex 会话占用 `node_repl.exe` 而失败，使启动被无关的环境状态阻断。
+   启用 `--startup-shell-check` 时，Windows 启动在主线程通过上述门禁后，为 shell 预检启动独立
+   app-server。辅助进程重新核对版本 banner 和 initialize 必需字段，使用
    相同启动配置及共享 catalog 副本，不创建线程或模型轮次。主进程的
    MCP 保留；辅助端 RPC ID 不进入主连接的 pending 表。
 6. shell 预检成功且辅助进程树清理确认后才能 dispatch 模型轮次。
@@ -67,8 +73,9 @@ codex app-server generate-json-schema --experimental --out target/codex-schema-r
 python scripts/check_protocol_schema.py --schema-dir target/codex-schema-review
 ```
 
-`scripts/verify.py --live` 还运行 ignored schema 导出测试，先确认固定版本，
-在独立临时目录导出并比较八份指纹，不发模型请求。脚本为该测试和
+`scripts/verify.py --live` 还运行 ignored schema 导出测试，在独立临时目录
+导出并比较八份指纹，不发模型请求。指纹来自 0.161.0，安装其他版本时该项
+可能因 schema 差异失败，这表示需要审核差异，不影响执行。脚本为该测试和
 provider 测试设置实际 Python 路径；单独运行时应显式设置：
 
 ```powershell
@@ -76,14 +83,14 @@ $env:NATIVE_AGENT_TUI_PYTHON = (python -c 'import sys; print(sys.executable)')
 cargo nextest run --locked --run-ignored only live_codex_schemas
 ```
 
-升级需要手动审核 schema 差异，更新固定版本和夹具，再运行协议/Core
+更新验证基线需要手动审核 schema 差异，更新夹具，再运行协议/Core
 回归、历史回放及真实 app-server 验证。指纹脚本只有比较入口，不能自动
 更新基线或绕过差异。
 
 ## 验证范围
 
-九个共有本地 CLI 场景覆盖版本不符、空 banner、私有 banner、超大输出、
-非零退出、超时查询、初始化缺字段、新线程版本不符及正常执行。前六种
+九个共有本地 CLI 场景覆盖 banner 缺少版本、空 banner、私有 banner、超大输出、
+非零退出、超时查询、初始化缺字段、新线程缺少有效 ID 及正常执行。前六种
 只调用版本查询；初始化与线程拒绝场景分别停在其响应边界。测试确认
 拒绝时零根请求、错误/日志不含私有夹具文本、关闭状态可回放；Windows
 超时场景在结束前持有父子进程句柄，随后确认退出。Windows 额外验证

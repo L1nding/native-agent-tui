@@ -4,14 +4,19 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Borders, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::layout::wrap;
+use super::lang::{self, tr};
 use super::scope::Scope;
-use super::tool_detail;
+use super::theme::{self, Theme};
+use super::tool_detail::{
+    self, activity_scope_zh, execution_text, execution_zh, field_segments, field_shown_text,
+    field_text, help_parts, scope_text, wrap_segments, Field as Fact, Segment, Tone,
+};
 use super::{search, Editor};
 use crate::interactions::RequestRef;
 use crate::observation::{ActivityScope, EvidenceKind, ExecutionState};
@@ -57,6 +62,18 @@ impl Category {
         };
         self == Self::All || self == category
     }
+
+    /// Name shown in the filter row; English is the variant name.
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => tr("All", "全部"),
+            Self::Lifecycle => tr("Lifecycle", "生命周期"),
+            Self::Output => tr("Output", "输出"),
+            Self::Tool => tr("Tool", "工具"),
+            Self::Request => tr("Request", "请求"),
+            Self::Waiting => tr("Waiting", "等待"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +83,18 @@ enum State {
     Active,
     Terminal,
     Unknown,
+}
+
+impl State {
+    /// Name shown in the filter row; English is the variant name.
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => tr("All", "全部"),
+            Self::Active => tr("Active", "进行中"),
+            Self::Terminal => tr("Terminal", "已结束"),
+            Self::Unknown => tr("Unknown", "未知"),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -183,8 +212,7 @@ impl TimelinePanel {
                             .iter()
                             .any(|request| request.matches(reference) && !request.responding)
                     }))
-                && (self.query.text.is_empty()
-                    || metadata(entry).join("\n").contains(&self.query.text))
+                && (self.query.text.is_empty() || metadata_matches(entry, &self.query.text))
         };
         let mut rows: Vec<_> = if self.bookmarks_only {
             self.bookmarks
@@ -261,7 +289,13 @@ impl TimelinePanel {
         if self.editor().text.len() + text.len() <= FIELD_BYTES {
             self.editor().insert(&text);
         } else {
-            self.notice = Some("Timeline field limited to 1024 UTF-8 bytes.".into());
+            self.notice = Some(
+                tr(
+                    "Timeline field limited to 1024 UTF-8 bytes.",
+                    "时间线输入框最多 1024 个 UTF-8 字节。",
+                )
+                .into(),
+            );
         }
     }
 
@@ -271,20 +305,25 @@ impl TimelinePanel {
         }
     }
     pub fn reject_paste(&mut self) {
-        self.notice = Some(super::PASTE_REJECTED.into());
+        self.notice = Some(super::paste_rejected().into());
     }
 
     fn toggle_bookmark(&mut self, current: &CoreSnapshot) {
         let Some(entry) = self.selected(current) else {
-            self.notice =
-                Some("Selected evidence was evicted or filtered; select a retained event.".into());
+            self.notice = Some(
+                tr(
+                    "Selected evidence was evicted or filtered; select a retained event.",
+                    "所选证据已被清出或被筛掉，请选择一条已保留的事件。",
+                )
+                .into(),
+            );
             return;
         };
         if let Some(index) = self.bookmarks.iter().position(|bookmark| {
             bookmark.session == self.session && bookmark.entry.evidence.id == entry.evidence.id
         }) {
             self.bookmarks.remove(index);
-            self.notice = Some("Bookmark removed.".into());
+            self.notice = Some(tr("Bookmark removed.", "书签已移除。").into());
             return;
         }
         let bookmark = Bookmark {
@@ -296,11 +335,21 @@ impl TimelinePanel {
                 > BOOKMARK_BYTES
         {
             self.notice = Some(
-                "Bookmark budget reached (64 entries / 64 KiB); remove a bookmark first.".into(),
+                tr(
+                    "Bookmark budget reached (64 entries / 64 KiB); remove a bookmark first.",
+                    "书签已达上限（64 条 / 64 KiB），请先移除一个书签。",
+                )
+                .into(),
             );
         } else {
             self.bookmarks.push(bookmark);
-            self.notice = Some("Bookmark saved locally for this live session.".into());
+            self.notice = Some(
+                tr(
+                    "Bookmark saved locally for this live session.",
+                    "书签已保存在本地，仅本次实时会话有效。",
+                )
+                .into(),
+            );
         }
     }
 
@@ -444,13 +493,22 @@ impl TimelinePanel {
             KeyCode::Enter if !ctrl => {
                 let Some(entry) = self.selected(current) else {
                     self.notice = Some(
-                        "Selected evidence was evicted or filtered; navigation required.".into(),
+                        tr(
+                            "Selected evidence was evicted or filtered; navigation required.",
+                            "所选证据已被清出或被筛掉，请重新选择。",
+                        )
+                        .into(),
                     );
                     return None;
                 };
                 if !self.retained(&entry, current) {
-                    self.notice =
-                        Some("Bookmarked content was evicted; original metadata only.".into());
+                    self.notice = Some(
+                        tr(
+                            "Bookmarked content was evicted; original metadata only.",
+                            "书签对应的内容已被清出，只剩原始元数据。",
+                        )
+                        .into(),
+                    );
                     return None;
                 }
                 if let Some(reference) = &entry.request {
@@ -462,8 +520,13 @@ impl TimelinePanel {
                         self.close();
                         return Some(Locate::Request(reference.clone()));
                     }
-                    self.notice =
-                        Some("This request delivery has ended; no current request matches.".into());
+                    self.notice = Some(
+                        tr(
+                            "This request delivery has ended; no current request matches.",
+                            "这次请求投递已结束，没有匹配的当前请求。",
+                        )
+                        .into(),
+                    );
                 } else if (entry.scope == ActivityScope::Tool
                     || has_exact_tool_detail(&entry, current))
                     && matches!(
@@ -475,8 +538,13 @@ impl TimelinePanel {
                     )
                 {
                     let Some(item_id) = entry.item_id.clone() else {
-                        self.notice =
-                            Some("Tool detail unavailable: item identity is missing.".into());
+                        self.notice = Some(
+                            tr(
+                                "Tool detail unavailable: item identity is missing.",
+                                "工具详情不可用：缺少条目标识。",
+                            )
+                            .into(),
+                        );
                         return None;
                     };
                     let locator = ToolDetailLocator {
@@ -493,8 +561,11 @@ impl TimelinePanel {
                         self.notice = None;
                     } else {
                         self.notice = Some(
-                            "Tool detail unavailable or evicted for this exact item identity."
-                                .into(),
+                            tr(
+                                "Tool detail unavailable or evicted for this exact item identity.",
+                                "这个条目的工具详情不可用或已被清出。",
+                            )
+                            .into(),
                         );
                     }
                 } else if matches!(
@@ -511,11 +582,20 @@ impl TimelinePanel {
                         return Some(Locate::Message(search::Focus::message(message)));
                     }
                     self.notice = Some(
-                        "Message body unavailable or evicted; evidence metadata remains.".into(),
+                        tr(
+                            "Message body unavailable or evicted; evidence metadata remains.",
+                            "消息正文不可用或已被清出，证据元数据仍在。",
+                        )
+                        .into(),
                     );
                 } else {
-                    self.notice =
-                        Some("Evidence details shown; no retained message or request link.".into());
+                    self.notice = Some(
+                        tr(
+                            "Evidence details shown; no retained message or request link.",
+                            "已显示证据详情；没有可定位的已保留消息或请求。",
+                        )
+                        .into(),
+                    );
                 }
             }
             _ => {}
@@ -541,6 +621,10 @@ impl TimelinePanel {
             self.scroll.set(self.scroll.get().min(max));
             return;
         }
+        let theme = theme::current();
+        // One themed surface, so the panel matches the framed panels around it.
+        frame.render_widget(theme::panel(), area);
+        let value = Style::default().fg(theme.foreground);
         let rows = self.rows(current);
         let index = rows
             .iter()
@@ -551,52 +635,105 @@ impl TimelinePanel {
             .front()
             .zip(current.timeline.entries.back())
             .map_or_else(
-                || "empty".into(),
+                || tr("empty", "空").into(),
                 |(first, last)| format!("#{}..#{}", first.evidence.id, last.evidence.id),
             );
-        let range = format!(
-            "Retained {}; accepted through #{}; omitted {} (gaps possible); budget {} / {} KiB",
-            retained,
-            current.timeline.high_water,
-            current.timeline.dropped_entries,
-            ENTRY_LIMIT,
-            BYTE_LIMIT / 1024
-        );
-        let filters = format!(
-            "{:?} / {:?} / {:?}{}{}",
-            self.scope,
-            self.category,
-            self.state,
-            if self.bookmarks_only {
-                " / bookmarks"
-            } else {
-                ""
-            },
-            if self.pending_only {
-                " / current pending"
-            } else {
-                ""
-            }
-        );
-        let header_height = area.height.min(if area.height >= 12 { 4 } else { 2 });
-        let mut header = vec![
-            format!(
-                "Evidence timeline {}/{} | {} bookmarks",
-                index.map_or(0, |index| index + 1),
-                rows.len(),
-                self.bookmarks.len()
+        let zh = lang::zh();
+        // Text: "Retained ..; accepted through #..; omitted N (gaps possible); budget ..".
+        let range: Vec<Segment> = vec![
+            (
+                if zh {
+                    format!(
+                        "已保留 {}；已接收至 #{}；",
+                        retained, current.timeline.high_water
+                    )
+                } else {
+                    format!(
+                        "Retained {}; accepted through #{}; ",
+                        retained, current.timeline.high_water
+                    )
+                },
+                theme.secondary(),
             ),
+            (
+                if zh {
+                    format!("已省略 {}（可能有缺口）", current.timeline.dropped_entries)
+                } else {
+                    format!(
+                        "omitted {} (gaps possible)",
+                        current.timeline.dropped_entries
+                    )
+                },
+                if current.timeline.dropped_entries > 0 {
+                    Style::default().fg(theme.warning)
+                } else {
+                    theme.secondary()
+                },
+            ),
+            (
+                if zh {
+                    format!("；预算 {} 条 / {} KiB", ENTRY_LIMIT, BYTE_LIMIT / 1024)
+                } else {
+                    format!("; budget {} / {} KiB", ENTRY_LIMIT, BYTE_LIMIT / 1024)
+                },
+                theme.secondary(),
+            ),
+        ];
+        let filters: Vec<Segment> = vec![(
+            format!(
+                "{} / {} / {}{}{}",
+                scope_text(self.scope),
+                self.category.label(),
+                self.state.label(),
+                if self.bookmarks_only {
+                    tr(" / bookmarks", " / 仅书签")
+                } else {
+                    ""
+                },
+                if self.pending_only {
+                    tr(" / current pending", " / 当前待处理")
+                } else {
+                    ""
+                }
+            ),
+            value,
+        )];
+        let header_height = area.height.min(if area.height >= 12 { 4 } else { 2 });
+        let mut header: Vec<Vec<Segment>> = vec![
+            vec![
+                (
+                    tr("Evidence timeline", "证据时间线").to_owned(),
+                    theme.heading(),
+                ),
+                (
+                    format!(
+                        " {}/{} | {}",
+                        index.map_or(0, |index| index + 1),
+                        rows.len(),
+                        if zh {
+                            format!("{} 个书签", self.bookmarks.len())
+                        } else {
+                            format!("{} bookmarks", self.bookmarks.len())
+                        }
+                    ),
+                    theme.secondary(),
+                ),
+            ],
             range.clone(),
             filters.clone(),
-            format!(
-                "Thread: {} | turn: {} | query: {}",
-                self.thread,
-                if self.turn.text.is_empty() {
-                    "all"
-                } else {
-                    &self.turn.text
-                },
-                self.query.text
+            field_segments(
+                theme,
+                &[
+                    Fact::new("Thread", self.thread.clone()).zh("线程"),
+                    if self.turn.text.is_empty() {
+                        Fact::new("turn", "all").zh_value("全部")
+                    } else {
+                        Fact::new("turn", self.turn.text.clone())
+                    }
+                    .zh("轮次"),
+                    Fact::new("query", self.query.text.clone()).zh("查询"),
+                ],
+                " | ",
             ),
         ];
         if let Some(field) = self.editing {
@@ -606,22 +743,35 @@ impl TimelinePanel {
             };
             let mut left = editor.text[..editor.cursor].to_string();
             let prefix = match field {
-                Field::Query => "Metadata: ",
-                Field::Turn => "Exact turn: ",
+                Field::Query => tr("Metadata: ", "元数据："),
+                Field::Turn => tr("Exact turn: ", "精确轮次："),
             };
             let width = (area.width as usize).saturating_sub(prefix.width()).max(1);
             while left.width() >= width && !left.is_empty() {
                 let bytes = left.graphemes(true).next().unwrap().len();
                 left.drain(..bytes);
             }
-            header[0] = format!(
-                "Timeline: edit {} (Enter apply)",
-                match field {
-                    Field::Query => "metadata",
-                    Field::Turn => "turn",
-                }
-            );
-            header[1] = format!("{prefix}{left}{}", &editor.text[editor.cursor..]);
+            header[0] = vec![
+                (
+                    format!(
+                        "{}{}",
+                        tr("Timeline: edit ", "时间线：编辑"),
+                        match field {
+                            Field::Query => tr("metadata", "元数据"),
+                            Field::Turn => tr("turn", "轮次"),
+                        }
+                    ),
+                    theme.heading(),
+                ),
+                (
+                    tr(" (Enter apply)", "（Enter 应用）").to_owned(),
+                    theme.secondary(),
+                ),
+            ];
+            header[1] = vec![
+                (prefix.to_owned(), theme.label()),
+                (format!("{left}{}", &editor.text[editor.cursor..]), value),
+            ];
             if area.width as usize > prefix.width() && area.height > 1 {
                 frame.set_cursor_position((
                     area.x + (prefix.width() + left.width()) as u16,
@@ -633,7 +783,14 @@ impl TimelinePanel {
             Paragraph::new(
                 header
                     .into_iter()
-                    .map(|text| Line::from(display_text(&text)))
+                    .map(|segments| {
+                        Line::from(
+                            segments
+                                .into_iter()
+                                .map(|(text, style)| Span::styled(display_text(&text), style))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             ),
             Rect {
@@ -646,29 +803,75 @@ impl TimelinePanel {
             height: area.height.saturating_sub(header_height + 1),
             ..area
         };
-        let mut details = Vec::new();
+        let quiet = |text: &str| vec![(text.to_owned(), theme.secondary())];
+        let warning = |text: &str| vec![(text.to_owned(), Tone::Warning.style(theme))];
+        let mut details: Vec<Vec<Segment>> = Vec::new();
         if let Some(notice) = &self.notice {
-            details.push(notice.clone());
+            details.push(warning(notice));
         }
         if self.help {
-            details.extend(HELP.iter().map(|line| (*line).to_owned()));
+            let help = if zh { HELP_ZH } else { HELP };
+            details.extend(help.iter().enumerate().map(|(row, line)| {
+                // Key rows read `keys: action`; the remaining rows are notes.
+                match help_parts(line).filter(|_| row < HELP_KEY_ROWS) {
+                    Some((keys, action)) => {
+                        vec![(keys.to_owned(), theme.key()), (action.to_owned(), value)]
+                    }
+                    None => quiet(line),
+                }
+            }));
         } else if let Some(entry) = index.and_then(|index| rows.get(index)) {
-            details.push(format!(
-                "#{} {:?} | {:?} / {:?}",
-                entry.evidence.id, entry.evidence.kind, entry.scope, entry.execution_state
-            ));
+            details.push(vec![
+                (
+                    format!("#{} {:?}", entry.evidence.id, entry.evidence.kind),
+                    theme.heading(),
+                ),
+                (
+                    if zh {
+                        format!(
+                            " | {} / {}",
+                            activity_scope_zh(entry.scope),
+                            execution_text(entry.execution_state)
+                        )
+                    } else {
+                        format!(" | {:?} / {:?}", entry.scope, entry.execution_state)
+                    },
+                    theme.secondary(),
+                ),
+            ]);
             if !self.retained(entry, current) {
-                details.push("BOOKMARK: content evicted; original metadata only".into());
+                details.push(warning(tr(
+                    "BOOKMARK: content evicted; original metadata only",
+                    "书签：内容已被清出，只剩原始元数据",
+                )));
             }
-            details.extend(metadata(entry));
-            details.push("Enter: locate retained message / current request delivery".into());
-            details.push("Raw tool output and reasoning: unavailable here".into());
-        } else if self.selected.is_some() {
-            details.push(
-                "Selected evidence evicted or filtered. Up/Down selects an available event.".into(),
+            details.extend(
+                metadata_fields(entry)
+                    .iter()
+                    .map(|fields| field_segments(theme, fields, " | ")),
             );
+            details.push(quiet(tr(
+                "Enter: locate retained message / current request delivery",
+                "Enter：定位已保留的消息 / 当前请求投递",
+            )));
+            details.push(quiet(tr(
+                "Raw tool output and reasoning: unavailable here",
+                "原始工具输出和推理：这里不可用",
+            )));
+        } else if self.selected.is_some() {
+            details.push(warning(tr(
+                "Selected evidence evicted or filtered. Up/Down selects an available event.",
+                "所选证据已被清出或被筛掉。按 Up/Down 选择一条可用的事件。",
+            )));
         } else {
-            details.push("No evidence matches this retained range and filter.".into());
+            details.push(vec![(
+                tr(
+                    "No evidence matches this retained range and filter.",
+                    "当前保留范围和筛选条件下没有匹配的证据。",
+                )
+                .to_owned(),
+                value,
+            )]);
         }
         let detail_area = if area.width >= 100 && body.height >= 4 && !self.help {
             let panels = Layout::default()
@@ -676,6 +879,7 @@ impl TimelinePanel {
                 .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
                 .split(body);
             let height = panels[0].height.saturating_sub(2) as usize;
+            let list_width = panels[0].width.saturating_sub(2) as usize;
             let start = index
                 .unwrap_or(0)
                 .saturating_sub(height / 2)
@@ -685,33 +889,40 @@ impl TimelinePanel {
                 .skip(start)
                 .take(height)
                 .map(|entry| {
-                    Line::from(display_text(&format!(
-                        "{}{} #{} {:?}",
-                        if Some(entry.evidence.id) == self.selected {
-                            ">"
-                        } else {
-                            " "
-                        },
-                        if self
-                            .bookmarks
-                            .iter()
-                            .any(|bookmark| bookmark.session == self.session
-                                && bookmark.entry.evidence.id == entry.evidence.id)
-                        {
-                            "*"
-                        } else {
-                            " "
-                        },
-                        entry.evidence.id,
-                        entry.evidence.kind
-                    )))
+                    let selected = Some(entry.evidence.id) == self.selected;
+                    let bookmarked = self.bookmarks.iter().any(|bookmark| {
+                        bookmark.session == self.session
+                            && bookmark.entry.evidence.id == entry.evidence.id
+                    });
+                    // `>` and `*` mark selection and bookmarks without color.
+                    let marker = if selected { ">" } else { " " };
+                    let star = if bookmarked { "*" } else { " " };
+                    let id = format!(" #{} ", entry.evidence.id);
+                    let kind = format!("{:?}", entry.evidence.kind);
+                    if selected {
+                        // One padded span, so the selection reads as a full row.
+                        // 按显示宽度补齐，双宽字符不会把这一行撑出边框。
+                        let text = format!("{marker}{star}{id}{kind}");
+                        let fill = list_width.saturating_sub(text.width());
+                        Line::from(Span::styled(
+                            format!("{text}{}", " ".repeat(fill)),
+                            theme.selected(),
+                        ))
+                    } else {
+                        Line::from(vec![
+                            Span::raw(marker),
+                            Span::styled(star, theme.heading()),
+                            Span::styled(id, theme.secondary()),
+                            Span::styled(kind, evidence_style(entry, theme)),
+                        ])
+                    }
                 })
                 .collect();
             frame.render_widget(
                 Paragraph::new(list).block(
-                    Block::default()
+                    theme::panel()
                         .borders(Borders::ALL)
-                        .title(" Evidence acceptance order "),
+                        .title(tr(" Evidence acceptance order ", " 证据接收顺序 ")),
                 ),
                 panels[0],
             );
@@ -725,7 +936,7 @@ impl TimelinePanel {
         }
         let lines: Vec<_> = details
             .iter()
-            .flat_map(|line| wrap(line, detail_area.width as usize))
+            .flat_map(|segments| wrap_segments(segments, detail_area.width as usize))
             .collect();
         let start = self
             .scroll
@@ -737,14 +948,31 @@ impl TimelinePanel {
                     .into_iter()
                     .skip(start)
                     .take(detail_area.height as usize)
-                    .map(Line::from)
                     .collect::<Vec<_>>(),
             ),
             detail_area,
         );
         if area.height > header_height {
+            let hints = [
+                tr(
+                    "Enter locate | b bookmark | / filter | Esc close | F1 help",
+                    "Enter 定位 | b 书签 | / 筛选 | Esc 关闭 | F1 帮助",
+                ),
+                tr(
+                    "Enter locate | b bookmark | Esc close | F1 help",
+                    "Enter 定位 | b 书签 | Esc 关闭 | F1 帮助",
+                ),
+                tr(
+                    "Enter locate | Esc close | F1 help",
+                    "Enter 定位 | Esc 关闭 | F1 帮助",
+                ),
+                tr("Esc close | F1 help", "Esc 关闭 | F1 帮助"),
+            ];
             frame.render_widget(
-                Paragraph::new("Enter locate  b bookmark  / filter  Esc close  F1 help"),
+                Paragraph::new(
+                    tool_detail::fit_hints(&hints, area.width as usize)
+                        .unwrap_or_else(|| theme::hints(hints[hints.len() - 1])),
+                ),
                 Rect {
                     y: area.y + area.height - 1,
                     height: 1,
@@ -752,6 +980,23 @@ impl TimelinePanel {
                 },
             );
         }
+    }
+}
+
+/// Restrained emphasis for an evidence kind; the kind name stays in the text.
+fn evidence_style(entry: &TimelineEntry, theme: Theme) -> Style {
+    use EvidenceKind::*;
+    let ended = |state| match state {
+        ExecutionState::Failed | ExecutionState::Interrupted => Style::default().fg(theme.error),
+        ExecutionState::Unknown => Style::default().fg(theme.warning),
+        _ => Style::default().fg(theme.foreground),
+    };
+    match entry.evidence.kind {
+        RequestCreated | RequestExpired | ExecutionUnknown => Style::default().fg(theme.warning),
+        TurnFailed | TurnInterrupted => Style::default().fg(theme.error),
+        ToolCompleted | ChildTerminal => ended(entry.execution_state),
+        Output | StateChanged => theme.secondary(),
+        _ => Style::default().fg(theme.foreground),
     }
 }
 
@@ -774,63 +1019,139 @@ fn has_exact_tool_detail(entry: &TimelineEntry, current: &CoreSnapshot) -> bool 
     current.tool_details.get(&locator).is_some()
 }
 
+/// Whether a metadata query finds this entry. The English text always
+/// matches, so a query finds the same rows in both languages; the Chinese
+/// interface also matches the wording it shows.
+fn metadata_matches(entry: &TimelineEntry, query: &str) -> bool {
+    if metadata(entry).join("\n").contains(query) {
+        return true;
+    }
+    lang::zh()
+        && metadata_fields(entry)
+            .iter()
+            .map(|fields| field_shown_text(fields, " | "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .contains(query)
+}
+
+/// The searchable metadata text of an entry, one row per fact group. Always
+/// English, whatever the interface language.
 fn metadata(entry: &TimelineEntry) -> Vec<String> {
+    metadata_fields(entry)
+        .iter()
+        .map(|fields| field_text(fields, " | "))
+        .collect()
+}
+
+/// Entry metadata as labelled facts; `metadata` is exactly their English text.
+/// Kind, activity, category and source names are Core identifiers and stay as
+/// they are; only labels and the small closed state sets get Chinese wording.
+fn metadata_fields(entry: &TimelineEntry) -> Vec<Vec<Fact>> {
     let mut rows = vec![
-        format!(
-            "Evidence: #{} {:?} | scope: {:?} | execution: {:?}",
-            entry.evidence.id, entry.evidence.kind, entry.scope, entry.execution_state
-        ),
-        format!(
-            "Activity: {:?} | tool: {:?} | source: {:?}",
-            entry.activity_kind, entry.tool_category, entry.evidence.source
-        ),
-        format!(
-            "Thread: {}",
-            entry.identity.thread_id.as_deref().unwrap_or("unavailable")
-        ),
-        format!(
-            "Turn: {}",
-            entry.identity.turn_id.as_deref().unwrap_or("unavailable")
-        ),
-        format!(
-            "Agent: {} | task: {:?} | attempt: {:?} | generation: {:?}",
-            entry.identity.agent_id,
-            entry.identity.task_id,
-            entry.identity.attempt_id,
-            entry.identity.generation
-        ),
-        format!(
-            "Item: {} | request: {:?}",
-            entry.item_id.as_deref().unwrap_or("unavailable"),
-            entry.evidence.request_id
-        ),
-        format!(
-            "Interaction: {:?} | recorded wall ms: {:?} | output bytes: {}",
-            entry.interaction_state, entry.evidence.recorded_at_ms, entry.evidence.output_bytes
-        ),
+        vec![
+            Fact::new(
+                "Evidence",
+                format!("#{} {:?}", entry.evidence.id, entry.evidence.kind),
+            )
+            .zh("证据"),
+            Fact::new("scope", format!("{:?}", entry.scope))
+                .zh("范围")
+                .zh_value(activity_scope_zh(entry.scope)),
+            Fact::new("execution", format!("{:?}", entry.execution_state))
+                .zh("执行")
+                .zh_value(execution_zh(entry.execution_state))
+                .tone(match entry.execution_state {
+                    ExecutionState::Failed | ExecutionState::Interrupted => Tone::Error,
+                    ExecutionState::Unknown => Tone::Warning,
+                    _ => Tone::Value,
+                }),
+        ],
+        vec![
+            Fact::new("Activity", format!("{:?}", entry.activity_kind)).zh("活动"),
+            Fact::new("tool", super::lang::show(&entry.tool_category)).zh("工具"),
+            Fact::new("source", format!("{:?}", entry.evidence.source))
+                .zh("来源")
+                .tone(Tone::Quiet),
+        ],
+        vec![Fact::optional("Thread", entry.identity.thread_id.as_deref()).zh("线程")],
+        vec![Fact::optional("Turn", entry.identity.turn_id.as_deref()).zh("轮次")],
+        vec![
+            Fact::new("Agent", entry.identity.agent_id.clone()).zh("Agent"),
+            Fact::new("task", super::lang::show(&entry.identity.task_id)).zh("任务"),
+            Fact::new("attempt", super::lang::show(&entry.identity.attempt_id)).zh("尝试"),
+            Fact::new("generation", super::lang::show(&entry.identity.generation)).zh("代次"),
+        ],
+        vec![
+            Fact::optional("Item", entry.item_id.as_deref()).zh("条目"),
+            Fact::new("request", super::lang::show(&entry.evidence.request_id)).zh("请求"),
+        ],
+        vec![
+            Fact::new("Interaction", super::lang::show(&entry.interaction_state)).zh("交互"),
+            Fact::new(
+                "recorded wall ms",
+                super::lang::show(&entry.evidence.recorded_at_ms),
+            )
+            .zh("记录时间（ms）"),
+            Fact::new("output bytes", entry.evidence.output_bytes.to_string()).zh("输出字节"),
+        ],
     ];
     if let Some(request) = &entry.request {
-        rows.push(format!(
-            "Request delivery: {:?} / {} / {} / received {}",
+        rows.push(vec![Fact::new(
+            "Request delivery",
+            format!(
+                "{:?} / {} / {} / received {}",
+                request.id, request.thread_id, request.turn_id, request.received_seq
+            ),
+        )
+        .zh("请求投递")
+        .zh_value(format!(
+            "{:?} / {} / {} / 接收序号 {}",
             request.id, request.thread_id, request.turn_id, request.received_seq
-        ));
+        ))]);
     }
     if entry.tool_category == Some(crate::protocol::ToolCategory::Compaction)
         || entry.compaction.is_some()
     {
-        rows.extend(super::compaction_fact_rows(entry.compaction.as_deref()));
+        // These rows are built as `Label: value` text by the activity view; a
+        // Chinese row uses the full-width colon instead.
+        rows.extend(
+            super::compaction_fact_rows(entry.compaction.as_deref())
+                .into_iter()
+                .map(|row| match row.split_once(": ") {
+                    Some((label, value)) => vec![Fact::new(label, value)],
+                    None => match row.split_once('：') {
+                        Some((label, value)) => vec![Fact::new(label, value).zh(label)],
+                        None => vec![Fact::new("", row)],
+                    },
+                }),
+        );
     }
     for target in &entry.wait_targets {
-        rows.push(format!(
-            "Wait target: {} / turn {} / generation {} / {:?}",
+        rows.push(vec![Fact::new(
+            "Wait target",
+            format!(
+                "{} / turn {} / generation {} / {:?}",
+                target.id,
+                target.turn_id.as_deref().unwrap_or("unbound"),
+                target.generation,
+                target.outcome
+            ),
+        )
+        .zh("等待目标")
+        .zh_value(format!(
+            "{} / 轮次 {} / 代次 {} / {:?}",
             target.id,
-            target.turn_id.as_deref().unwrap_or("unbound"),
+            target.turn_id.as_deref().unwrap_or("未绑定"),
             target.generation,
             target.outcome
-        ));
+        ))]);
     }
     rows
 }
+
+/// The first rows of `HELP` are `keys: action`; the rest are notes.
+const HELP_KEY_ROWS: usize = 10;
 
 const HELP: &[&str] = &[
     "Up/Down or j/k, n/N: previous/next evidence",
@@ -849,6 +1170,26 @@ const HELP: &[&str] = &[
     "Evicted bookmarks keep metadata; opening unavailable content is disabled",
     "Bookmarks are local to this TUI; not persisted, exported or restored",
     "Live archive: 512 entries / 256 KiB; bookmarks: 64 / 64 KiB",
+];
+
+/// Same rows as `HELP`; key rows read `keys：action`.
+const HELP_ZH: &[&str] = &[
+    "Up/Down 或 j/k、n/N：上一条/下一条证据",
+    "Home/End：第一条/最后一条匹配；PgUp/Dn：滚动详情/帮助",
+    "Tab：线程/子树/路径/全部（仅已确认的关系）",
+    "F6：事件类别；F7：事件发生时的执行状态",
+    "F8：只看关联当前待处理请求的证据",
+    "/ 或 Ctrl+F：元数据文本；Ctrl+T：精确轮次 ID；Enter 应用",
+    "b：添加/移除书签；B：只看书签（筛选仍然生效）",
+    "Enter：定位当前请求或已保留的 Agent 消息；不会执行任何操作",
+    "Esc：关闭；F2：请求；F3：Agent；F4：任务；F11：活动",
+    "Ctrl+C：中断根 Agent；Ctrl+Q：退出并清理",
+    "接收顺序就是证据顺序，不是 RPC 到达顺序，也不是 journal 游标",
+    "状态定格在事件发生时；当前状态见顶部",
+    "仅元数据：不含提示词、保密内容、原始输出和历史对话",
+    "被清出的书签只保留元数据，不能再打开对应内容",
+    "书签只存在于本 TUI，不会持久化、导出或恢复",
+    "实时存档：512 条 / 256 KiB；书签：64 条 / 64 KiB",
 ];
 
 #[cfg(test)]

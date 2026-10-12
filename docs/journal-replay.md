@@ -28,7 +28,9 @@ cargo run --locked -- --export SESSION_ID --output diagnostic.jsonl
 
 ## 存储与故障语义
 
-默认目录：Windows `%LOCALAPPDATA%/native-agent-tui/journal`；macOS `~/Library/Application Support/native-agent-tui/journal`；Linux `$XDG_DATA_HOME/native-agent-tui/journal`，未设置时使用 `~/.local/share/native-agent-tui/journal`。
+默认目录：用户目录下的 `.zf/journal`（Windows 为 `%USERPROFILE%\.zf\journal`），和设置（`.zf/preferences.json`）、对话（`.zf/sessions`）放在一起。
+
+2026-10-12 之前的默认目录是：Windows `%LOCALAPPDATA%/native-agent-tui/journal`；macOS `~/Library/Application Support/native-agent-tui/journal`；Linux `$XDG_DATA_HOME/native-agent-tui/journal`，未设置时使用 `~/.local/share/native-agent-tui/journal`。未指定 `--journal-dir` 时，每次启动会把旧目录里的会话搬到新目录：一个会话的文件整体搬或整体不搬；只搬已关闭的会话，以及所属进程已不存在的未关闭会话；新目录已有同名文件时不覆盖。还可能有进程在写的会话留在原处，下次启动再试。
 
 日志为 `<workspace>_<session>.jsonl`，配套 `.cursor` 保存提交高水位，`.lease` 保护活动写入者。专用线程先写入并同步日志，再同步并替换游标；回放只读游标确认的字节前缀。完整但未提交或撕裂的尾部用 `uncommitted_tail=true` 报告。日志与游标不匹配、未知 schema、错误 session、无效游标均显式失败。
 

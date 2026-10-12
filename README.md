@@ -4,7 +4,7 @@ A Rust terminal client for the local Codex app-server. Interactive and headless 
 
 ## Run
 
-Install Rust and make an authenticated Codex CLI **0.161.0** available on `PATH`. Execution checks the exact CLI release before catalog lookup, then validates initialization and the new thread's reported release. `--codex PATH` or `CODEX_BIN` selects a compatible executable; Windows uses `codex.cmd` by default. Other versions are refused before model execution. See [backend compatibility](docs/codex-compatibility.md).
+Install Rust and make an authenticated Codex CLI available on `PATH`. Any release is accepted; the protocol fixtures were verified against **0.161.0**. Execution checks for a `codex-cli` version banner before catalog lookup, then validates initialization and the new thread's identity. `--codex PATH` or `CODEX_BIN` selects the executable; Windows uses `codex.cmd` by default. See [backend compatibility](docs/codex-compatibility.md).
 
 ```text
 cargo run --locked -- --check-shell
@@ -18,6 +18,8 @@ cargo run --locked -- --help
 The TUI requires an interactive terminal. `--run` prints streamed agent text and returns a nonzero exit code for failure, interruption, or an uncertain result. Headless runs decline approvals and interrupt when user input is required.
 
 ### Windows sandbox setup
+
+Startup does not run a sandbox shell check by default; the sandbox is first used when the model executes a command. Pass `--startup-shell-check` to verify it before the first task, or run `--check-shell` on its own.
 
 The client inherits Codex's Windows sandbox implementation. The elevated sandbox needs a one-time administrator setup (repeated after some Codex upgrades). Started from app-server, that setup cannot show its UAC prompt, so shell preflight times out. Run it once in an interactive terminal and approve the prompt:
 
@@ -64,7 +66,14 @@ This flag leaves the selected `--sandbox` policy in place. Preflight uses that p
 | F10 | Edit temporary attention thresholds; Up/Down class, Tab field, Enter apply |
 | F11 / PageUp, PageDown | Open activity evidence / scroll its details |
 | F12 | Browse retained sessions and export redacted historical evidence |
+| Left on an empty task input | Sessions page: this workspace's saved conversations by title, the ones waiting for an answer first. Enter resumes the selected conversation here with its earlier messages (dsh backend); Right or Esc returns. Conversations are saved the way dsh stores sessions, as append-only logs at `.zf/sessions/--<workspace>--/<session id>/session.v1.jsonl` in the user's home directory, so they can be listed and resumed; the journal itself stays redacted |
 | Ctrl+P | Open the local command palette; type to filter, Enter to open a panel, Esc to close |
+| `/model` + Enter | Pick the model from the backend's list; `/model NAME` selects it directly. Applies from the next turn and is remembered per backend in `.zf/preferences.json` in the user's home directory; `--model` overrides it for one run |
+| Ctrl+N / Ctrl+E in the `/model` list | Add a provider and model, or edit the highlighted one (dsh backend). Written to `profiles/<profile>/cordis.patch.yml` under `DSH_HOME` (backed up first); an entered API key goes to dsh's `.credentials.yaml`. Saving reloads dsh at once when no turn is running |
+| Ctrl+T in the `/model` list or the provider form | Test a model: a separate dsh process sends one short message through it and reports the reply time or the provider's error. The conversation is not touched. In the form, Ctrl+T saves first and keeps the form open (dsh backend) |
+| Ctrl+R in the `/model` list | Reload dsh configuration without leaving the TUI: a new dsh process resumes the same session, so the conversation continues and edited providers and models appear in the list (dsh backend) |
+| `/setting` | Language, theme, sandbox, approval and attention thresholds; each choice is saved to `.zf/preferences.json` in the user's home directory. Language and theme apply at once, sandbox and approval from the next start. `--sandbox`, `--approval` and the `NATIVE_AGENT_TUI_LANG` / `NATIVE_AGENT_TUI_THEME` variables take precedence |
+| `/search` `/timeline` `/context` `/skills` `/requests` `/workflow` `/evidence` `/attention` `/help` `/agent` `/tools` `/quit` | Typed in the task input and sent with Enter; each opens the same panel as its key. A single `/word` is never sent to the model |
 | Ctrl+S / Ctrl+Enter when supported | Explicitly queue a root task during a running turn; submit an active answer form |
 | Escape | Close help, panels, and notices; the draft is kept (Ctrl+U clears it) |
 
@@ -92,7 +101,7 @@ The next release, `0.1.0-alpha`, covers reliable single-agent work, activity evi
 
 `0.1.0-alpha` supports **Windows only**. Linux and macOS may compile, but process cleanup, terminal input, and startup have not been validated there; treat them as unsupported.
 
-The `deepseek-acp` backend is **experimental**. It is not covered by the Codex compatibility gate and may change without notice.
+The `deepseek-acp` backend is the CLI default and is **experimental**. It is not covered by the Codex compatibility checks and may change without notice. Use `--backend codex` (or `--codex PATH`) for Codex.
 
 See the [product plan](docs/native-agent-tui-plan.md), [release checklist](docs/release-0.1.0-alpha.md), [observability contract](docs/native-agent-tui-observability.md), and [GitHub roadmap](https://github.com/L1nding/native-agent-tui/issues/1).
 

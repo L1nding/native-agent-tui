@@ -98,6 +98,20 @@ pub fn session_new_request(id: RpcId, cwd: &str, mcp_servers: Value) -> Envelope
     ))
 }
 
+/// Reattaches a new agent process to an existing session without replaying it.
+pub fn session_resume_request(
+    id: RpcId,
+    session_id: &str,
+    cwd: &str,
+    mcp_servers: Value,
+) -> Envelope {
+    acp(Envelope::request(
+        id,
+        "session/resume",
+        Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers})),
+    ))
+}
+
 pub fn encode_mcp_servers(servers: &[McpServerConfig]) -> Value {
     Value::Array(
         servers

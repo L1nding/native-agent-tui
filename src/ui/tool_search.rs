@@ -1,6 +1,7 @@
 //! 对当前保留的工具详情做只读、本地搜索。
 use std::ops::Range;
 
+use super::lang::tr;
 use crate::protocol::ToolCategory;
 use crate::tool_details::{ToolDetail, ToolDetailLocator, ToolDetailsSnapshot, ToolLifecycle};
 
@@ -21,6 +22,17 @@ impl Field {
             Self::Parameters => detail.parameters.as_deref(),
             Self::Result => detail.result.as_deref(),
             Self::Output => Some(&detail.output),
+        }
+    }
+
+    /// Name shown to the user; English is the variant name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Command => tr("Command", "命令"),
+            Self::Cwd => tr("Cwd", "工作目录"),
+            Self::Parameters => tr("Parameters", "参数"),
+            Self::Result => tr("Result", "结果"),
+            Self::Output => tr("Output", "输出"),
         }
     }
 }
@@ -57,6 +69,15 @@ impl CategoryFilter {
             Self::Other => Self::All,
         }
     }
+
+    /// Name shown to the user; English is the variant name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => tr("All", "全部"),
+            Self::Shell => "Shell",
+            Self::Other => tr("Other", "其他"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,6 +102,15 @@ impl LifecycleFilter {
             Self::All => Self::Running,
             Self::Running => Self::Ended,
             Self::Ended => Self::All,
+        }
+    }
+
+    /// Name shown to the user; English is the variant name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => tr("All", "全部"),
+            Self::Running => tr("Running", "运行中"),
+            Self::Ended => tr("Ended", "已结束"),
         }
     }
 }
@@ -249,6 +279,38 @@ mod tests {
         )
         .0
         .is_empty());
+    }
+
+    #[test]
+    fn labels_are_the_variant_names_in_english_and_translated_in_chinese() {
+        for field in [
+            Field::Command,
+            Field::Cwd,
+            Field::Parameters,
+            Field::Result,
+            Field::Output,
+        ] {
+            assert_eq!(field.label(), format!("{field:?}"));
+        }
+        for filter in [
+            CategoryFilter::All,
+            CategoryFilter::Shell,
+            CategoryFilter::Other,
+        ] {
+            assert_eq!(filter.label(), format!("{filter:?}"));
+        }
+        for filter in [
+            LifecycleFilter::All,
+            LifecycleFilter::Running,
+            LifecycleFilter::Ended,
+        ] {
+            assert_eq!(filter.label(), format!("{filter:?}"));
+        }
+        crate::ui::lang::with_zh(|| {
+            assert_eq!(Field::Cwd.label(), "工作目录");
+            assert_eq!(CategoryFilter::Other.label(), "其他");
+            assert_eq!(LifecycleFilter::Ended.label(), "已结束");
+        });
     }
 
     #[test]

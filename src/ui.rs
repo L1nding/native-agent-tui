@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
 use thiserror::Error;
 
 use crate::client::Command;
@@ -15,12 +14,16 @@ mod activity;
 mod attention;
 mod commands;
 mod context;
+mod conversation;
 mod editor;
 mod help;
 mod history;
 mod input;
+mod lang;
 mod layout;
+mod models;
 mod overlays;
+mod provider_form;
 mod reminders;
 mod render;
 mod request_state;
@@ -28,12 +31,17 @@ mod requests;
 mod runtime;
 mod scope;
 mod search;
+mod sessions;
+mod settings;
 mod skills;
 mod terminal;
+mod theme;
 mod timeline;
 mod tool_detail;
 mod tool_search;
 mod tool_trace;
+#[cfg(test)]
+mod visual_tests;
 mod workflow;
 mod workflow_view;
 
@@ -41,7 +49,7 @@ use activity::compaction_fact_rows;
 use attention::AttentionEditor;
 use commands::PaletteEvent;
 use editor::Editor;
-use layout::{conversation_content_size, main_layout};
+use layout::{conversation_content_size, main_layout, workspace_layout};
 use overlays::open_palette_action;
 use render::draw;
 use request_state::{request_locked, selected_request, sync_local_requests};
@@ -77,6 +85,11 @@ use workflow::{selected_task, workflow_conversation, ConversationTarget, Workflo
 
 const PASTE_REJECTED: &str = "Paste exceeds 32 KiB; the entire paste was discarded.";
 
+/// 粘贴被拒绝时的提示，随界面语言显示。
+fn paste_rejected() -> &'static str {
+    lang::tr(PASTE_REJECTED, "粘贴内容超过 32 KiB，已全部丢弃。")
+}
+
 #[derive(Debug, Error)]
 pub enum UiError {
     #[error(transparent)]
@@ -102,11 +115,18 @@ struct LocalState {
     editor: Editor,
     task_draft: Option<Editor>,
     scroll_from_bottom: usize,
+    /// 展开对话中折叠的工具组；只影响显示，不改变任何执行事实。
+    tools_expanded: bool,
     notice: Option<String>,
     help: bool,
     workflow: workflow::WorkflowPanel,
     context: context::ContextPanel,
     palette: commands::PaletteState,
+    models: models::ModelPicker,
+    settings: settings::SettingsPanel,
+    provider_form: provider_form::ProviderForm,
+    /// 输入 `/名称` 时提示列表里的选中行。
+    slash_selected: usize,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -128,6 +148,17 @@ struct InputDraft {
 fn handle_paste(text: &str, snapshot: &CoreSnapshot, local: &mut LocalState) {
     if local.palette.visible {
         local.palette.paste(text);
+        return;
+    }
+    if local.models.visible {
+        local.models.paste(text);
+        return;
+    }
+    if local.provider_form.visible {
+        local.provider_form.paste(text);
+        return;
+    }
+    if local.settings.visible {
         return;
     }
     if local.workflow.visible {
@@ -159,9 +190,9 @@ fn reject_paste(local: &mut LocalState) {
     } else if local.timeline.visible {
         local.timeline.reject_paste();
     } else if let Some(editor) = &mut local.attention_editor {
-        editor.notice = Some(PASTE_REJECTED.into());
+        editor.notice = Some(paste_rejected().into());
     } else {
-        local.notice = Some(PASTE_REJECTED.into());
+        local.notice = Some(paste_rejected().into());
     }
 }
 
@@ -172,10 +203,43 @@ fn send(command: Command, tx: &tokio::sync::mpsc::Sender<Command>, local: &mut L
             true
         }
         Err(error) => {
-            local.notice = Some(format!("Could not submit: {error}"));
+            local.notice = Some(if lang::zh() {
+                format!("提交失败：{error}")
+            } else {
+                format!("Could not submit: {error}")
+            });
             false
         }
     }
+}
+
+/// Nothing covers the conversation and the task input is empty, so Left has
+/// no caret to move and can open the sessions page instead.
+fn left_opens_sessions(key: KeyEvent, snapshot: &CoreSnapshot, local: &LocalState) -> bool {
+    key.code == KeyCode::Left
+        && key.modifiers.is_empty()
+        && local.editor.text.is_empty()
+        && selected_request(snapshot, local).is_none()
+        && !(local.palette.visible
+            || local.models.visible
+            || local.settings.visible
+            || local.provider_form.visible
+            || local.search.visible
+            || local.timeline.visible
+            || local.context.visible
+            || local.skills
+            || local.request_panel
+            || local.evidence
+            || local.workflow.visible
+            || local.help
+            || local.attention_editor.is_some())
+}
+
+/// Opens the picker and asks Core for the current inventory.
+fn open_model_picker(local: &mut LocalState, tx: &tokio::sync::mpsc::Sender<Command>) {
+    overlays::close_mutual_overlays(local);
+    local.models.open();
+    send(Command::ListModels, tx, local);
 }
 
 fn handle_key(
@@ -193,8 +257,73 @@ fn handle_key(
     }
     if local.palette.visible {
         match local.palette.key(key) {
+            PaletteEvent::Action(commands::PaletteAction::Model) => open_model_picker(local, tx),
             PaletteEvent::Action(action) => open_palette_action(action, snapshot, local),
             PaletteEvent::Close | PaletteEvent::Consumed => {}
+        }
+        return false;
+    }
+    if local.models.visible {
+        match local.models.key(key, snapshot) {
+            models::ModelPickerEvent::Select(model) => {
+                send(Command::SelectModel { model }, tx, local);
+            }
+            models::ModelPickerEvent::Reload => {
+                send(Command::ReloadBackend, tx, local);
+            }
+            models::ModelPickerEvent::Test(model) => {
+                send(Command::TestModel { model }, tx, local);
+            }
+            models::ModelPickerEvent::AddProvider => local.provider_form.open(),
+            models::ModelPickerEvent::EditProvider(option) => local
+                .provider_form
+                .open_edit(&option, &snapshot.models.providers),
+            models::ModelPickerEvent::Interrupt => {
+                send(Command::Interrupt, tx, local);
+            }
+            models::ModelPickerEvent::Quit => return true,
+            models::ModelPickerEvent::Close | models::ModelPickerEvent::Consumed => {}
+        }
+        return false;
+    }
+    if local.provider_form.visible {
+        use provider_form::ProviderFormEvent;
+        match local.provider_form.key(key) {
+            ProviderFormEvent::Submit(spec) => {
+                send(Command::AddModelProvider { spec, test: false }, tx, local);
+            }
+            ProviderFormEvent::Test(spec) => {
+                send(Command::AddModelProvider { spec, test: true }, tx, local);
+            }
+            ProviderFormEvent::Interrupt => {
+                send(Command::Interrupt, tx, local);
+            }
+            ProviderFormEvent::Quit => return true,
+            ProviderFormEvent::Close | ProviderFormEvent::Consumed => {}
+        }
+        return false;
+    }
+    if local.settings.visible {
+        use settings::SettingsEvent;
+        match local.settings.key(key, snapshot) {
+            SettingsEvent::Change(setting, value) => {
+                // 语言和主题属于界面，立即切换；所有选择都交给 Core 保存。
+                match setting {
+                    crate::preferences::Setting::Language => lang::set(value),
+                    crate::preferences::Setting::Theme => theme::set(value),
+                    _ => {}
+                }
+                let value = value.to_owned();
+                send(Command::SaveSetting { setting, value }, tx, local);
+            }
+            SettingsEvent::Attention => {
+                local.attention_editor = Some(AttentionEditor::new(snapshot, 0));
+            }
+            SettingsEvent::Interrupt => {
+                send(Command::Interrupt, tx, local);
+            }
+            SettingsEvent::Quit => return true,
+            SettingsEvent::Close | SettingsEvent::Consumed => {}
         }
         return false;
     }
@@ -239,7 +368,8 @@ fn handle_key(
                     open_request_panel(snapshot, local);
                 } else {
                     local.request_panel = false;
-                    local.notice = Some("No pending requests.".into());
+                    local.notice =
+                        Some(lang::tr("No pending requests.", "没有待处理的请求。").into());
                 }
             }
             KeyCode::Enter => {
@@ -347,30 +477,28 @@ fn handle_key(
                 local.viewport,
                 render::header_activity(snapshot, local).is_some(),
                 render::status_rows(snapshot, local, &status),
+                render::editor_view(snapshot, local, local.viewport.width)
+                    .visible_rows(local.viewport.height),
             );
-            let mut area = chunks[1];
-            if local.viewport.width >= 100 && !snapshot.agents.is_empty() {
-                area = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(32), Constraint::Min(1)])
-                    .split(area)[1];
-            }
+            let area = workspace_layout(
+                chunks[1],
+                !snapshot.agents.is_empty(),
+                render::wants_inspector(snapshot, local),
+            )
+            .conversation;
             let (width, height) = conversation_content_size(area);
-            let mut rows = 0;
-            let mut target = None;
-            for message in snapshot
-                .messages
-                .iter()
-                .filter(|m| m.thread_id == focus.thread())
-            {
-                let (lines, header) = render::message_rows(message, width);
-                if focus.matches(message) {
-                    target = Some(rows + header + focus.row(width));
-                }
-                rows += lines.len();
-            }
-            let max_scroll = rows.saturating_sub(1).saturating_sub(height);
-            if let Some(row) = target {
+            // 与渲染共用同一份投影，翻页起点才会落在焦点所在的显示行。
+            let projected = conversation::transcript(
+                snapshot
+                    .messages
+                    .iter()
+                    .filter(|m| m.thread_id == focus.thread()),
+                Some(focus),
+                width,
+                local.tools_expanded,
+            );
+            let max_scroll = projected.lines.len().saturating_sub(height);
+            if let Some(row) = projected.focused {
                 local.scroll_from_bottom =
                     max_scroll.saturating_sub(row.saturating_sub(height / 3).min(max_scroll));
             }
@@ -424,7 +552,13 @@ fn handle_key(
                         local.attention_editor = None;
                     }
                 } else {
-                    editor.notice = Some("Require 0 < quiet < attention <= 604800000".into());
+                    editor.notice = Some(
+                        lang::tr(
+                            "Require 0 < quiet < attention <= 604800000",
+                            "需满足 0 < 静默 < 提醒 <= 604800000",
+                        )
+                        .into(),
+                    );
                 }
             }
             _ => {}
@@ -465,7 +599,7 @@ fn handle_key(
                 {
                     None
                 } else {
-                    Some("No silence reminders for the selected agent. Pending requests still require an answer.".into())
+                    Some(lang::tr("No silence reminders for the selected agent. Pending requests still require an answer.", "所选 Agent 没有可暂停的静默提醒；待处理请求仍需要回答。").into())
                 };
                 return false;
             }
@@ -478,7 +612,11 @@ fn handle_key(
                     };
                     if request_locked(snapshot, local, request) {
                         local.notice = Some(
-                            "Request is submitted or unavailable; wait for resolution.".into(),
+                            lang::tr(
+                                "Request is submitted or unavailable; wait for resolution.",
+                                "请求已提交或不可用，请等待结果。",
+                            )
+                            .into(),
                         );
                     } else if let Err(error) = request.approval_result(decision) {
                         local.notice = Some(error.to_string());
@@ -494,7 +632,11 @@ fn handle_key(
                     }
                 } else {
                     local.notice = Some(
-                        "Selected request expired; press F2 to select a current request.".into(),
+                        lang::tr(
+                            "Selected request expired; press F2 to select a current request.",
+                            "所选请求已过期；按 F2 选择当前请求。",
+                        )
+                        .into(),
                     );
                 }
                 return false;
@@ -513,14 +655,24 @@ fn handle_key(
             local.skills = !local.skills;
             local.skills_scroll = 0;
         }
+        KeyCode::Char('e') if control => local.tools_expanded = !local.tools_expanded,
         KeyCode::PageUp if local.request_panel => {
-            local.request_scroll = local.request_scroll.saturating_sub(1)
+            // 先收回到实际可滚动范围，越界后第一次 PageUp 就能生效。
+            local.request_scroll = local
+                .request_scroll
+                .min(requests::max_scroll(snapshot, local, local.viewport))
+                .saturating_sub(1)
         }
         KeyCode::PageDown if local.request_panel => {
-            local.request_scroll = local.request_scroll.saturating_add(1)
+            local.request_scroll = local
+                .request_scroll
+                .saturating_add(1)
+                .min(requests::max_scroll(snapshot, local, local.viewport))
         }
         KeyCode::Home if local.request_panel && control => local.request_scroll = 0,
-        KeyCode::End if local.request_panel && control => local.request_scroll = usize::MAX,
+        KeyCode::End if local.request_panel && control => {
+            local.request_scroll = requests::max_scroll(snapshot, local, local.viewport)
+        }
         KeyCode::F(10) => local.attention_editor = Some(AttentionEditor::new(snapshot, 0)),
         KeyCode::F(11) => {
             local.request_panel = false;
@@ -593,20 +745,57 @@ fn handle_key(
             local.conversation_focus = None;
             local.scroll_from_bottom = 0;
         }
+        KeyCode::Up | KeyCode::Down | KeyCode::Tab
+            if !commands::slash_hints(&local.editor.text).is_empty() =>
+        {
+            let hints = commands::slash_hints(&local.editor.text);
+            let selected = local.slash_selected.min(hints.len() - 1);
+            match key.code {
+                KeyCode::Up => local.slash_selected = selected.saturating_sub(1),
+                KeyCode::Down => local.slash_selected = (selected + 1).min(hints.len() - 1),
+                _ => {
+                    // `/model` 可以带模型名，补全后留一个空格。
+                    let name = hints[selected].name;
+                    let tail = if name == "model" { " " } else { "" };
+                    local.editor.clear();
+                    local.editor.insert(&format!("/{name}{tail}"));
+                    local.slash_selected = 0;
+                }
+            }
+        }
         KeyCode::Left => local.editor.left(),
         KeyCode::Right => local.editor.right(),
         KeyCode::Home => local.editor.cursor = 0,
         KeyCode::End => local.editor.cursor = local.editor.text.len(),
-        KeyCode::Backspace => local.editor.backspace(),
-        KeyCode::Delete => local.editor.delete(),
+        KeyCode::Backspace => {
+            local.editor.backspace();
+            local.slash_selected = 0;
+        }
+        KeyCode::Delete => {
+            local.editor.delete();
+            local.slash_selected = 0;
+        }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => local.editor.insert("\n"),
         KeyCode::Enter if !local.editor.text.trim().is_empty() => {
-            let text = local.editor.text.clone();
+            let mut text = local.editor.text.clone();
+            // 提示列表可见时，Enter 执行选中的命令，不要求把名字打全。
+            let hints = commands::slash_hints(&text);
+            if !hints.is_empty()
+                && !selected_request(snapshot, local)
+                    .is_some_and(|r| matches!(r.kind, RequestKind::UserInput { .. }))
+            {
+                text = format!("/{}", hints[local.slash_selected.min(hints.len() - 1)].name);
+                local.slash_selected = 0;
+            }
             if let Some(request) = selected_request(snapshot, local) {
                 if let RequestKind::UserInput { questions } = &request.kind {
                     if request_locked(snapshot, local, request) {
                         local.notice = Some(
-                            "Request is submitted or unavailable; wait for resolution.".into(),
+                            lang::tr(
+                                "Request is submitted or unavailable; wait for resolution.",
+                                "请求已提交或不可用，请等待结果。",
+                            )
+                            .into(),
                         );
                         return false;
                     }
@@ -639,11 +828,48 @@ fn handle_key(
                     return false;
                 }
             }
+            // `/名称` 是界面命令，不作为任务发给模型。
+            if let Some(slash) = commands::parse_slash(&text) {
+                use commands::{PaletteAction, Slash};
+                if slash == Slash::Unknown {
+                    // 保留输入，方便改正拼写。
+                    local.notice = Some(format!(
+                        "{} {}",
+                        lang::tr("Unknown command. Available:", "未知命令。可用："),
+                        commands::slash_names()
+                    ));
+                    return false;
+                }
+                local.editor.clear();
+                match slash {
+                    Slash::Model(Some(model)) => {
+                        let model = model.to_owned();
+                        send(Command::SelectModel { model }, tx, local);
+                    }
+                    Slash::Model(None) | Slash::Action(PaletteAction::Model) => {
+                        open_model_picker(local, tx)
+                    }
+                    Slash::Action(action) => open_palette_action(action, snapshot, local),
+                    Slash::Tools => local.tools_expanded = !local.tools_expanded,
+                    Slash::Settings => {
+                        overlays::close_mutual_overlays(local);
+                        local.settings.open();
+                    }
+                    Slash::Quit => return true,
+                    Slash::Unknown => {}
+                }
+                return false;
+            }
             if local.request_panel
                 || local.request_selection.is_some() && selected_request(snapshot, local).is_none()
             {
-                local.notice =
-                    Some("Close request details with Esc before submitting a root task.".into());
+                local.notice = Some(
+                    lang::tr(
+                        "Close request details with Esc before submitting a root task.",
+                        "先按 Esc 关闭请求详情，再提交新任务。",
+                    )
+                    .into(),
+                );
                 return false;
             }
             let explicit_queue = control && key.code == KeyCode::Enter;
@@ -657,21 +883,26 @@ fn handle_key(
                 local.notice = Some(
                     match snapshot.phase {
                         _ if snapshot.startup_blocked => {
-                            "This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history."
+                            lang::tr("This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history.", "当前会话无法运行任务，草稿已保留。按 Ctrl+Q 退出后重新启动；F12 查看历史。")
                         }
                         Created | Launching | Initializing | CheckingShell | Ready => {
-                            "Still starting; your draft is kept. Press Enter again once Ready."
+                            lang::tr("Still starting; your draft is kept. Press Enter again once Ready.", "仍在启动，草稿已保留。就绪后再按一次 Enter。")
                         }
                         Stopping | ClosingTransport | Stopped | Disconnected | Unknown => {
-                            "This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history."
+                            lang::tr("This session cannot run tasks; your draft is kept. Quit with Ctrl+Q and restart; F12 shows history.", "当前会话无法运行任务，草稿已保留。按 Ctrl+Q 退出后重新启动；F12 查看历史。")
                         }
-                        _ => "A turn is running: Ctrl+S queues this task to run next, Ctrl+C interrupts.",
+                        _ => lang::tr("A turn is running: Ctrl+S queues this task to run next, Ctrl+C interrupts.", "当前有一轮正在运行：Ctrl+S 把这个任务排到下一个，Ctrl+C 中断。"),
                     }
                     .into(),
                 );
             } else if snapshot.scheduler.queued_roots >= ROOT_QUEUE_LIMIT {
-                local.notice =
-                    Some("The task queue is full (8 tasks); your draft is retained.".into());
+                local.notice = Some(
+                    lang::tr(
+                        "The task queue is full (8 tasks); your draft is retained.",
+                        "任务队列已满（8 个），草稿已保留。",
+                    )
+                    .into(),
+                );
             } else if send(
                 if explicit_queue {
                     let mut task = RootTaskSpec::input(text);
@@ -690,7 +921,8 @@ fn handle_key(
             }
         }
         KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
-            local.editor.insert(&c.to_string())
+            local.editor.insert(&c.to_string());
+            local.slash_selected = 0;
         }
         _ => {}
     }
@@ -2663,6 +2895,213 @@ mod tests {
     }
 
     #[test]
+    fn slash_model_opens_the_picker_and_submits_a_typed_selection_instead_of_a_task() {
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            thread_id: Some("root".into()),
+            ..CoreSnapshot::default()
+        };
+        snapshot.models.options = vec![crate::models::ModelOption {
+            id: "hi/gpt-6-luna".into(),
+            name: "GPT-6 Luna".into(),
+        }];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        local.editor.insert("/model");
+        handle_key(enter, &snapshot, &mut local, &tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::ListModels)));
+        assert!(local.models.visible && local.editor.text.is_empty());
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &local))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("/model"), "{rendered}");
+        assert!(rendered.contains("hi/gpt-6-luna"), "{rendered}");
+        handle_key(enter, &snapshot, &mut local, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SelectModel { model }) if model == "hi/gpt-6-luna"
+        ));
+        assert!(!local.models.visible);
+
+        local.editor.insert("/model other/name");
+        handle_key(enter, &snapshot, &mut local, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SelectModel { model }) if model == "other/name"
+        ));
+        assert!(!local.models.visible && local.editor.text.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        // 其他面板也能用 `/名称` 打开；未知命令保留输入并列出可用命令。
+        local.editor.insert("/help");
+        handle_key(enter, &snapshot, &mut local, &tx);
+        assert!(local.help && local.editor.text.is_empty());
+        local.editor.insert("/tools");
+        handle_key(enter, &snapshot, &mut local, &tx);
+        assert!(local.tools_expanded);
+        local.editor.insert("/nope");
+        assert!(!handle_key(enter, &snapshot, &mut local, &tx));
+        assert_eq!(local.editor.text, "/nope");
+        assert!(local.notice.as_deref().unwrap().contains("/timeline"));
+        local.editor.clear();
+        local.editor.insert("/quit");
+        assert!(handle_key(enter, &snapshot, &mut local, &tx));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn left_opens_sessions_only_from_an_empty_input_on_the_main_view() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("root".into()),
+            ..CoreSnapshot::default()
+        };
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let mut local = LocalState::default();
+        assert!(left_opens_sessions(left, &snapshot, &local));
+        assert!(!left_opens_sessions(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            &snapshot,
+            &local
+        ));
+        assert!(!left_opens_sessions(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &snapshot,
+            &local
+        ));
+        // 有草稿时 ← 仍然是移动光标。
+        local.editor.insert("draft");
+        assert!(!left_opens_sessions(left, &snapshot, &local));
+        local.editor.clear();
+        local.help = true;
+        assert!(!left_opens_sessions(left, &snapshot, &local));
+        local.help = false;
+        local.settings.open();
+        assert!(!left_opens_sessions(left, &snapshot, &local));
+        local.settings.close();
+        local.models.open();
+        assert!(!left_opens_sessions(left, &snapshot, &local));
+        local.models.close();
+        assert!(left_opens_sessions(left, &snapshot, &local));
+    }
+
+    #[test]
+    fn slash_setting_changes_the_interface_now_and_asks_core_to_save_each_choice() {
+        use crate::preferences::Setting;
+
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("root".into()),
+            sandbox: "workspace-write".into(),
+            approval_policy: "on-request".into(),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        local.editor.insert("/setting");
+        handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
+        assert!(local.settings.visible && local.editor.text.is_empty());
+
+        assert_eq!(lang::name(), "en");
+        handle_key(press(KeyCode::Right), &snapshot, &mut local, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SaveSetting { setting: Setting::Language, value }) if value == "zh"
+        ));
+        assert_eq!(lang::name(), "zh");
+        lang::set("en");
+
+        handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Right), &snapshot, &mut local, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SaveSetting { setting: Setting::Theme, value }) if value == "light"
+        ));
+        assert_eq!(theme::name(), "light");
+        theme::set("dark");
+
+        handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Left), &snapshot, &mut local, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SaveSetting { setting: Setting::Sandbox, value }) if value == "read-only"
+        ));
+        // 提醒阈值沿用已有的编辑器。
+        handle_key(press(KeyCode::End), &snapshot, &mut local, &tx);
+        for _ in 0..3 {
+            handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
+        }
+        handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
+        assert!(!local.settings.visible && local.attention_editor.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn typing_a_slash_lists_commands_above_the_input_and_enter_runs_the_selection() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("root".into()),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState::default();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let rows = |local: &LocalState| -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..30)
+                .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect()
+        };
+        let row_of = |rows: &[String], needle: &str| rows.iter().position(|r| r.contains(needle));
+
+        assert!(row_of(&rows(&local), "Commands").is_none());
+        handle_key(press(KeyCode::Char('/')), &snapshot, &mut local, &tx);
+        let screen = rows(&local);
+        let input = row_of(&screen, "› /").expect("input row");
+        for name in ["> /search", "/timeline", "/model", "/quit", "Tab complete"] {
+            let row = row_of(&screen, name).unwrap_or_else(|| panic!("{name}: {screen:#?}"));
+            assert!(row < input, "{name} must be above the input");
+        }
+
+        // 继续输入会收窄列表；↓ 移动选择，Enter 执行选中的命令。
+        handle_key(press(KeyCode::Char('t')), &snapshot, &mut local, &tx);
+        let screen = rows(&local);
+        assert!(row_of(&screen, "> /timeline").is_some(), "{screen:#?}");
+        assert!(row_of(&screen, "/tools").is_some(), "{screen:#?}");
+        assert!(row_of(&screen, "/search").is_none(), "{screen:#?}");
+        handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
+        assert!(row_of(&rows(&local), "> /tools").is_some());
+        handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
+        assert!(local.tools_expanded && local.editor.text.is_empty());
+        assert!(row_of(&rows(&local), "Commands").is_none());
+
+        // Tab 补全名字；带空格或路径的输入不再是命令，提示消失。
+        local.editor.insert("/mo");
+        handle_key(press(KeyCode::Tab), &snapshot, &mut local, &tx);
+        assert_eq!(local.editor.text, "/model ");
+        assert!(row_of(&rows(&local), "Commands").is_none());
+        local.editor.clear();
+        local.editor.insert("/etc/hosts");
+        assert!(row_of(&rows(&local), "Commands").is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn request_details_show_the_command_first_and_a_clean_hint_row() {
         let request = RequestView::decode(
             RpcId::Number(7),
@@ -4351,17 +4790,24 @@ mod tests {
             let rendered = rows.join("\n");
             assert!(rendered.contains("SECRET_DRAFT"), "{rendered}");
             if width >= 100 {
-                let panel_start = rows
-                    .iter()
-                    .position(|row| row.contains("Agents · F3"))
-                    .expect("agent panel title");
-                let panel_end = rows[panel_start..]
-                    .iter()
-                    .position(|row| row.contains("└──────────────────────────────┘"))
-                    .map_or(rows.len() - panel_start - 1, |offset| offset);
-                let panel = rows[panel_start..=panel_start + panel_end]
-                    .iter()
-                    .map(|row| row.chars().take(32).collect::<String>())
+                // 侧栏范围取自渲染使用的同一份布局，不靠边框字符猜测。
+                let status = render::status_text(&snapshot, &local);
+                let chunks = main_layout(
+                    ratatui::layout::Rect::new(0, 0, width, height),
+                    render::header_activity(&snapshot, &local).is_some(),
+                    render::status_rows(&snapshot, &local, &status),
+                    render::editor_view(&snapshot, &local, width).visible_rows(height),
+                );
+                let side = workspace_layout(chunks[1], true, false)
+                    .agents
+                    .expect("agent panel at this width");
+                let buffer = terminal.backend().buffer();
+                let panel = (side.y..side.y + side.height)
+                    .map(|y| {
+                        (side.x..side.x + side.width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 assert!(panel.contains("Agents · F3"), "{panel}");

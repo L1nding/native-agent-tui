@@ -42,7 +42,7 @@ def main():
         home = root / "home"
         home.mkdir()
         version = subprocess.run([codex, "--version"], env=env, capture_output=True, timeout=15, creationflags=flags)
-        assert version.returncode == 0 and b"0.161.0" in version.stdout, "This fixture requires the pinned Codex 0.161.0 baseline"
+        assert version.returncode == 0 and version.stdout.startswith(b"codex-cli "), "This fixture requires a Codex CLI"
         bundled = subprocess.run([codex, "debug", "models", "--bundled"], env=env, capture_output=True, timeout=15, creationflags=flags)
         assert bundled.returncode == 0, bundled.stderr.decode()
         catalog = json.loads(bundled.stdout)

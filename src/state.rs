@@ -192,6 +192,16 @@ pub struct CoreSnapshot {
     pub usage_facts: Vec<UsageFact>,
     pub token_budget: TokenBudgetSnapshot,
     pub skills: crate::skills::SkillsSnapshot,
+    pub models: crate::models::ModelsSnapshot,
+    /// Saved conversations of this workspace, as last listed for the sessions page.
+    pub conversations: Vec<crate::conversations::ConversationSummary>,
+    /// Name of the saved conversation this session is writing to; empty
+    /// until the first save, when it is this session's own id.
+    pub conversation_id: String,
+    /// Title of a saved conversation the backend is being asked to resume.
+    pub resuming: Option<String>,
+    /// Choices stored for the next start; empty for a setting never saved.
+    pub saved_settings: BTreeMap<crate::preferences::Setting, String>,
     pub history_truncated: bool,
     /// 启动预检未通过且已不在启动阶段：本会话不能再提交任务。
     pub startup_blocked: bool,
