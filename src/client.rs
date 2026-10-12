@@ -922,7 +922,6 @@ impl Core {
             self.state.finish_all_reasoning();
         }
         self.state.view.tool_details = self.tool_details.snapshot();
-        self.domain.observe(&self.state.view.tool_details);
         self.state.view.domain = self.domain.snapshot.clone();
         self.domain
             .project_control_messages(&mut self.state.view.messages);
@@ -3056,6 +3055,7 @@ impl Core {
         else {
             return;
         };
+        self.domain.observe(notice, &params["item"]);
         let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
         if notice.outcome.is_none() {
             self.tool_details

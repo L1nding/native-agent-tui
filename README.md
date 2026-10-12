@@ -163,7 +163,7 @@ Results use a fixed snapshot. Press r to refresh; changed or evicted content can
 cargo run -- --cwd D:/project/blender-agent-modeler --domain-context PATH/TO/context.json --model hi/gpt-6.1-sol --permission read-only --tui "在首层新增两张床，先给我看方案"
 ~~~
 
-运行上下文由操作员预先配置 scene、floor、scope/protected_ids。当前领域工具支持单层新增床/洗手盆和未应用方案修订。Python 独立异步 worker 构建封存快照，Core 不接管领域几何。详见 [建模业务协议](docs/modeling-domain.md)。
+运行上下文由操作员预先配置 scene、floor、scope/protected_ids。当前领域工具支持来源扫描与实例对账、单层落地床/桌/椅/柜/盆/坐便器、未应用方案修订和依赖完整的部分采纳。门窗宿主、楼梯标高和井道跨层关系仍标为缺能力。Python 独立异步 worker 构建封存快照，Core 不接管领域几何。详见 [建模业务协议](docs/modeling-domain.md)。
 
 --modeling MODELER_REPO 与 --change-context 保留为 Python 整段调度的兼容模式；不能和 --domain-context 用于同一运行。已有 CAD/医院功能与历史验收保留。新模式没有独立模型配置或额外会话主控。
 

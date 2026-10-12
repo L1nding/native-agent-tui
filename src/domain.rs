@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::{Config, McpServerConfig};
-use crate::tool_details::{ToolDetailsSnapshot, ToolLifecycle};
+use crate::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 
 const CONTRACT: &str = "modeling-domain/v2";
 const SERVER: &str = "modeling_domain";
@@ -172,7 +172,6 @@ impl std::fmt::Debug for DomainSnapshot {
 
 pub struct DomainFacts {
     setup: Option<DomainSetup>,
-    seen: BTreeMap<String, u64>,
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
     fact_sequences: BTreeMap<String, u64>,
@@ -190,145 +189,127 @@ impl DomainFacts {
         };
         Self {
             setup,
-            seen: BTreeMap::new(),
             snapshot,
             control_messages: BTreeMap::new(),
             fact_sequences: BTreeMap::new(),
         }
     }
 
-    pub fn observe(&mut self, tools: &ToolDetailsSnapshot) {
+    /// Consume a complete, identity-checked MCP completion before the display cache
+    /// clips tool details. The domain envelope has its own bounded decode budget.
+    pub(crate) fn observe(&mut self, notice: &ObservedTool, item: &Value) {
         let Some(setup) = self.setup.as_ref() else {
             return;
         };
-        let prefix = format!("{SERVER}/");
-        let live_keys: std::collections::BTreeSet<String> = tools
-            .entries
-            .iter()
-            .map(|detail| format!("{:?}/{}", detail.locator.identity, detail.locator.item_id))
-            .collect();
-        self.seen.retain(|key, _| live_keys.contains(key));
-        for detail in tools.entries.iter() {
-            if detail.lifecycle != ToolLifecycle::Completed
-                || detail.clipped
-                || !detail.authoritative
-                || detail.category != crate::protocol::ToolCategory::Mcp
-            {
-                continue;
-            }
-            let Some(name) = detail.name.as_deref() else {
-                continue;
-            };
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            let key = format!("{:?}/{}", detail.locator.identity, detail.locator.item_id);
-            if self.seen.get(&key) == Some(&detail.revision) {
-                continue;
-            }
-            let envelope = detail
-                .result
-                .as_deref()
-                .and_then(decode_envelope)
-                .or_else(|| decode_envelope(&detail.output));
-            let Some(value) = envelope else {
-                continue;
-            };
-            if value["run_id"] != setup.run_id || value["context_sha256"] != setup.context_sha256 {
-                continue;
-            }
-            self.seen.insert(key, detail.revision);
-            let Some(kind) = value["kind"].as_str() else {
-                continue;
-            };
-            let sequence = value["fact_sequence"].as_u64();
-            if self
-                .fact_sequences
-                .get(kind)
-                .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
-            {
-                continue;
-            }
-            let mut accepted = false;
-            match Some(kind) {
-                Some("proposal") => {
-                    if let Some(proposal) = proposal_fact(&value) {
-                        let old = self.snapshot.proposal.as_ref();
-                        let same = old.is_some_and(|p| p.binding == proposal.binding);
-                        let parent = value["proposal"]["parent_id"].as_str();
-                        let follows = old.is_none_or(|p| {
-                            parent == Some(p.binding.proposal_id.as_str())
-                                || value["current"] == true
-                        });
-                        if same || follows {
-                            if !same {
-                                self.snapshot.application = None;
-                                self.snapshot.artifact = None;
-                                self.snapshot.artifact_validation = None;
-                                for kind in ["application", "artifact", "artifact_validation"] {
-                                    self.fact_sequences.remove(kind);
-                                }
+        if notice.category != ToolCategory::Mcp
+            || notice.outcome != Some(ObservedToolOutcome::Completed)
+            || item["type"] != "mcpToolCall"
+            || item["server"] != SERVER
+            || item["result"]["isError"] == true
+        {
+            return;
+        }
+        let Some(envelope) = unwrap_envelope(item["result"].clone(), 0) else {
+            return;
+        };
+        let Some(value) = serde_json::to_string(&envelope)
+            .ok()
+            .and_then(|raw| decode_envelope(&raw))
+        else {
+            return;
+        };
+        if value["run_id"] != setup.run_id || value["context_sha256"] != setup.context_sha256 {
+            return;
+        }
+        let Some(kind) = value["kind"].as_str() else {
+            return;
+        };
+        let sequence = value["fact_sequence"].as_u64();
+        if self
+            .fact_sequences
+            .get(kind)
+            .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
+        {
+            return;
+        }
+        let mut accepted = false;
+        match Some(kind) {
+            Some("proposal") => {
+                if let Some(proposal) = proposal_fact(&value) {
+                    let old = self.snapshot.proposal.as_ref();
+                    let same = old.is_some_and(|p| p.binding == proposal.binding);
+                    let parent = value["proposal"]["parent_id"].as_str();
+                    let follows = old.is_none_or(|p| {
+                        parent == Some(p.binding.proposal_id.as_str()) || value["current"] == true
+                    });
+                    if same || follows {
+                        if !same {
+                            self.snapshot.application = None;
+                            self.snapshot.artifact = None;
+                            self.snapshot.artifact_validation = None;
+                            for kind in ["application", "artifact", "artifact_validation"] {
+                                self.fact_sequences.remove(kind);
                             }
-                            self.snapshot.proposal = Some(proposal);
-                            accepted = true;
                         }
-                    }
-                }
-                Some("source_ledger") => {
-                    if let Some(ledger) = source_ledger_fact(&value) {
-                        self.snapshot.ledger = Some(ledger);
+                        self.snapshot.proposal = Some(proposal);
                         accepted = true;
                     }
                 }
-                Some("application") if matches_proposal(&self.snapshot, &value["receipt"]) => {
-                    self.snapshot.application = value["receipt"]["state"]
-                        .as_str()
-                        .map(|state| format!("{state} · current={}", value["current"]));
-                    if let Some(proposal) = &mut self.snapshot.proposal {
-                        proposal.ready = false;
-                    }
-                    if let Some(sequence) = sequence {
-                        let watermark = self.fact_sequences.entry("proposal".into()).or_default();
-                        *watermark = (*watermark).max(sequence);
-                    }
-                    accepted = true;
-                }
-                Some("artifact")
-                    if matches_proposal(&self.snapshot, &value["artifact"])
-                        && !(value["artifact"]["candidate"] == true
-                            && self.snapshot.application.is_some()) =>
-                {
-                    self.snapshot.artifact = Some(format!(
-                        "{} · current={} · {}",
-                        value["artifact"]["state"].as_str().unwrap_or("unknown"),
-                        value["artifact"]["current"],
-                        value["artifact"]["output"].as_str().unwrap_or("")
-                    ));
-                    accepted = true;
-                }
-                Some("artifact_validation")
-                    if matches_proposal(&self.snapshot, &value["artifact"])
-                        && !(value["artifact"]["candidate"] == true
-                            && self.snapshot.application.is_some()) =>
-                {
-                    self.snapshot.artifact_validation = Some(format!(
-                        "valid={} · current={} · AI/人工复核未执行",
-                        value["artifact"]["valid"], value["artifact"]["current"]
-                    ));
-                    accepted = true;
-                }
-                Some("diagnostic") => {
-                    self.snapshot.notice = value["diagnostics"][0]["message"]
-                        .as_str()
-                        .map(str::to_owned);
-                    accepted = true;
-                }
-                _ => {}
             }
-            if accepted {
-                if let Some(sequence) = sequence {
-                    self.fact_sequences.insert(kind.into(), sequence);
+            Some("source_ledger") => {
+                if let Some(ledger) = source_ledger_fact(&value) {
+                    self.snapshot.ledger = Some(ledger);
+                    accepted = true;
                 }
+            }
+            Some("application") if matches_proposal(&self.snapshot, &value["receipt"]) => {
+                self.snapshot.application = value["receipt"]["state"]
+                    .as_str()
+                    .map(|state| format!("{state} · current={}", value["current"]));
+                if let Some(proposal) = &mut self.snapshot.proposal {
+                    proposal.ready = false;
+                }
+                if let Some(sequence) = sequence {
+                    let watermark = self.fact_sequences.entry("proposal".into()).or_default();
+                    *watermark = (*watermark).max(sequence);
+                }
+                accepted = true;
+            }
+            Some("artifact")
+                if matches_proposal(&self.snapshot, &value["artifact"])
+                    && !(value["artifact"]["candidate"] == true
+                        && self.snapshot.application.is_some()) =>
+            {
+                self.snapshot.artifact = Some(format!(
+                    "{} · current={} · {}",
+                    value["artifact"]["state"].as_str().unwrap_or("unknown"),
+                    value["artifact"]["current"],
+                    value["artifact"]["output"].as_str().unwrap_or("")
+                ));
+                accepted = true;
+            }
+            Some("artifact_validation")
+                if matches_proposal(&self.snapshot, &value["artifact"])
+                    && !(value["artifact"]["candidate"] == true
+                        && self.snapshot.application.is_some()) =>
+            {
+                self.snapshot.artifact_validation = Some(format!(
+                    "valid={} · current={} · AI/人工复核未执行",
+                    value["artifact"]["valid"], value["artifact"]["current"]
+                ));
+                accepted = true;
+            }
+            Some("diagnostic") => {
+                self.snapshot.notice = value["diagnostics"][0]["message"]
+                    .as_str()
+                    .map(str::to_owned);
+                accepted = true;
+            }
+            _ => {}
+        }
+        if accepted {
+            if let Some(sequence) = sequence {
+                self.fact_sequences.insert(kind.into(), sequence);
             }
         }
     }
