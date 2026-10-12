@@ -200,7 +200,7 @@ def main():
     parser.add_argument("--model", required=True, help="provider/model that answers")
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
-    parser.add_argument("--only", choices=["tui", "cli"], help="run one half")
+    parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run one half")
     args = parser.parse_args()
     binary = args.binary.resolve()
     repo = Path(__file__).resolve().parents[2]
@@ -531,6 +531,46 @@ def tui_checks(report, binary, common, args, workspace, code_word):
         expect(value.get("defaultPreset", "workspace-write") == "workspace-write", f"dsh's default preset is now {value}")
     report.step("dsh's default permission preset is back to workspace-write", default_restored)
 
+
+
+def domain_checks(report, binary, common, args, workspace, root):
+    fixture = Path(os.environ.get("MODELING_COMPLEX_FIXTURE", ""))
+    context = Path(os.environ.get("MODELING_COMPLEX_CONTEXT", str(fixture / "context.json")))
+    repository = Path(os.environ.get("MODELING_COMPLEX_ROOT", str(fixture)))
+    if not context.is_file():
+        report.step("complex fixture context exists", lambda: expect(False, f"missing {context}"))
+        return
+    domain_journal = root / "domain-journal"
+    domain_journal.mkdir(parents=True, exist_ok=True)
+    command = [str(binary), "--cwd", str(repository), "--domain-context", str(context),
+               "--model", args.model, "--journal-dir", str(domain_journal),
+               "--dsh", args.dsh, "--profile", args.profile]
+    tui = Tui(command, repository, report.evidence)
+    try:
+        def run_domain():
+            tui.wait("modeling session ready", lambda s: "建模" in s and "Initializing" not in s, 120)
+            tui.type("开始混合楼层建模。请先用 modeling_domain.describe_capabilities，再调用 scan_source_instances 分页扫描并展示来源实例对账；保留已有、待新增、疑似重复、待确认和缺能力状态，先不要提交构建方案。")
+            tui.keys(ENTER, 0.5)
+            screen = tui.wait("source ledger", lambda s: "来源实例对账" in s or "source_ledger" in s, 180)
+            expect("pending_addition" in screen and "suspected_duplicate" in screen,
+                   "ledger did not expose expected mixed-floor states")
+            if os.environ.get("MODELING_COMPLEX_FULL") != "1":
+                tui.keys(CTRL_C)
+                return
+            tui.type("根据当前台账，只为 source.mixed.instance.84.80.7E 这一张待新增椅子准备可执行方案；保留 source_id、实例身份和来源 XY，使用 0.5 米宽深、0.9 米示意高度，明确高度为 assumed；不要扫描其他类别。")
+            tui.keys(ENTER, 0.5)
+            proposal = tui.wait("typed chair proposal", lambda s: bool(__import__("re").search(r"方案 [0-9a-f]{32} · 修订", s)) and ("prepared" in s or "blocked" in s), 300)
+            expect("prepared" in proposal, "chair proposal was not executable")
+            tui.type("只把这张椅子向北移动 1 米，保留来源和身份")
+            tui.keys(ENTER, 0.5)
+            revised = tui.wait("chair revision", lambda s: "修订 2" in s, 180)
+            expect("prepared" in revised, "chair revision was not prepared")
+            tui.keys(CTRL_Y, 1.0)
+            tui.wait("approval result", lambda s: "applied" in s or "授权" in s or "具体版本" in s, 180)
+            tui.keys(CTRL_C)
+        report.step("real dsh scans and shows the mixed-floor ledger", run_domain, tui)
+    finally:
+        tui.close()
 
 def cli_checks(report, binary, common, args, workspace, journal, root):
     def run(arguments, **kwargs):

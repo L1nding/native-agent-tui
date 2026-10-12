@@ -134,11 +134,20 @@ pub struct ProposalFact {
     pub ready: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLedgerFact {
+    pub scan_id: String,
+    pub scene_sha256: String,
+    pub rows: Vec<String>,
+    pub counts: BTreeMap<String, usize>,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainSnapshot {
     pub enabled: bool,
     pub floor_id: String,
     pub proposal: Option<ProposalFact>,
+    pub ledger: Option<SourceLedgerFact>,
     pub application: Option<String>,
     pub artifact: Option<String>,
     pub artifact_validation: Option<String>,
@@ -166,6 +175,7 @@ pub struct DomainFacts {
     seen: BTreeMap<String, u64>,
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
+    fact_sequences: BTreeMap<String, u64>,
 }
 
 impl DomainFacts {
@@ -183,6 +193,7 @@ impl DomainFacts {
             seen: BTreeMap::new(),
             snapshot,
             control_messages: BTreeMap::new(),
+            fact_sequences: BTreeMap::new(),
         }
     }
 
@@ -227,7 +238,19 @@ impl DomainFacts {
                 continue;
             }
             self.seen.insert(key, detail.revision);
-            match value["kind"].as_str() {
+            let Some(kind) = value["kind"].as_str() else {
+                continue;
+            };
+            let sequence = value["fact_sequence"].as_u64();
+            if self
+                .fact_sequences
+                .get(kind)
+                .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
+            {
+                continue;
+            }
+            let mut accepted = false;
+            match Some(kind) {
                 Some("proposal") => {
                     if let Some(proposal) = proposal_fact(&value) {
                         let old = self.snapshot.proposal.as_ref();
@@ -242,9 +265,19 @@ impl DomainFacts {
                                 self.snapshot.application = None;
                                 self.snapshot.artifact = None;
                                 self.snapshot.artifact_validation = None;
+                                for kind in ["application", "artifact", "artifact_validation"] {
+                                    self.fact_sequences.remove(kind);
+                                }
                             }
                             self.snapshot.proposal = Some(proposal);
+                            accepted = true;
                         }
+                    }
+                }
+                Some("source_ledger") => {
+                    if let Some(ledger) = source_ledger_fact(&value) {
+                        self.snapshot.ledger = Some(ledger);
+                        accepted = true;
                     }
                 }
                 Some("application") if matches_proposal(&self.snapshot, &value["receipt"]) => {
@@ -254,28 +287,48 @@ impl DomainFacts {
                     if let Some(proposal) = &mut self.snapshot.proposal {
                         proposal.ready = false;
                     }
+                    if let Some(sequence) = sequence {
+                        let watermark = self.fact_sequences.entry("proposal".into()).or_default();
+                        *watermark = (*watermark).max(sequence);
+                    }
+                    accepted = true;
                 }
-                Some("artifact") if matches_proposal(&self.snapshot, &value["artifact"]) => {
+                Some("artifact")
+                    if matches_proposal(&self.snapshot, &value["artifact"])
+                        && !(value["artifact"]["candidate"] == true
+                            && self.snapshot.application.is_some()) =>
+                {
                     self.snapshot.artifact = Some(format!(
-                        "{} · {}",
+                        "{} · current={} · {}",
                         value["artifact"]["state"].as_str().unwrap_or("unknown"),
+                        value["artifact"]["current"],
                         value["artifact"]["output"].as_str().unwrap_or("")
                     ));
+                    accepted = true;
                 }
                 Some("artifact_validation")
-                    if matches_proposal(&self.snapshot, &value["artifact"]) =>
+                    if matches_proposal(&self.snapshot, &value["artifact"])
+                        && !(value["artifact"]["candidate"] == true
+                            && self.snapshot.application.is_some()) =>
                 {
                     self.snapshot.artifact_validation = Some(format!(
                         "valid={} · current={} · AI/人工复核未执行",
                         value["artifact"]["valid"], value["artifact"]["current"]
                     ));
+                    accepted = true;
                 }
                 Some("diagnostic") => {
                     self.snapshot.notice = value["diagnostics"][0]["message"]
                         .as_str()
-                        .map(str::to_owned)
+                        .map(str::to_owned);
+                    accepted = true;
                 }
                 _ => {}
+            }
+            if accepted {
+                if let Some(sequence) = sequence {
+                    self.fact_sequences.insert(kind.into(), sequence);
+                }
             }
         }
     }
@@ -316,6 +369,47 @@ fn matches_proposal(snapshot: &DomainSnapshot, value: &Value) -> bool {
     })
 }
 
+fn source_ledger_fact(value: &Value) -> Option<SourceLedgerFact> {
+    let mut counts = BTreeMap::new();
+    let mut rows = Vec::new();
+    for row in value["objects"].as_array()?.iter().take(100) {
+        let state = text(row, "state").ok()?;
+        if !matches!(
+            state.as_str(),
+            "built"
+                | "pending_addition"
+                | "pending_confirmation"
+                | "suspected_duplicate"
+                | "skipped"
+                | "rejected"
+                | "capability_missing"
+        ) {
+            return None;
+        }
+        *counts.entry(state.clone()).or_insert(0) += 1;
+        rows.push(format!(
+            "{} · {} · {} · 位置 {} · 已有实例 {}",
+            text(row, "source_id").ok()?,
+            row["category"].as_str().unwrap_or("待确认类别"),
+            state,
+            row["origin_m"],
+            row["matched_component_ids"]
+        ));
+    }
+    if let Some(total_counts) = value["state_counts"].as_object() {
+        counts = total_counts
+            .iter()
+            .map(|(state, count)| Some((state.clone(), usize::try_from(count.as_u64()?).ok()?)))
+            .collect::<Option<_>>()?;
+    }
+    Some(SourceLedgerFact {
+        scan_id: text(value, "scan_id").ok()?,
+        scene_sha256: text(value, "scene_sha256").ok()?,
+        rows,
+        counts,
+    })
+}
+
 fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     let p = &value["proposal"];
     let binding = ProposalBinding {
@@ -334,8 +428,9 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         }
         let solid: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
         objects.push(format!(
-            "{} · 位置 {} · 来源 {} · {}",
+            "{} · 类别 {} · 位置 {} · 来源 {} · {}",
             solid["id"].as_str()?,
+            solid["metadata"]["category"].as_str().unwrap_or("未分类"),
             solid["origin"],
             solid["source_ids"],
             op["basis"].as_str().unwrap_or("unknown")

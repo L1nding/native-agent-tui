@@ -30,6 +30,25 @@ pub(super) fn draw(
         chunks[0],
     );
     let mut lines = Vec::new();
+    if let Some(ledger) = &domain.ledger {
+        lines.push(Line::from(format!(
+            "来源实例对账 · 扫描 {}",
+            ledger.scan_id
+        )));
+        lines.push(Line::from(format!("对账场景 {}", ledger.scene_sha256)));
+        lines.push(Line::from(
+            ledger
+                .counts
+                .iter()
+                .map(|(state, count)| format!("{state} {count}"))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        ));
+        lines.extend(ledger.rows.iter().map(|row| Line::from(display_text(row))));
+        lines.push(Line::from(
+            "跳过、待确认及缺能力对象保留在台账中。可输入类别或实例的采纳意见。",
+        ));
+    }
     if let Some(p) = &domain.proposal {
         lines.push(Line::from(format!(
             "方案 {} · 修订 {} · {}",
