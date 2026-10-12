@@ -3,7 +3,7 @@
 use std::io;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -12,9 +12,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, GetNumberOfConsoleInputEvents, ReadConsoleInputW, SetConsoleMode,
+    ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_WINDOW_INPUT, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD,
-    LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
-    WINDOW_BUFFER_SIZE_EVENT,
+    LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_WHEELED,
+    RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED, WINDOW_BUFFER_SIZE_EVENT,
 };
 
 use super::vt::Decoder;
@@ -60,7 +61,12 @@ impl TerminalInput {
         if unsafe {
             SetConsoleMode(
                 handle,
-                mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT,
+                (mode
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT
+                    | ENABLE_WINDOW_INPUT
+                    | ENABLE_MOUSE_INPUT
+                    | ENABLE_EXTENDED_FLAGS)
+                    & !ENABLE_QUICK_EDIT_MODE,
             )
         } == 0
         {
@@ -115,6 +121,12 @@ impl TerminalInput {
                 match u32::from(record.EventType) {
                     // SAFETY: EventType selects the matching union member.
                     KEY_EVENT => self.key(unsafe { record.Event.KeyEvent }, now),
+                    MOUSE_EVENT => {
+                        // SAFETY: EventType selects the mouse union member.
+                        if let Some(mouse) = wheel_event(unsafe { record.Event.MouseEvent }) {
+                            self.decoder.mouse(mouse);
+                        }
+                    }
                     WINDOW_BUFFER_SIZE_EVENT => {
                         let (width, height) = crossterm::terminal::size()?;
                         self.decoder.resize(width, height);
@@ -134,6 +146,38 @@ impl TerminalInput {
     }
 }
 
+fn modifiers(controls: u32) -> KeyModifiers {
+    let mut modifiers = KeyModifiers::NONE;
+    if controls & SHIFT_PRESSED != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if controls & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if controls & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    modifiers
+}
+
+fn wheel_event(record: MOUSE_EVENT_RECORD) -> Option<MouseEvent> {
+    if record.dwEventFlags != MOUSE_WHEELED {
+        return None;
+    }
+    let delta = (record.dwButtonState >> 16) as i16;
+    let kind = match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => MouseEventKind::ScrollUp,
+        std::cmp::Ordering::Less => MouseEventKind::ScrollDown,
+        std::cmp::Ordering::Equal => return None,
+    };
+    Some(MouseEvent {
+        kind,
+        column: u16::try_from(record.dwMousePosition.X).ok()?,
+        row: u16::try_from(record.dwMousePosition.Y).ok()?,
+        modifiers: modifiers(record.dwControlKeyState),
+    })
+}
+
 fn feed_key(
     decoder: &mut Decoder,
     surrogate: &mut Option<(u16, KeyModifiers)>,
@@ -146,16 +190,7 @@ fn feed_key(
     if key.bKeyDown == 0 && !alt_release {
         return;
     }
-    let mut modifiers = KeyModifiers::NONE;
-    if key.dwControlKeyState & SHIFT_PRESSED != 0 {
-        modifiers |= KeyModifiers::SHIFT;
-    }
-    if key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0 {
-        modifiers |= KeyModifiers::ALT;
-    }
-    if key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0 {
-        modifiers |= KeyModifiers::CONTROL;
-    }
+    let modifiers = modifiers(key.dwControlKeyState);
     if !alt_release {
         let code = match key.wVirtualKeyCode {
             0x08 => Some(KeyCode::Backspace),
@@ -244,6 +279,45 @@ mod tests {
         key.wRepeatCount = 1;
         key.dwControlKeyState = controls;
         key
+    }
+
+    #[test]
+    fn windows_wheel_records_preserve_direction_coordinates_and_modifiers() {
+        for (delta, kind) in [
+            (120i16, MouseEventKind::ScrollUp),
+            (-120, MouseEventKind::ScrollDown),
+        ] {
+            let record = MOUSE_EVENT_RECORD {
+                dwMousePosition: windows_sys::Win32::System::Console::COORD { X: 20, Y: 11 },
+                dwButtonState: u32::from(delta as u16) << 16,
+                dwControlKeyState: LEFT_CTRL_PRESSED | SHIFT_PRESSED,
+                dwEventFlags: MOUSE_WHEELED,
+            };
+            let mouse = wheel_event(record).unwrap();
+            assert_eq!(
+                mouse,
+                MouseEvent {
+                    kind,
+                    column: 20,
+                    row: 11,
+                    modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                }
+            );
+            let mut decoder = Decoder::default();
+            decoder.mouse(mouse);
+            assert_eq!(decoder.next(Instant::now()), Some(InputEvent::Mouse(mouse)));
+            let now = Instant::now();
+            for ch in "\x1b[200~".chars() {
+                decoder.feed(ch, KeyModifiers::NONE, now);
+            }
+            decoder.mouse(mouse);
+            assert!(decoder.next(now).is_none());
+            assert!(wheel_event(MOUSE_EVENT_RECORD {
+                dwEventFlags: 0,
+                ..record
+            })
+            .is_none());
+        }
     }
 
     #[test]

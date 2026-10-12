@@ -48,6 +48,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("F11", "activity evidence"),
             ("F12", "history and export"),
             ("PgUp/PgDn", "scroll"),
+            ("Wheel", "scroll conversation"),
         ],
     ),
     (
@@ -102,6 +103,7 @@ const SECTIONS_ZH: &[(&str, &[(&str, &str)])] = &[
             ("F11", "活动证据"),
             ("F12", "历史与导出"),
             ("PgUp/PgDn", "滚动"),
+            ("Wheel", "鼠标滚轮滚动对话"),
         ],
     ),
     (

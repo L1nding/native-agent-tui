@@ -22,6 +22,9 @@ use crate::interactions::RequestKind;
 use crate::observation::{AttentionLevel, ExecutionState};
 use crate::state::{display_text, CoreSnapshot, SessionPhase};
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, local: &LocalState) {
+    local
+        .conversation_viewport
+        .set(super::ConversationViewport::default());
     let area = frame.area();
     let theme = theme::current();
     frame.render_widget(Block::default().style(theme.base()), area);
@@ -307,6 +310,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     let focused_row = projected.transcript.focused;
     let foldable_tools = projected.transcript.foldable > 0;
     let below = projected.below;
+    local
+        .conversation_viewport
+        .set(super::ConversationViewport {
+            area: conversation_area,
+            scroll: below,
+        });
     let mut transcript = projected.transcript.lines;
     if transcript.is_empty() {
         transcript.push(

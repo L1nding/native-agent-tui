@@ -259,6 +259,12 @@ pub async fn run_tasks_with_history(
                                 }
                                 redraw.request();
                             }
+                            InputEvent::Mouse(mouse) => {
+                                if !sessions_panel.visible && !history_panel.visible
+                                    && super::handle_mouse(mouse, &mut local) {
+                                    redraw.request();
+                                }
+                            }
                             InputEvent::Resize(_, _) => redraw.request(),
                             _ => {}
                         }

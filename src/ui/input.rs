@@ -1,5 +1,5 @@
 //! Terminal input belongs to the UI; payloads never become execution facts.
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 #[cfg(not(windows))]
 use std::io;
 
@@ -17,6 +17,7 @@ pub(crate) const PASTE_BYTES: usize = 32 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InputEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     Resize(u16, u16),
     PasteRejected,
@@ -50,6 +51,7 @@ pub(crate) struct TerminalInput;
 #[cfg(not(windows))]
 impl TerminalInput {
     pub(crate) fn enter() -> io::Result<Self> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
         Ok(Self)
     }
 
@@ -60,6 +62,7 @@ impl TerminalInput {
         }
         Ok(match event::read()? {
             Event::Key(key) => Some(InputEvent::Key(key)),
+            Event::Mouse(mouse) => Some(InputEvent::Mouse(mouse)),
             Event::Paste(text) => Some(paste_event(text)),
             Event::Resize(width, height) => Some(InputEvent::Resize(width, height)),
             _ => None,
@@ -67,7 +70,7 @@ impl TerminalInput {
     }
 
     pub(crate) fn restore(&mut self) -> io::Result<()> {
-        Ok(())
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
     }
 }
 

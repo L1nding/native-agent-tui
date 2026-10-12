@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut control_paste = false;
         let mut limit_paste = false;
         let mut keys = Vec::new();
+        let mut wheels = Vec::new();
         let mut quit = false;
         while Instant::now() < deadline && !quit {
             match input.read_ready()? {
@@ -46,6 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     limit_paste |= text == format!("{}ab", "中".repeat(input::PASTE_BYTES / 3));
                 }
                 Some(InputEvent::PasteRejected) => rejected_events += 1,
+                Some(InputEvent::Mouse(mouse)) => {
+                    if wheels.len() < 64 {
+                        wheels.push(mouse);
+                    }
+                }
                 Some(InputEvent::Key(key)) if key.kind != KeyEventKind::Release => {
                     key_events += 1;
                     enter_events += usize::from(key.code == KeyCode::Enter);
@@ -111,10 +117,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             physical[3],
         ];
+        let expected_wheels = [
+            crossterm::event::MouseEventKind::ScrollUp,
+            crossterm::event::MouseEventKind::ScrollDown,
+        ]
+        .map(|kind| crossterm::event::MouseEvent {
+            kind,
+            column: 20,
+            row: 11,
+            modifiers: KeyModifiers::NONE,
+        });
         Ok(
             serde_json::json!({"paste_events":paste_events,"key_events":key_events,
             "enter_events":enter_events,"rejected_events":rejected_events,
-            "exact_paste":exact_paste,"quit":quit,"control_paste":control_paste,
+            "exact_paste":exact_paste,"quit":quit,"wheel_reports_match":wheels==expected_wheels,"control_paste":control_paste,
             "limit_paste":limit_paste,"keys_match":keys==expected,"physical_keys_match":keys==physical,
             "physical_records_decoded":keys==physical || keys==plain_physical,
             "portable_keys_match":keys==portable,
