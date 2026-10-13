@@ -332,7 +332,8 @@ pub(super) fn transcript<'a>(
             .map(|focus| display_text(&message.text[..focus.offset]).len());
         let text = display_text(&message.text);
         let is_tool = message.role == "Tool";
-        if !is_tool {
+        // 耗时行和工具行一样没有标题，直接跟在这一步的内容后面。
+        if !is_tool && message.role != "Timing" {
             out.lines.push(header(message, theme));
         }
         let calls = message.tools.len();
@@ -360,6 +361,11 @@ pub(super) fn transcript<'a>(
             let (runs, hang, code) = match message.role.as_str() {
                 "Tool" => tool_runs(source, tool.map(|tool| tool.lifecycle), theme),
                 "You" => (vec![(source.len(), Style::default())], 0, false),
+                "Timing" => (
+                    vec![(source.len(), Style::default().fg(theme.muted))],
+                    0,
+                    false,
+                ),
                 _ => markdown_runs(source, &mut fence, theme),
             };
             // 悬挂缩进只在行足够宽时使用，否则续行几乎放不下内容。
@@ -712,6 +718,34 @@ mod tests {
         let mut focus = Focus::message(message);
         focus.offset = message.text.find(needle).unwrap();
         focus
+    }
+
+    #[test]
+    fn timing_row_is_a_muted_line_without_a_title_after_the_step() {
+        let messages = [
+            item("Agent", "answer"),
+            item(
+                "Timing",
+                "Model wait 1.0s · Response 3.0s · Completed 14:32:12 UTC",
+            ),
+        ];
+        let view = transcript(messages.iter(), None, 80, false);
+        assert_eq!(
+            rows(&view),
+            [
+                "Agent",
+                "  answer",
+                "",
+                "  Model wait 1.0s · Response 3.0s · Completed 14:32:12 UTC"
+            ]
+        );
+        let theme = theme::current();
+        assert_eq!(view.lines[3].spans[1].style.fg, Some(theme.muted));
+        // 窄窗口按词换行，不丢阶段。
+        let narrow = rows(&transcript(messages.iter(), None, 24, false)).join(" ");
+        for stage in ["Model wait 1.0s", "Response 3.0s", "14:32:12 UTC"] {
+            assert!(narrow.contains(stage), "{narrow}");
+        }
     }
 
     #[test]

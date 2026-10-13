@@ -1,7 +1,10 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use tokio::time::Instant;
 
 use crate::agents::{AgentRegistry, AgentSnapshot};
 use crate::gate::WaitTarget;
@@ -225,6 +228,69 @@ pub(crate) struct SessionState {
     pub(crate) usage_facts: BTreeMap<String, UsageFact>,
     /// 每个 (thread, turn) 的工具摘要行，按 item 原位更新；只存在内存中。
     pub(crate) tool_lines: VecDeque<ToolLines>,
+    /// 当前 root 轮次的分阶段耗时；轮次结束后固定进对话并清空。
+    pub(crate) turn_timing: Option<TurnTiming>,
+}
+
+/// 一个 root 轮次的耗时阶段；由 Core 按事件到达时间切换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStage {
+    ModelWait,
+    Thinking,
+    Response,
+    Tools,
+}
+
+const TURN_STAGES: [(TurnStage, &str); 4] = [
+    (TurnStage::ModelWait, "Model wait"),
+    (TurnStage::Thinking, "Thinking"),
+    (TurnStage::Response, "Response"),
+    (TurnStage::Tools, "Tools"),
+];
+
+#[derive(Debug)]
+pub(crate) struct TurnTiming {
+    turn_id: String,
+    stage: TurnStage,
+    since: Instant,
+    totals: [Duration; 4],
+    /// 仍在运行的工具；非空时保持工具阶段，穿插的输出不打断它。
+    running_tools: BTreeSet<String>,
+}
+
+impl TurnTiming {
+    fn switch(&mut self, stage: TurnStage, now: Instant) {
+        self.totals[self.stage as usize] += now.saturating_duration_since(self.since);
+        self.stage = stage;
+        self.since = now;
+    }
+
+    fn text(&self, now: Instant, active: bool) -> String {
+        TURN_STAGES
+            .iter()
+            .filter_map(|(stage, label)| {
+                let live = active && *stage == self.stage;
+                let mut total = self.totals[*stage as usize];
+                if live {
+                    total += now.saturating_duration_since(self.since);
+                }
+                (live || !total.is_zero())
+                    .then(|| format!("{label} {:.1}s", total.as_millis() as f64 / 1000.0))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+/// 轮次结束时刻的墙上时间；没有时区数据，明确标注 UTC。
+pub(crate) fn wall_clock_label(now: SystemTime) -> Option<String> {
+    let seconds = now.duration_since(UNIX_EPOCH).ok()?.as_secs() % 86_400;
+    Some(format!(
+        "{:02}:{:02}:{:02} UTC",
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -414,6 +480,140 @@ impl SessionState {
         }
         self.view.turn_id = Some(id);
         self.view.phase = SessionPhase::Running;
+    }
+
+    /// 开始为当前 root 轮次计时；同一轮次重复绑定不重置。
+    pub fn begin_turn_timing(&mut self, now: Instant) {
+        let Some(turn) = self.view.turn_id.clone() else {
+            return;
+        };
+        if self
+            .turn_timing
+            .as_ref()
+            .is_some_and(|timing| timing.turn_id == turn)
+        {
+            return;
+        }
+        self.turn_timing = Some(TurnTiming {
+            turn_id: turn,
+            stage: TurnStage::ModelWait,
+            since: now,
+            totals: [Duration::ZERO; 4],
+            running_tools: BTreeSet::new(),
+        });
+        self.render_turn_timing(now, None);
+    }
+
+    /// 已被接受的 root 输出把计时切到对应阶段。
+    pub fn turn_stage(&mut self, turn: &str, stage: TurnStage, now: Instant) {
+        let Some(timing) = self
+            .turn_timing
+            .as_mut()
+            .filter(|timing| timing.turn_id == turn)
+        else {
+            return;
+        };
+        if timing.running_tools.is_empty() && timing.stage != stage {
+            timing.switch(stage, now);
+        }
+        self.render_turn_timing(now, None);
+    }
+
+    /// 工具开始进入工具阶段；全部工具结束后回到等待模型。
+    pub fn turn_tool(&mut self, turn: &str, item: &str, running: bool, now: Instant) {
+        let Some(timing) = self
+            .turn_timing
+            .as_mut()
+            .filter(|timing| timing.turn_id == turn)
+        else {
+            return;
+        };
+        if running {
+            if timing.running_tools.len() < 64 {
+                timing.running_tools.insert(item.to_owned());
+            }
+            if timing.stage != TurnStage::Tools {
+                timing.switch(TurnStage::Tools, now);
+            }
+        } else {
+            timing.running_tools.remove(item);
+            if timing.running_tools.is_empty() && timing.stage == TurnStage::Tools {
+                timing.switch(TurnStage::ModelWait, now);
+            }
+        }
+        self.render_turn_timing(now, None);
+    }
+
+    /// 没有新事件时，只推进正在进行的阶段的显示值。
+    pub fn refresh_turn_timing(&mut self, now: Instant) {
+        if self.turn_timing.is_some() {
+            self.render_turn_timing(now, None);
+        }
+    }
+
+    /// 轮次终结：固定各阶段数值。`completed_at` 只在服务端确认完成时给出。
+    pub fn finish_turn_timing(&mut self, now: Instant, completed_at: Option<String>) {
+        if let Some(timing) = self.turn_timing.as_mut() {
+            let stage = timing.stage;
+            timing.switch(stage, now);
+            self.render_turn_timing(now, Some(completed_at));
+            self.turn_timing = None;
+        }
+    }
+
+    fn render_turn_timing(&mut self, now: Instant, finished: Option<Option<String>>) {
+        let Some(timing) = self.turn_timing.as_ref() else {
+            return;
+        };
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        let turn = timing.turn_id.clone();
+        let mut text = timing.text(now, finished.is_none());
+        if let Some(Some(completed_at)) = &finished {
+            if !text.is_empty() {
+                text.push_str(" · ");
+            }
+            text.push_str("Completed ");
+            text.push_str(completed_at);
+        }
+        let id = format!("timing:{turn}");
+        let same_turn = |m: &ConversationItem| m.thread_id == thread && m.turn_id == turn;
+        let existing = self
+            .view
+            .messages
+            .iter()
+            .position(|m| same_turn(m) && m.id == id);
+        let mut item = match existing {
+            // 耗时行排在这一步的最末尾；后面来了新消息就挪到它们之后。
+            Some(index) if self.view.messages[index + 1..].iter().any(same_turn) => {
+                self.view.messages.remove(index)
+            }
+            Some(index) => {
+                let item = &mut self.view.messages[index];
+                item.text = text;
+                item.complete = finished.is_some();
+                return;
+            }
+            None => ConversationItem {
+                id,
+                thread_id: thread.clone(),
+                turn_id: turn.clone(),
+                role: "Timing".into(),
+                text: String::new(),
+                complete: false,
+                truncated: false,
+                tools: Vec::new(),
+            },
+        };
+        item.text = text;
+        item.complete = finished.is_some();
+        let at = self
+            .view
+            .messages
+            .iter()
+            .rposition(same_turn)
+            .map_or(self.view.messages.len(), |index| index + 1);
+        self.view.messages.insert(at, item);
+        self.bound_history();
     }
 
     pub fn message(&mut self, turn: &str, id: &str, text: &str, complete: bool) -> bool {
@@ -673,6 +873,69 @@ mod tests {
                 .filter(|m| m.role == "Tool")
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn turn_timing_accumulates_each_stage_and_freezes_when_the_turn_ends() {
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let row = |state: &SessionState| {
+            let rows: Vec<_> = state
+                .view
+                .messages
+                .iter()
+                .filter(|m| m.role == "Timing")
+                .collect();
+            assert_eq!(rows.len(), 1);
+            (rows[0].text.clone(), rows[0].complete)
+        };
+        state.begin_turn_timing(at(0));
+        state.refresh_turn_timing(at(400));
+        assert_eq!(row(&state), ("Model wait 0.4s".into(), false));
+        state.reasoning("root", "turn", "r", "think", false);
+        state.turn_stage("turn", TurnStage::Thinking, at(1000));
+        state.message("turn", "a", "answer", false);
+        state.turn_stage("turn", TurnStage::Response, at(3000));
+        state.turn_tool("turn", "tool-1", true, at(6000));
+        state.turn_tool("turn", "tool-2", true, at(6100));
+        // 工具运行期间穿插的输出不结束工具阶段；另一轮次的事件不计入。
+        state.turn_stage("turn", TurnStage::Response, at(6200));
+        state.turn_stage("old", TurnStage::Thinking, at(6250));
+        state.turn_tool("turn", "tool-1", false, at(6300));
+        assert!(row(&state).0.ends_with("Tools 0.3s"));
+        state.turn_tool("turn", "tool-2", false, at(6500));
+        state.message("turn", "b", "more", false);
+        state.turn_stage("turn", TurnStage::Response, at(7000));
+        // 这一步后来的消息到达后，耗时行仍在最末尾。
+        assert_eq!(state.view.messages.last().unwrap().role, "Timing");
+        state.begin_turn_timing(at(7200));
+        state.finish_turn_timing(at(7500), Some("14:32:12 UTC".into()));
+        let frozen = (
+            "Model wait 1.5s · Thinking 2.0s · Response 3.5s · Tools 0.5s · Completed 14:32:12 UTC"
+                .to_owned(),
+            true,
+        );
+        assert_eq!(row(&state), frozen);
+        state.refresh_turn_timing(at(60_000));
+        state.turn_stage("turn", TurnStage::Thinking, at(60_000));
+        assert_eq!(row(&state), frozen);
+        assert_eq!(
+            wall_clock_label(UNIX_EPOCH + Duration::from_secs(86_400 + 52_332)).as_deref(),
+            Some("14:32:12 UTC")
+        );
+
+        // 没有服务端终态的结束只固定数值，不写完成时刻。
+        state.view.turn_id = Some("lost".into());
+        state.begin_turn_timing(at(0));
+        state.finish_turn_timing(at(2000), None);
+        let lost = state.view.messages.last().unwrap();
+        assert_eq!(
+            (lost.text.as_str(), lost.complete),
+            ("Model wait 2.0s", true)
         );
     }
 

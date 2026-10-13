@@ -313,6 +313,7 @@ impl ClientHandle {
                     agents: AgentRegistry::with_limits(agent_limits),
                     usage_facts: Default::default(),
                     tool_lines: Default::default(),
+                    turn_timing: None,
                 },
                 pending: HashMap::new(),
                 next_id: 1,
@@ -917,6 +918,15 @@ impl Core {
         self.state.view.scheduler = self.scheduler.snapshot();
         self.update_token_budget_snapshot();
         self.reconcile_observation();
+        if matches!(
+            self.state.view.phase,
+            SessionPhase::Running | SessionPhase::GatePending
+        ) {
+            self.state.refresh_turn_timing(Instant::now());
+        } else {
+            // 断连、停止等没有服务端终态的结束：固定数值，不写完成时刻。
+            self.state.finish_turn_timing(Instant::now(), None);
+        }
         self.state.view.observation = self
             .observer
             .snapshot_at(self.state.view.version + 1, Instant::now());
@@ -2305,6 +2315,7 @@ impl Core {
             }
         } else if self.state.view.phase == SessionPhase::StartingTurn {
             self.state.turn_started(id.into());
+            self.state.begin_turn_timing(Instant::now());
         }
         if let Some(attempt) = self.scheduler.active_root() {
             if let Err(error) = self.scheduler.started_root(
@@ -3654,7 +3665,17 @@ impl Core {
                 if let Some(notice) = protocol::decode_observed_tool(method, &params) {
                     match notice {
                         Ok(notice) => match self.observer.tool(&notice, Instant::now()) {
-                            Ok(true) => self.observe_tool_detail_event(&notice, &params),
+                            Ok(true) => {
+                                if Some(thread) == self.state.view.thread_id.as_deref() {
+                                    self.state.turn_tool(
+                                        turn,
+                                        &notice.item_id,
+                                        notice.outcome.is_none(),
+                                        Instant::now(),
+                                    );
+                                }
+                                self.observe_tool_detail_event(&notice, &params)
+                            }
                             Ok(false) => {}
                             Err(error) => {
                                 self.state.error(SessionPhase::Unknown, error.to_string());
@@ -3688,6 +3709,13 @@ impl Core {
                                     &output.text,
                                     false,
                                 ) {
+                                    if Some(thread) == self.state.view.thread_id.as_deref() {
+                                        self.state.turn_stage(
+                                            turn,
+                                            crate::state::TurnStage::Thinking,
+                                            Instant::now(),
+                                        );
+                                    }
                                     self.observe_output(
                                         thread,
                                         turn,
@@ -3852,6 +3880,10 @@ impl Core {
                 if let Some(thread) = self.state.view.thread_id.clone() {
                     self.retire_turn_evidence(&thread, id.unwrap());
                 }
+                let completed_at = (self.state.view.phase == SessionPhase::Completed)
+                    .then(|| crate::state::wall_clock_label(std::time::SystemTime::now()))
+                    .flatten();
+                self.state.finish_turn_timing(Instant::now(), completed_at);
                 self.state.view.notice = None;
                 self.interrupt_requested = false;
                 self.interrupt_sent = false;
@@ -3881,6 +3913,11 @@ impl Core {
                     (turn, params["itemId"].as_str(), params["delta"].as_str())
                 {
                     if self.state.message(turn, id, delta, false) {
+                        self.state.turn_stage(
+                            turn,
+                            crate::state::TurnStage::Response,
+                            Instant::now(),
+                        );
                         let thread = self.state.view.thread_id.clone().unwrap_or_default();
                         self.observe_output(&thread, turn, id, delta.len(), false);
                     }
@@ -8500,10 +8537,17 @@ mod tests {
         )
         .await;
         phase(&mut client, SessionPhase::Completed).await;
-        assert_eq!(
-            client.snapshots.borrow().messages.last().unwrap().text,
-            "中文"
-        );
+        {
+            let snapshot = client.snapshots.borrow();
+            let [.., answer, timing] = snapshot.messages.as_slice() else {
+                panic!("the answer and its timing row are missing");
+            };
+            assert_eq!(answer.text, "中文");
+            // 耗时行排在这一步的最末尾，服务端确认完成后固定并带完成时刻。
+            assert_eq!((timing.role.as_str(), timing.complete), ("Timing", true));
+            assert!(timing.text.contains("Response "), "{}", timing.text);
+            assert!(timing.text.contains(" · Completed "), "{}", timing.text);
+        }
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -8522,9 +8566,11 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(3),
             client.snapshots.wait_for(|s| {
-                s.messages
-                    .last()
-                    .is_some_and(|m| m.text == "second" && m.role == "Agent")
+                // 运行中的耗时行跟在回答之后，还没有固定。
+                matches!(s.messages.as_slice(), [.., answer, timing]
+                    if answer.text == "second" && answer.role == "Agent"
+                        && timing.role == "Timing" && !timing.complete
+                        && timing.turn_id == "two")
             }),
         )
         .await

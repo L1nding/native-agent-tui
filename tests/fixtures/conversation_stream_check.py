@@ -46,7 +46,9 @@ def provider():
         update({"sessionUpdate": "tool_call", "toolCallId": "failed-tool", "title": "pwsh", "kind": "other", "status": "in_progress", "rawInput": {"command": "echo FAILED_PROBE"}})
         time.sleep(.7)
         update({"sessionUpdate": "tool_call_update", "toolCallId": "failed-tool", "status": "failed", "content": []})
-        update({"sessionUpdate": "agent_message_chunk", "messageId": "shared", "content": {"type": "text", "text": "Stream answer"}})
+        update({"sessionUpdate": "agent_message_chunk", "messageId": "shared", "content": {"type": "text", "text": "Stream "}})
+        time.sleep(.3)
+        update({"sessionUpdate": "agent_message_chunk", "messageId": "shared", "content": {"type": "text", "text": "answer"}})
         send({"id": request["id"], "result": {"stopReason": "end_turn"}})
 
     for line in sys.stdin:
@@ -100,6 +102,12 @@ def main():
         console.wait(lambda screen: "Stream answer" in screen and "done · echo STREAM_PROBE" in screen and "failed · echo FAILED_PROBE" in screen, "tool terminal states and answer are visible")
         assert "Inspect the probe carefully" in console.read()
         console.wait(lambda screen: "Completed" in screen, "turn completion is confirmed")
+        import re
+        timing = re.compile(r"Model wait \d+\.\ds · Thinking \d+\.\ds · Response \d+\.\ds · Tools \d+\.\ds · Completed \d\d:\d\d:\d\d UTC")
+        console.wait(lambda screen: timing.search(" ".join(screen.split())), "frozen per-stage timing follows the step")
+        frozen = timing.search(" ".join(console.read().split())).group()
+        time.sleep(1.2)
+        assert timing.search(" ".join(console.read().split())).group() == frozen, "timing changed after the turn ended"
         (root / "completed-screen.txt").write_text(console.read(), encoding="utf-8")
         console.write("/new\r")
         console.wait(lambda screen: "New conversation started." in screen, "new session is confirmed")
