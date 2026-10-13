@@ -818,7 +818,9 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     };
     let mut objects = Vec::new();
     let mut seen_connections = std::collections::BTreeSet::new();
-    for op in p["draft"]["operations"].as_array()?.iter().take(512) {
+    // Verified facts already have an 8 MiB transport bound. Every approved operation
+    // must be projected and validated, including parts after a large batch boundary.
+    for op in p["draft"]["operations"].as_array()? {
         if op["collection"] == "openings" {
             let opening: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
             let kind = opening["kind"].as_str()?;
@@ -1048,7 +1050,13 @@ pub async fn authorize(setup: DomainSetup, binding: ProposalBinding) -> Result<S
     );
     let payload = json!({"user_action":"approve_concrete_change", "proposal":binding,
               "authorization_id":authorization_id,
-              "instruction":"用户已批准此具体版本。调用领域 apply_change，再独立构建和验证产物。保留假设标签。"});
+              "apply_change_arguments": {
+                  "proposal_id": binding.proposal_id, "revision": binding.revision,
+                  "prepare_token": binding.prepare_token,
+                  "expected_sha256": binding.base_sha256,
+                  "authorization_id": authorization_id
+              },
+              "instruction":"用户已批准此具体版本。使用 apply_change_arguments 并补充稳定 operation_id 调用领域 apply_change；expected_sha256 必须是 base_sha256。再独立构建和验证产物，保留假设标签。"});
     Ok(format!("{display}\n{payload}"))
 }
 

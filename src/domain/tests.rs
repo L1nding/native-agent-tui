@@ -720,3 +720,30 @@ fn source_group_assessment_count_requires_actual_bound_reasons() {
     assert_eq!(facts.snapshot.groups.as_ref().unwrap().assessed_groups, 1);
     assert!(facts.snapshot.groups.as_ref().unwrap().rows[1].contains("unclear host"));
 }
+
+#[test]
+fn large_multipart_batch_projects_every_approved_part_after_512_operations() {
+    let mut value = envelope();
+    value["fact_sequence"] = json!(10);
+    value["proposal"]["draft"]["operations"] = Value::Array(
+        (0..600)
+            .map(|index| {
+                json!({"collection":"solids","value_json":json!({
+            "id":format!("bed.{}.part.{}",index / 6,index % 6),
+            "origin":[index,2,0],"source_ids":[]
+        }).to_string(),"basis":"assumed"})
+            })
+            .collect(),
+    );
+    let mut facts = sequenced_facts();
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let proposal = facts.snapshot.proposal.as_ref().unwrap();
+    assert_eq!(proposal.objects.len(), 600);
+    assert!(proposal.objects.last().unwrap().contains("bed.99.part.5"));
+    assert!(facts.can_authorize(&proposal.binding));
+    let original = proposal.clone();
+    value["fact_sequence"] = json!(11);
+    value["proposal"]["draft"]["operations"][599]["value_json"] = json!("{broken}");
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    assert_eq!(facts.snapshot.proposal.as_ref(), Some(&original));
+}
