@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async"], help="modeling scenario for --only domain")
     args = parser.parse_args()
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
@@ -606,6 +606,10 @@ def domain_checks(report, binary, common, args, workspace, root):
         tui.type(prompt)
         tui.keys(ENTER, 0.5)
     try:
+        if case == "async":
+            from domain_async_check import run_async_checks
+            run_async_checks(report, tui, send, finished, fact, context, root)
+            return
         if case == "hosted":
             from domain_hosted_check import run_hosted_checks
             run_hosted_checks(report, tui, send, finished, fact, context, root)
