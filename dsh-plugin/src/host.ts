@@ -224,6 +224,24 @@ function resolveHostAcp(): string {
 }
 
 /**
+ * The host's error for a question the user dismissed. Tools read its code, so
+ * a dismissed plan review keeps the agent planning instead of failing oddly.
+ * Absent on a host without the user-questions package.
+ */
+export async function loadQuestionDismissal(): Promise<((message: string) => Error) | undefined> {
+  try {
+    const path = createRequire(resolveHostAcp()).resolve('@deepseek-ai/dsh-user-questions')
+    const module = (await import(pathToFileURL(path).href)) as {
+      UserQuestionError?: new (message: string, code: string) => Error
+    }
+    const Dismissed = module.UserQuestionError
+    return Dismissed === undefined ? undefined : (message) => new Dismissed(message, 'ASK_CANCELLED')
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * The host's own user-message constructor, the one its ACP server uses, so a
  * steered message has the same shape and identity scheme as a prompt.
  */

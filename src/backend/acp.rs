@@ -390,6 +390,8 @@ struct AcpBridge {
     /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
     tool_inputs: HashMap<String, acp_protocol::ToolInput>,
     mcp_calls: HashMap<String, acp_protocol::McpCall>,
+    /// 插件转来、Core 尚未回答的提问。
+    asks: std::collections::HashSet<RpcId>,
     tool_presentations:
         HashMap<String, (acp_protocol::ToolKind, String, Vec<acp_protocol::FileDiff>)>,
 }
@@ -420,6 +422,7 @@ impl AcpBridge {
             startup_stderr: None,
             tool_inputs: HashMap::new(),
             mcp_calls: HashMap::new(),
+            asks: Default::default(),
             tool_presentations: HashMap::new(),
         }
     }
@@ -945,6 +948,23 @@ impl AcpBridge {
                 ))?;
             }
             (Some("initialized"), None) => {}
+            // Core 对插件提问的答复原样交还；结果的换算在插件里做。
+            (None, Some(id)) if self.asks.remove(&id) => {
+                self.acp.send(with_jsonrpc(Envelope {
+                    jsonrpc: None,
+                    id: Some(id.clone()),
+                    method: None,
+                    params: None,
+                    result: message.result,
+                    error: message.error,
+                }))?;
+                if let Some(session) = &self.session_id {
+                    self.core.send(Envelope::notification(
+                        "serverRequest/resolved",
+                        Some(json!({"threadId": session, "requestId": id})),
+                    ))?;
+                }
+            }
             (None, Some(id)) if self.permissions.contains_key(&id) => {
                 let permission = self.permissions.remove(&id).unwrap();
                 let response = if let Some(error) = message.error {
@@ -999,10 +1019,76 @@ impl AcpBridge {
             (Some("zf/session/event"), None) => {
                 self.plugin_event(message.params.unwrap_or(Value::Null))?;
             }
+            (Some("zf/session/ask"), Some(id)) => {
+                self.ask(id, message.params.unwrap_or(Value::Null))?;
+            }
             (None, Some(id)) => self.response(id, message).await?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Agent 向用户提的问题（如 plan 评审）。dsh 的 ACP 没有应答者，由插件转来；
+    /// 这里把它变成 Core 已有的用户输入请求，绑定当前会话和轮次。
+    fn ask(&mut self, id: RpcId, params: Value) -> Result<(), TransportError> {
+        let questions = params["questions"]
+            .as_array()
+            .filter(|questions| !questions.is_empty() && questions.len() <= 16);
+        let (Some(session), Some(turn), Some(questions)) = (
+            self.session_id
+                .clone()
+                .filter(|id| params["sessionId"] == id.as_str()),
+            self.turn_id.clone(),
+            questions,
+        ) else {
+            return self.acp.send(with_jsonrpc(Envelope::error_response(
+                id,
+                -32000,
+                "no turn of this session is running",
+            )));
+        };
+        // Core 的请求上限是 32 KiB；被评审的正文按题目数均分预算后截断。
+        let budget = 20_000 / questions.len();
+        let clip = |value: &Value, limit: usize| -> String {
+            let text = value.as_str().unwrap_or_default();
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end < text.len() {
+                format!("{}\n[truncated]", &text[..end])
+            } else {
+                text.to_owned()
+            }
+        };
+        let questions: Vec<Value> = questions
+            .iter()
+            .map(|question| {
+                let options: Vec<Value> = question["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(12)
+                    .map(|option| {
+                        json!({"label":clip(&option["label"], 200),
+                            "description":clip(&option["description"], 400)})
+                    })
+                    .collect();
+                let mut item = json!({"id":clip(&question["id"], 128),
+                    "header":clip(&question["header"], 200),
+                    "question":clip(&question["question"], budget)});
+                if !options.is_empty() {
+                    item["options"] = Value::Array(options);
+                }
+                item
+            })
+            .collect();
+        self.asks.insert(id.clone());
+        self.core.send(Envelope::request(
+            id,
+            "item/tool/requestUserInput",
+            Some(json!({"threadId":session,"turnId":turn,"questions":questions})),
+        ))
     }
 
     /// dsh 的 ACP 只转发已提交的整条消息；模型所处阶段和 todo 列表由
@@ -1037,6 +1123,17 @@ impl AcpBridge {
                     "turn/stage",
                     Some(json!({"threadId":session,"turnId":turn,"stage":stage})),
                 ))?;
+            }
+            Some("ask") => {
+                if let Some(id) = event["id"].as_str().filter(|id| id.len() <= 128) {
+                    let id = RpcId::String(id.to_owned());
+                    if event["state"] == "withdrawn" && self.asks.remove(&id) {
+                        self.core.send(Envelope::notification(
+                            "serverRequest/resolved",
+                            Some(json!({"threadId": session, "requestId": id})),
+                        ))?;
+                    }
+                }
             }
             Some("steer") => {
                 let (Some(turn), Some(id)) = (
@@ -3146,6 +3243,110 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn questions_from_the_plugin_become_user_input_requests_and_answers_return() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        let ask = |id: &str, session: &str, question: String| {
+            Envelope::request(
+                RpcId::String(id.into()),
+                "zf/session/ask",
+                Some(
+                    json!({"sessionId":session,"questions":[{"id":"plan-review","header":"Plan review",
+                    "question":question,"options":[{"label":"Approve","description":"Leave plan mode"},
+                    {"label":"Keep planning","description":"Stay"}]}]}),
+                ),
+            )
+        };
+        // 没有进行中的轮次时没有人能回答：直接告诉 dsh，不留悬而未决的请求。
+        acp_server
+            .send(ask("zf-ask-0", "s", "early".into()))
+            .unwrap();
+        let refused = acp_server.recv().await.unwrap();
+        assert_eq!(refused.id, Some(RpcId::String("zf-ask-0".into())));
+        assert!(refused.error.is_some());
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        acp_server
+            .send(ask("zf-ask-x", "other", "foreign".into()))
+            .unwrap();
+        assert!(acp_server.recv().await.unwrap().error.is_some());
+        acp_server
+            .send(ask(
+                "zf-ask-1",
+                "s",
+                format!("Approve?\n\n{}", "计划".repeat(20_000)),
+            ))
+            .unwrap();
+        let request = core_client.recv().await.unwrap();
+        assert_eq!(
+            request.method.as_deref(),
+            Some("item/tool/requestUserInput")
+        );
+        assert_eq!(request.id, Some(RpcId::String("zf-ask-1".into())));
+        let params = request.params.unwrap();
+        assert_eq!(params["threadId"], "s");
+        assert!(params["turnId"]
+            .as_str()
+            .is_some_and(|turn| !turn.is_empty()));
+        assert!(params.to_string().len() <= 32 * 1024);
+        assert_eq!(params["questions"][0]["options"][0]["label"], "Approve");
+        assert!(crate::interactions::RequestView::decode(
+            RpcId::String("zf-ask-1".into()),
+            "item/tool/requestUserInput",
+            &params
+        )
+        .is_ok());
+        core_client
+            .send(Envelope::response(
+                RpcId::String("zf-ask-1".into()),
+                Some(json!({"answers":{"plan-review":{"answers":["Approve"]}}})),
+            ))
+            .unwrap();
+        let answer = acp_server.recv().await.unwrap();
+        assert_eq!(answer.id, Some(RpcId::String("zf-ask-1".into())));
+        assert_eq!(
+            answer.result.unwrap(),
+            json!({"answers":{"plan-review":{"answers":["Approve"]}}})
+        );
+        let resolved = core_client.recv().await.unwrap();
+        assert_eq!(resolved.method.as_deref(), Some("serverRequest/resolved"));
+        assert_eq!(resolved.params.unwrap()["requestId"], "zf-ask-1");
+        // dsh 撤回问题（例如轮次被中断）：Core 里的请求随之结束，迟到的答复不再转发。
+        acp_server
+            .send(ask("zf-ask-2", "s", "again".into()))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server
+            .send(Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":"s","event":{"type":"ask","id":"zf-ask-2","state":"withdrawn"}})),
+            ))
+            .unwrap();
+        let resolved = core_client.recv().await.unwrap();
+        assert_eq!(resolved.method.as_deref(), Some("serverRequest/resolved"));
+        assert_eq!(resolved.params.unwrap()["requestId"], "zf-ask-2");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
     async fn backend_commands_are_listed_any_time_but_run_only_between_turns() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();

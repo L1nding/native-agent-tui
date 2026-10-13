@@ -18,9 +18,10 @@
 import { createInterface } from 'node:readline'
 import { listCommands, runCommand } from './commands.js'
 import { relayEvents } from './events.js'
-import { loadCreateUserMessage, loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
+import { loadCreateUserMessage, loadHostAcp, loadQuestionDismissal, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
 import { describePermission, setPermission } from './permission.js'
 import { listProviders, removeProvider, saveProvider } from './providers.js'
+import { answerQuestions } from './questions.js'
 import { listSessions, readHistory } from './sessions.js'
 
 export const name = 'zf-tui-bridge'
@@ -61,6 +62,9 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
     send({ jsonrpc: '2.0', id, error: { code, message } })
 
   const turns = relayEvents(ctx, send)
+  let dismissed: ((message: string) => Error) | undefined
+  void loadQuestionDismissal().then((build) => { dismissed = build })
+  const questions = answerQuestions(ctx, send, (message) => dismissed?.(message) ?? new Error(message))
 
   // dsh's ACP server reads client frames from `toAcp` and writes its own to `fromAcp`.
   const toAcp = new TransformStream<Frame, Frame>()
@@ -268,6 +272,8 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       handleOwn(frame)
       return
     }
+    // The TUI's answer to a question this bridge forwarded.
+    if (questions.settle(frame)) return
     if (acp === 'unavailable') {
       if (frame.id !== undefined && frame.method !== undefined) {
         fail(frame.id, -32603, `ACP is unavailable: ${acpFailure}`)
