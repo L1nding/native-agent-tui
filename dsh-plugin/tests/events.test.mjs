@@ -6,11 +6,16 @@ import { relayEvents, EVENT_METHOD } from '../lib/events.js'
 function host() {
   const listeners = new Map()
   const sent = []
-  const ctx = { on: (name, listener, options) => listeners.set(name, { listener, options }) }
-  relayEvents(ctx, frame => sent.push(frame))
+  const agents = new Map()
+  const ctx = {
+    on: (name, listener, options) => listeners.set(name, { listener, options }),
+    get: name => (name === 'agents' ? agents : undefined),
+  }
+  const turns = relayEvents(ctx, frame => sent.push(frame))
   const stream = (session, frame) => listeners.get('agent/assistant-stream').listener({ agent: { session: { header: { id: session } } }, frame })
   const event = (session, type, data) => listeners.get('session/event').listener({ header: { id: session } }, { type, data })
-  return { listeners, sent, stream, event }
+  const claim = (session, id) => listeners.get('agent/inbox/claimed').listener({ agent: { session: { header: { id: session } } }, message: { id } })
+  return { listeners, sent, stream, event, agents, turns, claim }
 }
 const chunk = type => ({ type: 'chunk', chunk: { type, text: 'PRIVATE model output' } })
 
@@ -50,6 +55,44 @@ test('retries carry counts and the host failure code, compaction its outcome', (
     { type: 'compaction', id: 'c2', state: 'failed' },
   ])
   assert.ok(!JSON.stringify(sent).includes('PRIVATE'))
+})
+
+test('steering reaches only a running turn and reports delivery once', () => {
+  const { sent, event, agents, turns, claim } = host()
+  const steered = []
+  const agent = { status: 'running', steer: message => steered.push(message) }
+  let next = 0
+  const create = input => ({ id: `message-${++next}`, ...input })
+  assert.throws(() => turns.steer('s', 'go left', create), /no running agent/)
+  agents.set('s', agent)
+  // An agent without an open turn would start one that no prompt waits for.
+  assert.throws(() => turns.steer('s', 'go left', create), /no turn is running/)
+  event('s', 'turn/start', {})
+  assert.throws(() => turns.steer('s', '   ', create), /empty or too long/)
+  assert.throws(() => turns.steer('s', 'x'.repeat(32 * 1024 + 1), create), /empty or too long/)
+  agent.status = 'idle'
+  assert.throws(() => turns.steer('s', 'go left', create), /no turn is running/)
+  agent.status = 'running'
+  assert.deepEqual(turns.steer('s', 'go left', create), { messageId: 'message-1' })
+  assert.deepEqual(steered[0].content, [{ type: 'text', text: 'go left' }])
+  assert.deepEqual(steered[0].source, { kind: 'user' })
+  claim('s', 'someone-elses-message')
+  claim('other', 'message-1')
+  claim('s', 'message-1')
+  claim('s', 'message-1')
+  assert.deepEqual(sent.map(frame => frame.params.event), [{ type: 'steer', id: 'message-1', state: 'delivered' }])
+  // A message the turn never claimed is not reported as delivered afterwards.
+  turns.steer('s', 'go right', create)
+  event('s', 'turn/end', {})
+  claim('s', 'message-2')
+  assert.equal(sent.length, 1)
+  assert.throws(() => turns.steer('s', 'late', create), /no turn is running/)
+  // A host refusal leaves nothing pending.
+  event('s', 'turn/start', {})
+  agent.steer = () => { throw new Error('host refused') }
+  assert.throws(() => turns.steer('s', 'again', create), /host refused/)
+  claim('s', 'message-3')
+  assert.equal(sent.length, 1)
 })
 
 test('a todo list is relayed whole, bounded, and without malformed items', () => {

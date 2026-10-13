@@ -969,6 +969,19 @@ fn handle_key(
                     Slash::New => {
                         send(Command::NewConversation, tx, local);
                     }
+                    Slash::Steer("") => {
+                        local.notice = Some(
+                            lang::tr(
+                                "Usage: /steer <guidance for the running turn>",
+                                "用法：/steer <给当前轮次的引导>",
+                            )
+                            .into(),
+                        );
+                    }
+                    Slash::Steer(text) => {
+                        let text = text.to_owned();
+                        send(Command::SteerRoot { text }, tx, local);
+                    }
                     Slash::Quit => return true,
                     Slash::Skill { .. } | Slash::Unknown => {}
                 }

@@ -207,6 +207,16 @@ pub(crate) fn turn_start(id: RpcId, thread: &str, text: &str, model: Option<&str
     Envelope::request(id, "turn/start", Some(params))
 }
 
+/// Understood by the ACP bridge only: guide the running turn. dsh hands the
+/// text to the model at the next step; the turn is not restarted.
+pub(crate) fn turn_steer(id: RpcId, thread: &str, turn: &str, text: &str) -> Envelope {
+    Envelope::request(
+        id,
+        "turn/steer",
+        Some(json!({"threadId":thread,"turnId":turn,"text":text})),
+    )
+}
+
 pub(crate) fn model_list(id: RpcId) -> Envelope {
     Envelope::request(id, "model/list", Some(json!({"limit":100})))
 }

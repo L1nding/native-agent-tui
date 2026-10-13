@@ -793,14 +793,44 @@ impl SessionState {
         );
     }
 
-    /// 执行不可用时，没有等到结果的压缩不能继续显示为进行中。
+    /// 执行不可用时，没有等到结果的压缩和引导不能继续显示为进行中。
     pub fn finish_all_notices(&mut self) {
         for message in &mut self.view.messages {
             if message.role == "Notice" && !message.complete {
-                message.text = "Context compaction ended, outcome unknown.".into();
+                message.text = if message.id.starts_with("steer:") {
+                    "Steering outcome unknown."
+                } else {
+                    "Context compaction ended, outcome unknown."
+                }
+                .into();
                 message.complete = true;
             }
         }
+    }
+
+    /// 一次引导的占位提示：已提交、被拒绝或没有送达。
+    pub fn steer_notice(&mut self, id: &str, text: String, complete: bool) {
+        let turn = self.view.turn_id.clone().unwrap_or_default();
+        self.notice_item(id.into(), &turn, text, complete);
+    }
+
+    /// dsh 确认引导已交给模型：占位提示换成用户消息，排在它实际生效的位置。
+    pub fn steer_delivered(&mut self, id: &str, text: &str) {
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        self.view
+            .messages
+            .retain(|m| !(m.role == "Notice" && m.thread_id == thread && m.id == id));
+        self.view.messages.push(ConversationItem {
+            id: format!("user-{id}"),
+            thread_id: thread,
+            turn_id: self.view.turn_id.clone().unwrap_or_default(),
+            role: "You".into(),
+            text: text.to_owned(),
+            complete: true,
+            truncated: false,
+            tools: Vec::new(),
+        });
+        self.bound_history();
     }
 
     fn notice_item(&mut self, id: String, turn: &str, text: String, complete: bool) {

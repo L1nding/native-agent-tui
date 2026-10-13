@@ -17,7 +17,7 @@
 
 import { createInterface } from 'node:readline'
 import { relayEvents } from './events.js'
-import { loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
+import { loadCreateUserMessage, loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
 import { describePermission, setPermission } from './permission.js'
 import { listProviders, removeProvider, saveProvider } from './providers.js'
 import { listSessions, readHistory } from './sessions.js'
@@ -59,7 +59,7 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
   const fail = (id: FrameId, code: number, message: string): void =>
     send({ jsonrpc: '2.0', id, error: { code, message } })
 
-  relayEvents(ctx, send)
+  const turns = relayEvents(ctx, send)
 
   // dsh's ACP server reads client frames from `toAcp` and writes its own to `fromAcp`.
   const toAcp = new TransformStream<Frame, Frame>()
@@ -195,6 +195,18 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       const provider = params['provider']
       if (typeof provider !== 'string' || provider === '') throw new Error('provider is required')
       return removeProvider(ctx, provider)
+    },
+
+    /**
+     * Guide the running turn of a live session: the text reaches the model at
+     * the next step. Refused when no turn is running.
+     */
+    'zf/session/steer': async (params) => {
+      const sessionId = params['sessionId']
+      const text = params['text']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      if (typeof text !== 'string') throw new Error('text is required')
+      return turns.steer(sessionId, text, await loadCreateUserMessage())
     },
 
     /** Conversation text, server reasoning and tool summaries for a resumed session. */

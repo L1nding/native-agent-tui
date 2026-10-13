@@ -33,6 +33,10 @@ pub enum Command {
     SubmitRootInput {
         text: String,
     },
+    /// 引导正在运行的 root 轮次；不开始新轮次，也不排队。
+    SteerRoot {
+        text: String,
+    },
     ConfirmExtension {
         confirmation: crate::extensions::ExtensionConfirmation,
     },
@@ -303,6 +307,8 @@ impl ClientHandle {
                 domain_fact_attempt: 0,
                 domain_fact_task: None,
                 domain_fact_queue: VecDeque::new(),
+                steer: None,
+                steer_count: 0,
                 config,
                 server,
                 command_rx,
@@ -376,6 +382,10 @@ enum RpcKind {
         force_reload: bool,
         source: SkillRefreshSource,
     },
+    /// Guidance for the running root turn.
+    Steer {
+        generation: u64,
+    },
     ModelList,
     /// dsh's permission presets and this session's choice.
     PermissionDescribe,
@@ -396,10 +406,19 @@ enum RpcKind {
 impl RpcKind {
     fn generation(self) -> Option<u64> {
         match self {
-            Self::StartTurn { generation } | Self::Interrupt { generation } => Some(generation),
+            Self::StartTurn { generation }
+            | Self::Interrupt { generation }
+            | Self::Steer { generation } => Some(generation),
             _ => None,
         }
     }
+}
+
+struct PendingSteer {
+    notice_id: String,
+    text: String,
+    /// dsh 给这条消息的身份；应答到达前未知。
+    message_id: Option<String>,
 }
 
 struct PendingRpc {
@@ -462,6 +481,9 @@ struct Core {
     domain_fact_attempt: u64,
     domain_fact_task: Option<PendingDomainFact>,
     domain_fact_queue: VecDeque<(u64, crate::domain::receipt::FactReceipt)>,
+    /// 已提交、尚未确认送达的一次引导；同一时刻只允许一个。
+    steer: Option<PendingSteer>,
+    steer_count: u64,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -799,6 +821,15 @@ impl Core {
                             self.state.view.notice = Some(
                                 "Resumed; its earlier messages were not loaded in time.".into(),
                             );
+                        } else if matches!(kind, RpcKind::Steer { .. }) {
+                            // 没有答复：dsh 可能已经收下，也可能没有；不重发。
+                            if let Some(steer) = self.steer.take() {
+                                self.state.steer_notice(
+                                    &steer.notice_id,
+                                    "Steering was not confirmed in time; it may still reach the model.".into(),
+                                    true,
+                                );
+                            }
                         } else if matches!(kind, RpcKind::NewThread) {
                             self.state.view.creating_conversation = false;
                             self.state.error(SessionPhase::Unknown,
@@ -957,6 +988,7 @@ impl Core {
             self.state.finish_all_tool_lines();
             self.state.finish_all_reasoning();
             self.state.finish_all_notices();
+            self.steer = None;
         }
         self.state.view.tool_details = self.tool_details.snapshot();
         self.state.view.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
@@ -1235,6 +1267,12 @@ impl Core {
                 id.clone(),
                 self.state.view.thread_id.as_deref().unwrap_or(""),
                 self.state.view.turn_id.as_deref().unwrap_or(""),
+            ),
+            RpcKind::Steer { .. } => app_server::turn_steer(
+                id.clone(),
+                self.state.view.thread_id.as_deref().unwrap_or(""),
+                self.state.view.turn_id.as_deref().unwrap_or(""),
+                self.steer.as_ref().map_or("", |steer| steer.text.as_str()),
             ),
             RpcKind::ModelList => app_server::model_list(id.clone()),
             RpcKind::BackendReload => app_server::backend_reload(id.clone()),
@@ -1535,6 +1573,11 @@ impl Core {
                         Some(format!("Conversation was not resumed: {reason}"));
                 }
             }
+            Command::SteerRoot { text } => {
+                if let Err(reason) = self.steer_root(text) {
+                    self.state.view.notice = Some(format!("Steering was not sent: {reason}"));
+                }
+            }
             Command::NewConversation => {
                 if let Err(reason) = self.start_new_conversation() {
                     self.state.view.notice =
@@ -1796,6 +1839,44 @@ impl Core {
             return Err(error.to_string());
         }
         self.state.view.notice = Some("Resuming the conversation...".into());
+        Ok(())
+    }
+
+    /// 引导只在 root 轮次运行中有效。等待子 Agent 时不接受：那时 root 没有
+    /// 可以消费引导的下一步，放行只会让它在门释放后才被处理。
+    fn steer_root(&mut self, text: String) -> Result<(), String> {
+        let text = text.trim().to_owned();
+        if text.is_empty() || text.len() > crate::state::MESSAGE_BYTES {
+            return Err("the guidance is empty or too long.".into());
+        }
+        match self.state.view.phase {
+            SessionPhase::Running if self.state.view.turn_id.is_some() => {}
+            SessionPhase::GatePending => {
+                return Err("the turn is waiting for child agents.".into());
+            }
+            _ => return Err("no turn is running; send it as a task instead.".into()),
+        }
+        if self.steer.is_some() {
+            return Err("the previous guidance is still being delivered.".into());
+        }
+        self.steer_count += 1;
+        let notice_id = format!("steer:{}", self.steer_count);
+        self.steer = Some(PendingSteer {
+            notice_id: notice_id.clone(),
+            text,
+            message_id: None,
+        });
+        if let Err(error) = self.send_rpc(RpcKind::Steer {
+            generation: self.generation,
+        }) {
+            self.steer = None;
+            return Err(error.to_string());
+        }
+        self.state.steer_notice(
+            &notice_id,
+            "Steering queued for the next step…".into(),
+            false,
+        );
         Ok(())
     }
 
@@ -2454,6 +2535,17 @@ impl Core {
                         .and_then(Value::as_str)
                         .unwrap_or("RPC failed")
                         .to_owned();
+                    if matches!(pending.kind, RpcKind::Steer { .. }) {
+                        if let Some(steer) = self.steer.take() {
+                            let reason: String = message.chars().take(200).collect();
+                            self.state.steer_notice(
+                                &steer.notice_id,
+                                format!("Steering was not accepted: {reason}"),
+                                true,
+                            );
+                        }
+                        return;
+                    }
                     if matches!(pending.kind, RpcKind::Interrupt { .. }) {
                         // Rejection proves the interrupt was not accepted, not that the turn ended.
                         self.interrupt_requested = false;
@@ -2697,6 +2789,7 @@ impl Core {
                     self.state.view.creating_conversation = false;
                     self.state.view.messages.clear();
                     self.state.view.todos.clear();
+                    self.steer = None;
                     self.state.view.requests.clear();
                     self.state.view.permission = Default::default();
                     self.state.view.turn_id = None;
@@ -2733,6 +2826,26 @@ impl Core {
                     return;
                 };
                 self.bind_turn(id);
+                None
+            }
+            RpcKind::Steer { .. } => {
+                // 应答只说明 dsh 收下了；送达由之后的事件确认。
+                match result["messageId"].as_str().filter(|id| id.len() <= 128) {
+                    Some(id) => {
+                        if let Some(steer) = &mut self.steer {
+                            steer.message_id = Some(id.to_owned());
+                        }
+                    }
+                    None => {
+                        if let Some(steer) = self.steer.take() {
+                            self.state.steer_notice(
+                                &steer.notice_id,
+                                "Steering was not confirmed by dsh.".into(),
+                                true,
+                            );
+                        }
+                    }
+                }
                 None
             }
             RpcKind::Interrupt { .. } => None, // An RPC acknowledgement is not a terminal turn event.
@@ -2855,6 +2968,7 @@ impl Core {
                 self.state.view.permission = Default::default();
                 self.state.view.messages.clear();
                 self.state.view.todos.clear();
+                self.steer = None;
                 self.state.tool_lines.clear();
                 self.state.view.history_truncated = false;
                 self.state.view.thread_id = Some(thread);
@@ -3887,6 +4001,13 @@ impl Core {
                     .then(|| crate::state::wall_clock_label(std::time::SystemTime::now()))
                     .flatten();
                 self.state.finish_turn_timing(Instant::now(), completed_at);
+                if let Some(steer) = self.steer.take() {
+                    self.state.steer_notice(
+                        &steer.notice_id,
+                        "Steering was not delivered: the turn ended first.".into(),
+                        true,
+                    );
+                }
                 self.state.view.notice = None;
                 self.interrupt_requested = false;
                 self.interrupt_sent = false;
@@ -3926,6 +4047,20 @@ impl Core {
                         )
                 }) {
                     self.state.turn_stream_stage(turn, stage, Instant::now());
+                }
+            }
+            "turn/steer/delivered" => {
+                let current = turn.is_some() && turn == self.state.view.turn_id.as_deref();
+                let known = self.steer.as_ref().is_some_and(|steer| {
+                    // 投递事件可能先于应答到达；同一时刻只有一个待确认的引导。
+                    steer
+                        .message_id
+                        .as_deref()
+                        .is_none_or(|id| params["id"] == id)
+                });
+                if current && known {
+                    let steer = self.steer.take().unwrap();
+                    self.state.steer_delivered(&steer.notice_id, &steer.text);
                 }
             }
             "turn/notice" => match params["kind"].as_str() {
@@ -8550,6 +8685,168 @@ mod tests {
         assert!(snapshot.thread_id.is_none());
         assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
         drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_only_a_running_root_turn_and_shows_its_real_outcome() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let steer = |text: &str| Command::SteerRoot { text: text.into() };
+        let notices = |snapshot: &crate::state::CoreSnapshot| -> Vec<String> {
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role == "Notice")
+                .map(|message| message.text.clone())
+                .collect()
+        };
+        client
+            .commands
+            .send(steer("  use 中文 names "))
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(
+            request["params"],
+            json!({"threadId":"root","turnId":"root-turn","text":"use 中文 names"})
+        );
+        client
+            .snapshots
+            .wait_for(|snapshot| notices(snapshot) == ["Steering queued for the next step…"])
+            .await
+            .unwrap();
+        // 上一条还没确认时不接受第二条，也不向 dsh 发送。
+        client.commands.send(steer("second")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("still being delivered"))
+            })
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"messageId":"m1"}}),
+        )
+        .await;
+        // 别的消息身份和旧轮次的投递事件不算数。
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"root-turn","id":"other"}})).await;
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"old","id":"m1"}})).await;
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"root-turn","id":"m1"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                // 耗时行始终排在这一步的最末尾，引导消息在它之前。
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|m| m.role == "You" && m.text == "use 中文 names")
+            })
+            .await
+            .unwrap();
+        assert!(notices(&client.snapshots.borrow()).is_empty());
+
+        // dsh 拒绝时显示它给的原因；没有送达的引导不变成用户消息。
+        client.commands.send(steer("rejected")).await.unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "turn/steer");
+        send(&mut server, json!({"id":request["id"],"error":{"code":-32603,"message":"no turn is running; send this as a new task"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                notices(snapshot)
+                    == ["Steering was not accepted: no turn is running; send this as a new task"]
+            })
+            .await
+            .unwrap();
+
+        // 被接受但轮次先结束：明确显示没有送达。
+        client.commands.send(steer("too late")).await.unwrap();
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"messageId":"m3"}}),
+        )
+        .await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        phase(&mut client, SessionPhase::Completed).await;
+        assert_eq!(
+            notices(&client.snapshots.borrow()).last().unwrap(),
+            "Steering was not delivered: the turn ended first."
+        );
+        assert!(!client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.text == "too late" || m.text == "rejected"));
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"root-turn","id":"m3"}})).await;
+
+        // 没有运行中的轮次：Core 自己拒绝，不发请求。
+        client.commands.send(steer("idle")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("no turn is running"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert!(!client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.text == "too late"));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steering_is_refused_while_the_root_turn_waits_at_a_gate() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        wait_call(&mut server, "steer-wait", vec!["a"]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        client
+            .commands
+            .send(Command::SteerRoot {
+                text: "hurry".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("waiting for child agents"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        let snapshot = client.snapshots.borrow().clone();
+        assert_eq!(snapshot.phase, SessionPhase::GatePending);
+        assert!(!snapshot.messages.iter().any(|m| m.role == "Notice"));
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

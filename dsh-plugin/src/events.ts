@@ -13,10 +13,12 @@
  * @module zf-tui-bridge/events
  */
 
-import type { Frame, HostContext } from './host.js'
+import type { CreateUserMessage, Frame, HostContext } from './host.js'
 
 export const EVENT_METHOD = 'zf/session/event'
 
+/** Longest steering text accepted, in UTF-16 code units. */
+export const MAX_STEER_CHARS = 32 * 1024
 const MAX_TODOS = 100
 const MAX_TODO_CHARS = 512
 
@@ -104,8 +106,9 @@ export function compactionOf(type: unknown, data: unknown): Record<string, unkno
  * Relay stage changes, todo lists, retries and compaction of every live session.
  * @param ctx - host context; its listeners end with the plugin.
  * @param send - writes one frame to the TUI.
+ * @returns what the relay knows about live turns, for steering.
  */
-export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): void {
+export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): LiveTurns {
   const notify = (session: string, event: Record<string, unknown>): void =>
     send({ jsonrpc: '2.0', method: EVENT_METHOD, params: { sessionId: session, event } })
 
@@ -124,10 +127,28 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): voi
     { global: true },
   )
 
+  // Sessions with a turn between its start and end, and the steering messages
+  // each one has not claimed yet.
+  const open = new Map<string, Set<string>>()
+  ctx.on('agent/inbox/claimed', (payload: unknown) => {
+    const session = sessionId(record(payload)?.['agent'])
+    const id = record(record(payload)?.['message'])?.['id']
+    if (session === undefined || typeof id !== 'string') return
+    if (open.get(session)?.delete(id) === true) notify(session, { type: 'steer', id, state: 'delivered' })
+  })
+
   ctx.on('session/event', (owner: unknown, event: unknown) => {
     const session = sessionId(owner)
     const type = record(event)?.['type']
     if (session === undefined) return
+    if (type === 'turn/start') {
+      if (open.size >= 256 && !open.has(session)) open.clear()
+      open.set(session, new Set())
+    } else if (type === 'turn/end') {
+      // The host ends a turn only with an empty next-step inbox, or clears the
+      // inbox when it cancels: whatever is still unclaimed was not delivered.
+      open.delete(session)
+    }
     if (type === 'todo/write') {
       const todos = todosOf(record(event)?.['data'])
       if (todos !== undefined) notify(session, { type: 'todos', todos })
@@ -141,4 +162,33 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): voi
       stages.delete(session)
     }
   })
+
+  return {
+    steer(session, text, createUserMessage) {
+      const pending = open.get(session)
+      const agent = ctx.get('agents')?.get(session)
+      if (agent === undefined) throw new Error(`session "${session}" has no running agent in this dsh process`)
+      // An idle agent would start a turn of its own that no prompt is waiting for.
+      if (pending === undefined || agent.status !== 'running') throw new Error('no turn is running; send this as a new task')
+      if (text.trim() === '' || text.length > MAX_STEER_CHARS) throw new Error('steering text is empty or too long')
+      const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+      pending.add(message.id)
+      try {
+        agent.steer(message)
+      } catch (error) {
+        pending.delete(message.id)
+        throw error
+      }
+      return { messageId: message.id }
+    },
+  }
+}
+
+/** Live turns as the relay tracks them. */
+export interface LiveTurns {
+  /**
+   * Hand a message to the running turn; it takes effect at the next step.
+   * Refused when no turn is running. Delivery is reported by a `steer` event.
+   */
+  steer(session: string, text: string, createUserMessage: CreateUserMessage): { messageId: string }
 }

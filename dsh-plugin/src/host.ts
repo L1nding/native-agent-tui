@@ -112,6 +112,24 @@ export interface LiveSessions {
   get(id: string): unknown
 }
 
+/** A live agent, narrowed to what steering needs. Its id is the session id. */
+export interface LiveAgent {
+  readonly status: 'idle' | 'running'
+  /** Queue a message for the next step of the running turn. */
+  steer(message: unknown): void
+}
+
+/** `ctx.agents`: agents running in this process. */
+export interface LiveAgents {
+  get(id: string): LiveAgent | undefined
+}
+
+/** A user message as the host builds it; only its id is read here. */
+export type CreateUserMessage = (input: {
+  content: readonly { type: 'text'; text: string }[]
+  source: { kind: 'user' }
+}) => { id: string }
+
 /** `ctx.sessionQuery`: read-only views over live and stored sessions. */
 export interface SessionQuery {
   listSessions(signal?: AbortSignal): Promise<readonly { header: SessionHeader; live: boolean }[]>
@@ -164,6 +182,7 @@ export interface HostContext {
   get(name: 'credentials'): CredentialProvider | undefined
   get(name: 'permissionPresets'): PermissionPresets | undefined
   get(name: 'sessions'): LiveSessions | undefined
+  get(name: 'agents'): LiveAgents | undefined
   get(name: string): unknown
 }
 
@@ -173,10 +192,24 @@ export interface HostContext {
  * Cordis instance and always matches the host's version.
  */
 export async function loadHostAcp(): Promise<PluginModule> {
+  return (await import(pathToFileURL(resolveHostAcp()).href)) as PluginModule
+}
+
+function resolveHostAcp(): string {
   const entry = process.argv[1]
   if (entry === undefined) throw new Error('the dsh entry script is unknown')
   const fromHost = createRequire(realpathSync(entry))
   const app = fromHost.resolve('@deepseek-ai/dsh-acp-app/package.json')
-  const acp = createRequire(app).resolve('@deepseek-ai/dsh-acp')
-  return (await import(pathToFileURL(acp).href)) as PluginModule
+  return createRequire(app).resolve('@deepseek-ai/dsh-acp')
+}
+
+/**
+ * The host's own user-message constructor, the one its ACP server uses, so a
+ * steered message has the same shape and identity scheme as a prompt.
+ */
+export async function loadCreateUserMessage(): Promise<CreateUserMessage> {
+  const llm = createRequire(resolveHostAcp()).resolve('@deepseek-ai/dsh-llm')
+  const module = (await import(pathToFileURL(llm).href)) as { createUserMessage?: CreateUserMessage }
+  if (typeof module.createUserMessage !== 'function') throw new Error('this dsh version has no createUserMessage')
+  return module.createUserMessage
 }

@@ -755,6 +755,29 @@ impl AcpBridge {
                     self.mcp_servers.clone(),
                 ))?;
             }
+            // 引导只对桥接当前绑定的轮次有效；dsh 在下一步边界把它交给模型。
+            (Some("turn/steer"), Some(id)) => {
+                let params = message.params.unwrap_or(Value::Null);
+                let (Some(session), Some(text)) = (
+                    self.session_id.clone().filter(|_| {
+                        self.turn_id.is_some()
+                            && params["turnId"].as_str() == self.turn_id.as_deref()
+                    }),
+                    params["text"].as_str(),
+                ) else {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "no turn is running",
+                    ));
+                };
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp.send(with_jsonrpc(Envelope::request(
+                    id,
+                    "zf/session/steer",
+                    Some(json!({"sessionId":session,"text":text})),
+                )))?;
+            }
             // dsh's permission presets belong to a session; the bridge names ours.
             (Some(method @ ("permission/describe" | "permission/set")), Some(id)) => {
                 let Some(session) = self.session_id.clone() else {
@@ -985,6 +1008,22 @@ impl AcpBridge {
                     "turn/stage",
                     Some(json!({"threadId":session,"turnId":turn,"stage":stage})),
                 ))?;
+            }
+            Some("steer") => {
+                let (Some(turn), Some(id)) = (
+                    self.turn_id.clone(),
+                    event["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128),
+                ) else {
+                    return Ok(());
+                };
+                if event["state"] == "delivered" {
+                    self.core.send(Envelope::notification(
+                        "turn/steer/delivered",
+                        Some(json!({"threadId":session,"turnId":turn,"id":id})),
+                    ))?;
+                }
             }
             Some("retry") => {
                 let (Some(turn), Some(retry)) = (self.turn_id.clone(), event["retry"].as_u64())
@@ -3078,6 +3117,105 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steering_is_forwarded_for_the_bound_turn_and_its_delivery_is_reported() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        // 没有进行中的轮次：桥接直接拒绝，不打扰 dsh。
+        core_client
+            .send(app_server::turn_steer(
+                RpcId::Number(9),
+                "s",
+                "none",
+                "early",
+            ))
+            .unwrap();
+        let refused = core_client.recv().await.unwrap();
+        assert_eq!(refused.id, Some(RpcId::Number(9)));
+        assert_eq!(refused.error.unwrap()["message"], "no turn is running");
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        let mut turn = None;
+        for _ in 0..2 {
+            let frame = core_client.recv().await.unwrap();
+            for value in [frame.result.as_ref(), frame.params.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = value.pointer("/turn/id").and_then(|id| id.as_str()) {
+                    turn = Some(id.to_owned());
+                }
+            }
+        }
+        let turn = turn.expect("the bridge names the turn");
+        acp_server.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_steer(
+                RpcId::Number(10),
+                "s",
+                "stale-turn",
+                "late",
+            ))
+            .unwrap();
+        assert!(core_client.recv().await.unwrap().error.is_some());
+        core_client
+            .send(app_server::turn_steer(
+                RpcId::Number(11),
+                "s",
+                &turn,
+                "use 中文",
+            ))
+            .unwrap();
+        let forwarded = acp_server.recv().await.unwrap();
+        assert_eq!(forwarded.method.as_deref(), Some("zf/session/steer"));
+        assert_eq!(
+            forwarded.params.unwrap(),
+            json!({"sessionId":"s","text":"use 中文"})
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(11),
+                Some(json!({"messageId":"m1"})),
+            ))
+            .unwrap();
+        let accepted = core_client.recv().await.unwrap();
+        assert_eq!(accepted.result.unwrap()["messageId"], "m1");
+        for (session, state) in [
+            ("other", "delivered"),
+            ("s", "invented"),
+            ("s", "delivered"),
+        ] {
+            acp_server
+                .send(Envelope::notification(
+                    "zf/session/event",
+                    Some(json!({"sessionId":session,"event":{"type":"steer","id":"m1","state":state}})),
+                ))
+                .unwrap();
+        }
+        let delivered = core_client.recv().await.unwrap();
+        assert_eq!(delivered.method.as_deref(), Some("turn/steer/delivered"));
+        assert_eq!(
+            delivered.params.unwrap(),
+            json!({"threadId":"s","turnId":turn,"id":"m1"})
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
     async fn plugin_events_reach_core_only_for_the_current_session_and_stay_bounded() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();

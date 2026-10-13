@@ -227,6 +227,8 @@ pub(super) enum Slash<'a> {
     Tools,
     Settings,
     New,
+    /// `/steer TEXT`: guide the running turn at its next step.
+    Steer(&'a str),
     Quit,
     /// `/skill-name [request]`: ask the agent to use one of dsh's skills.
     Skill {
@@ -258,7 +260,7 @@ pub(super) struct SlashHint {
     pub skill: bool,
 }
 
-const BUILT_IN: [&str; 5] = ["model", "setting", "tools", "new", "quit"];
+const BUILT_IN: [&str; 6] = ["model", "setting", "tools", "new", "steer", "quit"];
 
 fn built_in(name: &str) -> bool {
     name == "settings"
@@ -310,6 +312,13 @@ pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
                 ),
             ),
             command("new", tr("Start a new conversation", "新建会话")),
+            command(
+                "steer",
+                tr(
+                    "Guide the running turn at its next step",
+                    "引导正在运行的轮次，下一步生效",
+                ),
+            ),
             command(
                 "tools",
                 tr("Fold or unfold tool groups", "折叠或展开工具组"),
@@ -435,6 +444,9 @@ pub(super) fn parse_slash<'a>(text: &'a str, skills: &'a [SkillEntry]) -> Option
     let name = name.to_ascii_lowercase();
     if name == "model" {
         return Some(Slash::Model((!argument.is_empty()).then_some(argument)));
+    }
+    if name == "steer" {
+        return Some(Slash::Steer(argument));
     }
     if !argument.is_empty() {
         return None;
@@ -834,6 +846,11 @@ mod tests {
         );
         assert_eq!(parse_slash("/tools", &[]), Some(Slash::Tools));
         assert_eq!(parse_slash("/new", &[]), Some(Slash::New));
+        assert_eq!(
+            parse_slash("/steer use 中文 names ", &[]),
+            Some(Slash::Steer("use 中文 names"))
+        );
+        assert_eq!(parse_slash("/steer", &[]), Some(Slash::Steer("")));
         assert_eq!(parse_slash("/quit", &[]), Some(Slash::Quit));
         assert_eq!(parse_slash("/nope", &[]), Some(Slash::Unknown));
         for task in [
@@ -852,7 +869,7 @@ mod tests {
             assert!(names.contains(&format!("/{name}")), "{names}");
         }
         assert!(
-            names.ends_with("/model /setting /tools /new /quit"),
+            names.ends_with("/model /setting /tools /new /steer /quit"),
             "{names}"
         );
         assert_eq!(parse_slash("/setting", &[]), Some(Slash::Settings));
