@@ -42,6 +42,7 @@ mod skills;
 mod terminal;
 mod theme;
 mod timeline;
+mod todos;
 mod tool_detail;
 mod tool_search;
 mod tool_trace;

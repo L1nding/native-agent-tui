@@ -944,7 +944,72 @@ impl AcpBridge {
             (Some(acp_protocol::SESSION_REQUEST_PERMISSION), Some(id)) => {
                 self.permission(id, message.params.unwrap_or(Value::Null))?;
             }
+            (Some("zf/session/event"), None) => {
+                self.plugin_event(message.params.unwrap_or(Value::Null))?;
+            }
             (None, Some(id)) => self.response(id, message).await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// dsh 的 ACP 只转发已提交的整条消息；模型所处阶段和 todo 列表由
+    /// zf-tui-bridge 插件补发。只接受当前会话的事件，载荷在这里再次限界。
+    fn plugin_event(&mut self, params: Value) -> Result<(), TransportError> {
+        let Some(session) = self
+            .session_id
+            .clone()
+            .filter(|id| params["sessionId"] == id.as_str())
+        else {
+            return Ok(());
+        };
+        let event = &params["event"];
+        match event["type"].as_str() {
+            Some("stage") => {
+                let (Some(turn), Some(stage)) = (
+                    self.turn_id.clone(),
+                    event["stage"]
+                        .as_str()
+                        .filter(|stage| matches!(*stage, "waiting" | "thinking" | "response")),
+                ) else {
+                    return Ok(());
+                };
+                if !self.turn_started {
+                    self.core.send(Envelope::notification(
+                        "turn/started",
+                        Some(json!({"threadId":session,"turn":{"id":turn}})),
+                    ))?;
+                    self.turn_started = true;
+                }
+                self.core.send(Envelope::notification(
+                    "turn/stage",
+                    Some(json!({"threadId":session,"turnId":turn,"stage":stage})),
+                ))?;
+            }
+            Some("todos") => {
+                let Some(todos) = event["todos"].as_array() else {
+                    return Ok(());
+                };
+                let todos: Vec<Value> = todos
+                    .iter()
+                    .take(crate::state::MAX_TODOS)
+                    .filter_map(|todo| {
+                        let status = todo["status"].as_str().filter(|status| {
+                            matches!(*status, "pending" | "in_progress" | "completed")
+                        })?;
+                        let content: String = todo["content"]
+                            .as_str()?
+                            .chars()
+                            .take(crate::state::MAX_TODO_CHARS)
+                            .collect();
+                        Some(json!({"content":content,"status":status}))
+                    })
+                    .collect();
+                self.core.send(Envelope::notification(
+                    "thread/todos/updated",
+                    Some(json!({"threadId":session,"todos":todos})),
+                ))?;
+            }
             _ => {}
         }
         Ok(())
@@ -2974,6 +3039,103 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_events_reach_core_only_for_the_current_session_and_stay_bounded() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        let event = |session: &str, event: serde_json::Value| {
+            Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":session,"event":event})),
+            )
+        };
+        // 没有进行中的轮次时，阶段没有归属，不转发；todo 列表属于会话，照常转发。
+        acp_server
+            .send(event("s", json!({"type":"stage","stage":"waiting"})))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"todos","todos":[
+                {"content":"scan","status":"completed"},
+                {"content":"中".repeat(2000),"status":"in_progress"},
+                {"content":"bad","status":"done"},
+                {"content":7,"status":"pending"}]}),
+            ))
+            .unwrap();
+        let todos = core_client.recv().await.unwrap();
+        assert_eq!(todos.method.as_deref(), Some("thread/todos/updated"));
+        let todos = todos.params.unwrap();
+        assert_eq!(todos["threadId"], "s");
+        assert_eq!(todos["todos"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            todos["todos"][0],
+            json!({"content":"scan","status":"completed"})
+        );
+        assert_eq!(
+            todos["todos"][1]["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            crate::state::MAX_TODO_CHARS
+        );
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        for (session, stage) in [
+            ("other", "thinking"),
+            ("s", "invented"),
+            ("s", "thinking"),
+            ("s", "response"),
+        ] {
+            acp_server
+                .send(event(session, json!({"type":"stage","stage":stage})))
+                .unwrap();
+        }
+        acp_server
+            .send(event("other", json!({"type":"todos","todos":[]})))
+            .unwrap();
+        acp_server
+            .send(event("s", json!({"type":"unknown"})))
+            .unwrap();
+        for stage in ["thinking", "response"] {
+            let relayed = core_client.recv().await.unwrap();
+            assert_eq!(relayed.method.as_deref(), Some("turn/stage"));
+            let params = relayed.params.unwrap();
+            assert_eq!(params["threadId"], "s");
+            assert!(params["turnId"]
+                .as_str()
+                .is_some_and(|turn| !turn.is_empty()));
+            assert_eq!(params["stage"], stage);
+        }
+        // 其余事件都被丢弃：下一条到达 Core 的是之后的普通更新。
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
+            "sessionUpdate":"agent_message_chunk", "messageId":"m", "content":{"type":"text","text":"ok"}}})))).unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("item/agentMessage/delta")
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
     async fn mcp_calls_retain_typed_identity_arguments_and_structured_results() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();

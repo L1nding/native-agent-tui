@@ -16,6 +16,7 @@
  */
 
 import { createInterface } from 'node:readline'
+import { relayEvents } from './events.js'
 import { loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
 import { describePermission, setPermission } from './permission.js'
 import { listProviders, removeProvider, saveProvider } from './providers.js'
@@ -57,6 +58,8 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
   const reply = (id: FrameId, result: unknown): void => send({ jsonrpc: '2.0', id, result })
   const fail = (id: FrameId, code: number, message: string): void =>
     send({ jsonrpc: '2.0', id, error: { code, message } })
+
+  relayEvents(ctx, send)
 
   // dsh's ACP server reads client frames from `toAcp` and writes its own to `fromAcp`.
   const toAcp = new TransformStream<Frame, Frame>()

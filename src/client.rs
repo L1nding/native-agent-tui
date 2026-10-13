@@ -2695,6 +2695,7 @@ impl Core {
                     self.state.view.phase = SessionPhase::Initializing;
                     self.state.view.creating_conversation = false;
                     self.state.view.messages.clear();
+                    self.state.view.todos.clear();
                     self.state.view.requests.clear();
                     self.state.view.permission = Default::default();
                     self.state.view.turn_id = None;
@@ -2852,6 +2853,7 @@ impl Core {
                 self.reset_domain_session();
                 self.state.view.permission = Default::default();
                 self.state.view.messages.clear();
+                self.state.view.todos.clear();
                 self.state.tool_lines.clear();
                 self.state.view.history_truncated = false;
                 self.state.view.thread_id = Some(thread);
@@ -3907,6 +3909,26 @@ impl Core {
                         self.state.view.notice = Some("Dependent tasks remain blocked; retry the failed task or cancel queued work in F4.".into());
                     }
                 }
+            }
+            "turn/stage" => {
+                let stage = match params["stage"].as_str() {
+                    Some("waiting") => crate::state::TurnStage::ModelWait,
+                    Some("thinking") => crate::state::TurnStage::Thinking,
+                    Some("response") => crate::state::TurnStage::Response,
+                    _ => return,
+                };
+                if let Some(turn) = turn.filter(|turn| {
+                    Some(*turn) == self.state.view.turn_id.as_deref()
+                        && matches!(
+                            self.state.view.phase,
+                            SessionPhase::Running | SessionPhase::GatePending
+                        )
+                }) {
+                    self.state.turn_stream_stage(turn, stage, Instant::now());
+                }
+            }
+            "thread/todos/updated" => {
+                self.state.view.todos = crate::state::parse_todos(&params["todos"]);
             }
             "item/agentMessage/delta" => {
                 if let (Some(turn), Some(id), Some(delta)) =
@@ -8506,6 +8528,89 @@ mod tests {
         assert!(snapshot.thread_id.is_none());
         assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
         drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_stage_and_todo_events_update_the_current_root_turn_only() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "first".into(),
+            })
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        let timing = |snapshot: &crate::state::CoreSnapshot| {
+            snapshot
+                .messages
+                .iter()
+                .find(|message| message.role == "Timing")
+                .map(|message| message.text.clone())
+                .unwrap_or_default()
+        };
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"one","stage":"thinking"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| timing(snapshot).contains("Thinking"))
+            .await
+            .unwrap();
+        // 旧轮次、未知阶段和整块到达的正文都不改变当前阶段。
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"old","stage":"response"}})).await;
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"one","stage":"invented"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"one","itemId":"a","delta":"answer"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.messages.iter().any(|m| m.text == "answer"))
+            .await
+            .unwrap();
+        assert!(!timing(&client.snapshots.borrow()).contains("Response"));
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"one","stage":"response"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| timing(snapshot).contains("Response"))
+            .await
+            .unwrap();
+
+        send(
+            &mut server,
+            json!({"method":"thread/todos/updated","params":{"threadId":"other","todos":[
+            {"content":"foreign","status":"pending"}]}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"thread/todos/updated","params":{"threadId":"root","todos":[
+            {"content":"scan","status":"completed"},{"content":"build","status":"in_progress"},
+            {"content":"bad","status":"done"}]}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| !snapshot.todos.is_empty())
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.todos.len(), 2);
+            assert_eq!(snapshot.todos[1].content, "build");
+            assert_eq!(
+                snapshot.todos[1].status,
+                crate::state::TodoStatus::InProgress
+            );
+            let stored = serde_json::to_string(&StoredSnapshot::capture(&snapshot)).unwrap();
+            assert!(!stored.contains("build"));
+        }
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

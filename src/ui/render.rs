@@ -294,6 +294,17 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         wants_inspector(snapshot, local),
     );
     let (agents_area, conversation_area) = (workspace.agents, workspace.conversation);
+    // todo 面板占用对话区底部几行；只显示 root 会话的列表。
+    let todo_lines = if selected_agent.is_none() {
+        super::todos::lines(
+            &snapshot.todos,
+            conversation_area.width,
+            conversation_area.height,
+        )
+    } else {
+        Vec::new()
+    };
+    let (conversation_area, todo_area) = super::todos::split(conversation_area, todo_lines.len());
     if let Some(inspector) = workspace.inspector {
         requests::draw_inspector(frame, inspector, snapshot, local);
     }
@@ -426,6 +437,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         }),
         conversation_area,
     );
+    if !todo_lines.is_empty() {
+        frame.render_widget(Paragraph::new(todo_lines), todo_area);
+    }
     if local.workflow.visible {
         workflow_view::draw_workflow(
             frame,

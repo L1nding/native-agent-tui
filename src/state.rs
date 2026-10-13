@@ -208,8 +208,62 @@ pub struct CoreSnapshot {
     /// Choices stored for the next start; empty for a setting never saved.
     pub saved_settings: BTreeMap<crate::preferences::Setting, String>,
     pub history_truncated: bool,
+    /// 当前 root 会话里 Agent 自己维护的 todo 列表；由 dsh 推送，整份替换。
+    pub todos: Vec<TodoItem>,
     /// 启动预检未通过且已不在启动阶段：本会话不能再提交任务。
     pub startup_blocked: bool,
+}
+
+pub const MAX_TODOS: usize = 100;
+pub const MAX_TODO_CHARS: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+impl std::fmt::Debug for TodoItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 内容是 Agent 写给用户看的文字；调试输出只给长度。
+        f.debug_struct("TodoItem")
+            .field("content_bytes", &self.content.len())
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+/// 解析一份推送来的 todo 列表；无法识别的条目丢弃，不猜测状态。
+pub(crate) fn parse_todos(value: &serde_json::Value) -> Vec<TodoItem> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_TODOS)
+        .filter_map(|todo| {
+            let status = match todo["status"].as_str()? {
+                "pending" => TodoStatus::Pending,
+                "in_progress" => TodoStatus::InProgress,
+                "completed" => TodoStatus::Completed,
+                _ => return None,
+            };
+            Some(TodoItem {
+                content: todo["content"]
+                    .as_str()?
+                    .chars()
+                    .take(MAX_TODO_CHARS)
+                    .collect(),
+                status,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +310,8 @@ pub(crate) struct TurnTiming {
     totals: [Duration; 4],
     /// 仍在运行的工具；非空时保持工具阶段，穿插的输出不打断它。
     running_tools: BTreeSet<String>,
+    /// 后端报告过模型所处阶段：之后整块到达的输出不再用来划分阶段。
+    stream_staged: bool,
 }
 
 impl TurnTiming {
@@ -500,6 +556,7 @@ impl SessionState {
             since: now,
             totals: [Duration::ZERO; 4],
             running_tools: BTreeSet::new(),
+            stream_staged: false,
         });
         self.render_turn_timing(now, None);
     }
@@ -513,6 +570,23 @@ impl SessionState {
         else {
             return;
         };
+        if !timing.stream_staged && timing.running_tools.is_empty() && timing.stage != stage {
+            timing.switch(stage, now);
+        }
+        self.render_turn_timing(now, None);
+    }
+
+    /// 后端报告的模型阶段。dsh 的输出在提交时整块到达，只有这些事件能区分
+    /// 等首字、思考和输出；收到第一条后，输出到达的时刻不再划分阶段。
+    pub fn turn_stream_stage(&mut self, turn: &str, stage: TurnStage, now: Instant) {
+        let Some(timing) = self
+            .turn_timing
+            .as_mut()
+            .filter(|timing| timing.turn_id == turn)
+        else {
+            return;
+        };
+        timing.stream_staged = true;
         if timing.running_tools.is_empty() && timing.stage != stage {
             timing.switch(stage, now);
         }
@@ -874,6 +948,46 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn backend_stages_replace_block_arrival_for_timing_and_todos_parse_strictly() {
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        state.begin_turn_timing(at(0));
+        state.turn_stream_stage("turn", TurnStage::Thinking, at(1000));
+        state.turn_stream_stage("turn", TurnStage::Response, at(3000));
+        state.turn_stream_stage("old", TurnStage::ModelWait, at(3500));
+        // dsh 在提交时才把整块思考和正文发来：这些到达时刻不能改写阶段。
+        state.reasoning("root", "turn", "r", "think", false);
+        state.turn_stage("turn", TurnStage::Thinking, at(5000));
+        state.message("turn", "a", "answer", false);
+        state.turn_stage("turn", TurnStage::Response, at(5000));
+        state.turn_tool("turn", "tool", true, at(5000));
+        // 下一次请求在工具结果转发完之前就开始了；工具结束后回到等首字。
+        state.turn_stream_stage("turn", TurnStage::ModelWait, at(5900));
+        state.turn_tool("turn", "tool", false, at(6000));
+        state.turn_stream_stage("turn", TurnStage::Response, at(6500));
+        state.finish_turn_timing(at(7000), None);
+        assert_eq!(
+            state.view.messages.last().unwrap().text,
+            "Model wait 1.5s · Thinking 2.0s · Response 2.5s · Tools 1.0s"
+        );
+
+        let todos = parse_todos(&serde_json::json!([
+            {"content":"scan","status":"completed"},
+            {"content":"x".repeat(2000),"status":"in_progress"},
+            {"content":"bad","status":"done"},
+            {"status":"pending"},
+        ]));
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[1].status, TodoStatus::InProgress);
+        assert_eq!(todos[1].content.len(), MAX_TODO_CHARS);
+        assert!(!format!("{todos:?}").contains("scan"));
+        assert!(parse_todos(&serde_json::json!("not a list")).is_empty());
     }
 
     #[test]
