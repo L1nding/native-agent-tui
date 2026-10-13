@@ -42,6 +42,25 @@ pub(super) struct Transcript {
 pub(super) struct ProjectionCache {
     entries: std::collections::VecDeque<CachedMessage>,
     bytes: usize,
+    anchor: Option<ScrollAnchor>,
+    requested_scroll: usize,
+}
+
+struct ScrollAnchor {
+    thread: String,
+    turn: String,
+    item: String,
+    role: String,
+    row: usize,
+}
+
+impl ScrollAnchor {
+    fn matches(&self, message: &ConversationItem) -> bool {
+        self.thread == message.thread_id
+            && self.turn == message.turn_id
+            && self.item == message.id
+            && self.role == message.role
+    }
 }
 
 struct CachedMessage {
@@ -168,11 +187,59 @@ impl ProjectionCache {
         scroll: usize,
         expanded: bool,
     ) -> Viewport {
+        let requested = scroll;
+        let anchored = if focus.is_none() && scroll > 0 && scroll == self.requested_scroll {
+            self.anchor.take().map(|anchor| {
+                let mut below = 0;
+                for message in messages.clone().rev() {
+                    if below > 0 {
+                        below += 1;
+                    }
+                    let layout = self.message(message, None, width, expanded);
+                    if anchor.matches(message) {
+                        let row = anchor.row.min(layout.lines.len());
+                        return (below + layout.lines.len()).saturating_sub(row + height);
+                    }
+                    below += layout.lines.len();
+                }
+                // 被淘汰的锚点回到最早保留内容，不能突然跳到流式尾部。
+                below.saturating_sub(height)
+            })
+        } else {
+            None
+        };
         let scroll = focus
             .filter(|focus| messages.clone().any(|message| focus.matches(message)))
             .and_then(|focus| self.focused_scroll(messages.clone(), focus, width, height, expanded))
+            .or(anchored)
             .unwrap_or(scroll);
-        self.window(messages, focus, width, height, scroll, expanded)
+        let view = self.window(messages.clone(), focus, width, height, scroll, expanded);
+        self.requested_scroll = requested;
+        self.anchor = if view.below > 0 {
+            let top = view.below + view.transcript.lines.len();
+            let mut below = 0;
+            let mut anchor = None;
+            for message in messages.rev() {
+                let separator = usize::from(below > 0);
+                let layout = self.message(message, focus, width, expanded);
+                let end = below + separator + layout.lines.len();
+                if top <= end {
+                    anchor = Some(ScrollAnchor {
+                        thread: message.thread_id.clone(),
+                        turn: message.turn_id.clone(),
+                        item: message.id.clone(),
+                        role: message.role.clone(),
+                        row: end.saturating_sub(top).min(layout.lines.len()),
+                    });
+                    break;
+                }
+                below = end;
+            }
+            anchor
+        } else {
+            None
+        };
+        view
     }
 
     fn window<'a>(
@@ -676,6 +743,8 @@ mod tests {
                     for focus in [None, Some(&focus), Some(&tool_focus)] {
                         let full = transcript(messages.iter(), focus, width, expanded);
                         for scroll in [0, 1, 13, 10000] {
+                            // 每个组合代表一次独立导航；流式锚点另有回归。
+                            cache.anchor = None;
                             let max_scroll = full.lines.len().saturating_sub(height);
                             let start = full.focused.map_or_else(
                                 || max_scroll.saturating_sub(scroll.min(max_scroll)),
@@ -733,6 +802,38 @@ mod tests {
             view.transcript.lines,
             transcript(messages.iter(), None, 80, false).lines
         );
+    }
+
+    #[test]
+    fn scrolled_viewport_keeps_its_message_row_during_growth_and_returns_to_tail() {
+        let mut messages = vec![item("Agent", &"中文 👋 e\u{301}\n".repeat(50))];
+        messages[0].complete = false;
+        let mut cache = ProjectionCache::default();
+        let before = cache.viewport(messages.iter(), None, 40, 10, 8, false);
+        messages[0].text.push_str(&"new response\n".repeat(20));
+        let after = cache.viewport(messages.iter(), None, 40, 10, 8, false);
+        assert_eq!(before.transcript.lines, after.transcript.lines);
+        assert_eq!(after.below, before.below + 20);
+        messages.push(item("You", "next message"));
+        let next = cache.viewport(messages.iter(), None, 40, 10, 8, false);
+        assert_eq!(before.transcript.lines, next.transcript.lines);
+        let tail = cache.viewport(messages.iter(), None, 40, 10, 0, false);
+        assert_eq!(tail.below, 0);
+        assert!(rows(&tail.transcript)
+            .iter()
+            .any(|row| row.contains("next message")));
+    }
+
+    #[test]
+    fn evicted_anchor_clamps_to_retained_history_without_binding_a_reused_item_id() {
+        let mut messages = vec![item("Agent", &"old\n".repeat(50)), item("You", "tail")];
+        let mut cache = ProjectionCache::default();
+        cache.viewport(messages.iter(), None, 40, 10, 20, false);
+        messages.remove(0);
+        messages.insert(0, item("Agent", &"replacement\n".repeat(40)));
+        messages[0].turn_id = "another-turn".into();
+        let view = cache.viewport(messages.iter(), None, 40, 10, 20, false);
+        assert_eq!(rows(&view.transcript)[0], "Agent");
     }
 
     #[test]

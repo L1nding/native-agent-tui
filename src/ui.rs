@@ -836,11 +836,23 @@ fn handle_key(
         }
         KeyCode::PageUp => {
             local.conversation_focus = None;
-            local.scroll_from_bottom = local.scroll_from_bottom.saturating_add(8);
+            let view = local.conversation_viewport.get();
+            let current = if view.area.height > 0 {
+                view.scroll
+            } else {
+                local.scroll_from_bottom
+            };
+            local.scroll_from_bottom = current.saturating_add(8);
         }
         KeyCode::PageDown => {
             local.conversation_focus = None;
-            local.scroll_from_bottom = local.scroll_from_bottom.saturating_sub(8);
+            let view = local.conversation_viewport.get();
+            let current = if view.area.height > 0 {
+                view.scroll
+            } else {
+                local.scroll_from_bottom
+            };
+            local.scroll_from_bottom = current.saturating_sub(8);
         }
         KeyCode::Home if control => {
             local.conversation_focus = None;
