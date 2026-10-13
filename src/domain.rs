@@ -355,6 +355,11 @@ impl DomainFacts {
                     let follows = old.is_none_or(|p| {
                         parent == Some(p.binding.proposal_id.as_str()) || value["current"] == true
                     });
+                    if !same && !follows {
+                        // Valid historical-family reads are not current state
+                        // and do not imply transport or projection corruption.
+                        return FactProjection::Superseded;
+                    }
                     if same || follows {
                         if !same {
                             self.snapshot.application = None;
@@ -536,6 +541,30 @@ impl DomainFacts {
         if self.synchronization_errors.is_empty() {
             self.snapshot.notice = None;
             self.snapshot.fact_sync_notice = None;
+        } else {
+            self.show_remaining_synchronization_errors();
+        }
+    }
+
+    fn show_remaining_synchronization_errors(&mut self) {
+        let pending = self
+            .synchronization_errors
+            .iter()
+            .take(8)
+            .map(|(kind, sequence)| format!("{kind} (seq {sequence})"))
+            .collect::<Vec<_>>()
+            .join("、");
+        self.snapshot.fact_sync_notice = Some(format!(
+            "领域事实同步失败：尚未核验 {pending}；请重新查询对应事实"
+        ));
+    }
+
+    pub(crate) fn synchronization_queue_drained(&mut self) {
+        self.synchronizing = false;
+        if self.synchronization_errors.is_empty() {
+            self.snapshot.fact_sync_notice = None;
+        } else {
+            self.show_remaining_synchronization_errors();
         }
     }
 

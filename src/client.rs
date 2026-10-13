@@ -2052,7 +2052,7 @@ impl Core {
             return;
         }
         let Some((generation, receipt)) = self.domain_fact_queue.pop_front() else {
-            self.domain.synchronizing = false;
+            self.domain.synchronization_queue_drained();
             return;
         };
         let Some(setup) = self.config.domain_setup.clone() else {

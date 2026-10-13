@@ -747,3 +747,54 @@ fn large_multipart_batch_projects_every_approved_part_after_512_operations() {
     assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
     assert_eq!(facts.snapshot.proposal.as_ref(), Some(&original));
 }
+
+#[test]
+fn valid_historical_proposal_inspection_is_superseded_not_a_sync_failure() {
+    let mut facts = sequenced_facts();
+    let mut current = envelope();
+    current["fact_sequence"] = json!(20);
+    current["proposal"]["proposal_id"] = json!("current-family");
+    assert_eq!(facts.apply_verified_fact(&current), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    let mut old = envelope();
+    old["current"] = json!(false);
+    old["fact_sequence"] = json!(21);
+    old["proposal"]["state"] = json!("blocked");
+    assert_eq!(facts.apply_verified_fact(&old), FactProjection::Superseded);
+    assert_eq!(facts.snapshot.proposal.as_ref().unwrap().binding, binding);
+    assert!(facts.can_authorize(&binding));
+    old["proposal"]["summary"] = Value::Null;
+    assert_eq!(facts.apply_verified_fact(&old), FactProjection::Invalid);
+}
+
+#[test]
+fn drained_fact_queue_preserves_specific_unresolved_failures_and_blocks_approval() {
+    let mut facts = sequenced_facts();
+    let mut proposal = envelope();
+    proposal["fact_sequence"] = json!(20);
+    assert_eq!(
+        facts.apply_verified_fact(&proposal),
+        FactProjection::Applied
+    );
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    facts.synchronization_failed("proposal", 21, "actual malformed proposal".into());
+    facts.synchronizing = true;
+    facts.snapshot.fact_sync_notice = Some("正在同步完整领域事实".into());
+    let mut unrelated = private_receipt(&proposal);
+    unrelated.kind = "source_groups".into();
+    unrelated.fact_sequence = 22;
+    facts.synchronization_finished(&unrelated);
+    facts.synchronization_queue_drained();
+    assert!(!facts.synchronizing);
+    let notice = facts.snapshot.fact_sync_notice.as_deref().unwrap();
+    assert!(notice.contains("领域事实同步失败"));
+    assert!(notice.contains("proposal (seq 21)"));
+    assert!(!notice.contains("正在同步"));
+    assert!(!facts.can_authorize(&binding));
+    let mut repaired = private_receipt(&proposal);
+    repaired.fact_sequence = 23;
+    facts.synchronization_finished(&repaired);
+    facts.synchronization_queue_drained();
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+    assert!(facts.can_authorize(&binding));
+}
