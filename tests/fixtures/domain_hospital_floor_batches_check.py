@@ -10,7 +10,7 @@ import re
 import time
 from pathlib import Path
 
-from domain_hospital_mixed_check import business
+from domain_hospital_mixed_check import artifact_validation_visible, business
 
 
 def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, evidence):
@@ -62,6 +62,22 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
     save_lineage()
 
     def checkpoint(name):
+        screen = tui.screen()
+        if "领域事实同步失败" in screen and " · Completed · " in screen:
+            proposal_id = lineage.get("proposal_id")
+            request = (
+                f"先只读inspect_change查询当前提案 {proposal_id}；"
+                if proposal_id
+                else ""
+            )
+            send(
+                "刚才工具查询出现同步提示，保持当前场景、授权、操作与所有产物字节。"
+                + request
+                + "仅用scan_source_groups重新读取当前事实，作为本轮最后一次领域调用。"
+                "本轮不需要read_fact_view，不重新准备、批准、应用或构建，不运行shell。"
+                "这是只读事实对账，不能重放writer。"
+            )
+            finished()
         pattern = (
             r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B(?: · |\s+)SHA256 ([a-f0-9]{64})"
         )
@@ -225,10 +241,7 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
         )
         fact(
             "concrete next floor preview valid",
-            lambda s: (
-                f"产物验证 valid=true · current=true · build_id={lineage['preview_id']}"
-                in business(s)
-            ),
+            lambda s: artifact_validation_visible(s, lineage["preview_id"]),
             1800,
         )
         finished()
@@ -281,10 +294,7 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
         )
         fact(
             "next floor applied build valid",
-            lambda s: (
-                f"产物验证 valid=true · current=true · build_id={lineage['build_id']}"
-                in business(s)
-            ),
+            lambda s: artifact_validation_visible(s, lineage["build_id"]),
             1800,
         )
         finished()
@@ -295,3 +305,158 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
         checkpoint("built")
 
     report.step("Agent builds validates and regroups all remaining sources", build, tui)
+
+
+def run_hospital_floor_batch_finalize(
+    report, tui, send, finished, fact, context_path, evidence
+):
+    """Recover only the missing UI checkpoint of an already applied/built batch."""
+    import os
+
+    from dsh_tui_check import ENTER, F6, expect
+
+    context = json.loads(context_path.read_bytes())
+    root = Path(context["project_root"])
+    scene = root / context["scene_path"]
+    directory = root / "outputs/domain" / context["run_id"] / "changes"
+    parent = Path(os.environ["MODELING_FLOOR_BATCH_PARENT_EVIDENCE"]).resolve()
+    parent_path = parent / "hospital-floor-batch-stages.json"
+    parent_lineage = json.loads(
+        (parent / "hospital-floor-batch-lineage.json").read_bytes()
+    )
+    stages = json.loads(parent_path.read_bytes())
+    expect(
+        [s["stage"] for s in stages] == ["initial", "prepared", "previewed", "applied"],
+        "parent lacks actual pre-build checkpoints",
+    )
+    initial = scene.read_bytes()
+    expect(
+        hashlib.sha256(initial).hexdigest() == stages[-1]["scene_sha256"],
+        "parent applied scene changed",
+    )
+    before_grants = [
+        json.loads(p.read_bytes())
+        for p in sorted(directory.glob("authorization-*.json"))
+    ]
+    before_ops = [
+        json.loads(p.read_bytes()) for p in sorted(directory.glob("operation-*.json"))
+    ]
+    lineage = {
+        "parent_evidence": str(parent),
+        "parent_stages_sha256": hashlib.sha256(parent_path.read_bytes()).hexdigest(),
+        "parent_report_sha256": hashlib.sha256(
+            (parent / "report.json").read_bytes()
+        ).hexdigest(),
+        "context_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
+        "initial_scene_sha256": hashlib.sha256(initial).hexdigest(),
+        "initial_authorizations": before_grants,
+        "initial_operations": before_ops,
+        "scope": "read-only post-build checkpoint recovery; original failure remains recorded",
+    }
+    (evidence / "hospital-floor-finalize-lineage.json").write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    def reconcile():
+        tui.wait(
+            "read-only floor finalize ready",
+            lambda s: "建模" in s and "Initializing" not in s,
+            180,
+        )
+        proposal = parent_lineage["proposal_id"]
+        build = parent_lineage["build_id"]
+        operation = next(
+            o["operation_id"]
+            for o in stages[-1]["operations"]
+            if o["proposal_id"] == proposal
+        )
+        tui.type(
+            f"恢复医院八层上一批的只读对账。提案 {proposal} 已实际应用，操作 {operation}；"
+            f"已构建产物build_id={build}。本轮禁止重新准备、授权、应用或构建。"
+            "只用领域工具依次查询describe_capabilities、inspect_change、inspect_operation、"
+            "inspect_artifact、validate_artifact，最后调用scan_source_groups展示state_counts和剩余请求。"
+            "最后一次领域调用必须是scan_source_groups；本轮不需要read_fact_view或重新分析线稿，"
+            "Core会读取完整事实。仅查询已有数据，不运行shell，不请求额外写权限。"
+        )
+        tui.keys(ENTER, 0.5)
+        if "目标 / 自然语言反馈" not in tui.screen():
+            tui.keys(F6, 0.5)
+        fact(
+            "reconciled current applied batch visible",
+            lambda s: artifact_validation_visible(s, build),
+            1800,
+        )
+        finished()
+        pattern = (
+            r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B(?: · |\s+)SHA256 ([a-f0-9]{64})"
+        )
+        screen = tui.wait(
+            "reconciled full private Core checkpoint",
+            lambda s: re.search(pattern, s),
+            90,
+        )
+        kind, seq, size, digest = re.search(pattern, screen).groups()
+        raw = (directory / "facts" / (digest + ".json")).read_bytes()
+        expect(
+            hashlib.sha256(raw).hexdigest() == digest and len(raw) == int(size),
+            "reconciled Core bytes differ",
+        )
+        expect(scene.read_bytes() == initial, "readonly recovery wrote scene")
+        grants = [
+            json.loads(p.read_bytes())
+            for p in sorted(directory.glob("authorization-*.json"))
+        ]
+        ops = [
+            json.loads(p.read_bytes())
+            for p in sorted(directory.glob("operation-*.json"))
+        ]
+        expect(
+            grants == before_grants and ops == before_ops,
+            "readonly recovery changed writer authority",
+        )
+        groups = [
+            json.loads(p.read_bytes()) for p in (directory / "facts").glob("*.json")
+        ]
+        groups = [
+            g
+            for g in groups
+            if g["kind"] == "source_groups"
+            and g["scene_sha256"] == lineage["initial_scene_sha256"]
+        ]
+        expect(groups, "no current actual source regrouping")
+        row = {
+            "stage": "built",
+            "time_ns": time.time_ns(),
+            "scene_sha256": lineage["initial_scene_sha256"],
+            "core_fact": {
+                "kind": kind,
+                "sequence": int(seq),
+                "bytes": int(size),
+                "sha256": digest,
+            },
+            "groups": max(groups, key=lambda g: g["fact_sequence"]),
+            "proposals": [
+                json.loads(p.read_bytes())
+                for p in directory.glob("*.json")
+                if re.fullmatch(r"[a-f0-9]{32}", p.stem)
+            ],
+            "authorizations": grants,
+            "operations": ops,
+            "artifacts": [
+                json.loads(p.read_bytes())
+                for p in sorted(directory.glob("artifacts/*/build.json"))
+            ],
+        }
+        (evidence / "core-facts").mkdir(exist_ok=True)
+        (evidence / "core-facts" / (digest + ".json")).write_bytes(raw)
+        (evidence / "built.txt").write_text(screen, encoding="utf-8")
+        (evidence / "built.scene.json").write_bytes(initial)
+        (evidence / "hospital-floor-finalized-checkpoint.json").write_text(
+            json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    report.step(
+        "Agent reconciles actual prior batch without replaying writer or build",
+        reconcile,
+        tui,
+    )

@@ -3,7 +3,9 @@
 import copy
 import unittest
 
-from domain_hospital_mixed_check import classified_state_visible, fact_sync_failure_is_terminal
+from domain_hospital_mixed_check import (
+    classified_state_visible, fact_sync_failure_is_terminal, artifact_validation_visible,
+)
 
 
 class HospitalViewTest(unittest.TestCase):
@@ -29,6 +31,21 @@ class HospitalViewTest(unittest.TestCase):
 │capability_missing 1 · pending_addition 2 · pending_confirmation 484│
 │bed · pending_addition│
 ┌Agent 回复┐"""
+
+    def test_current_artifact_validation_survives_wrapping_at_build_identifier(self):
+        build_id = "floor-built-8351deef91f143fda63ab0f72e98d3a1-430bb6bb"
+        screen = f"""┌方案与执行事实┐
+│产物验证 valid=true · current=true · │
+│build_id={build_id}│
+┌Agent 回复┐"""
+        self.assertTrue(artifact_validation_visible(screen, build_id))
+        for wrong in (screen.replace("current=true", "current=false"),
+                      screen.replace("valid=true", "valid=false"),
+                      screen.replace(build_id, "foreign-build")):
+            self.assertFalse(artifact_validation_visible(wrong, build_id))
+        self.assertFalse(artifact_validation_visible(
+            f"┌方案与执行事实┐\n│产物验证 not_run│\n┌Agent 回复┐\n"
+            f"产物验证 valid=true · current=true · build_id={build_id}", build_id))
 
     def test_running_tool_error_remains_recoverable_until_actual_terminal_state(self):
         message = "领域事实同步失败：领域工具未成功返回事实回执"

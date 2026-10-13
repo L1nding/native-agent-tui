@@ -16,6 +16,13 @@ def business(screen):
     )
 
 
+def artifact_validation_visible(screen, build_id):
+    # Terminal wrapping may discard a separator space at the next line boundary.
+    # Only compare the Core business pane; conversational claims are excluded.
+    expected = f"产物验证 valid=true · current=true · build_id={build_id}"
+    return "".join(expected.split()) in "".join(business(screen).split())
+
+
 def fact_sync_failure_is_terminal(screen):
     # Core still inhibits approval; the Agent may correct a failed tool call in this turn.
     return "领域事实同步失败" in screen and " · Running · " not in screen
