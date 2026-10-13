@@ -11,6 +11,9 @@
 - `ui/render`：从只读 `CoreSnapshot` 与 `LocalState` 组合终端视图；不处理按键、发送命令或修改状态。
 - `ui/overlays`：命令面板触发的互斥面板切换与关闭；接收快照和本地 UI 状态，调用父模块的请求同步 seam，不发送 Core 命令。
 - `ui/editor`：有界、按 Unicode grapheme 操作的文本编辑器状态与光标操作；不发送 Core 命令。
+- `ui/extensions`：领域视图注册、可用快照定位、通用滚动和实际绘制后的确认绑定；只接受 typed `ExtensionSnapshot` 与窄 `ViewContext`，返回 `ExtensionAction`，不访问后端或修改 Core。根 UI 只路由 F6、消费动作并发送 `ConfirmExtension`。
+- `ui/domain`：注册的建模视图实现，消费建模投影与只读视图上下文，保留方案／操作／产物的身份，不依赖根 `LocalState`。
+- `ui/busy`：只根据 Core 生命周期显示有文字的活动标记；动画帧是本地显示状态，50 ms 重绘由 runtime 限流，空闲不产生动画重绘或 Core 命令。
 - `ui/attention`：注意力阈值编辑器状态与弹窗渲染；只通过根模块路由提交类型化命令。
 - `ui/requests`：审批和用户输入请求的详情、草稿和身份校验。
 - `ui/request_state`：按稳定 `RequestRef` 选择当前请求、同步各请求输入草稿，并依据 Core 阶段与提交状态锁定回答；只更新 UI 本地状态，不构造或发送命令。

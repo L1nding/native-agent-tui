@@ -25,6 +25,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     local
         .conversation_viewport
         .set(super::ConversationViewport::default());
+    local.extension.clear_displayed();
     let area = frame.area();
     let theme = theme::current();
     frame.render_widget(Block::default().style(theme.base()), area);
@@ -44,13 +45,13 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.provider_form.draw(frame, area, &snapshot.models.test);
         return;
     }
-    if local.domain_visible
-        && snapshot.domain.enabled
-        && snapshot.requests.is_empty()
-        && area.width >= 24
-        && area.height >= 8
-    {
-        super::domain::draw(frame, area, snapshot, local);
+    let extension_context = super::extensions::ViewContext::new(
+        snapshot,
+        &local.extension,
+        &local.editor.text,
+        local.notice.as_deref(),
+    );
+    if super::extensions::REGISTRY.draw(frame, snapshot, &extension_context) {
         return;
     }
     if area.width < 24 || area.height < 8 {

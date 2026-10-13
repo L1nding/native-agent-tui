@@ -161,7 +161,11 @@ async fn domain_proposals_survive_display_clipping_but_reject_foreign_or_incompl
         *event.pointer_mut(invalid.0).unwrap() = invalid.1;
         observation_event(&mut client, &mut server, event).await;
         assert!(
-            client.snapshots.borrow().domain.proposal.is_none(),
+            client.snapshots.borrow().extensions[0]
+                .modeling()
+                .unwrap()
+                .proposal
+                .is_none(),
             "{}",
             invalid.0
         );
@@ -173,8 +177,9 @@ async fn domain_proposals_survive_display_clipping_but_reject_foreign_or_incompl
         .entries
         .iter()
         .any(|entry| entry.clipped));
-    let proposal = snapshot
-        .domain
+    let proposal = snapshot.extensions[0]
+        .modeling()
+        .unwrap()
         .proposal
         .as_ref()
         .expect("complete domain result was lost to display clipping");
@@ -183,6 +188,30 @@ async fn domain_proposals_survive_display_clipping_but_reject_foreign_or_incompl
     assert!(proposal.objects[0].contains("chair.base"));
     let stored = serde_json::to_string(&StoredSnapshot::capture(&snapshot)).unwrap();
     assert!(!stored.contains("source evidence"));
+    client
+        .commands
+        .send(Command::ConfirmExtension {
+            confirmation: crate::extensions::ExtensionConfirmation::Modeling(
+                proposal.binding.clone(),
+            ),
+        })
+        .await
+        .unwrap();
+    client
+        .snapshots
+        .wait_for(|snapshot| {
+            snapshot.extensions[0].modeling().unwrap().notice.as_deref()
+                == Some("当前方案或执行状态不允许批准；请等待当前轮完成并核对版本")
+        })
+        .await
+        .unwrap();
+    assert!(
+        !client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .authorizing
+    );
+    assert_eq!(client.snapshots.borrow().root_start_requests, 1);
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();
 }

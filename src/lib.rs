@@ -8,6 +8,7 @@ pub mod config;
 pub mod conversations;
 pub mod diagnostics;
 pub mod domain;
+pub mod extensions;
 pub mod gate;
 pub mod headless;
 pub mod history;

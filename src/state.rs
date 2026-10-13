@@ -175,7 +175,7 @@ pub struct CoreSnapshot {
     pub observation: crate::observation::ObservationSnapshot,
     pub timeline: crate::timeline::TimelineSnapshot,
     pub tool_details: crate::tool_details::ToolDetailsSnapshot,
-    pub domain: crate::domain::DomainSnapshot,
+    pub extensions: Vec<crate::extensions::ExtensionSnapshot>,
     pub diagnostics: crate::diagnostics::CoreMetrics,
     pub journal: Option<crate::journal::JournalView>,
     pub persistence: PersistenceState,

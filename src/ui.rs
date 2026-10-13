@@ -17,6 +17,7 @@ mod context;
 mod conversation;
 mod domain;
 mod editor;
+mod extensions;
 mod help;
 mod history;
 mod input;
@@ -120,10 +121,7 @@ struct LocalState {
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
-    domain_visible: bool,
-    domain_scroll: u16,
-    domain_reply_scroll_from_bottom: u16,
-    displayed_domain_binding: Option<crate::domain::ProposalBinding>,
+    extension: extensions::ExtensionPanel,
     evidence_scroll: usize,
     skills: bool,
     skills_scroll: usize,
@@ -635,54 +633,31 @@ fn handle_key(
     } else {
         key
     };
-    if key.code == KeyCode::F(6) && snapshot.domain.enabled {
-        local.domain_visible = !local.domain_visible;
-        local.domain_scroll = 0;
-        local.domain_reply_scroll_from_bottom = 0;
+    if key.code == KeyCode::F(6)
+        && (local.extension.visible.is_some() || extensions::REGISTRY.first(snapshot).is_some())
+    {
+        local.extension.toggle(snapshot);
         local.workflow.visible = false;
         return false;
     }
-    if local.domain_visible && snapshot.requests.is_empty() {
-        match key.code {
-            KeyCode::Esc => {
-                local.domain_visible = false;
-                return false;
+    if let Some(action) = extensions::REGISTRY.handle_key(
+        key,
+        snapshot,
+        &mut local.extension,
+        local.viewport,
+        &local.editor.text,
+        local.notice.as_deref(),
+    ) {
+        match action {
+            extensions::ExtensionAction::Confirm(confirmation) => {
+                send(Command::ConfirmExtension { confirmation }, tx, local);
             }
-            KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                local.domain_reply_scroll_from_bottom =
-                    local.domain_reply_scroll_from_bottom.saturating_add(8);
-                return false;
+            extensions::ExtensionAction::NoDisplayedConfirmation => {
+                local.notice = Some("当前尚无已展示的可批准方案".into())
             }
-            KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                local.domain_reply_scroll_from_bottom =
-                    local.domain_reply_scroll_from_bottom.saturating_sub(8);
-                return false;
-            }
-            KeyCode::PageUp => {
-                local.domain_scroll = local
-                    .domain_scroll
-                    .min(domain::max_scroll(snapshot, local, local.viewport))
-                    .saturating_sub(8);
-                return false;
-            }
-            KeyCode::PageDown => {
-                local.domain_scroll = local
-                    .domain_scroll
-                    .min(domain::max_scroll(snapshot, local, local.viewport))
-                    .saturating_add(8)
-                    .min(domain::max_scroll(snapshot, local, local.viewport));
-                return false;
-            }
-            KeyCode::Char('y') if control => {
-                if let Some(binding) = local.displayed_domain_binding.clone() {
-                    send(Command::ApproveDomainChange { binding }, tx, local);
-                } else {
-                    local.notice = Some("当前尚无已展示的可批准方案".into());
-                }
-                return false;
-            }
-            _ => {}
+            extensions::ExtensionAction::Handled => {}
         }
+        return false;
     }
     if control {
         match key.code {
@@ -1054,7 +1029,7 @@ fn handle_key(
             ) {
                 local.editor.clear();
                 local.scroll_from_bottom = 0;
-                local.domain_reply_scroll_from_bottom = 0;
+                local.extension.reply_scroll_from_bottom = 0;
             }
         }
         KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {

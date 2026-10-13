@@ -66,7 +66,7 @@ fn urgent_snapshot_change(
     old.phase != new.phase
         || old.thread_id != new.thread_id
         || old.turn_id != new.turn_id
-        || old.domain != new.domain
+        || old.extensions != new.extensions
         || old.requests != new.requests
         || old.gate != new.gate
         || old.scheduler != new.scheduler
@@ -143,7 +143,7 @@ pub async fn run_tasks_with_history(
     }
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
-        let mut local = LocalState { domain_visible: client.snapshots.borrow().domain.enabled, ..Default::default() };
+        let mut local = LocalState { extension: super::extensions::ExtensionPanel::new(super::extensions::REGISTRY.first(&client.snapshots.borrow())), ..Default::default() };
         if !tasks.is_empty() {
             client.commands.send(Command::QueueRootTasks { tasks }).await
                 .map_err(|_| UiError::Shutdown("client is closed".into()))?;
@@ -161,18 +161,13 @@ pub async fn run_tasks_with_history(
                 sync_local_requests(&mut local, &snapshot);
                 local.search.dispatch(snapshot.clone(), &mut search);
                 local.timeline.sync(&snapshot);
+                local.extension.clear_displayed();
                 terminal.terminal.draw(|frame| {
                     if local.palette.visible { draw(frame, &snapshot, &local); }
                     else if sessions_panel.visible { sessions_panel.draw(frame, &snapshot); }
                     else if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
                 })?;
-                local.displayed_domain_binding = if local.domain_visible && snapshot.domain.enabled
-                    && !local.palette.visible && !sessions_panel.visible && !history_panel.visible
-                    && !local.models.visible && !local.settings.visible && !local.provider_form.visible
-                    && snapshot.requests.is_empty() && local.viewport.width >= 24 && local.viewport.height >= 8 {
-                    snapshot.domain.proposal.as_ref().filter(|p| p.ready).map(|p| p.binding.clone())
-                } else { None };
                 last_drawn = Some(snapshot);
                 redraw.drawn(tokio::time::Instant::now());
             }

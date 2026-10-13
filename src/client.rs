@@ -33,8 +33,8 @@ pub enum Command {
     SubmitRootInput {
         text: String,
     },
-    ApproveDomainChange {
-        binding: crate::domain::ProposalBinding,
+    ConfirmExtension {
+        confirmation: crate::extensions::ExtensionConfirmation,
     },
     DomainAuthorizationFinished {
         attempt_id: u64,
@@ -247,7 +247,9 @@ impl ClientHandle {
             },
             observation: observer.snapshot_at(0, Instant::now()),
             timeline: observer.timeline_snapshot(),
-            domain: crate::domain::DomainFacts::new(config.domain_setup.clone()).snapshot,
+            extensions: vec![crate::extensions::ExtensionSnapshot::Modeling(
+                crate::domain::DomainFacts::new(config.domain_setup.clone()).snapshot,
+            )],
             ..Default::default()
         }
     }
@@ -922,7 +924,9 @@ impl Core {
             self.state.finish_all_reasoning();
         }
         self.state.view.tool_details = self.tool_details.snapshot();
-        self.state.view.domain = self.domain.snapshot.clone();
+        self.state.view.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
+            self.domain.snapshot.clone(),
+        )];
         self.domain
             .project_control_messages(&mut self.state.view.messages);
         let transport = self.pipe.stats();
@@ -1323,9 +1327,11 @@ impl Core {
                     },
                 );
             }
-            Command::ApproveDomainChange { binding } => {
-                self.approve_domain_change(binding);
-            }
+            Command::ConfirmExtension { confirmation } => match confirmation {
+                crate::extensions::ExtensionConfirmation::Modeling(binding) => {
+                    self.approve_domain_change(binding)
+                }
+            },
             Command::DomainAuthorizationFinished {
                 attempt_id,
                 generation,
