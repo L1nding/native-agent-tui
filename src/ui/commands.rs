@@ -275,6 +275,55 @@ fn usable_skills(skills: &[SkillEntry]) -> impl Iterator<Item = &SkillEntry> {
         .filter(|skill| skill.enabled && !skill.name.is_empty() && !built_in(&skill.name))
 }
 
+/// The whole line when it names one of dsh's own commands, e.g. `/plan off`.
+/// The TUI's commands and dsh skills of the same name take precedence.
+pub(super) fn backend_command(
+    text: &str,
+    skills: &[SkillEntry],
+    commands: &[crate::state::BackendCommand],
+) -> Option<String> {
+    let line = text.trim();
+    let name = line
+        .strip_prefix('/')?
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or_default();
+    (!built_in(name)
+        && !usable_skills(skills).any(|skill| skill.name == name)
+        && commands.iter().any(|command| command.name == name))
+    .then(|| line.to_owned())
+}
+
+/// Hints with dsh's own commands after the TUI's and the skills.
+pub(super) fn slash_hints_with(
+    text: &str,
+    skills: &[SkillEntry],
+    commands: &[crate::state::BackendCommand],
+) -> Vec<SlashHint> {
+    let mut hints = slash_hints(text, skills);
+    let typed = text
+        .strip_prefix('/')
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if text.starts_with('/') && typed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        for command in commands {
+            if command.name.starts_with(typed.as_str())
+                && !hints.iter().any(|hint| hint.name == command.name)
+            {
+                hints.push(SlashHint {
+                    name: command.name.clone(),
+                    detail: match &command.hint {
+                        Some(hint) => format!("dsh · {} · {hint}", command.description),
+                        None => format!("dsh · {}", command.description),
+                    },
+                    skill: false,
+                });
+            }
+        }
+    }
+    hints
+}
+
 /// Commands, then dsh skills, whose name starts with what follows the `/`;
 /// empty unless `text` is a single `/word` still being typed.
 pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
@@ -851,6 +900,52 @@ mod tests {
             Some(Slash::Steer("use 中文 names"))
         );
         assert_eq!(parse_slash("/steer", &[]), Some(Slash::Steer("")));
+        let dsh = [
+            crate::state::BackendCommand {
+                name: "compact".into(),
+                description: "Summarise earlier history".into(),
+                hint: None,
+            },
+            crate::state::BackendCommand {
+                name: "plan".into(),
+                description: "Plan mode".into(),
+                hint: Some("on|off".into()),
+            },
+            crate::state::BackendCommand {
+                name: "help".into(),
+                description: "shadowed by the TUI".into(),
+                hint: None,
+            },
+        ];
+        assert_eq!(
+            backend_command(" /plan off ", &[], &dsh).as_deref(),
+            Some("/plan off")
+        );
+        assert_eq!(
+            backend_command("/compact", &[], &dsh).as_deref(),
+            Some("/compact")
+        );
+        for other in ["/help", "/nope", "plan", "/", "/etc/hosts"] {
+            assert_eq!(backend_command(other, &[], &dsh), None, "{other}");
+        }
+        let hints = slash_hints_with("/", &[], &dsh);
+        assert_eq!(hints.iter().filter(|hint| hint.name == "help").count(), 1);
+        assert_eq!(
+            hints
+                .iter()
+                .find(|hint| hint.name == "plan")
+                .unwrap()
+                .detail,
+            "dsh · Plan mode · on|off"
+        );
+        assert_eq!(
+            slash_hints_with("/co", &[], &dsh)
+                .iter()
+                .map(|hint| hint.name.as_str())
+                .collect::<Vec<_>>(),
+            ["context", "compact"]
+        );
+        assert!(slash_hints_with("/plan off", &[], &dsh).is_empty());
         assert_eq!(parse_slash("/quit", &[]), Some(Slash::Quit));
         assert_eq!(parse_slash("/nope", &[]), Some(Slash::Unknown));
         for task in [

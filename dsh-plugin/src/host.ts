@@ -124,6 +124,25 @@ export interface LiveAgents {
   get(id: string): LiveAgent | undefined
 }
 
+/** One command as `ctx.commands.list()` describes it. */
+export interface CommandDescriptor {
+  name: string
+  description?: string
+  input?: { hint?: string }
+}
+
+/** `ctx.commands`: the host's slash-command registry. */
+export interface CommandRegistry {
+  list(agent: LiveAgent): readonly CommandDescriptor[]
+  /** Resolves to `undefined` when the line names no command. */
+  execute(
+    agent: LiveAgent,
+    line: string,
+    attachments: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<{ result: { kind: string; text?: string } } | undefined>
+}
+
 /** A user message as the host builds it; only its id is read here. */
 export type CreateUserMessage = (input: {
   content: readonly { type: 'text'; text: string }[]
@@ -183,6 +202,7 @@ export interface HostContext {
   get(name: 'permissionPresets'): PermissionPresets | undefined
   get(name: 'sessions'): LiveSessions | undefined
   get(name: 'agents'): LiveAgents | undefined
+  get(name: 'commands'): CommandRegistry | undefined
   get(name: string): unknown
 }
 

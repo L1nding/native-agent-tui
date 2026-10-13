@@ -143,6 +143,8 @@ struct LocalState {
     provider_form: provider_form::ProviderForm,
     /// 输入 `/名称` 时提示列表里的选中行。
     slash_selected: usize,
+    /// 已经为哪个会话问过 dsh 的命令清单。
+    commands_requested: Option<String>,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -299,6 +301,20 @@ fn open_model_picker(local: &mut LocalState, tx: &tokio::sync::mpsc::Sender<Comm
     send(Command::ListModels, tx, local);
 }
 
+fn request_backend_commands(
+    snapshot: &CoreSnapshot,
+    local: &mut LocalState,
+    tx: &tokio::sync::mpsc::Sender<Command>,
+) {
+    if !snapshot.commands_loaded
+        && snapshot.thread_id.is_some()
+        && local.commands_requested != snapshot.thread_id
+        && tx.try_send(Command::ListBackendCommands).is_ok()
+    {
+        local.commands_requested.clone_from(&snapshot.thread_id);
+    }
+}
+
 fn handle_key(
     key: KeyEvent,
     snapshot: &CoreSnapshot,
@@ -307,6 +323,10 @@ fn handle_key(
 ) -> bool {
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
+    // dsh 自己的命令只在用户开始输入 `/` 时问一次，启动时不多发请求。
+    if key.code != KeyCode::Enter && local.editor.text.starts_with('/') {
+        request_backend_commands(snapshot, local, tx);
+    }
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     if control && key.code == KeyCode::Char('p') {
         local.palette.toggle();
@@ -841,9 +861,18 @@ fn handle_key(
             local.scroll_from_bottom = 0;
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Tab
-            if !commands::slash_hints(&local.editor.text, &snapshot.skills.entries).is_empty() =>
+            if !commands::slash_hints_with(
+                &local.editor.text,
+                &snapshot.skills.entries,
+                &snapshot.commands,
+            )
+            .is_empty() =>
         {
-            let hints = commands::slash_hints(&local.editor.text, &snapshot.skills.entries);
+            let hints = commands::slash_hints_with(
+                &local.editor.text,
+                &snapshot.skills.entries,
+                &snapshot.commands,
+            );
             let selected = local.slash_selected.min(hints.len() - 1);
             match key.code {
                 KeyCode::Up => local.slash_selected = selected.saturating_sub(1),
@@ -878,7 +907,8 @@ fn handle_key(
         KeyCode::Enter if !local.editor.text.trim().is_empty() => {
             let mut text = local.editor.text.clone();
             // 提示列表可见时，Enter 执行选中的命令，不要求把名字打全。
-            let hints = commands::slash_hints(&text, &snapshot.skills.entries);
+            let hints =
+                commands::slash_hints_with(&text, &snapshot.skills.entries, &snapshot.commands);
             if !hints.is_empty()
                 && !selected_request(snapshot, local)
                     .is_some_and(|r| matches!(r.kind, RequestKind::UserInput { .. }))
@@ -937,10 +967,20 @@ fn handle_key(
             if let Some(task) = skill_task {
                 text = task;
             }
+            // dsh 自己的命令（如 `/compact`、`/plan off`）交给 dsh 执行。
+            else if let Some(line) =
+                commands::backend_command(&text, &snapshot.skills.entries, &snapshot.commands)
+            {
+                local.editor.clear();
+                send(Command::RunBackendCommand { line }, tx, local);
+                return false;
+            }
             // `/名称` 是界面命令，不作为任务发给模型。
             else if let Some(slash) = commands::parse_slash(&text, &snapshot.skills.entries) {
                 use commands::{PaletteAction, Slash};
                 if slash == Slash::Unknown {
+                    // 还没问过 dsh 时，这个名称可能是它的命令：先取清单。
+                    request_backend_commands(snapshot, local, tx);
                     // 保留输入，方便改正拼写。
                     local.notice = Some(format!(
                         "{} {}",
@@ -3302,6 +3342,8 @@ mod tests {
         local.editor.clear();
         local.editor.insert("/quit");
         assert!(handle_key(enter, &snapshot, &mut local, &tx));
+        // 未知名称可能是 dsh 自己的命令：只向它要一次清单，不执行任何东西。
+        assert_eq!(rx.try_recv().unwrap(), Command::ListBackendCommands);
         assert!(rx.try_recv().is_err());
     }
 
@@ -3489,6 +3531,8 @@ mod tests {
         local.editor.clear();
         local.editor.insert("/etc/hosts");
         assert!(row_of(&rows(&local), "Commands").is_none());
+        // 开始输入 `/` 后只向 dsh 要一次它的命令清单。
+        assert_eq!(rx.try_recv().unwrap(), Command::ListBackendCommands);
         assert!(rx.try_recv().is_err());
     }
 

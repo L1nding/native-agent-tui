@@ -217,6 +217,16 @@ pub(crate) fn turn_steer(id: RpcId, thread: &str, turn: &str, text: &str) -> Env
     )
 }
 
+/// dsh's own slash commands for the current session; understood by the ACP bridge.
+pub(crate) fn backend_commands_list(id: RpcId) -> Envelope {
+    Envelope::request(id, "backend/commands/list", Some(json!({})))
+}
+
+/// Runs one of dsh's slash commands, e.g. `/compact`, on the idle session.
+pub(crate) fn backend_command_run(id: RpcId, line: &str) -> Envelope {
+    Envelope::request(id, "backend/command/run", Some(json!({"line":line})))
+}
+
 pub(crate) fn model_list(id: RpcId) -> Envelope {
     Envelope::request(id, "model/list", Some(json!({"limit":100})))
 }

@@ -16,6 +16,7 @@
  */
 
 import { createInterface } from 'node:readline'
+import { listCommands, runCommand } from './commands.js'
 import { relayEvents } from './events.js'
 import { loadCreateUserMessage, loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
 import { describePermission, setPermission } from './permission.js'
@@ -207,6 +208,22 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
       if (typeof text !== 'string') throw new Error('text is required')
       return turns.steer(sessionId, text, await loadCreateUserMessage())
+    },
+
+    /** dsh's slash commands for one live session. */
+    'zf/commands/list': (params) => {
+      const sessionId = params['sessionId']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      return listCommands(ctx, sessionId)
+    },
+
+    /** Run one of dsh's slash commands on an idle session and return its result. */
+    'zf/commands/run': (params) => {
+      const sessionId = params['sessionId']
+      const line = params['line']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      if (typeof line !== 'string' || line.length > 4096) throw new Error('line is required')
+      return runCommand(ctx, sessionId, line)
     },
 
     /** Conversation text, server reasoning and tool summaries for a resumed session. */

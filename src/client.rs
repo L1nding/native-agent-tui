@@ -33,6 +33,12 @@ pub enum Command {
     SubmitRootInput {
         text: String,
     },
+    /// 向 dsh 询问它自己的斜杠命令。
+    ListBackendCommands,
+    /// 在空闲的会话上执行一条 dsh 斜杠命令，例如 `/compact`。
+    RunBackendCommand {
+        line: String,
+    },
     /// 引导正在运行的 root 轮次；不开始新轮次，也不排队。
     SteerRoot {
         text: String,
@@ -309,6 +315,8 @@ impl ClientHandle {
                 domain_fact_queue: VecDeque::new(),
                 steer: None,
                 steer_count: 0,
+                backend_command: None,
+                backend_command_count: 0,
                 config,
                 server,
                 command_rx,
@@ -386,6 +394,10 @@ enum RpcKind {
     Steer {
         generation: u64,
     },
+    /// dsh's own slash commands for this session.
+    CommandList,
+    /// One of dsh's slash commands, running on the idle session.
+    CommandRun,
     ModelList,
     /// dsh's permission presets and this session's choice.
     PermissionDescribe,
@@ -484,6 +496,9 @@ struct Core {
     /// 已提交、尚未确认送达的一次引导；同一时刻只允许一个。
     steer: Option<PendingSteer>,
     steer_count: u64,
+    /// 正在执行的 dsh 命令：(对话里的提示 id, 命令行)。同一时刻只有一条。
+    backend_command: Option<(String, String)>,
+    backend_command_count: u64,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -821,6 +836,18 @@ impl Core {
                             self.state.view.notice = Some(
                                 "Resumed; its earlier messages were not loaded in time.".into(),
                             );
+                        } else if matches!(kind, RpcKind::CommandList) {
+                            self.state.view.notice =
+                                Some("dsh commands were not listed in time.".into());
+                        } else if matches!(kind, RpcKind::CommandRun) {
+                            // 没有答复：命令可能仍在执行或已经生效；不重发。
+                            if let Some((notice, line)) = self.backend_command.take() {
+                                self.state.command_notice(
+                                    &notice,
+                                    format!("{line} was not confirmed in time; it may still finish."),
+                                    true,
+                                );
+                            }
                         } else if matches!(kind, RpcKind::Steer { .. }) {
                             // 没有答复：dsh 可能已经收下，也可能没有；不重发。
                             if let Some(steer) = self.steer.take() {
@@ -989,6 +1016,7 @@ impl Core {
             self.state.finish_all_reasoning();
             self.state.finish_all_notices();
             self.steer = None;
+            self.backend_command = None;
         }
         self.state.view.tool_details = self.tool_details.snapshot();
         self.state.view.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
@@ -1274,6 +1302,13 @@ impl Core {
                 self.state.view.turn_id.as_deref().unwrap_or(""),
                 self.steer.as_ref().map_or("", |steer| steer.text.as_str()),
             ),
+            RpcKind::CommandList => app_server::backend_commands_list(id.clone()),
+            RpcKind::CommandRun => app_server::backend_command_run(
+                id.clone(),
+                self.backend_command
+                    .as_ref()
+                    .map_or("", |(_, line)| line.as_str()),
+            ),
             RpcKind::ModelList => app_server::model_list(id.clone()),
             RpcKind::BackendReload => app_server::backend_reload(id.clone()),
             RpcKind::ThreadResume => app_server::thread_resume(
@@ -1303,14 +1338,15 @@ impl Core {
         let outbox_id = self.send_effect(envelope, None)?;
         let skills_cwd = matches!(kind, RpcKind::SkillsList { .. })
             .then(|| self.config.cwd.display().to_string());
-        self.expect_response(
-            id,
-            outbox_id,
-            PendingRpc {
-                skills_cwd,
-                ..PendingRpc::new(kind)
-            },
-        );
+        let mut pending = PendingRpc {
+            skills_cwd,
+            ..PendingRpc::new(kind)
+        };
+        if matches!(kind, RpcKind::CommandRun) {
+            // 手动压缩要等模型写完摘要，比普通请求慢得多。
+            pending.deadline = Instant::now() + Duration::from_secs(300);
+        }
+        self.expect_response(id, outbox_id, pending);
         Ok(())
     }
 
@@ -1571,6 +1607,19 @@ impl Core {
                 if let Err(reason) = self.resume_conversation(&id) {
                     self.state.view.notice =
                         Some(format!("Conversation was not resumed: {reason}"));
+                }
+            }
+            Command::ListBackendCommands => {
+                if self.session_ready && self.state.view.thread_id.is_some() {
+                    if let Err(error) = self.send_rpc(RpcKind::CommandList) {
+                        self.state.view.notice =
+                            Some(format!("dsh commands were not listed: {error}"));
+                    }
+                }
+            }
+            Command::RunBackendCommand { line } => {
+                if let Err(reason) = self.run_backend_command(line) {
+                    self.state.view.notice = Some(format!("The command was not run: {reason}"));
                 }
             }
             Command::SteerRoot { text } => {
@@ -1839,6 +1888,30 @@ impl Core {
             return Err(error.to_string());
         }
         self.state.view.notice = Some("Resuming the conversation...".into());
+        Ok(())
+    }
+
+    /// dsh 的命令会改变会话状态（压缩历史、切换计划模式），只在会话空闲时执行。
+    fn run_backend_command(&mut self, line: String) -> Result<(), String> {
+        let line = line.trim().to_owned();
+        if !line.starts_with('/') || line.len() > 4096 {
+            return Err("it is not a command line.".into());
+        }
+        if !self.idle_for_backend_change() || self.scheduler.snapshot().queued_roots > 0 {
+            return Err("wait for the current turn and queued tasks to finish first.".into());
+        }
+        if self.backend_command.is_some() {
+            return Err("another command is still running.".into());
+        }
+        self.backend_command_count += 1;
+        let notice = format!("command:{}", self.backend_command_count);
+        self.backend_command = Some((notice.clone(), line.clone()));
+        if let Err(error) = self.send_rpc(RpcKind::CommandRun) {
+            self.backend_command = None;
+            return Err(error.to_string());
+        }
+        self.state
+            .command_notice(&notice, format!("Running {line}…"), false);
         Ok(())
     }
 
@@ -2535,6 +2608,23 @@ impl Core {
                         .and_then(Value::as_str)
                         .unwrap_or("RPC failed")
                         .to_owned();
+                    if matches!(pending.kind, RpcKind::CommandList) {
+                        let message: String = message.chars().take(200).collect();
+                        self.state.view.notice =
+                            Some(format!("dsh commands were not listed: {message}"));
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::CommandRun) {
+                        if let Some((notice, line)) = self.backend_command.take() {
+                            let reason: String = message.chars().take(400).collect();
+                            self.state.command_notice(
+                                &notice,
+                                format!("{line} was not run: {reason}"),
+                                true,
+                            );
+                        }
+                        return;
+                    }
                     if matches!(pending.kind, RpcKind::Steer { .. }) {
                         if let Some(steer) = self.steer.take() {
                             let reason: String = message.chars().take(200).collect();
@@ -2790,6 +2880,9 @@ impl Core {
                     self.state.view.messages.clear();
                     self.state.view.todos.clear();
                     self.steer = None;
+                    self.backend_command = None;
+                    self.state.view.commands.clear();
+                    self.state.view.commands_loaded = false;
                     self.state.view.requests.clear();
                     self.state.view.permission = Default::default();
                     self.state.view.turn_id = None;
@@ -2826,6 +2919,37 @@ impl Core {
                     return;
                 };
                 self.bind_turn(id);
+                None
+            }
+            RpcKind::CommandList => {
+                match crate::state::parse_backend_commands(&result) {
+                    Some(commands) => {
+                        self.state.view.commands = commands;
+                        self.state.view.commands_loaded = true;
+                    }
+                    None => {
+                        self.state.view.notice =
+                            Some("dsh commands were not listed: the answer was malformed.".into())
+                    }
+                }
+                None
+            }
+            RpcKind::CommandRun => {
+                if let Some((notice, line)) = self.backend_command.take() {
+                    let text: String = result["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(2000)
+                        .collect();
+                    let outcome = match (result["kind"].as_str(), text.is_empty()) {
+                        (Some("success"), true) => format!("{line}: done."),
+                        (Some("success"), false) => format!("{line}: {text}"),
+                        (_, true) => format!("{line} failed."),
+                        (_, false) => format!("{line} failed: {text}"),
+                    };
+                    self.state.command_notice(&notice, outcome, true);
+                }
                 None
             }
             RpcKind::Steer { .. } => {
@@ -2969,6 +3093,9 @@ impl Core {
                 self.state.view.messages.clear();
                 self.state.view.todos.clear();
                 self.steer = None;
+                self.backend_command = None;
+                self.state.view.commands.clear();
+                self.state.view.commands_loaded = false;
                 self.state.tool_lines.clear();
                 self.state.view.history_truncated = false;
                 self.state.view.thread_id = Some(thread);
@@ -8685,6 +8812,137 @@ mod tests {
         assert!(snapshot.thread_id.is_none());
         assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
         drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_commands_run_only_when_idle_and_quote_the_backend_outcome() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        let notices = |snapshot: &crate::state::CoreSnapshot| -> Vec<String> {
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role == "Notice")
+                .map(|message| message.text.clone())
+                .collect()
+        };
+        client
+            .commands
+            .send(Command::ListBackendCommands)
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "backend/commands/list");
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"commands":[
+            {"name":"compact","description":"Summarise earlier history"},
+            {"name":"plan","description":"Plan mode","hint":"on|off"},
+            {"name":"Bad Name","description":"dropped"}]}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.commands_loaded)
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(
+                snapshot
+                    .commands
+                    .iter()
+                    .map(|command| command.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["compact", "plan"]
+            );
+            assert_eq!(snapshot.commands[1].hint.as_deref(), Some("on|off"));
+        }
+        let run = |line: &str| Command::RunBackendCommand { line: line.into() };
+        client.commands.send(run(" /compact ")).await.unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "backend/command/run");
+        assert_eq!(request["params"], json!({"line":"/compact"}));
+        client
+            .snapshots
+            .wait_for(|snapshot| notices(snapshot) == ["Running /compact…"])
+            .await
+            .unwrap();
+        // 上一条没有结果前不执行第二条。
+        client.commands.send(run("/plan off")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("another command is still running"))
+            })
+            .await
+            .unwrap();
+        send(&mut server, json!({"id":request["id"],"result":{"kind":"success","text":"Compacted 3 history items."}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| notices(snapshot) == ["/compact: Compacted 3 history items."])
+            .await
+            .unwrap();
+        client.commands.send(run("/plan off")).await.unwrap();
+        let request = next(&mut server).await;
+        send(&mut server, json!({"id":request["id"],"error":{"code":-32603,"message":"dsh has no command /plan"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                notices(snapshot).last().map(String::as_str)
+                    == Some("/plan off was not run: dsh has no command /plan")
+            })
+            .await
+            .unwrap();
+        client.commands.send(run("not a command")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("not a command line"))
+            })
+            .await
+            .unwrap();
+
+        // 轮次运行中不执行，也不向 dsh 发请求。
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "work".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        client.commands.send(run("/compact")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("wait for the current turn"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

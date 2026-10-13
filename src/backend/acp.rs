@@ -778,6 +778,35 @@ impl AcpBridge {
                     Some(json!({"sessionId":session,"text":text})),
                 )))?;
             }
+            // dsh 自己的斜杠命令；只在没有进行中的轮次时执行。
+            (Some(method @ ("backend/commands/list" | "backend/command/run")), Some(id)) => {
+                let Some(session) = self.session_id.clone() else {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "ACP session is not ready",
+                    ));
+                };
+                let (target, params) = if method == "backend/commands/list" {
+                    ("zf/commands/list", json!({"sessionId":session}))
+                } else if self.turn_id.is_some() {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "a turn is running",
+                    ));
+                } else {
+                    let line = message
+                        .params
+                        .as_ref()
+                        .and_then(|params| params["line"].as_str())
+                        .unwrap_or_default();
+                    ("zf/commands/run", json!({"sessionId":session,"line":line}))
+                };
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp
+                    .send(with_jsonrpc(Envelope::request(id, target, Some(params))))?;
+            }
             // dsh's permission presets belong to a session; the bridge names ours.
             (Some(method @ ("permission/describe" | "permission/set")), Some(id)) => {
                 let Some(session) = self.session_id.clone() else {
@@ -3117,6 +3146,79 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backend_commands_are_listed_any_time_but_run_only_between_turns() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::backend_commands_list(RpcId::Number(1)))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().error.unwrap()["message"],
+            "ACP session is not ready"
+        );
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::backend_command_run(
+                RpcId::Number(4),
+                "/plan off",
+            ))
+            .unwrap();
+        let forwarded = acp_server.recv().await.unwrap();
+        assert_eq!(forwarded.method.as_deref(), Some("zf/commands/run"));
+        assert_eq!(
+            forwarded.params.unwrap(),
+            json!({"sessionId":"s","line":"/plan off"})
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(4),
+                Some(json!({"kind":"success","text":"Plan mode off."})),
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().result.unwrap()["text"],
+            "Plan mode off."
+        );
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        // 轮次进行中：清单照常可取，执行由桥接直接拒绝。
+        core_client
+            .send(app_server::backend_command_run(
+                RpcId::Number(5),
+                "/compact",
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().error.unwrap()["message"],
+            "a turn is running"
+        );
+        core_client
+            .send(app_server::backend_commands_list(RpcId::Number(6)))
+            .unwrap();
+        let forwarded = acp_server.recv().await.unwrap();
+        assert_eq!(forwarded.method.as_deref(), Some("zf/commands/list"));
+        assert_eq!(forwarded.params.unwrap(), json!({"sessionId":"s"}));
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
     async fn steering_is_forwarded_for_the_bound_turn_and_its_delivery_is_reported() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();

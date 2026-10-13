@@ -198,6 +198,9 @@ pub struct CoreSnapshot {
     pub usage_facts: Vec<UsageFact>,
     pub token_budget: TokenBudgetSnapshot,
     pub skills: crate::skills::SkillsSnapshot,
+    /// dsh 自己的斜杠命令；`commands_loaded` 为假时还没有向 dsh 问过。
+    pub commands: Vec<BackendCommand>,
+    pub commands_loaded: bool,
     pub models: crate::models::ModelsSnapshot,
     /// dsh's sessions of this workspace, as last listed for the sessions page.
     pub conversations: Vec<crate::conversations::ConversationSummary>,
@@ -212,6 +215,46 @@ pub struct CoreSnapshot {
     pub todos: Vec<TodoItem>,
     /// 启动预检未通过且已不在启动阶段：本会话不能再提交任务。
     pub startup_blocked: bool,
+}
+
+/// dsh 的一条斜杠命令，例如 `compact`；名称不带斜杠。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCommand {
+    pub name: String,
+    pub description: String,
+    pub hint: Option<String>,
+}
+
+/// 解析 dsh 的命令清单；名称必须是可以直接跟在斜杠后面的小写标识。
+pub(crate) fn parse_backend_commands(value: &serde_json::Value) -> Option<Vec<BackendCommand>> {
+    Some(
+        value["commands"]
+            .as_array()?
+            .iter()
+            .take(64)
+            .filter_map(|command| {
+                let name = command["name"].as_str().filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })?;
+                Some(BackendCommand {
+                    name: name.to_owned(),
+                    description: command["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect(),
+                    hint: command["hint"]
+                        .as_str()
+                        .map(|hint| hint.chars().take(80).collect()),
+                })
+            })
+            .collect(),
+    )
 }
 
 pub const MAX_TODOS: usize = 100;
@@ -799,6 +842,8 @@ impl SessionState {
             if message.role == "Notice" && !message.complete {
                 message.text = if message.id.starts_with("steer:") {
                     "Steering outcome unknown."
+                } else if message.id.starts_with("command:") {
+                    "Command outcome unknown."
                 } else {
                     "Context compaction ended, outcome unknown."
                 }
@@ -806,6 +851,12 @@ impl SessionState {
                 message.complete = true;
             }
         }
+    }
+
+    /// dsh 命令的结果：对话流里的一行，原样引用 dsh 给出的说明。
+    pub fn command_notice(&mut self, id: &str, text: String, complete: bool) {
+        let turn = self.view.turn_id.clone().unwrap_or_default();
+        self.notice_item(id.into(), &turn, text, complete);
     }
 
     /// 一次引导的占位提示：已提交、被拒绝或没有送达。
