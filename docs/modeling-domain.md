@@ -125,3 +125,8 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 ACP完整回执修复（2026-10-13）：第4轮target/dsh-e2e-b919c3df通过扫描和实际标高冲突，生成同链prepared修订2；候选44,404字节，完整envelope44,800字节，随后被ACP的32KiB文本展示截断，Core仍显示旧blocked事实，平台验收失败。实际Agent提案事实sequence6存在，无授权／操作，verified-failure-retention.json只证明来源与场景保留。
 
 ACP边界现在分别返回32KiB有界展示文本与64KiB有界完整JSON回执。只有登记过MCP身份的completed事件将完整JSON交给Core；未登记工具仍是commandExecution，展示文本不再反解为领域JSON。原始回执超限、畸形或明确isError时，不能用短展示内容替代；错误标记保持。Core继续核对领域64KiB预算、run/context、fact_sequence及具体批准版本。4项新增协议专项及扩展桥接测试覆盖这些边界。scripts/verify.py完整通过：563项Rust测试通过、2项可选live默认跳过，格式／类型／Clippy／doctest／release与全部native fixtures通过，日志为模型器outputs/c08-acp-complete-result-check-20261013.log。第5轮真实平台跨层验收正在运行，不能将这些协议测试记为真实闭环。
+
+
+MCP包装规范化补充（2026-10-13）：第5轮target/dsh-e2e-447307c5再次通过扫描和标高冲突；Agent持久化同链prepared修订2（实际事实sequence5），UI未显示新事实，验收失败。场景／CAD保持，无授权／操作，verified-failure-retention.json保留。边界进一步展开单个文本内容块、ACP content包装及标准MCP structuredContent；包装读取限256KiB，展开后的完整逻辑JSON仍限64KiB，Core独立64KiB检查保持。明确错误和超限内层不能退回短内容冒充完整事实。
+
+本地纯序列化核对未调用领域工具：第4轮44,800字节逻辑envelope经当前FastMCP转成52,397字节文本、60,182字节MCP包装（无structured output schema，单个文本块）。新增回归覆盖文本块对象／数组、JSON编码数组、双份标准包装、内层超限及错误标记。最终完整scripts/verify.py通过564项Rust测试、2项可选live默认跳过及全部native fixtures，日志outputs/c08-acp-wrapper-complete-check-20261013.log。第6轮真实跨层仍在运行。

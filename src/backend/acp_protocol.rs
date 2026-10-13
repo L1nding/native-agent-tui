@@ -26,6 +26,8 @@ fn acp(mut envelope: Envelope) -> Envelope {
 
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_STRUCTURED_RESULT_BYTES: usize = 64 * 1024;
+// MCP may duplicate the same JSON as structuredContent and escaped text content.
+const MAX_RESULT_WRAPPER_BYTES: usize = 4 * MAX_STRUCTURED_RESULT_BYTES;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AcpProtocolError {
@@ -529,17 +531,30 @@ pub fn tool_input(tool: &Value) -> ToolInput {
 /// Preserve one complete JSON receipt independently of the display text budget.
 fn bounded_json_result(value: &Value) -> Option<Value> {
     let parsed = if let Some(text) = value.as_str() {
-        if text.len() > MAX_STRUCTURED_RESULT_BYTES {
+        if text.len() > MAX_RESULT_WRAPPER_BYTES {
             return None;
         }
-        serde_json::from_str(text).ok()?
+        serde_json::from_str::<Value>(text).ok()?
     } else {
-        if serde_json::to_vec(value).ok()?.len() > MAX_STRUCTURED_RESULT_BYTES {
+        if serde_json::to_vec(value).ok()?.len() > MAX_RESULT_WRAPPER_BYTES {
             return None;
         }
-        return Some(value.clone());
+        value.clone()
     };
-    (serde_json::to_vec(&parsed).ok()?.len() <= MAX_STRUCTURED_RESULT_BYTES).then_some(parsed)
+    if parsed["isError"] == true {
+        return Some(json!({"isError": true}));
+    }
+    if parsed.is_array() || parsed["type"] == "text" || parsed["type"] == "content" {
+        return bounded_content_result(&parsed);
+    }
+    let receipt = if let Some(inner) = parsed.get("structuredContent").filter(|v| !v.is_null()) {
+        inner.clone()
+    } else if let Some(content) = parsed.get("content") {
+        return bounded_content_result(content);
+    } else {
+        parsed
+    };
+    (serde_json::to_vec(&receipt).ok()?.len() <= MAX_STRUCTURED_RESULT_BYTES).then_some(receipt)
 }
 
 fn bounded_content_result(value: &Value) -> Option<Value> {
@@ -803,6 +818,43 @@ mod structured_result_tests {
             assert!(output.unwrap().ends_with("[output truncated]"));
             assert_eq!(structured_output, Some(receipt.clone()));
         }
+    }
+
+    #[test]
+    fn duplicated_standard_mcp_wrapper_preserves_one_complete_bounded_receipt() {
+        let receipt = json!({"contract":"modeling-domain/v2", "reason":"中".repeat(14_000)});
+        let wrapper = json!({"isError":false,"structuredContent":receipt,
+            "content":[{"type":"text","text":receipt.to_string()}]});
+        assert!(wrapper.to_string().len() > MAX_STRUCTURED_RESULT_BYTES);
+        let block = json!({"type":"text","text":receipt.to_string()});
+        let blocks = json!([block.clone()]);
+        for raw in [
+            wrapper.clone(),
+            json!(wrapper.to_string()),
+            blocks.clone(),
+            json!(blocks.to_string()),
+            block,
+        ] {
+            let (
+                _,
+                Update::ToolCallUpdate {
+                    structured_output, ..
+                },
+            ) = update(&json!({
+                "sessionId":"s","update":{"sessionUpdate":"tool_call_update",
+                "toolCallId":"t","status":"completed","rawOutput":raw}
+            }))
+            .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(structured_output, Some(receipt.clone()));
+        }
+        let too_large = json!({"isError":false,
+            "structuredContent":{"reason":"x".repeat(MAX_STRUCTURED_RESULT_BYTES)},
+            "content":[{"type":"text","text":"{\"ok\":true}"}]});
+        assert!(bounded_json_result(&too_large).is_none());
+        assert!(bounded_json_result(&json!("x".repeat(MAX_RESULT_WRAPPER_BYTES + 1))).is_none());
     }
 
     #[test]
