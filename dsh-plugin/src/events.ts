@@ -10,6 +10,10 @@
  * stage is a label, a todo is the text the agent chose to show the user, and a
  * retry carries the host's failure code, never the provider's message.
  *
+ * The text being generated is relayed too, as a preview: batched, bounded, and
+ * always followed by an end marker, after which the committed message that
+ * dsh's ACP server sends is the only authority.
+ *
  * @module zf-tui-bridge/events
  */
 
@@ -20,6 +24,9 @@ export const EVENT_METHOD = 'zf/session/event'
 /** Longest steering text accepted, in UTF-16 code units. */
 export const MAX_STEER_CHARS = 32 * 1024
 const MAX_TODOS = 100
+/** Generated text is batched this long before it is sent as one delta. */
+const DELTA_BATCH_MS = 60
+const MAX_DELTA_CHARS = 8192
 const MAX_TODO_CHARS = 512
 
 /** What the model is doing within one request, as far as the stream shows. */
@@ -112,17 +119,63 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
   const notify = (session: string, event: Record<string, unknown>): void =>
     send({ jsonrpc: '2.0', method: EVENT_METHOD, params: { sessionId: session, event } })
 
+  // Generated text of one request, batched per content block.
+  interface Batch {
+    kind: 'text' | 'thinking'
+    block: number
+    text: string
+    timer: ReturnType<typeof setTimeout>
+  }
+  const batches = new Map<string, Batch>()
+  const flush = (session: string): void => {
+    const batch = batches.get(session)
+    if (batch === undefined) return
+    batches.delete(session)
+    clearTimeout(batch.timer)
+    notify(session, { type: 'delta', kind: batch.kind, block: batch.block, text: batch.text })
+  }
+  const preview = (session: string, frame: Record<string, unknown> | undefined): void => {
+    if (frame?.['type'] === 'end') {
+      flush(session)
+      // Committed or abandoned, the preview is over; only the former is followed by a message.
+      notify(session, { type: 'delta-end', committed: record(frame['outcome'])?.['kind'] === 'committed' })
+      return
+    }
+    const chunk = frame?.['type'] === 'chunk' ? record(frame['chunk']) : undefined
+    const kind = chunk?.['type'] === 'text-delta' ? 'text' : chunk?.['type'] === 'reasoning-delta' ? 'thinking' : undefined
+    const text = chunk?.['text']
+    if (kind === undefined || typeof text !== 'string' || text === '') return
+    const block = count(chunk?.['index']) ?? 0
+    const current = batches.get(session)
+    if (current !== undefined && (current.kind !== kind || current.block !== block || current.text.length + text.length > MAX_DELTA_CHARS)) flush(session)
+    const batch = batches.get(session)
+    if (batch !== undefined) {
+      batch.text += text
+      return
+    }
+    if (batches.size >= 256) for (const other of [...batches.keys()]) flush(other)
+    const timer = setTimeout(() => flush(session), DELTA_BATCH_MS)
+    timer.unref?.()
+    batches.set(session, { kind, block, text: text.slice(0, MAX_DELTA_CHARS), timer })
+  }
+
   // One notification per change of stage, not per token.
   const stages = new Map<string, Stage>()
   ctx.on(
     'agent/assistant-stream',
     (payload: unknown) => {
       const session = sessionId(record(payload)?.['agent'])
-      const stage = stageOf(record(payload)?.['frame'])
-      if (session === undefined || stage === undefined || stages.get(session) === stage) return
-      if (stages.size >= 256 && !stages.has(session)) stages.clear()
-      stages.set(session, stage)
-      notify(session, { type: 'stage', stage })
+      const frame = record(record(payload)?.['frame'])
+      const stage = stageOf(frame)
+      if (session === undefined) return
+      if (stage !== undefined && stages.get(session) !== stage) {
+        if (stages.size >= 256 && !stages.has(session)) stages.clear()
+        stages.set(session, stage)
+        // A change of stage closes the batch before it, so text never trails its stage.
+        flush(session)
+        notify(session, { type: 'stage', stage })
+      }
+      preview(session, frame)
     },
     { global: true },
   )

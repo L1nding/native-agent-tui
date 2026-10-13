@@ -24,17 +24,46 @@ test('a stage is announced once per change and never carries model output', () =
   assert.equal(listeners.get('agent/assistant-stream').options.global, true)
   stream('s', { type: 'start', turn: 't', step: 1 })
   for (const type of ['reasoning-delta', 'reasoning-delta', 'usage', 'text-delta', 'text-delta', 'tool-call-delta']) stream('s', chunk(type))
-  stream('s', { type: 'end' })
   stream('other', chunk('text-delta'))
   // The next request of the same turn waits again; a new turn starts clean.
   stream('s', { type: 'start' })
   event('s', 'turn/end', {})
   stream('s', { type: 'start' })
-  assert.deepEqual(sent.map(frame => [frame.method, frame.params.sessionId, frame.params.event.stage]), [
+  const stages = sent.filter(frame => frame.params.event.type === 'stage')
+  assert.deepEqual(stages.map(frame => [frame.method, frame.params.sessionId, frame.params.event.stage]), [
     [EVENT_METHOD, 's', 'waiting'], [EVENT_METHOD, 's', 'thinking'], [EVENT_METHOD, 's', 'response'],
     [EVENT_METHOD, 'other', 'response'], [EVENT_METHOD, 's', 'waiting'], [EVENT_METHOD, 's', 'waiting'],
   ])
-  assert.ok(!JSON.stringify(sent).includes('PRIVATE'))
+  // A stage is only a label: the generated text travels in `delta` events alone.
+  assert.ok(!JSON.stringify(stages).includes('PRIVATE'))
+})
+
+test('generated text is batched per block and always closed by an end marker', async () => {
+  const { sent, stream } = host()
+  const delta = (type, index, text) => ({ type: 'chunk', chunk: { type, index, text } })
+  stream('s', { type: 'start' })
+  stream('s', delta('reasoning-delta', 0, 'weigh '))
+  stream('s', delta('reasoning-delta', 0, 'options'))
+  stream('s', delta('text-delta', 1, 'Hel'))
+  stream('s', delta('text-delta', 1, 'lo'))
+  stream('s', delta('usage', 0, 'ignored'))
+  stream('s', { type: 'end', outcome: { kind: 'committed', eventType: 'assistant/message', seq: 9 } })
+  const events = sent.map(frame => frame.params.event)
+  assert.deepEqual(events, [
+    { type: 'stage', stage: 'waiting' },
+    { type: 'stage', stage: 'thinking' },
+    { type: 'delta', kind: 'thinking', block: 0, text: 'weigh options' },
+    { type: 'stage', stage: 'response' },
+    { type: 'delta', kind: 'text', block: 1, text: 'Hello' },
+    { type: 'delta-end', committed: true },
+  ])
+  // A batch left alone is sent by its timer; an abandoned attempt is closed as such.
+  stream('s', { type: 'start' })
+  stream('s', delta('text-delta', 0, 'partial'))
+  await new Promise(resolve => setTimeout(resolve, 120))
+  assert.deepEqual(sent.at(-1).params.event, { type: 'delta', kind: 'text', block: 0, text: 'partial' })
+  stream('s', { type: 'end', outcome: { kind: 'abandoned' } })
+  assert.deepEqual(sent.at(-1).params.event, { type: 'delta-end', committed: false })
 })
 
 test('retries carry counts and the host failure code, compaction its outcome', () => {

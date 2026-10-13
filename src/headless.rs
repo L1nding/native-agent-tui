@@ -61,7 +61,9 @@ pub async fn run(
         });
         if !json_events {
             for message in snapshot.messages.iter().filter(|message| {
+                // 生成中的预览只属于交互界面；这里只输出 dsh 提交的正式回答。
                 message.role == "Agent"
+                    && !message.id.starts_with("live:")
                     && Some(message.thread_id.as_str()) == snapshot.thread_id.as_deref()
             }) {
                 let previous = displayed

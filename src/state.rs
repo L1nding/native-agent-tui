@@ -914,6 +914,17 @@ impl SessionState {
         }
     }
 
+    /// 撤掉当前 root 轮次里的一段预览；权威内容随后以自己的身份到达。
+    pub fn discard_item(&mut self, turn: &str, id: &str) {
+        if self.view.turn_id.as_deref() != Some(turn) || !id.starts_with("live:") {
+            return;
+        }
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        self.view
+            .messages
+            .retain(|m| !(m.thread_id == thread && m.turn_id == turn && m.id == id));
+    }
+
     pub fn finish_all_reasoning(&mut self) {
         for message in &mut self.view.messages {
             if message.role == "Reasoning" {

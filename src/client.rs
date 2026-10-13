@@ -4176,6 +4176,11 @@ impl Core {
                     self.state.turn_stream_stage(turn, stage, Instant::now());
                 }
             }
+            "item/discarded" => {
+                if let (Some(turn), Some(id)) = (turn, params["itemId"].as_str()) {
+                    self.state.discard_item(turn, id);
+                }
+            }
             "turn/steer/delivered" => {
                 let current = turn.is_some() && turn == self.state.view.turn_id.as_deref();
                 let known = self.steer.as_ref().is_some_and(|steer| {
@@ -8812,6 +8817,47 @@ mod tests {
         assert!(snapshot.thread_id.is_none());
         assert!(!snapshot.last_error.as_deref().unwrap().contains("PRIVATE_"));
         drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_preview_is_dropped_when_the_committed_message_replaces_it() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let texts = |snapshot: &crate::state::CoreSnapshot| -> Vec<(String, String)> {
+            snapshot
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role.as_str(), "Agent" | "Reasoning"))
+                .map(|m| (m.id.clone(), m.text.clone()))
+                .collect()
+        };
+        send(&mut server, json!({"method":"item/reasoning/textDelta","params":{"threadId":"root","turnId":"root-turn","itemId":"live:thinking:0","delta":"weigh"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"live:text:1","delta":"Hel"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| texts(snapshot).len() == 2)
+            .await
+            .unwrap();
+        // 只有预览可以撤掉；其他轮次或权威消息的身份不受影响。
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"m0","delta":"kept"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"root-turn","itemId":"m0"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"old","itemId":"live:text:1"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"root-turn","itemId":"live:thinking:0"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"root-turn","itemId":"live:text:1"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"m1","delta":"Hello"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                texts(snapshot)
+                    == [
+                        ("m0".to_owned(), "kept".to_owned()),
+                        ("m1".to_owned(), "Hello".to_owned()),
+                    ]
+            })
+            .await
+            .unwrap();
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }
