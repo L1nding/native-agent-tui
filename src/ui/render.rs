@@ -619,6 +619,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             &snapshot.commands,
         );
         super::commands::draw_slash_hints(frame, chunks[3], &hints, local.slash_selected);
+        let paths = super::commands::path_hints(
+            &local.editor.text,
+            local.editor.cursor,
+            &snapshot.path_hints,
+        );
+        super::commands::draw_path_hints(frame, chunks[3], &paths, local.slash_selected);
     }
     if input_height > 0 && chunks[3].width > 2 {
         frame.set_cursor_position((

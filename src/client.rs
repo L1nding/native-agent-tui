@@ -33,6 +33,10 @@ pub enum Command {
     SubmitRootInput {
         text: String,
     },
+    /// 列出工作区里能补全 `@路径` 的条目；只读，限一层目录。
+    CompletePath {
+        query: String,
+    },
     /// 向 dsh 询问它自己的斜杠命令。
     ListBackendCommands,
     /// 在空闲的会话上执行一条 dsh 斜杠命令，例如 `/compact`。
@@ -1608,6 +1612,9 @@ impl Core {
                     self.state.view.notice =
                         Some(format!("Conversation was not resumed: {reason}"));
                 }
+            }
+            Command::CompletePath { query } => {
+                self.state.view.path_hints = crate::path_hints::complete(&self.config.cwd, &query);
             }
             Command::ListBackendCommands => {
                 if self.session_ready && self.state.view.thread_id.is_some() {

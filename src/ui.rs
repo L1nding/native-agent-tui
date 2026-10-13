@@ -147,6 +147,8 @@ struct LocalState {
     slash_selected: usize,
     /// 已经为哪个会话问过 dsh 的命令清单。
     commands_requested: Option<String>,
+    /// 已经向 Core 问过的 `@路径` 查询。
+    path_query: Option<String>,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -337,6 +339,41 @@ fn request_backend_commands(
 }
 
 fn handle_key(
+    key: KeyEvent,
+    snapshot: &CoreSnapshot,
+    local: &mut LocalState,
+    tx: &tokio::sync::mpsc::Sender<Command>,
+) -> bool {
+    let quit = handle_key_inner(key, snapshot, local, tx);
+    // 输入 `@路径` 时，每进入一个新目录向 Core 问一次；同一目录内在本地收窄。
+    match commands::path_token(&local.editor.text, local.editor.cursor) {
+        Some((_, query)) => {
+            let directory = query
+                .rsplit_once(['/', '\\'])
+                .map_or("", |(directory, _)| directory);
+            let asked = local.path_query.as_deref().is_some_and(|asked| {
+                asked
+                    .rsplit_once(['/', '\\'])
+                    .map_or("", |(directory, _)| directory)
+                    == directory
+                    && query.starts_with(asked)
+            });
+            if !asked
+                && tx
+                    .try_send(Command::CompletePath {
+                        query: query.to_owned(),
+                    })
+                    .is_ok()
+            {
+                local.path_query = Some(query.to_owned());
+            }
+        }
+        None => local.path_query = None,
+    }
+    quit
+}
+
+fn handle_key_inner(
     key: KeyEvent,
     snapshot: &CoreSnapshot,
     local: &mut LocalState,
@@ -880,6 +917,37 @@ fn handle_key(
         KeyCode::End if control => {
             local.conversation_focus = None;
             local.scroll_from_bottom = 0;
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Tab
+            if !commands::path_hints(
+                &local.editor.text,
+                local.editor.cursor,
+                &snapshot.path_hints,
+            )
+            .is_empty() =>
+        {
+            let hints = commands::path_hints(
+                &local.editor.text,
+                local.editor.cursor,
+                &snapshot.path_hints,
+            );
+            let selected = local.slash_selected.min(hints.len() - 1);
+            match key.code {
+                KeyCode::Up => local.slash_selected = selected.saturating_sub(1),
+                KeyCode::Down => local.slash_selected = (selected + 1).min(hints.len() - 1),
+                _ => {
+                    // 目录补全后继续往下选；文件补全后留一个空格。
+                    let entry = hints[selected].name.as_str();
+                    let tail = if entry.ends_with('/') { "" } else { " " };
+                    let cursor = local.editor.cursor;
+                    if let Some((start, _)) = commands::path_token(&local.editor.text, cursor) {
+                        let completed = format!("@{entry}{tail}");
+                        local.editor.text.replace_range(start..cursor, &completed);
+                        local.editor.cursor = start + completed.len();
+                    }
+                    local.slash_selected = 0;
+                }
+            }
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Tab
             if !commands::slash_hints_with(
@@ -3470,6 +3538,56 @@ mod tests {
         handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
         handle_key(press(KeyCode::Enter), &snapshot, &mut local, &tx);
         assert!(!local.settings.visible && local.attention_editor.is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn at_path_asks_core_once_per_directory_and_tab_completes_the_word_at_the_cursor() {
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("root".into()),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        sync_local_requests(&mut local, &snapshot);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        local.editor.insert("read ");
+        for key in ['@', 's'] {
+            handle_key(press(KeyCode::Char(key)), &snapshot, &mut local, &tx);
+        }
+        // 进入一个目录只问一次；同一目录里继续输入不再发请求。
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::CompletePath {
+                query: String::new()
+            }
+        );
+        assert!(rx.try_recv().is_err());
+        snapshot.path_hints = crate::path_hints::PathHints {
+            query: String::new(),
+            entries: vec!["src/".into(), "scripts/".into(), "README.md".into()],
+        };
+        handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Up), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Tab), &snapshot, &mut local, &tx);
+        assert_eq!(local.editor.text, "read @src/");
+        assert_eq!(local.editor.cursor, local.editor.text.len());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::CompletePath {
+                query: "src/".into()
+            }
+        );
+        // 文件补全后留一个空格，其后的输入不再是路径。
+        snapshot.path_hints = crate::path_hints::PathHints {
+            query: "src/".into(),
+            entries: vec!["src/ui/".into(), "src/lib.rs".into()],
+        };
+        handle_key(press(KeyCode::Char('l')), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Tab), &snapshot, &mut local, &tx);
+        assert_eq!(local.editor.text, "read @src/lib.rs ");
+        assert!(local.path_query.is_none());
         assert!(rx.try_recv().is_err());
     }
 

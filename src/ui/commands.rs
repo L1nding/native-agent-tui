@@ -407,6 +407,99 @@ pub(super) fn draw_slash_hints(
     hints: &[SlashHint],
     selected: usize,
 ) {
+    draw_hints(
+        frame,
+        input,
+        hints,
+        selected,
+        "/",
+        tr(" Commands ", " 命令 "),
+        tr(
+            "↑/↓ select | Tab complete | Enter run",
+            "↑/↓ 选择 | Tab 补全 | Enter 执行",
+        ),
+    );
+}
+
+/// The `@word` being typed at the cursor: its start byte and what follows the `@`.
+pub(super) fn path_token(text: &str, cursor: usize) -> Option<(usize, &str)> {
+    let before = text.get(..cursor)?;
+    let start = before.rfind(char::is_whitespace).map_or(0, |at| {
+        at + before[at..].chars().next().map_or(1, char::len_utf8)
+    });
+    before[start..]
+        .strip_prefix('@')
+        .map(|query| (start, query))
+}
+
+/// Paths that complete the `@word` at the cursor. Core answered for the
+/// directory being typed in; a longer name is narrowed here without asking again.
+pub(super) fn path_hints(
+    text: &str,
+    cursor: usize,
+    hints: &crate::path_hints::PathHints,
+) -> Vec<SlashHint> {
+    let Some((_, query)) = path_token(text, cursor) else {
+        return Vec::new();
+    };
+    let split = |query: &str| -> (String, String) {
+        let query = query.replace('\\', "/");
+        match query.rsplit_once('/') {
+            Some((directory, name)) => (directory.to_owned(), name.to_lowercase()),
+            None => (String::new(), query.to_lowercase()),
+        }
+    };
+    let (directory, name) = split(query);
+    let (answered_directory, answered_name) = split(&hints.query);
+    if directory != answered_directory || !name.starts_with(&answered_name) {
+        return Vec::new();
+    }
+    hints
+        .entries
+        .iter()
+        .filter(|entry| {
+            let leaf = entry.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            leaf.to_lowercase().starts_with(&name)
+        })
+        .map(|entry| SlashHint {
+            name: entry.clone(),
+            detail: if entry.ends_with('/') {
+                tr("directory", "目录")
+            } else {
+                tr("file", "文件")
+            }
+            .to_owned(),
+            skill: false,
+        })
+        .collect()
+}
+
+pub(super) fn draw_path_hints(
+    frame: &mut ratatui::Frame<'_>,
+    input: Rect,
+    hints: &[SlashHint],
+    selected: usize,
+) {
+    draw_hints(
+        frame,
+        input,
+        hints,
+        selected,
+        "@",
+        tr(" Files ", " 文件 "),
+        tr("↑/↓ select | Tab complete", "↑/↓ 选择 | Tab 补全"),
+    );
+}
+
+fn draw_hints(
+    frame: &mut ratatui::Frame<'_>,
+    input: Rect,
+    hints: &[SlashHint],
+    selected: usize,
+    prefix: &str,
+    title: &str,
+    keys: &str,
+) {
     let rows = hints.len().min(input.y.saturating_sub(2) as usize);
     if rows == 0 || input.width < 12 {
         return;
@@ -421,14 +514,8 @@ pub(super) fn draw_slash_hints(
     let theme = theme::current();
     let block = theme::focus_panel()
         .borders(Borders::ALL)
-        .title(tr(" Commands ", " 命令 "))
-        .title_bottom(footer(
-            tr(
-                "↑/↓ select | Tab complete | Enter run",
-                "↑/↓ 选择 | Tab 补全 | Enter 执行",
-            ),
-            rect.width,
-        ));
+        .title(title.to_owned())
+        .title_bottom(footer(keys, rect.width));
     let width = block.inner(rect).width as usize;
     let selected = selected.min(hints.len() - 1);
     let start = (selected + 1).saturating_sub(rows);
@@ -445,7 +532,7 @@ pub(super) fn draw_slash_hints(
         .take(rows)
         .map(|(index, hint)| {
             let marker = if index == selected { "> " } else { "  " };
-            let name = format!("/{:<name_width$}", hint.name);
+            let name = format!("{prefix}{:<name_width$}", hint.name);
             let spans = vec![
                 Span::raw(marker),
                 Span::styled(name, theme.key()),
@@ -946,6 +1033,34 @@ mod tests {
             ["context", "compact"]
         );
         assert!(slash_hints_with("/plan off", &[], &dsh).is_empty());
+
+        // `@路径`：光标处的词以 @ 开头才算；目录相同时在本地按已输入的名字收窄。
+        assert_eq!(path_token("read @src/l", 11), Some((5, "src/l")));
+        assert_eq!(path_token("中文 @", "中文 @".len()), Some((7, "")));
+        assert_eq!(path_token("mail a@b", 8), None);
+        assert_eq!(path_token("@a b", 4), None);
+        let listed = crate::path_hints::PathHints {
+            query: "src/".into(),
+            entries: vec![
+                "src/ui/".into(),
+                "src/Layout.rs".into(),
+                "src/lib.rs".into(),
+            ],
+        };
+        let names = |text: &str| -> Vec<String> {
+            path_hints(text, text.len(), &listed)
+                .into_iter()
+                .map(|hint| hint.name)
+                .collect()
+        };
+        assert_eq!(
+            names("see @src/"),
+            ["src/ui/", "src/Layout.rs", "src/lib.rs"]
+        );
+        assert_eq!(names("see @src/l"), ["src/Layout.rs", "src/lib.rs"]);
+        assert!(names("see @docs/").is_empty());
+        assert!(names("see @sr").is_empty());
+        assert!(names("see src/").is_empty());
         assert_eq!(parse_slash("/quit", &[]), Some(Slash::Quit));
         assert_eq!(parse_slash("/nope", &[]), Some(Slash::Unknown));
         for task in [
