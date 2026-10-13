@@ -567,3 +567,24 @@ fn malformed_vertical_geometry_cannot_become_an_approval_fact() {
     missing["proposal"]["component_plan"] = json!({});
     assert!(proposal_fact(&missing).is_none());
 }
+
+#[test]
+fn vertical_anchor_proof_contract_keeps_concrete_approval_bound() {
+    let mut value = vertical_proposal();
+    let mut element: Value = serde_json::from_str(
+        value["proposal"]["draft"]["operations"][0]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    element["metadata"]["relation_validator"] = json!("vertical-connection/2");
+    element["metadata"]["vertical_spec_owner"] = json!("stair.1.step.01");
+    value["proposal"]["draft"]["operations"][0]["value_json"] = json!(element.to_string());
+    let fact = proposal_fact(&value).unwrap();
+    assert!(fact.ready);
+    assert!(fact.objects[1].contains("slab.upper"));
+    assert_eq!(
+        fact.binding,
+        proposal_fact(&vertical_proposal()).unwrap().binding
+    );
+}

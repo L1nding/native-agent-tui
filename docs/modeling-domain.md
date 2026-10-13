@@ -117,3 +117,6 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 2026-10-13：来源能力 floor-components/5、关系能力 relations/3 接通受控 connections 路线。平台 Agent 仍独占推进；Python 新增授权下层台阶／井道墙，引用两层已有洞口，上层和楼板只读。Rust Core 从真实 MCP 提案的 elements 读取部件轮廓、底标高、高度、服务楼层、洞口与来源位置，展示参数依据及未检查项。无效几何／缺少 typed connection 不能成为批准事实；批准仍绑定原具体版本。UI 沿现有 snapshot.objects 展示，不增加工作流主控或场景写入口。
 
 确定性领域与真实 Blender／重复构建／GLB 已有专项证据；台阶顶面20条与井道全高内腔9条射线检查实际几何。Core 新增两项解析／具体绑定测试。真实 dsh/TUI 跨层验收、建筑净空、结构／规范、电梯与视觉复核仍未完成，不能把上述证据替代真实平台闭环。
+
+
+2026-10-13跨层证明更新：Core elements解析接受vertical-connection/1及vertical-connection/2，保留具体版本／token／hash批准绑定。新版将完整typed spec与理由集中在稳定owner部件，其他部件引用，不扩大64KiB领域envelope上限。新增解析测试及两项原跨层专项通过，559项Rust全量测试通过、2项可选live默认跳过；release曾成功构建。全量verify随后重建exe时遇到运行中的真实验收占用（Windows os error 5），需验收终态后补跑该步骤；不记为全量verify成功。真实平台第2轮有效候选71,167字节被正确拒绝为批准事实，证据target/dsh-e2e-d1d7c10d保留，无授权／操作／场景写入。第3轮仍在运行。

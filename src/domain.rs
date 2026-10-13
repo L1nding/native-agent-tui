@@ -685,7 +685,10 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             let role = element["role"].as_str()?;
             let boundary = element["boundary"].as_array()?;
             if !matches!(role, "stair_step" | "shaft_wall")
-                || element["metadata"]["relation_validator"] != "vertical-connection/1"
+                || !matches!(
+                    element["metadata"]["relation_validator"].as_str(),
+                    Some("vertical-connection/1" | "vertical-connection/2")
+                )
                 || element["height"].as_f64()? <= 0.0
                 || element["base_z"].as_f64().is_none()
                 || boundary.len() < 3
