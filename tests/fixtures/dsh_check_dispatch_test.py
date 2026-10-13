@@ -36,7 +36,7 @@ class DomainDispatchTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("dsh_check_isolation", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for case in ("chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure"):
+        for case in ("chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 context = root / "context.json"

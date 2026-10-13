@@ -90,3 +90,14 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 三次失败原样保留：`target/dsh-e2e-4fc35226`（1通过／1失败）扫描后准备超时；`target/dsh-e2e-31182daa`（4通过／1失败）失败任务标题滚出短视口，验收无法绑定；`target/dsh-e2e-c0aa7270`（3通过／1失败）带 ID 的实际 valid=true 位于末行，验收把终端边框纳入末尾匹配而拒绝。独立保留核验只记录各轮实际已完成范围，不改写为组合成功。拆分扫描／准备、每条状态绑定 ID、修正边框／相似 ID／Agent 回复匹配，并扩大 failure 场景的有界滚动范围后，使用新副本重跑。两项 `domain_failure_view_test.py` 接入默认 `scripts/verify.py`。
 
 最终 `scripts/verify.py` 全量通过：556项 Rust 测试通过、2项可选 live 默认跳过，日志 `target/c11-artifact-binding-final-verify-20261013.log`。领域／业务页28项专项通过；新视口匹配测试接入后 `--fixtures-only` 再通过，日志 `target/c11-failure-view-final-fixtures-20261013.log`。真实6项另行执行。平台预览取消、未完成应用的后续编辑冲突、C08 跨层、医院完整闭环及 AI／人工视觉复核仍未完成；不能把该子路径当成 C11 或整个计划完成。
+
+
+## C11 单个预览取消与重载后的回执发现
+
+模型器提交 `a9b67d6` 新增 cancel_artifact 和 artifact_index：只取消当前 MCP owner 持有的运行进程树，Windows 在创建时原子加入 Job Object并确认整棵树退出；完成竞态保持完成，未拥有任务保持 unknown。关闭 MCP 与用户显式取消分别记录。范围内预览索引使新 owner 仅凭楼层发现没有应用操作的 preview；索引不推断产物有效性或授予批准。Agent 自然语言步骤已同步，Core 沿现有逐 build_id 的事实绑定展示回执，UI 发 typed command并消费快照。
+
+新 `--domain-case cancel` 实际使用键盘和 `hi/gpt-6.1-sol`，输入为模型器 `outputs/complex-cancel-live-20261013-01/context.json`。`target/dsh-e2e-4851c281` 7项通过、0失败，模型器独立 `verify_complex_platform_cancel.py` valid=true：旧真实预览 built／rebuilt／GLB有效，同方案第二实际 Blender 在隔离门闩运行；用户要求取消后，实际 owner66748及Blender确认退出，取消验证序号11，旧有效文件／prepared方案／Scene IR保持。无授权或应用，最终构建数2。
+
+`/model` Ctrl+R 重载先拒绝旧批准绑定，再仅凭楼层读取索引并查询／验证 built与cancelled；请求原ID重试后取消文件哈希保持，无新作业。native PID／creation time与完整实际TUI祖先链、业务页按任务展示、root generation及最后进程清理均核验。四项证据伪造（缺取消验证fact、错误owner创建时间、缺旧产物哈希、取消UI改成功）被拒绝，成功证据未改变。本次只添加验收路由／fixture／文档，`scripts/verify.py --fixtures-only` 通过（`target/c11-cancel-fixtures-20261013.log`）；此前556项Rust完整基线保持。
+
+未完成应用遇到后续编辑冲突、C08跨层、医院完整闭环及AI／人工视觉复核仍未完成，不能把该路径作为完整C11或整个计划完成。
