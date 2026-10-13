@@ -945,10 +945,15 @@ impl AcpBridge {
         Ok(())
     }
 
-    fn acp_tool_item(&self, item_id: &str, status: &str, output: Option<String>) -> Value {
+    fn acp_tool_item(
+        &self,
+        item_id: &str,
+        status: &str,
+        output: Option<String>,
+        structured_output: Option<Value>,
+    ) -> Value {
         if let Some(call) = self.mcp_calls.get(item_id) {
-            let result =
-                output.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)));
+            let result = structured_output.or_else(|| output.map(Value::String));
             json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"status":status,"result":result})
         } else {
             json!({"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output})
@@ -1393,7 +1398,7 @@ impl AcpBridge {
                 } else { json!({"id":item_id,"type":"commandExecution","command":title,"kind":kind}) };
                 self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
             }
-            Update::ToolCallUpdate { item_id, status, output } => {
+            Update::ToolCallUpdate { item_id, status, output, structured_output } => {
                 match status {
                     ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
                         let status = match status {
@@ -1402,11 +1407,11 @@ impl AcpBridge {
                             ToolStatus::Cancelled => "cancelled",
                             _ => unreachable!(),
                         };
-                        let item = self.acp_tool_item(&item_id, status, output);
+                        let item = self.acp_tool_item(&item_id, status, output, structured_output);
                         self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                     ToolStatus::InProgress | ToolStatus::Unknown => {
-                        let item = self.acp_tool_item(&item_id, "inProgress", output);
+                        let item = self.acp_tool_item(&item_id, "inProgress", output, None);
                         self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                 }
@@ -2938,13 +2943,22 @@ mod tests {
         assert_eq!(event["item"]["type"], "mcpToolCall");
         assert_eq!(event["item"]["server"], "modeling_domain");
         assert_eq!(event["item"]["arguments"], json!({"plan":{}}));
-        let result = json!({"contract":"modeling-domain/v2","kind":"proposal","ok":true});
+        let result = json!({"contract":"modeling-domain/v2","kind":"proposal","ok":true,"reason":"中".repeat(14_000)});
         acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
             "sessionUpdate":"tool_call_update", "toolCallId":"call", "status":"completed", "rawOutput":result.to_string()}})))).unwrap();
         let event = core_client.recv().await.unwrap().params.unwrap();
         assert_eq!(event["item"]["type"], "mcpToolCall");
         assert_eq!(event["item"]["tool"], "prepare_change");
         assert_eq!(event["item"]["result"], result);
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
+            "sessionUpdate":"tool_call_update", "toolCallId":"unregistered", "status":"completed", "rawOutput":result.to_string()}})))).unwrap();
+        let event = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(event["item"]["type"], "commandExecution");
+        assert!(event["item"].get("result").is_none());
+        assert!(event["item"]["aggregatedOutput"]
+            .as_str()
+            .unwrap()
+            .ends_with("[output truncated]"));
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }

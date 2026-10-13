@@ -120,3 +120,8 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 
 
 2026-10-13跨层证明更新：Core elements解析接受vertical-connection/1及vertical-connection/2，保留具体版本／token／hash批准绑定。新版将完整typed spec与理由集中在稳定owner部件，其他部件引用，不扩大64KiB领域envelope上限。新增解析测试及两项原跨层专项通过，559项Rust全量测试通过、2项可选live默认跳过；release曾成功构建。全量verify随后重建exe时遇到运行中的真实验收占用（Windows os error 5），需验收终态后补跑该步骤；不记为全量verify成功。真实平台第2轮有效候选71,167字节被正确拒绝为批准事实，证据target/dsh-e2e-d1d7c10d保留，无授权／操作／场景写入。第3轮仍在运行。
+
+
+ACP完整回执修复（2026-10-13）：第4轮target/dsh-e2e-b919c3df通过扫描和实际标高冲突，生成同链prepared修订2；候选44,404字节，完整envelope44,800字节，随后被ACP的32KiB文本展示截断，Core仍显示旧blocked事实，平台验收失败。实际Agent提案事实sequence6存在，无授权／操作，verified-failure-retention.json只证明来源与场景保留。
+
+ACP边界现在分别返回32KiB有界展示文本与64KiB有界完整JSON回执。只有登记过MCP身份的completed事件将完整JSON交给Core；未登记工具仍是commandExecution，展示文本不再反解为领域JSON。原始回执超限、畸形或明确isError时，不能用短展示内容替代；错误标记保持。Core继续核对领域64KiB预算、run/context、fact_sequence及具体批准版本。4项新增协议专项及扩展桥接测试覆盖这些边界。scripts/verify.py完整通过：563项Rust测试通过、2项可选live默认跳过，格式／类型／Clippy／doctest／release与全部native fixtures通过，日志为模型器outputs/c08-acp-complete-result-check-20261013.log。第5轮真实平台跨层验收正在运行，不能将这些协议测试记为真实闭环。

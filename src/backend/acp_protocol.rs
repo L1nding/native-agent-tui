@@ -25,6 +25,7 @@ fn acp(mut envelope: Envelope) -> Envelope {
 }
 
 const MAX_TEXT_BYTES: usize = 32 * 1024;
+const MAX_STRUCTURED_RESULT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AcpProtocolError {
@@ -58,6 +59,8 @@ pub enum Update {
         item_id: String,
         status: ToolStatus,
         output: Option<String>,
+        /// Complete bounded JSON for registered MCP completions; never display text.
+        structured_output: Option<Value>,
     },
     Usage {
         input_tokens: Option<u64>,
@@ -389,6 +392,18 @@ pub fn update(params: &Value) -> Result<(String, Update), AcpProtocolError> {
                 .get("content")
                 .and_then(truncated_text)
                 .or_else(|| payload.get("rawOutput").and_then(truncated_text)),
+            structured_output: (tool_status(payload.get("status").and_then(Value::as_str))
+                == ToolStatus::Completed)
+                .then(|| {
+                    if payload["rawOutput"]["isError"] == true {
+                        return Some(json!({"isError": true}));
+                    }
+                    match payload.get("rawOutput").filter(|value| !value.is_null()) {
+                        Some(raw) => bounded_json_result(raw),
+                        None => payload.get("content").and_then(bounded_content_result),
+                    }
+                })
+                .flatten(),
         },
         "usage_update" => Update::Usage {
             input_tokens: number(payload, &["inputTokens", "input_tokens", "input"]),
@@ -509,6 +524,44 @@ pub fn tool_input(tool: &Value) -> ToolInput {
         target: field(&["file_path", "path", "pattern", "url", "query"]),
         sandbox: field(&["sandbox_permissions"]),
     }
+}
+
+/// Preserve one complete JSON receipt independently of the display text budget.
+fn bounded_json_result(value: &Value) -> Option<Value> {
+    let parsed = if let Some(text) = value.as_str() {
+        if text.len() > MAX_STRUCTURED_RESULT_BYTES {
+            return None;
+        }
+        serde_json::from_str(text).ok()?
+    } else {
+        if serde_json::to_vec(value).ok()?.len() > MAX_STRUCTURED_RESULT_BYTES {
+            return None;
+        }
+        return Some(value.clone());
+    };
+    (serde_json::to_vec(&parsed).ok()?.len() <= MAX_STRUCTURED_RESULT_BYTES).then_some(parsed)
+}
+
+fn bounded_content_result(value: &Value) -> Option<Value> {
+    fn content(value: &Value, depth: usize) -> Option<Value> {
+        if depth > 4 {
+            return None;
+        }
+        if value.is_string() {
+            return bounded_json_result(value);
+        }
+        if let Some(text) = value.get("text") {
+            return bounded_json_result(text);
+        }
+        if let Some(inner) = value.get("content") {
+            return content(inner, depth + 1);
+        }
+        let items = value.as_array()?;
+        (items.len() == 1)
+            .then(|| content(&items[0], depth + 1))
+            .flatten()
+    }
+    content(value, 0)
 }
 
 /// 收集内容块中的文本，超过上限时按字符边界截断并标注。
@@ -718,5 +771,93 @@ mod tests {
             &json!({"title":"pwsh", "rawInput":{"command":"mcp__modeling_domain__prepare_change"}})
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod structured_result_tests {
+    use super::*;
+
+    #[test]
+    fn complete_mcp_json_survives_display_truncation_from_raw_or_content() {
+        let receipt = json!({"contract":"modeling-domain/v2", "reason":"中".repeat(14_000)});
+        for field in ["rawOutput", "content"] {
+            let mut payload = json!({"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed"}});
+            payload["update"][field] = if field == "rawOutput" {
+                json!(receipt.to_string())
+            } else {
+                json!([{"type":"content","content":{"type":"text","text":receipt.to_string()}}])
+            };
+            let (
+                _,
+                Update::ToolCallUpdate {
+                    output,
+                    structured_output,
+                    ..
+                },
+            ) = update(&payload).unwrap()
+            else {
+                panic!()
+            };
+            assert!(output.unwrap().ends_with("[output truncated]"));
+            assert_eq!(structured_output, Some(receipt.clone()));
+        }
+    }
+
+    #[test]
+    fn explicit_mcp_error_cannot_fall_back_to_success_looking_content() {
+        let (
+            _,
+            Update::ToolCallUpdate {
+                structured_output, ..
+            },
+        ) = update(&json!({
+            "sessionId":"s","update":{"sessionUpdate":"tool_call_update",
+            "toolCallId":"t","status":"completed",
+            "rawOutput":{"isError":true,"message":"x".repeat(MAX_STRUCTURED_RESULT_BYTES)},
+            "content":[{"type":"text","text":"{\"ok\":true}"}]}
+        }))
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(structured_output, Some(json!({"isError": true})));
+    }
+
+    #[test]
+    fn oversized_primary_receipt_cannot_be_replaced_by_short_content() {
+        let (
+            _,
+            Update::ToolCallUpdate {
+                structured_output, ..
+            },
+        ) = update(&json!({
+            "sessionId":"s","update":{"sessionUpdate":"tool_call_update",
+            "toolCallId":"t","status":"completed",
+            "rawOutput":json!({"reason":"x".repeat(MAX_STRUCTURED_RESULT_BYTES)}).to_string(),
+            "content":[{"type":"text","text":"{\"ok\":true}"}]}
+        }))
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert!(structured_output.is_none());
+    }
+
+    #[test]
+    fn oversized_malformed_and_failed_receipts_do_not_acquire_complete_json() {
+        for (status, receipt) in [
+            (
+                "completed",
+                json!({"reason":"x".repeat(MAX_STRUCTURED_RESULT_BYTES)}).to_string(),
+            ),
+            ("completed", "{broken".to_owned()),
+            ("failed", "{\"ok\":true}".to_owned()),
+        ] {
+            let (_, Update::ToolCallUpdate { structured_output, .. }) = update(&json!({"sessionId":"s","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"t","status":status,"rawOutput":receipt}})).unwrap() else { panic!() };
+            assert!(structured_output.is_none());
+        }
     }
 }
