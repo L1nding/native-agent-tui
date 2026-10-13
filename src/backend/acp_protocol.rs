@@ -832,6 +832,35 @@ mod structured_result_tests {
     use super::*;
 
     #[test]
+    fn mixed_review_image_blocks_preserve_small_fact_receipt_without_binary_output() {
+        let receipt = json!({"contract":"modeling-fact-receipt/v1", "kind":"artifact_validation",
+            "fact_sha256":"a".repeat(64), "fact_bytes":1200, "fact_sequence":10,
+            "run_id":"run", "context_sha256":"ctx", "ok":true,
+            "binding":{"build_id":"review-build"}});
+        let payload = json!({"sessionId":"s","update":{
+        "sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed",
+        "content":[
+            {"type":"content","content":{"type":"text","text":receipt.to_string()}},
+            {"type":"content","content":{"type":"image","mimeType":"image/png",
+                "data":"BINARY_IMAGE_DATA".repeat(100_000)}}
+        ]}});
+        let (
+            _,
+            Update::ToolCallUpdate {
+                content: ToolContent { output, .. },
+                ..
+            },
+        ) = update(&payload).unwrap()
+        else {
+            panic!()
+        };
+        let text = output.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), receipt);
+        assert!(text.len() < 6000);
+        assert!(!text.contains("BINARY_IMAGE_DATA"));
+    }
+
+    #[test]
     fn complete_mcp_json_survives_display_truncation_from_raw_or_content() {
         let receipt = json!({"contract":"modeling-domain/v2", "reason":"中".repeat(14_000)});
         for field in ["rawOutput", "content"] {
