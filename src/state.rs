@@ -327,7 +327,7 @@ pub(crate) struct SessionState {
     pub view: CoreSnapshot,
     pub agents: AgentRegistry,
     pub(crate) usage_facts: BTreeMap<String, UsageFact>,
-    /// 每个 (thread, turn) 的工具摘要行，按 item 原位更新；只存在内存中。
+    /// 工具摘要行，按 item 原位更新；一个轮次里被思考或正文隔开的调用各成一组。只存在内存中。
     pub(crate) tool_lines: VecDeque<ToolLines>,
     /// 当前 root 轮次的分阶段耗时；轮次结束后固定进对话并清空。
     pub(crate) turn_timing: Option<TurnTiming>,
@@ -400,12 +400,23 @@ pub(crate) fn wall_clock_label(now: SystemTime) -> Option<String> {
 pub(crate) struct ToolLines {
     thread_id: String,
     turn_id: String,
+    /// 这一组在轮次里的序号；第一组是 0。
+    segment: usize,
     lines: VecDeque<(crate::tool_details::ConversationTool, String)>,
     dropped: usize,
 }
 
+impl ToolLines {
+    fn message_id(&self) -> String {
+        match self.segment {
+            0 => format!("tools:{}", self.turn_id),
+            segment => format!("tools:{}:{segment}", self.turn_id),
+        }
+    }
+}
+
 const TOOL_LINES_PER_TURN: usize = 40;
-const TOOL_LINE_TURNS: usize = 16;
+const TOOL_LINE_TURNS: usize = 64;
 
 impl SessionState {
     pub fn snapshot(&mut self) -> Arc<CoreSnapshot> {
@@ -435,7 +446,8 @@ impl SessionState {
         }
     }
 
-    /// 用一条 "Tool" 消息汇总一个轮次内的工具调用，避免每次调用占用一条历史。
+    /// 用一条 "Tool" 消息汇总连续的工具调用，避免每次调用占用一条历史。
+    /// 思考或正文在上一组之后到达过，新的调用就另起一组，保持到达顺序。
     pub fn tool_line(
         &mut self,
         thread: &str,
@@ -443,19 +455,39 @@ impl SessionState {
         tool: crate::tool_details::ConversationTool,
         line: String,
     ) {
-        let index = match self
-            .tool_lines
-            .iter()
-            .position(|group| group.thread_id == thread && group.turn_id == turn)
-        {
+        let of_turn = |group: &ToolLines| group.thread_id == thread && group.turn_id == turn;
+        let known = self.tool_lines.iter().position(|group| {
+            of_turn(group)
+                && group
+                    .lines
+                    .iter()
+                    .any(|(existing, _)| existing.item_id == tool.item_id)
+        });
+        let latest = self.tool_lines.iter().rposition(of_turn);
+        let open = latest.filter(|&index| {
+            let id = self.tool_lines[index].message_id();
+            let messages = &self.view.messages;
+            messages
+                .iter()
+                .rposition(|m| m.thread_id == thread && m.turn_id == turn && m.id == id)
+                .is_some_and(|at| {
+                    !messages.iter().skip(at + 1).any(|m| {
+                        m.thread_id == thread
+                            && matches!(m.role.as_str(), "Agent" | "Reasoning" | "You")
+                    })
+                })
+        });
+        let index = match known.or(open) {
             Some(index) => index,
             None => {
+                let segment = latest.map_or(0, |index| self.tool_lines[index].segment + 1);
                 if self.tool_lines.len() >= TOOL_LINE_TURNS {
                     self.tool_lines.pop_front();
                 }
                 self.tool_lines.push_back(ToolLines {
                     thread_id: thread.into(),
                     turn_id: turn.into(),
+                    segment,
                     ..Default::default()
                 });
                 self.tool_lines.len() - 1
@@ -481,12 +513,11 @@ impl SessionState {
 
     /// 轮次结束时仍未报告终态的工具，结果不确定；不能继续显示为 running。
     pub fn finish_tool_lines(&mut self, thread: &str, turn: &str) {
-        if let Some(index) = self
-            .tool_lines
-            .iter()
-            .position(|group| group.thread_id == thread && group.turn_id == turn)
-        {
-            self.finish_tool_group(index);
+        for index in 0..self.tool_lines.len() {
+            let group = &self.tool_lines[index];
+            if group.thread_id == thread && group.turn_id == turn {
+                self.finish_tool_group(index);
+            }
         }
     }
 
@@ -534,7 +565,7 @@ impl SessionState {
 ",
                 ),
         );
-        let id = format!("tools:{turn}");
+        let id = group.message_id();
         let tools = group.lines.iter().map(|(tool, _)| tool.clone()).collect();
         match self
             .view
@@ -1125,6 +1156,49 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn tools_after_later_thinking_or_text_start_a_new_group_in_arrival_order() {
+        use crate::tool_details::ToolLifecycle::{Completed, Running};
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        state.reasoning("root", "turn", "r1", "first thought", true);
+        state.tool_line("root", "turn", tool("a", Running), "▸ running · a".into());
+        state.tool_line("root", "turn", tool("b", Running), "▸ running · b".into());
+        state.reasoning("root", "turn", "r2", "second thought", true);
+        state.tool_line("root", "turn", tool("c", Running), "▸ running · c".into());
+        // 迟到的结果更新它原来所在的那一组，不搬到新的一组里。
+        state.tool_line("root", "turn", tool("a", Completed), "▸ done · a".into());
+        // 提示和耗时行不算回答的进展，不拆组。
+        state.retry_notice("turn", 1, Some(2), Some(300), Some("rate_limit"));
+        state.tool_line("root", "turn", tool("d", Running), "▸ running · d".into());
+        state.message("turn", "answer", "done", true);
+        let shown: Vec<_> = state
+            .view
+            .messages
+            .iter()
+            .filter(|m| m.role != "Notice")
+            .map(|m| (m.id.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("r1", "first thought"),
+                ("tools:turn", "▸ done · a\n▸ running · b"),
+                ("r2", "second thought"),
+                ("tools:turn:1", "▸ running · c\n▸ running · d"),
+                ("answer", "done"),
+            ]
+        );
+        // 轮次结束时，每一组里没有终态的调用都变成结果未知。
+        state.finish_tool_lines("root", "turn");
+        let unknown = |id: &str| {
+            let message = state.view.messages.iter().find(|m| m.id == id).unwrap();
+            message.text.matches("ended, outcome unknown").count()
+        };
+        assert_eq!((unknown("tools:turn"), unknown("tools:turn:1")), (1, 2));
     }
 
     #[test]

@@ -10,3 +10,9 @@
         # can replace this row's config.
         provider: deepseek-official
         model: deepseek-v4-flash
+
+    # dsh-base leaves the model's question tool to whoever can show a question.
+    # The bridge answers `user-questions/request` through the TUI's request
+    # panel, so this composition carries the tool.
+    - id: tool-ask-user
+      name: '@deepseek-ai/dsh-tool-ask-user'

@@ -1126,6 +1126,7 @@ impl AcpBridge {
                     "question":clip(&question["question"], budget)});
                 if !options.is_empty() {
                     item["options"] = Value::Array(options);
+                    item["multiSelect"] = json!(question["multiSelect"] == true);
                 }
                 item
             })
@@ -3552,7 +3553,9 @@ mod tests {
                 Some(
                     json!({"sessionId":session,"questions":[{"id":"plan-review","header":"Plan review",
                     "question":question,"options":[{"label":"Approve","description":"Leave plan mode"},
-                    {"label":"Keep planning","description":"Stay"}]}]}),
+                    {"label":"Keep planning","description":"Stay"}]},
+                    {"id":"areas","header":"Areas","question":"Which areas?","multiSelect":true,
+                    "options":[{"label":"Core","description":""},{"label":"UI","description":""}]}]}),
                 ),
             )
         };
@@ -3593,6 +3596,8 @@ mod tests {
             .is_some_and(|turn| !turn.is_empty()));
         assert!(params.to_string().len() <= 32 * 1024);
         assert_eq!(params["questions"][0]["options"][0]["label"], "Approve");
+        assert_eq!(params["questions"][0]["multiSelect"], false);
+        assert_eq!(params["questions"][1]["multiSelect"], true);
         assert!(crate::interactions::RequestView::decode(
             RpcId::String("zf-ask-1".into()),
             "item/tool/requestUserInput",

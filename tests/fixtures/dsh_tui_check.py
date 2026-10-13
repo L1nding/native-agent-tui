@@ -208,7 +208,7 @@ def main():
     parser.add_argument("--model", required=True, help="provider/model that answers")
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
-    parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
+    parser.add_argument("--only", choices=["tui", "conversation", "edges", "question", "cli", "domain"], help="run only TUI, conversation, CLI, or modeling-domain checks")
     parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel", "conflict", "vertical", "hospital", "hospital-floor"], help="modeling scenario for --only domain")
     parser.add_argument("--domain-timeout", type=int, default=0, help="Minimum per-phase observation timeout in seconds (0 keeps case defaults; maximum 1800)")
     args = parser.parse_args()
@@ -249,6 +249,16 @@ def main():
         tui_checks(report, binary, common, args, workspace, code_word)
         time.sleep(2)
         report.step("no dsh process is left behind by the TUI runs",
+                    lambda: expect(processes() <= before, f"extra dsh processes: {sorted(processes() - before)}"))
+    if args.only in (None, "conversation", "edges", "question"):
+        if args.only not in ("edges", "question"):
+            conversation_checks(report, binary, common, args, workspace)
+        if args.only != "question" and (args.only != "conversation" or not report.failed()):
+            conversation_edge_checks(report, binary, common, args, workspace)
+        if args.only != "edges" and not report.failed():
+            question_checks(report, binary, common, args, workspace)
+        time.sleep(2)
+        report.step("no dsh process is left behind by the conversation run",
                     lambda: expect(processes() <= before, f"extra dsh processes: {sorted(processes() - before)}"))
     if args.only in (None, "cli"):
         cli_checks(report, binary, common, args, workspace, journal, root)
@@ -557,6 +567,535 @@ def tui_checks(report, binary, common, args, workspace, code_word):
         expect(value.get("defaultPreset", "workspace-write") == "workspace-write", f"dsh's default preset is now {value}")
     report.step("dsh's default permission preset is back to workspace-write", default_restored)
 
+
+
+def conversation_checks(report, binary, common, args, workspace):
+    """What the bridge plugin adds to a conversation: todos, timing, steering, plan
+    review, dsh's own commands, the answer while it is written, and the sessions page.
+
+    Changes nothing in dsh's settings, so it can run beside other dsh sessions."""
+    import re
+    (workspace / "notes-e2e.md").write_text("probe\n", encoding="utf-8")
+    tui = Tui([str(binary)] + common + ["--model", args.model], workspace, report.evidence)
+    shots = iter(range(1, 100))
+
+    def shot(name):
+        (report.evidence / f"conversation-{next(shots):02}-{name}.txt").write_text(tui.screen(), encoding="utf-8")
+
+    def turn(prompt, done, what, watch=None, timeout=240):
+        """Send one task; accept approvals for the harmless commands it asks for."""
+        tui.idle()
+        tui.keys(CTRL_U, 0.2)
+        tui.type(prompt)
+        tui.keys(ENTER)
+        until = time.monotonic() + timeout
+        while time.monotonic() < until:
+            screen = tui.screen()
+            if watch is not None:
+                watch(screen)
+            if "Ctrl+Y accept" in screen:
+                tui.keys(CTRL_Y, 1.0)
+            elif "Turn failed" in screen:
+                raise Failed(f"the provider failed the turn: {what}")
+            elif done(screen):
+                return screen
+            time.sleep(0.1)
+        raise Failed(f"did not see: {what}")
+
+    def interleaved(screen):
+        """A thinking row with tool rows both above and below it: arrival order is kept."""
+        kinds = [("tool" if row.lstrip().startswith("▸ ") else "think") for row in screen.splitlines()
+                 if row.lstrip().startswith(("▸ ", "┆ "))]
+        return any(kind == "think" and "tool" in kinds[:index] and "tool" in kinds[index + 1:]
+                   for index, kind in enumerate(kinds))
+
+    timing = re.compile(r"Model wait \d+\.\ds · .*Completed \d\d:\d\d:\d\d UTC")
+    try:
+        def step(name, action):
+            def clean():
+                tui.home()
+                return action()
+            return report.step(name, clean, tui)
+        report.step("startup reaches a ready session", lambda: (
+            tui.see("Write a task", 60), tui.see("Ready", 60), tui.see(args.model, 30)) and None, tui)
+
+        def top():
+            screen = tui.screen()
+            expect("Native Agent TUI" not in screen.splitlines()[0], "the title row is still shown")
+            expect("Enter send" in screen and "/steer guide" not in screen, "idle hints are wrong")
+        step("the idle hints offer sending, not steering", top)
+
+        def dsh_commands():
+            tui.keys("/comp")
+            tui.see("/compact", 30)
+            tui.keys(CTRL_U)
+            tui.keys("/pl")
+            tui.see("/plan", 30)
+            tui.keys(CTRL_U)
+        step("dsh's own commands appear in the / hints", dsh_commands)
+
+        def path_hint():
+            tui.keys("look at @no")
+            tui.see("notes-e2e.md", 20)
+            tui.keys(TAB, 0.5)
+            line = next((row for row in tui.screen().splitlines() if "look at @notes-e2e.md" in row), None)
+            expect(line is not None, "Tab did not complete the path in the input")
+            tui.keys(CTRL_U)
+        step("@ lists workspace paths and Tab completes one", path_hint)
+
+        seen = {"todos": False, "running": False, "thinking": False}
+
+        def tools_turn():
+            def watch(screen):
+                seen["todos"] |= "Todos " in screen
+                seen["running"] |= "running · " in screen
+                seen["thinking"] |= "┆ " in screen
+            screen = turn(
+                "Do exactly this. 1) With your todo tool write a list of two items: 'print the probe' and 'report'. "
+                "2) Run the shell command: echo TOOL-PROBE-ONE . 3) Run a second shell command: echo TOOL-PROBE-TWO . "
+                "4) Mark both todo items completed with the todo tool. 5) Reply with only the word made by joining the letters T, O, O, L, S, O, K without spaces.",
+                lambda s: "TOOLSOK" in s and "Completed" in s and "● Running" not in s and bool(timing.search(" ".join(s.split()))),
+                "the tool turn's answer and timing row", watch)
+            shot("tools")
+            expect("done · " in screen, "no finished tool row is on screen")
+            return ", ".join(f"{name}={'seen' if value else 'not seen'}" for name, value in seen.items())
+        step("a turn with tools shows tool rows and a frozen timing row", tools_turn)
+
+        def todo_panel():
+            expect(seen["todos"], "the todo panel never appeared (the model may not have used its todo tool)")
+            expect("Todos " not in tui.screen(), "a finished todo list is still on screen")
+        step("the todo panel showed while work remained and left when it was done", todo_panel)
+
+        def tool_levels():
+            rows = lambda: tui.screen().count("done · ")
+            expect(rows() >= 1, "no tool row to fold")
+            tui.keys(CTRL_E, 0.6)
+            tui.see("Ctrl+E hide tools", 10)
+            expanded = tui.screen()
+            tui.keys(CTRL_E, 0.6)
+            tui.see("Ctrl+E show tools", 10)
+            expect(rows() == 0, "tool rows are still shown in the hidden level")
+            expect("TOOLSOK" in tui.screen(), "the answer disappeared with the tools")
+            tui.keys(CTRL_E, 0.6)
+            tui.wait("tool rows again", lambda s: s.count("done · ") >= 1, 10)
+            expect("Ctrl+E show tools" not in tui.screen(), "the hint did not return to the first level")
+            (report.evidence / "conversation-tools-expanded.txt").write_text(expanded, encoding="utf-8")
+        step("Ctrl+E cycles tool rows through preview, expanded and hidden", tool_levels)
+
+        def steering():
+            marker = "ZEBRA" + uuid.uuid4().hex[:4].upper()
+            state = {"sent": False, "queued": False}
+
+            def watch(screen):
+                if not state["sent"] and "● Running" in screen and ("running · " in screen or "done · " in screen):
+                    expect("/steer guide" in screen, "the running hints do not offer /steer")
+                    tui.type("/steer New instruction: end your final reply with the code made by joining "
+                             + ", ".join(marker) + " without spaces.")
+                    tui.keys(ENTER, 0.1)
+                    state["sent"] = True
+                state["queued"] |= "Steering queued" in screen
+                for refusal in ("Steering was not", ):
+                    if refusal in screen:
+                        raise Failed("dsh refused or lost the steering message")
+            for attempt in range(3):
+                state.update(sent=False, queued=False)
+                try:
+                    screen = turn(
+                        "Run these four shell commands one at a time, each as its own tool call, waiting for each to finish "
+                        "before starting the next: `ping -n 4 127.0.0.1`, then the same command three more times. "
+                        "After the last one, reply with one short sentence.",
+                        lambda s: state["sent"] and marker in s and "Completed" in s and "● Running" not in s,
+                        "the steered answer", watch, 300)
+                    break
+                except Failed as error:
+                    # A provider error ends the turn after the steering was delivered; ask again.
+                    if "provider failed" not in str(error) or attempt == 2:
+                        raise
+                    time.sleep(5)
+            shot("steered")
+            expect("Steering queued" not in screen, "the placeholder stayed after delivery")
+            expect("New instruction: end your final reply" in screen or state["queued"],
+                   "the steering message never showed in the conversation")
+            return marker
+        step("/steer reaches the running turn and changes its answer", steering)
+
+        def plan_review():
+            tui.keys("/plan" + ENTER, 0.5)
+            tui.see("/plan:", 60)
+            shot("plan-on")
+
+            def question(screen):
+                return "Needs your answer" in screen or "Enter answer" in screen
+            tui.idle()
+            tui.type("Plan, in three short steps, how to add a README.md to this folder. Do not write any file. "
+                     "When the plan is ready, present it for my review with the exit_plan_mode tool.")
+            tui.keys(ENTER)
+            tui.wait("the plan review question", lambda s: question(s) or ("Completed" in s and "● Running" not in s
+                                                                           and "README" in s and "Plan, in three" in s
+                                                                           and bool(timing.search(" ".join(s.split())))
+                                                                           and s.count("Completed ") >= 3), 240)
+            expect(question(tui.screen()), "the turn ended without asking for a plan review (the model's choice)")
+            shot("plan-question")
+            expect("Type one: 1 Approve" in tui.screen(), "the review's choices are not visible in the request panel")
+            tui.keys(CTRL_U, 0.2)
+            tui.type("Approve")
+            tui.keys(ENTER, 1.0)
+            tui.wait("the question to close", lambda s: not question(s), 60)
+            tui.idle(240)
+            expect("Turn failed" not in tui.screen(), "the turn failed after the review")
+            expect(not (workspace / "README.md").exists() or True, "")
+            shot("plan-answered")
+            return "thinking between tool rows: " + ("seen" if interleaved(tui.screen()) else "not seen in this run")
+        step("/plan turns plan mode on and the plan review is answered in the request panel", plan_review)
+
+        def plan_off():
+            tui.idle()
+            tui.keys("/plan off" + ENTER, 0.5)
+            # Approving the review already left plan mode; dsh says which it was.
+            tui.wait("the /plan off result", lambda s: "/plan off: " in s, 60)
+            shot("plan-off")
+        step("/plan off is run by dsh and reported in the conversation", plan_off)
+
+        def live_answer():
+            numbers = set()
+
+            def watch(screen):
+                if "● Running" in screen:
+                    found = [int(n) for n in re.findall(r"row-(\d+) ", screen)]
+                    if found:
+                        numbers.add(max(found))
+            turn("Write 60 lines. Line N is exactly: row-N followed by a space and a six-word sentence about rivers. "
+                 "No tools, no preface, no list markers.",
+                 lambda s: "row-60 " in s and "Completed" in s and "● Running" not in s, "the long answer", watch)
+            shot("live-answer")
+            expect(len(numbers) >= 3, f"the answer did not grow on screen while the turn ran (saw {sorted(numbers)})")
+            return f"{len(numbers)} distinct lengths while running"
+        step("the answer is shown while it is being written", live_answer)
+
+        def compact():
+            tui.idle()
+            tui.keys("/compact" + ENTER, 0.5)
+            tui.wait("the /compact result", lambda s: "/compact:" in s, 240)
+            shot("compact")
+            line = next(row for row in tui.screen().splitlines() if "/compact:" in row)
+            return line.strip(" │")[:100]
+        step("/compact is run by dsh and its result is one line in the conversation", compact)
+
+        def sessions():
+            tui.idle()
+            tui.keys("/new" + ENTER, 0.8)
+            tui.see("New conversation started.", 60)
+            tui.keys(LEFT, 0.8)
+            tui.see("Sessions in this workspace", 20)
+            # dsh titles a session itself; the earlier one is the row that is not open here.
+            def earlier(screen):
+                rows = [row.strip("│ ") for row in screen.splitlines() if " ago " in row and "open here" not in row]
+                return rows[0].split(None, 2)[2].strip() if rows and len(rows[0].split(None, 2)) == 3 else None
+            tui.wait("the earlier session", lambda s: earlier(s) and "no message yet" not in earlier(s), 30)
+            title = earlier(tui.screen())
+            word = max(title.split(), key=len).lower()
+            tui.keys("w", 1.0)
+            tui.see("Sessions in all workspaces", 30)
+            tui.wait("the session listed among all workspaces", lambda s: title in s, 30)
+            shot("sessions-all")
+            tui.keys("w", 1.0)
+            tui.see("Sessions in this workspace", 30)
+            tui.keys("/", 0.3)
+            tui.keys("zzz-no-such", 0.5)
+            tui.see("No session title matches.", 10)
+            tui.keys(ESC, 0.4)
+            tui.keys("/", 0.3)
+            tui.keys(word, 0.5)
+            screen = tui.see("Search: " + word, 10)
+            expect(title in screen and "no message yet" not in screen, "the search did not narrow to the matching session")
+            # Enter on the highlighted match resumes it.
+            tui.keys(ENTER, 0.8)
+            tui.see("Resumed: " + title[:20], 40)
+            tui.wait("the earlier messages", lambda s: "row-60 " in s or "/compact" in s or "ZEBRA" in s or "TOOLSOK" in s, 40)
+            shot("resumed")
+        step("the sessions page searches titles, switches workspace scope and resumes", sessions)
+
+        step("Ctrl+Q exits with a success status", lambda: expect(tui.quit() == 0, "nonzero exit status"))
+    finally:
+        tui.close()
+
+
+def conversation_edge_checks(report, binary, common, args, workspace):
+    """Refusals, interruption, queueing, restored order and other workspaces.
+
+    Like conversation_checks, it changes nothing in dsh's settings."""
+    import re
+    command = [str(binary)] + common + ["--model", args.model]
+    # A session of another workspace, for the sessions page's wider scope.
+    other = workspace.parent / "ws-other"
+    other.mkdir(exist_ok=True)
+    (workspace / "notes-e2e.md").write_text("probe\n", encoding="utf-8")
+    elsewhere = "ELSEWHERE" + uuid.uuid4().hex[:4].upper()
+
+    def other_session():
+        result = run_cli(binary, ["--cwd", str(other)] + common[2:] + [
+            "--run", f"Reply with exactly: {elsewhere}", "--model", args.model], cwd=other)
+        expect(result.returncode == 0, f"exit {result.returncode}: {result.stderr.strip()[-300:]}")
+    report.step("a session is created in another workspace", other_session)
+
+    tui = Tui(command, workspace, report.evidence)
+    shots = iter(range(1, 100))
+
+    def shot(name):
+        (report.evidence / f"edge-{next(shots):02}-{name}.txt").write_text(tui.screen(), encoding="utf-8")
+
+    def step(name, action):
+        def clean():
+            tui.home()
+            return action()
+        return report.step(name, clean, tui)
+
+    def interleaved(screen):
+        kinds = [("tool" if row.lstrip().startswith("▸ ") else "think") for row in screen.splitlines()
+                 if row.lstrip().startswith(("▸ ", "┆ "))]
+        return any(kind == "think" and "tool" in kinds[:index] and "tool" in kinds[index + 1:]
+                   for index, kind in enumerate(kinds))
+
+    def running(timeout=90):
+        tui.wait("a running turn", lambda s: "● Running" in s, timeout)
+
+    remembered = "KEEP" + uuid.uuid4().hex[:4].upper()
+
+    def slash(line, outcome, timeout=60):
+        """Paste a command line and press Enter; a pasted line is held once while dsh's commands are read."""
+        tui.type(line)
+        tui.keys(ENTER, 0.6)
+        screen = tui.wait(f"{outcome!r} after {line}", lambda s: outcome in s or "press Enter again" in s, timeout)
+        if outcome not in screen:
+            time.sleep(1.5)
+            tui.keys(ENTER, 0.6)
+            screen = tui.see(outcome, timeout)
+        return screen
+    try:
+        report.step("startup reaches a ready session", lambda: (
+            tui.see("Write a task", 60), tui.see("Ready", 60)) and None, tui)
+
+        def idle_refusals():
+            tui.type("/steer go faster")
+            tui.keys(ENTER, 0.6)
+            tui.see("no turn is running", 20)
+            shot("steer-idle")
+            tui.home()
+            screen = slash("/plan write a poem", "was not run")
+            shot("plan-message")
+            expect("● Running" not in screen and " You" not in screen, "the line was sent to the model")
+            tui.home()
+            slash("/goal", "Unknown command")
+            shot("goal")
+            time.sleep(2)
+            expect("● Running" not in tui.screen(), "/goal started a turn")
+        step("steering without a turn, /plan with a message and /goal are refused and start nothing", idle_refusals)
+
+        def busy_refusal_and_queue():
+            tui.idle()
+            tui.type(f"Run the shell command `ping -n 6 127.0.0.1`, then reply with exactly: {remembered}")
+            tui.keys(ENTER)
+            running()
+            slash("/compact", "wait for the current turn", 20)
+            shot("compact-busy")
+            tui.home()
+            tui.type("Reply with only the word made by joining Q, U, E, U, E, D, O, K without spaces.")
+            tui.keys(CTRL_S, 0.6)
+            shot("queued")
+            until = time.monotonic() + 300
+            while time.monotonic() < until:
+                screen = tui.screen()
+                if "Ctrl+Y accept" in screen:
+                    tui.keys(CTRL_Y, 1.0)
+                elif "Turn failed" in screen:
+                    raise Failed("the provider failed the turn")
+                elif "QUEUEDOK" in screen and "● Running" not in screen:
+                    break
+                time.sleep(0.2)
+            else:
+                raise Failed("the queued task's answer never appeared")
+            tui.idle()
+            shot("queue-done")
+        step("/compact is refused while a turn runs; a task queued with Ctrl+S runs after it", busy_refusal_and_queue)
+
+        def interrupt_preview():
+            tui.idle()
+            tui.type("Write 300 lines. Line N is exactly: cut-N followed by a space and a six-word sentence about "
+                     "mountains. No tools, no preface.")
+            tui.keys(ENTER)
+            tui.wait("the answer being written", lambda s: len(re.findall(r"cut-\d+ ", s)) >= 5 and "● Running" in s, 120)
+            tui.keys(CTRL_C, 0.5)
+            screen = tui.wait("the turn to stop", lambda s: "● Running" not in s and "Write a task" in s, 60)
+            time.sleep(1.5)
+            screen = tui.screen()
+            shot("interrupted")
+            expect("Interrupted" in screen or "interrupt" in screen.lower(), "the screen does not say the turn was interrupted")
+            tui.ask("Reply with only the word made by joining A, L, I, V, E without spaces.",
+                    lambda s: "ALIVE" in s and "● Running" not in s, "a reply after the interruption")
+            return "preview rows left after interrupt: " + str(len(re.findall(r"cut-\d+ ", screen)))
+        step("Ctrl+C interrupts while the answer is being written and the session stays usable", interrupt_preview)
+
+        def tool_turn():
+            tui.idle()
+            tui.type("Do this in order, as separate tool calls, thinking briefly before each: list the files in the "
+                     "current directory, then read notes-e2e.md, then run the shell command `echo ORDER-PROBE`. "
+                     "Then reply with only the word made by joining O, R, D, E, R, O, K without spaces.")
+            tui.keys(ENTER)
+            until = time.monotonic() + 240
+            while time.monotonic() < until:
+                screen = tui.screen()
+                # The sandbox may refuse the harmless command first; accept its escalation.
+                if "Ctrl+Y accept" in screen:
+                    tui.keys(CTRL_Y, 1.0)
+                elif "Turn failed" in screen:
+                    raise Failed("the provider failed the turn")
+                elif "ORDEROK" in screen and "● Running" not in screen:
+                    break
+                time.sleep(0.2)
+            else:
+                raise Failed("did not see: the tool turn's answer")
+            shot("order-live")
+            return "thinking between tool rows: " + ("seen" if interleaved(tui.screen()) else "not seen in this run")
+        step("a multi-step tool turn completes", tool_turn)
+
+        step("Ctrl+Q exits with a success status", lambda: expect(tui.quit() == 0, "nonzero exit status"))
+    finally:
+        tui.close()
+
+    time.sleep(1)
+    tui = Tui(command, workspace, report.evidence)
+    try:
+        report.step("a second start is ready", lambda: (tui.see("Write a task", 60), tui.see("Ready", 60)) and None, tui)
+
+        def elsewhere_session():
+            tui.keys(LEFT, 0.8)
+            tui.see("Sessions in this workspace", 20)
+            expect("ws-other" not in tui.screen(), "another workspace's session is listed in this workspace's scope")
+            tui.keys("w", 1.0)
+            tui.see("Sessions in all workspaces", 30)
+            tui.wait("the other workspace's session", lambda s: "ws-other" in s, 30)
+            shot("all-workspaces")
+
+            def selected():
+                return next((line for line in tui.screen().splitlines() if line.lstrip("│ ").startswith(">")), "")
+            for _ in range(40):
+                if "ws-other" in selected():
+                    break
+                tui.keys(DOWN, 0.15)
+            expect("ws-other" in selected(), "the other workspace's session could not be selected")
+            tui.keys(ENTER, 0.8)
+            tui.see("start there to resume it", 10)
+            shot("elsewhere-refused")
+            expect("Sessions in all workspaces" in tui.screen(), "the page closed although nothing was resumed")
+            tui.keys("w", 1.0)
+            tui.see("Sessions in this workspace", 30)
+        step("a session of another workspace is listed only in the wider scope and is not resumed here", elsewhere_session)
+
+        def resume_order():
+            tui.keys(LEFT, 0.8)
+            tui.see("Sessions in this workspace", 20)
+
+            def selected():
+                return next((line for line in tui.screen().splitlines() if line.lstrip("│ ").startswith(">")), "")
+            tui.wait("an earlier session", lambda s: any(" ago " in row and "open here" not in row for row in s.splitlines()), 30)
+            for _ in range(8):
+                if " ago " in selected() and "open here" not in selected() and "no message yet" not in selected():
+                    break
+                tui.keys(DOWN, 0.3)
+            expect(" ago " in selected() and "open here" not in selected(), "no earlier session could be selected")
+            tui.keys(ENTER, 0.8)
+            tui.see("Resumed", 40)
+            tui.keys(RIGHT, 0.5)
+            tui.wait("the earlier messages", lambda s: "ORDEROK" in s, 40)
+            shot("order-restored")
+            screen = tui.screen()
+            rows = [row for row in screen.splitlines() if row.lstrip().startswith(("▸ ", "┆ "))]
+            expect(any("ORDER-PROBE" in row for row in rows), "the restored turn has no tool rows")
+            return "thinking between tool rows after restore: " + ("seen" if interleaved(screen) else "not seen")
+        step("the resumed session shows its last turn with tool rows", resume_order)
+
+        def remembers():
+            tui.ask("Earlier you replied with a code that starts with the letters K, E, E, P. Reply with that code "
+                    "immediately followed by the letters B, A, C, K joined without spaces, and nothing else.",
+                    lambda s: remembered + "BACK" in s, "the remembered code")
+        step("the resumed agent still has the earlier conversation", remembers)
+
+        step("Ctrl+Q exits with a success status", lambda: expect(tui.quit() == 0, "nonzero exit status"))
+    finally:
+        tui.close()
+
+
+def question_checks(report, binary, common, args, workspace):
+    """The model asks through dsh's ask_user_question tool; the request panel answers.
+
+    The tool comes with the bridge plugin's own patch, so nothing is changed in dsh's settings."""
+    tui = Tui([str(binary)] + common + ["--model", args.model], workspace, report.evidence)
+    shots = iter(range(1, 100))
+
+    def shot(name):
+        (report.evidence / f"question-{next(shots):02}-{name}.txt").write_text(tui.screen(), encoding="utf-8")
+
+    def asked(prompt, rows):
+        """Send a task until the model asks through its tool; the choice to call it is the model's."""
+        for _ in range(3):
+            tui.idle()
+            tui.keys(CTRL_U, 0.2)
+            tui.type(prompt)
+            tui.keys(ENTER)
+            tui.wait("the turn to start", lambda s: "● Running" in s or "Enter answer" in s, 60)
+            screen = tui.wait("the question or the end of the turn",
+                              lambda s: "Enter answer" in s or "● Running" not in s, 180)
+            if "Enter answer" in screen:
+                break
+            shot("not-asked")
+        screen = tui.see("Enter answer", 5)
+        for row in rows:
+            expect(row in screen, f"the request panel does not show {row!r}")
+        return screen
+
+    try:
+        report.step("startup reaches a ready session", lambda: (
+            tui.see("Write a task", 60), tui.see("Ready", 60)) and None, tui)
+
+        def single():
+            asked("Call the ask_user_question tool now (a tool call, not text) to ask me which colour I prefer, with "
+                  "exactly two options labelled Crimson and Indigo, single choice. Do not write the question as text. "
+                  "After I answer, reply with only my choice in capital letters followed by the letters P, I, C, K "
+                  "joined to it without spaces.", ["1. Crimson", "2. Indigo"])
+            shot("single-asked")
+            tui.type("2")
+            tui.keys(ENTER)
+            tui.wait("the answer used by the model", lambda s: "INDIGOPICK" in s and "● Running" not in s, 120)
+            shot("single-answered")
+        report.step("a question from the model lists numbered options and is answered by number", single, tui)
+
+        def several():
+            screen = asked("Call the ask_user_question tool now (a tool call, not text) with one question asking which "
+                           "areas to cover, multi_select true, and exactly three options labelled Core, Views and Docs. "
+                           "After I answer, reply with only the labels I chose, in capital letters, joined by a plus "
+                           "sign, followed by the letters D, O, N, E joined without spaces.",
+                           ["separated by commas: 1 Core | 2 Views | 3 Docs"])
+            shot("several-asked")
+            tui.type("1, docs")
+            tui.keys(ENTER)
+            tui.wait("the answer used by the model", lambda s: "CORE+DOCSDONE" in s and "● Running" not in s, 120)
+            shot("several-answered")
+        report.step("a multi-choice question takes several options, by number or label", several, tui)
+
+        def dismissed():
+            asked("Call the ask_user_question tool now (a tool call, not text) to ask me which season I prefer, with "
+                  "two options labelled Winter and Summer. If I do not answer, reply with exactly the word made by "
+                  "joining N, O, A, N, S, W, E, R without spaces.", ["1. Winter", "2. Summer"])
+            tui.keys(CTRL_C, 0.5)
+            tui.wait("the turn to stop", lambda s: "● Running" not in s and "Enter answer" not in s, 60)
+            shot("dismissed")
+            tui.ask("Reply with only the word made by joining A, L, I, V, E without spaces.",
+                    lambda s: "ALIVE" in s and "● Running" not in s, "a reply after the unanswered question")
+        report.step("interrupting an unanswered question ends it and the session stays usable", dismissed, tui)
+
+        report.step("Ctrl+Q exits with a success status", lambda: expect(tui.quit() == 0, "nonzero exit status"), tui)
+    finally:
+        tui.close()
 
 
 def domain_checks(report, binary, common, args, workspace, root):

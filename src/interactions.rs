@@ -50,6 +50,44 @@ pub struct InputQuestion {
     pub is_secret: bool,
     #[serde(default)]
     pub options: Option<Vec<InputOption>>,
+    #[serde(default, rename = "multiSelect")]
+    pub multi_select: bool,
+}
+
+impl InputQuestion {
+    /// Turns what the user typed into the answer list. An option may be named by its
+    /// number or its label in any letter case; several, separated by commas, are taken
+    /// only when the question allows it. Anything else stays the user's own text.
+    pub fn answer(&self, typed: &str) -> Vec<String> {
+        let options = self.options.as_deref().unwrap_or_default();
+        let pick = |part: &str| {
+            let part = part.trim();
+            part.parse::<usize>()
+                .ok()
+                .and_then(|number| options.get(number.checked_sub(1)?))
+                .or_else(|| {
+                    options
+                        .iter()
+                        .find(|option| option.label.to_lowercase() == part.to_lowercase())
+                })
+                .map(|option| option.label.clone())
+        };
+        if self.is_secret || options.is_empty() {
+            return vec![typed.to_owned()];
+        }
+        if let Some(label) = pick(typed) {
+            return vec![label];
+        }
+        if self.multi_select {
+            let picked: Option<Vec<String>> = typed.split([',', '，', '、']).map(pick).collect();
+            if let Some(mut picked) = picked {
+                let mut seen = BTreeSet::new();
+                picked.retain(|label| seen.insert(label.clone()));
+                return picked;
+            }
+        }
+        vec![typed.to_owned()]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +576,30 @@ mod tests {
             request.input_result(&answers).unwrap(),
             json!({"answers":{"a":{"answers":["private"]}}})
         );
+    }
+
+    #[test]
+    fn a_typed_answer_names_options_by_number_or_label_and_is_otherwise_the_users_own_text() {
+        let question = |multi: bool| -> InputQuestion {
+            serde_json::from_value(json!({"id":"a","header":"H","question":"Pick","multiSelect":multi,
+                "options":[{"label":"Approve","description":""},{"label":"Keep planning","description":""}]}))
+            .unwrap()
+        };
+        let one = question(false);
+        assert_eq!(one.answer("2"), ["Keep planning"]);
+        assert_eq!(one.answer(" approve "), ["Approve"]);
+        assert_eq!(one.answer("3"), ["3"]);
+        assert_eq!(one.answer("0"), ["0"]);
+        // 单选题里的逗号是用户自己的话，不拆开。
+        assert_eq!(one.answer("1, 2"), ["1, 2"]);
+        assert_eq!(one.answer("add tests first"), ["add tests first"]);
+        let many = question(true);
+        assert_eq!(many.answer("2，approve, 2"), ["Keep planning", "Approve"]);
+        assert_eq!(many.answer("1, and more"), ["1, and more"]);
+        let free: InputQuestion =
+            serde_json::from_value(json!({"id":"a","header":"H","question":"Count?"})).unwrap();
+        assert!(!free.multi_select);
+        assert_eq!(free.answer("1"), ["1"]);
     }
 
     #[test]

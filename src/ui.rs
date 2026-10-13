@@ -1017,9 +1017,10 @@ fn handle_key_inner(
                         );
                         return false;
                     }
+                    let question = &questions[local.question_index];
                     local
                         .answers
-                        .insert(questions[local.question_index].id.clone(), vec![text]);
+                        .insert(question.id.clone(), question.answer(&text));
                     if let Err(error) = request.validate_input_answers(
                         &local.answers,
                         local.question_index + 1 == questions.len(),
@@ -1062,6 +1063,23 @@ fn handle_key_inner(
             {
                 local.editor.clear();
                 send(Command::RunBackendCommand { line }, tx, local);
+                return false;
+            }
+            // dsh 的命令清单还没取过（例如整行是粘贴进来的）：这一行可能是它的命令，
+            // 先取清单，不把它当成未知命令，也不当成任务发给模型。只拦一次。
+            else if !snapshot.commands_loaded
+                && snapshot.thread_id.is_some()
+                && local.commands_requested != snapshot.thread_id
+                && commands::may_be_backend_command(&text, &snapshot.skills.entries)
+            {
+                request_backend_commands(snapshot, local, tx);
+                local.notice = Some(
+                    lang::tr(
+                        "Reading dsh's commands; press Enter again.",
+                        "正在读取 dsh 的命令，请再按一次 Enter。",
+                    )
+                    .into(),
+                );
                 return false;
             }
             // `/名称` 是界面命令，不作为任务发给模型。
@@ -3431,6 +3449,19 @@ mod tests {
         assert_eq!(local.tool_display(), conversation::ToolDisplay::Preview);
         local.cycle_tool_display();
         assert!(local.tools_expanded);
+        // 整行粘贴进来时还没向 dsh 要过命令清单：这一行可能是它的命令，
+        // 第一次回车只取清单，既不报未知命令，也不当成任务发给模型。
+        local.editor.insert("/plan write a poem");
+        assert!(!handle_key(enter, &snapshot, &mut local, &tx));
+        assert_eq!(local.editor.text, "/plan write a poem");
+        assert!(local
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("press Enter again"));
+        assert_eq!(rx.try_recv().unwrap(), Command::ListBackendCommands);
+        assert!(rx.try_recv().is_err());
+        local.editor.clear();
         local.editor.insert("/nope");
         assert!(!handle_key(enter, &snapshot, &mut local, &tx));
         assert_eq!(local.editor.text, "/nope");
@@ -3438,8 +3469,7 @@ mod tests {
         local.editor.clear();
         local.editor.insert("/quit");
         assert!(handle_key(enter, &snapshot, &mut local, &tx));
-        // 未知名称可能是 dsh 自己的命令：只向它要一次清单，不执行任何东西。
-        assert_eq!(rx.try_recv().unwrap(), Command::ListBackendCommands);
+        // 清单只要一次，没有执行任何东西。
         assert!(rx.try_recv().is_err());
     }
 

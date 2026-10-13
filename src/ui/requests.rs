@@ -9,7 +9,7 @@ use super::lang::{self, tr};
 use super::layout::wrap;
 use super::theme::{self, Theme};
 use super::{request_locked, selected_request, LocalState};
-use crate::interactions::{RequestKind, RequestView};
+use crate::interactions::{InputOption, RequestKind, RequestView};
 use crate::state::{display_text, CoreSnapshot};
 
 fn locked_text() -> &'static str {
@@ -17,6 +17,16 @@ fn locked_text() -> &'static str {
         "Submitted or unavailable; answers disabled",
         "已提交或不可用，不能回答",
     )
+}
+
+/// An option's number and label; the number is what the user may type instead.
+pub(super) fn option_line(index: usize, option: &InputOption) -> String {
+    let colon = if option.description.is_empty() {
+        ""
+    } else {
+        ":"
+    };
+    format!("{}. {}{colon}", index + 1, option.label)
 }
 
 fn unsupported_text() -> &'static str {
@@ -249,11 +259,23 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                         .lead(INDENT, RowKind::Decision),
                 );
                 if let Some(options) = &question.options {
-                    for option in options {
+                    for (index, option) in options.iter().enumerate() {
                         rows.push(
-                            Row::new(RowKind::Label, format!("{}:", option.label))
+                            Row::new(RowKind::Label, option_line(index, option))
                                 .lead(DEEP_INDENT, RowKind::Decision)
                                 .then(RowKind::Decision, format!(" {}", option.description)),
+                        );
+                    }
+                    if question.multi_select {
+                        rows.push(
+                            Row::new(
+                                RowKind::Meta,
+                                tr(
+                                    "Several may be chosen, separated by commas.",
+                                    "可以选多项，用逗号分隔。",
+                                ),
+                            )
+                            .lead(DEEP_INDENT, RowKind::Meta),
                         );
                     }
                 } else {

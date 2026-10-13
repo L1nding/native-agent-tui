@@ -294,6 +294,22 @@ pub(super) fn backend_command(
     .then(|| line.to_owned())
 }
 
+/// The line could be one of dsh's own commands: it starts with `/name` and is
+/// neither a TUI command nor a skill. Until dsh's list is known, such a line
+/// must not be sent to the model as a task.
+pub(super) fn may_be_backend_command(text: &str, skills: &[SkillEntry]) -> bool {
+    let name = text
+        .trim()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split(char::is_whitespace).next())
+        .unwrap_or_default();
+    name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && matches!(parse_slash(text, skills), None | Some(Slash::Unknown))
+}
+
 /// Hints with dsh's own commands after the TUI's and the skills.
 pub(super) fn slash_hints_with(
     text: &str,
