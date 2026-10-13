@@ -327,7 +327,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         width,
         height,
         local.scroll_from_bottom,
-        local.tools_expanded,
+        local.tool_display(),
     );
     let focused_row = projected.transcript.focused;
     let foldable_tools = projected.transcript.foldable > 0;
@@ -662,12 +662,18 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             (tr("Ctrl+P commands", "Ctrl+P 命令"), 3),
             (tr("Ctrl+F search", "Ctrl+F 搜索"), 4),
         ]);
-        if foldable_tools {
+        if foldable_tools || local.tools_expanded || local.tools_hidden {
             hints.push((
-                if local.tools_expanded {
-                    tr("Ctrl+E fold tools", "Ctrl+E 折叠工具")
-                } else {
-                    tr("Ctrl+E unfold tools", "Ctrl+E 展开工具")
+                match local.tool_display() {
+                    super::conversation::ToolDisplay::Preview => {
+                        tr("Ctrl+E unfold tools", "Ctrl+E 展开工具")
+                    }
+                    super::conversation::ToolDisplay::Expanded => {
+                        tr("Ctrl+E hide tools", "Ctrl+E 隐藏工具")
+                    }
+                    super::conversation::ToolDisplay::Hidden => {
+                        tr("Ctrl+E show tools", "Ctrl+E 显示工具")
+                    }
                 },
                 5,
             ));
@@ -1089,7 +1095,7 @@ mod tests {
             (1..=6).all(|index| screen.contains(&format!("step-{index}"))),
             "{screen}"
         );
-        assert!(screen.contains("Ctrl+E fold tools"), "{screen}");
+        assert!(screen.contains("Ctrl+E hide tools"), "{screen}");
         assert_eq!(local.editor.text, "draft");
         assert!(rx.try_recv().is_err());
     }

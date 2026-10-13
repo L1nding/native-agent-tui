@@ -133,6 +133,8 @@ struct LocalState {
     scroll_from_bottom: usize,
     /// 展开对话中折叠的工具组；只影响显示，不改变任何执行事实。
     tools_expanded: bool,
+    /// 第三档：不显示工具行。与 `tools_expanded` 互斥。
+    tools_hidden: bool,
     notice: Option<String>,
     help: bool,
     workflow: workflow::WorkflowPanel,
@@ -299,6 +301,25 @@ fn open_model_picker(local: &mut LocalState, tx: &tokio::sync::mpsc::Sender<Comm
     overlays::close_mutual_overlays(local);
     local.models.open();
     send(Command::ListModels, tx, local);
+}
+
+impl LocalState {
+    fn tool_display(&self) -> conversation::ToolDisplay {
+        match (self.tools_expanded, self.tools_hidden) {
+            (_, true) => conversation::ToolDisplay::Hidden,
+            (true, false) => conversation::ToolDisplay::Expanded,
+            (false, false) => conversation::ToolDisplay::Preview,
+        }
+    }
+
+    /// 预览 → 展开 → 隐藏 → 预览。
+    fn cycle_tool_display(&mut self) {
+        (self.tools_expanded, self.tools_hidden) = match self.tool_display() {
+            conversation::ToolDisplay::Preview => (true, false),
+            conversation::ToolDisplay::Expanded => (false, true),
+            conversation::ToolDisplay::Hidden => (false, false),
+        };
+    }
 }
 
 fn request_backend_commands(
@@ -575,7 +596,7 @@ fn handle_key(
                 focus,
                 width,
                 height,
-                local.tools_expanded,
+                local.tool_display(),
             ) {
                 local.scroll_from_bottom = scroll;
             }
@@ -758,7 +779,7 @@ fn handle_key(
             local.skills = !local.skills;
             local.skills_scroll = 0;
         }
-        KeyCode::Char('e') if control => local.tools_expanded = !local.tools_expanded,
+        KeyCode::Char('e') if control => local.cycle_tool_display(),
         KeyCode::PageUp if local.request_panel => {
             // 先收回到实际可滚动范围，越界后第一次 PageUp 就能生效。
             local.request_scroll = local
@@ -999,7 +1020,7 @@ fn handle_key(
                         open_model_picker(local, tx)
                     }
                     Slash::Action(action) => open_palette_action(action, snapshot, local),
-                    Slash::Tools => local.tools_expanded = !local.tools_expanded,
+                    Slash::Tools => local.cycle_tool_display(),
                     Slash::Settings => {
                         overlays::close_mutual_overlays(local);
                         local.settings.open();
@@ -3334,6 +3355,13 @@ mod tests {
         assert!(local.help && local.editor.text.is_empty());
         local.editor.insert("/tools");
         handle_key(enter, &snapshot, &mut local, &tx);
+        assert!(local.tools_expanded);
+        // 三档循环：预览 → 展开 → 隐藏 → 预览。
+        local.cycle_tool_display();
+        assert_eq!(local.tool_display(), conversation::ToolDisplay::Hidden);
+        local.cycle_tool_display();
+        assert_eq!(local.tool_display(), conversation::ToolDisplay::Preview);
+        local.cycle_tool_display();
         assert!(local.tools_expanded);
         local.editor.insert("/nope");
         assert!(!handle_key(enter, &snapshot, &mut local, &tx));

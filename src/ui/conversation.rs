@@ -28,6 +28,62 @@ const FOLDED_ATTENTION_ROWS: usize = 3;
 const INDENT: usize = 2;
 const TOOL_MARKER: &str = "▸ ";
 
+/// How tool calls appear in the conversation; `Ctrl+E` cycles through them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ToolDisplay {
+    /// One row per call; long groups fold to a summary.
+    #[default]
+    Preview,
+    /// Every call, each followed by the facts Core has about it.
+    Expanded,
+    /// No tool rows; the steps of one answer read as a single message.
+    Hidden,
+}
+
+impl From<bool> for ToolDisplay {
+    fn from(expanded: bool) -> Self {
+        if expanded {
+            Self::Expanded
+        } else {
+            Self::Preview
+        }
+    }
+}
+
+/// Hidden tool groups stay out of the layout unless the search focus is in one.
+fn shown(message: &ConversationItem, display: ToolDisplay, focus: Option<&Focus>) -> bool {
+    display != ToolDisplay::Hidden
+        || message.role != "Tool"
+        || focus.is_some_and(|focus| focus.matches(message))
+}
+
+fn continues(previous: Option<&ConversationItem>, message: &ConversationItem) -> bool {
+    previous.is_some_and(|previous| {
+        previous.role == "Agent"
+            && message.role == "Agent"
+            && previous.thread_id == message.thread_id
+            && previous.turn_id == message.turn_id
+    })
+}
+
+/// With tools hidden, the later steps of one answer do not repeat its title.
+fn continued<'a>(
+    messages: impl Iterator<Item = &'a ConversationItem>,
+    display: ToolDisplay,
+) -> std::collections::HashSet<*const ConversationItem> {
+    let mut set = std::collections::HashSet::new();
+    if display == ToolDisplay::Hidden {
+        let mut previous = None;
+        for message in messages {
+            if continues(previous, message) {
+                set.insert(std::ptr::from_ref(message));
+            }
+            previous = Some(message);
+        }
+    }
+    set
+}
+
 pub(super) struct Transcript {
     pub lines: Vec<Line<'static>>,
     /// Row of the search focus while its message is still present and unchanged.
@@ -66,7 +122,8 @@ impl ScrollAnchor {
 struct CachedMessage {
     message: ConversationItem,
     width: usize,
-    expanded: bool,
+    display: ToolDisplay,
+    continued: bool,
     target: Option<usize>,
     theme: &'static str,
     zh: bool,
@@ -85,7 +142,8 @@ impl ProjectionCache {
         message: &ConversationItem,
         focus: Option<&Focus>,
         width: usize,
-        expanded: bool,
+        display: ToolDisplay,
+        continued: bool,
     ) -> &Transcript {
         let target = focus
             .filter(|focus| focus.matches(message))
@@ -101,7 +159,8 @@ impl ProjectionCache {
             self.bytes -= entry.bytes;
             if entry.message == *message
                 && entry.width == width
-                && entry.expanded == expanded
+                && entry.display == display
+                && entry.continued == continued
                 && entry.target == target
                 && entry.theme == theme::name()
                 && entry.zh == lang::zh()
@@ -111,7 +170,7 @@ impl ProjectionCache {
                 return &self.entries[0].transcript;
             }
         }
-        let transcript = transcript(std::iter::once(message), focus, width, expanded);
+        let transcript = layout(std::iter::once(message), focus, width, display, continued);
         let bytes = std::mem::size_of::<CachedMessage>()
             + message.text.len()
             + message.id.len()
@@ -147,7 +206,8 @@ impl ProjectionCache {
         self.entries.push_front(CachedMessage {
             message: message.clone(),
             width,
-            expanded,
+            display,
+            continued,
             target,
             theme: theme::name(),
             zh: lang::zh(),
@@ -160,15 +220,24 @@ impl ProjectionCache {
     /// Search navigation and painting use exactly the same cached row positions.
     pub fn focused_scroll<'a>(
         &mut self,
-        messages: impl DoubleEndedIterator<Item = &'a ConversationItem>,
+        messages: impl DoubleEndedIterator<Item = &'a ConversationItem> + Clone,
         focus: &Focus,
         width: usize,
         height: usize,
-        expanded: bool,
+        display: impl Into<ToolDisplay>,
     ) -> Option<usize> {
+        let display = display.into();
+        let messages = messages.filter(|message| shown(message, display, Some(focus)));
+        let continued = continued(messages.clone(), display);
         let mut below = 0;
         for message in messages.rev() {
-            let layout = self.message(message, Some(focus), width, expanded);
+            let layout = self.message(
+                message,
+                Some(focus),
+                width,
+                display,
+                continued.contains(&std::ptr::from_ref(message)),
+            );
             if let Some(row) = layout.focused {
                 below += layout.lines.len().saturating_sub(row + 1);
                 return Some(below.saturating_sub(height.saturating_sub(height / 3 + 1)));
@@ -185,8 +254,12 @@ impl ProjectionCache {
         width: usize,
         height: usize,
         scroll: usize,
-        expanded: bool,
+        display: impl Into<ToolDisplay>,
     ) -> Viewport {
+        let display = display.into();
+        let messages = messages.filter(|message| shown(message, display, focus));
+        let continued = continued(messages.clone(), display);
+        let continued = &continued;
         let requested = scroll;
         let anchored = if focus.is_none() && scroll > 0 && scroll == self.requested_scroll {
             self.anchor.take().map(|anchor| {
@@ -195,7 +268,13 @@ impl ProjectionCache {
                     if below > 0 {
                         below += 1;
                     }
-                    let layout = self.message(message, None, width, expanded);
+                    let layout = self.message(
+                        message,
+                        None,
+                        width,
+                        display,
+                        continued.contains(&std::ptr::from_ref(message)),
+                    );
                     if anchor.matches(message) {
                         let row = anchor.row.min(layout.lines.len());
                         return (below + layout.lines.len()).saturating_sub(row + height);
@@ -210,10 +289,18 @@ impl ProjectionCache {
         };
         let scroll = focus
             .filter(|focus| messages.clone().any(|message| focus.matches(message)))
-            .and_then(|focus| self.focused_scroll(messages.clone(), focus, width, height, expanded))
+            .and_then(|focus| self.focused_scroll(messages.clone(), focus, width, height, display))
             .or(anchored)
             .unwrap_or(scroll);
-        let view = self.window(messages.clone(), focus, width, height, scroll, expanded);
+        let view = self.window(
+            messages.clone(),
+            focus,
+            width,
+            height,
+            scroll,
+            display,
+            continued,
+        );
         self.requested_scroll = requested;
         self.anchor = if view.below > 0 {
             let top = view.below + view.transcript.lines.len();
@@ -221,7 +308,13 @@ impl ProjectionCache {
             let mut anchor = None;
             for message in messages.rev() {
                 let separator = usize::from(below > 0);
-                let layout = self.message(message, focus, width, expanded);
+                let layout = self.message(
+                    message,
+                    focus,
+                    width,
+                    display,
+                    continued.contains(&std::ptr::from_ref(message)),
+                );
                 let end = below + separator + layout.lines.len();
                 if top <= end {
                     anchor = Some(ScrollAnchor {
@@ -242,6 +335,7 @@ impl ProjectionCache {
         view
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn window<'a>(
         &mut self,
         messages: impl DoubleEndedIterator<Item = &'a ConversationItem> + Clone,
@@ -249,7 +343,8 @@ impl ProjectionCache {
         width: usize,
         height: usize,
         scroll: usize,
-        expanded: bool,
+        display: ToolDisplay,
+        continued: &std::collections::HashSet<*const ConversationItem>,
     ) -> Viewport {
         let retry = messages.clone();
         let mut visible = std::collections::VecDeque::new();
@@ -263,7 +358,13 @@ impl ProjectionCache {
                 }
                 seen += 1;
             }
-            let layout = self.message(message, focus, width, expanded);
+            let layout = self.message(
+                message,
+                focus,
+                width,
+                display,
+                continued.contains(&std::ptr::from_ref(message)),
+            );
             foldable += layout.foldable;
             if let Some(row) = layout.focused {
                 focus_from_bottom = Some(seen + layout.lines.len().saturating_sub(row + 1));
@@ -288,7 +389,7 @@ impl ProjectionCache {
         if seen < scroll.saturating_add(height) && scroll > 0 {
             let clamped = seen.saturating_sub(height);
             if clamped != scroll {
-                return self.window(retry, focus, width, height, clamped, expanded);
+                return self.window(retry, focus, width, height, clamped, display, continued);
             }
         }
         let focused = focus_from_bottom.and_then(|row| {
@@ -309,11 +410,55 @@ impl ProjectionCache {
 /// Style runs over one source line as `(end byte, style)`, in order.
 type Runs = Vec<(usize, Style)>;
 
+#[cfg(test)]
 pub(super) fn transcript<'a>(
     messages: impl Iterator<Item = &'a ConversationItem>,
     focus: Option<&Focus>,
     width: usize,
-    expand_tools: bool,
+    display: impl Into<ToolDisplay>,
+) -> Transcript {
+    layout(messages, focus, width, display.into(), false)
+}
+
+/// Rows under one expanded tool call: only facts Core reported, nothing inferred.
+/// The outcome and exit code are already in the call's own row.
+fn tool_detail_rows(tool: &crate::tool_details::ConversationTool) -> Vec<String> {
+    let mut rows = Vec::new();
+    if let Some(cwd) = &tool.cwd {
+        rows.push(display_text(cwd));
+    }
+    if tool.command.is_some() {
+        if let Some(target) = &tool.target {
+            rows.push(display_text(target));
+        }
+    }
+    if tool.added_lines.is_some() || tool.removed_lines.is_some() {
+        rows.push(format!(
+            "└ +{} -{}",
+            tool.added_lines.unwrap_or(0),
+            tool.removed_lines.unwrap_or(0)
+        ));
+    }
+    let mut tail = Vec::new();
+    if let Some(lines) = tool.output_lines {
+        tail.push(format!(
+            "… {lines} {}",
+            tr("output lines (Ctrl+T for details)", "行输出（Ctrl+T 查看）")
+        ));
+    }
+    if !tail.is_empty() {
+        rows.push(tail.join(" · "));
+    }
+    rows
+}
+
+/// `first_continued`: the first message continues an answer laid out before it.
+fn layout<'a>(
+    messages: impl Iterator<Item = &'a ConversationItem>,
+    focus: Option<&Focus>,
+    width: usize,
+    display: ToolDisplay,
+    first_continued: bool,
 ) -> Transcript {
     let theme = theme::current();
     // 极窄窗口不缩进，把宽度全部留给正文。
@@ -324,7 +469,16 @@ pub(super) fn transcript<'a>(
         focused: None,
         foldable: 0,
     };
+    let mut previous: Option<&ConversationItem> = None;
+    let mut first = true;
     for message in messages {
+        if !shown(message, display, focus) {
+            continue;
+        }
+        let continued = (first && first_continued)
+            || (display == ToolDisplay::Hidden && continues(previous, message));
+        first = false;
+        previous = Some(message);
         #[cfg(test)]
         PROJECTED_MESSAGES.with(|count| count.set(count.get() + 1));
         let target = focus
@@ -333,12 +487,12 @@ pub(super) fn transcript<'a>(
         let text = display_text(&message.text);
         let is_tool = message.role == "Tool";
         // 耗时行和工具行一样没有标题，直接跟在这一步的内容后面。
-        if !is_tool && !matches!(message.role.as_str(), "Timing" | "Notice") {
+        if !is_tool && !continued && !matches!(message.role.as_str(), "Timing" | "Notice") {
             out.lines.push(header(message, theme));
         }
         let calls = message.tools.len();
         let foldable = is_tool && calls > TOOL_FOLD_LIMIT;
-        let folded = foldable && !expand_tools && target.is_none();
+        let folded = foldable && display == ToolDisplay::Preview && target.is_none();
         if foldable {
             out.foldable += 1;
             out.lines
@@ -391,6 +545,17 @@ pub(super) fn transcript<'a>(
                     spans.push(Span::styled(" ".repeat(body - used), code_style(theme)));
                 }
                 out.lines.push(Line::from(spans));
+            }
+            if let Some(tool) = tool.filter(|_| display == ToolDisplay::Expanded) {
+                let detail = body.saturating_sub(4).max(1);
+                for row in tool_detail_rows(tool) {
+                    for range in wrap_words(&row, detail, 0) {
+                        out.lines.push(Line::from(vec![
+                            Span::raw(" ".repeat(indent + 4)),
+                            Span::styled(row[range].to_owned(), Style::default().fg(theme.muted)),
+                        ]));
+                    }
+                }
             }
         }
         out.lines.push(Line::default());
@@ -718,6 +883,102 @@ mod tests {
         let mut focus = Focus::message(message);
         focus.offset = message.text.find(needle).unwrap();
         focus
+    }
+
+    #[test]
+    fn tool_display_levels_show_facts_or_hide_tools_and_join_the_steps_of_one_answer() {
+        let mut tools = item("Tool", "▸ done · cargo test\n▸ failed · edit src/view.rs");
+        tools.tools[0].command = Some("cargo test".into());
+        tools.tools[0].cwd = Some("/workspace/project".into());
+        tools.tools[0].exit_code = Some(0);
+        tools.tools[0].output_lines = Some(42);
+        tools.tools[1].added_lines = Some(3);
+        tools.tools[1].removed_lines = Some(1);
+        let mut first = item("Agent", "first step");
+        first.id = "a1".into();
+        let mut second = item("Agent", "second step");
+        second.id = "a2".into();
+        let mut other = item("Agent", "another turn");
+        other.id = "a3".into();
+        other.turn_id = "next".into();
+        let messages = [
+            first,
+            tools,
+            second,
+            other,
+            item("Timing", "Model wait 1.0s"),
+        ];
+
+        // 预览：每次调用一行，没有额外事实。
+        let preview = rows(&transcript(messages.iter(), None, 80, ToolDisplay::Preview));
+        assert!(preview.contains(&"  ▸ done · cargo test".to_owned()));
+        assert!(!preview.iter().any(|row| row.contains("/workspace/project")));
+
+        // 展开：每次调用下面列出 Core 给出的事实；没有的事实不出现。
+        let expanded = rows(&transcript(
+            messages.iter(),
+            None,
+            80,
+            ToolDisplay::Expanded,
+        ));
+        let at = expanded
+            .iter()
+            .position(|row| row == "  ▸ done · cargo test")
+            .unwrap();
+        assert_eq!(
+            &expanded[at + 1..at + 5],
+            [
+                "      /workspace/project",
+                "      … 42 output lines (Ctrl+T for details)",
+                "  ▸ failed · edit src/view.rs",
+                "      └ +3 -1",
+            ]
+        );
+
+        // 隐藏：没有工具行；同一轮的后续步骤不重复标题，另一轮照常有标题。
+        let hidden = rows(&transcript(messages.iter(), None, 80, ToolDisplay::Hidden));
+        assert_eq!(
+            hidden,
+            [
+                "Agent",
+                "  first step",
+                "",
+                "  second step",
+                "",
+                "Agent",
+                "  another turn",
+                "",
+                "  Model wait 1.0s",
+            ]
+        );
+
+        // 搜索焦点落在被隐藏的工具组里时，这一组照常显示，标题也随之恢复。
+        let focus = focus_at(&messages[1], "edit src");
+        let focused = rows(&transcript(
+            messages.iter(),
+            Some(&focus),
+            80,
+            ToolDisplay::Hidden,
+        ));
+        assert!(focused.contains(&"  ▸ failed · edit src/view.rs".to_owned()));
+        assert_eq!(focused.iter().filter(|row| *row == "Agent").count(), 3);
+
+        // 缓存的视口与整篇排版逐行一致，三档和窄宽度都如此。
+        let mut cache = ProjectionCache::default();
+        for display in [
+            ToolDisplay::Preview,
+            ToolDisplay::Expanded,
+            ToolDisplay::Hidden,
+        ] {
+            for width in [24, 80] {
+                for focus in [None, Some(&focus)] {
+                    let full = transcript(messages.iter(), focus, width, display);
+                    cache.anchor = None;
+                    let view = cache.viewport(messages.iter(), focus, width, 1000, 0, display);
+                    assert_eq!(rows(&view.transcript), rows(&full), "{display:?} {width}");
+                }
+            }
+        }
     }
 
     #[test]
