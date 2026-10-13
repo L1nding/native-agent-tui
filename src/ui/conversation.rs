@@ -19,6 +19,8 @@ use crate::tool_details::ToolLifecycle;
 #[cfg(test)]
 thread_local! {
     pub(super) static PROJECTED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes of message text that were wrapped and styled.
+    pub(super) static PROJECTED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A turn's tool summary folds once it has more calls than this.
@@ -102,6 +104,11 @@ pub(super) struct Transcript {
     pub focused: Option<usize>,
     /// Tool groups long enough to fold; the key hint is only useful when non-zero.
     pub foldable: usize,
+    /// For one agent or reasoning message: the last place its layout is settled,
+    /// as (byte offset in the displayed text, rows before it). It follows a
+    /// finished line outside a code fence: each line is laid out on its own, so
+    /// text appended later cannot change the rows above it.
+    checkpoint: Option<(usize, usize)>,
 }
 
 /// A bounded cache of message layouts, owned by this UI only. Width changes are
@@ -160,6 +167,7 @@ impl ProjectionCache {
         let target = focus
             .filter(|focus| focus.matches(message))
             .map(|focus| focus.offset);
+        let mut grown = None;
         let found = self.entries.iter().position(|entry| {
             entry.message.id == message.id
                 && entry.message.thread_id == message.thread_id
@@ -169,20 +177,68 @@ impl ProjectionCache {
         if let Some(index) = found {
             let entry = self.entries.remove(index).unwrap();
             self.bytes -= entry.bytes;
-            if entry.message == *message
-                && entry.width == width
+            let same_shape = entry.width == width
                 && entry.display == display
                 && entry.continued == continued
                 && entry.target == target
                 && entry.theme == theme::name()
-                && entry.zh == lang::zh()
-            {
+                && entry.zh == lang::zh();
+            if same_shape && entry.message == *message {
                 self.bytes += entry.bytes;
                 self.entries.push_front(entry);
                 return &self.entries[0].transcript;
             }
+            if same_shape {
+                grown = Some(entry);
+            }
         }
-        let transcript = layout(std::iter::once(message), focus, width, display, continued);
+        // 流式消息只在末尾变长：已经定稿的行原样保留，只重排最后一个完整行之后的部分。
+        let resumed = grown.and_then(|entry| {
+            let (offset, kept) = entry.transcript.checkpoint?;
+            let appended = target.is_none()
+                && matches!(message.role.as_str(), "Agent" | "Reasoning")
+                && message.tools.is_empty()
+                && message.truncated == entry.message.truncated
+                && message.text.len() > entry.message.text.len()
+                && message.text.starts_with(&entry.message.text);
+            let settled = display_text(&entry.message.text);
+            let same_prefix = display_text(&message.text)
+                .get(..offset)
+                .is_some_and(|prefix| settled.get(..offset) == Some(prefix));
+            if !appended || kept > entry.transcript.lines.len() || !same_prefix {
+                return None;
+            }
+            let tail = layout(
+                std::iter::once(message),
+                None,
+                width,
+                display,
+                continued,
+                Some(offset),
+            );
+            let mut lines = entry.transcript.lines;
+            lines.truncate(kept);
+            lines.extend(tail.lines);
+            Some(Transcript {
+                lines,
+                focused: None,
+                foldable: 0,
+                checkpoint: tail
+                    .checkpoint
+                    .map(|(offset, rows)| (offset, kept + rows))
+                    .or(Some((offset, kept))),
+            })
+        });
+        let transcript = resumed.unwrap_or_else(|| {
+            layout(
+                std::iter::once(message),
+                focus,
+                width,
+                display,
+                continued,
+                None,
+            )
+        });
         let bytes = std::mem::size_of::<CachedMessage>()
             + message.text.len()
             + message.id.len()
@@ -413,6 +469,7 @@ impl ProjectionCache {
                 lines: visible.into(),
                 focused,
                 foldable,
+                checkpoint: None,
             },
             below: scroll,
         }
@@ -429,7 +486,7 @@ pub(super) fn transcript<'a>(
     width: usize,
     display: impl Into<ToolDisplay>,
 ) -> Transcript {
-    layout(messages, focus, width, display.into(), false)
+    layout(messages, focus, width, display.into(), false, None)
 }
 
 /// Rows under one expanded tool call: only facts Core reported, nothing inferred.
@@ -465,12 +522,15 @@ fn tool_detail_rows(tool: &crate::tool_details::ConversationTool) -> Vec<String>
 }
 
 /// `first_continued`: the first message continues an answer laid out before it.
+/// `resume`: lay out one message from this offset of its displayed text only,
+/// producing just the rows after an earlier layout's checkpoint.
 fn layout<'a>(
     messages: impl Iterator<Item = &'a ConversationItem>,
     focus: Option<&Focus>,
     width: usize,
     display: ToolDisplay,
     first_continued: bool,
+    resume: Option<usize>,
 ) -> Transcript {
     let theme = theme::current();
     // 极窄窗口不缩进，把宽度全部留给正文。
@@ -480,7 +540,9 @@ fn layout<'a>(
         lines: Vec::new(),
         focused: None,
         foldable: 0,
+        checkpoint: None,
     };
+    let mut laid_out = 0;
     let mut flow = Flow::default();
     let mut first = true;
     for message in messages {
@@ -497,9 +559,20 @@ fn layout<'a>(
         let text = display_text(&message.text);
         let is_tool = message.role == "Tool";
         // 耗时行和工具行一样没有标题，直接跟在这一步的内容后面。
-        if !is_tool && !continued && !matches!(message.role.as_str(), "Timing" | "Notice") {
+        if !is_tool
+            && !continued
+            && resume.is_none()
+            && !matches!(message.role.as_str(), "Timing" | "Notice")
+        {
             out.lines.push(header(message, theme));
         }
+        laid_out += 1;
+        let resumable = matches!(message.role.as_str(), "Agent" | "Reasoning")
+            && message.tools.is_empty()
+            && target.is_none();
+        let from = resume.unwrap_or(0);
+        #[cfg(test)]
+        PROJECTED_BYTES.with(|count| count.set(count.get() + text.len() - from));
         let calls = message.tools.len();
         let foldable = is_tool && calls > TOOL_FOLD_LIMIT;
         let folded = foldable && display == ToolDisplay::Preview && target.is_none();
@@ -510,9 +583,9 @@ fn layout<'a>(
         }
         let shown = folded.then(|| folded_rows(&text, &message.tools));
         let mut fence = None;
-        let mut offset = 0;
+        let mut offset = from;
         let mut tools = message.tools.iter();
-        for (index, source) in text.split('\n').enumerate() {
+        for (index, source) in text[from..].split('\n').enumerate() {
             let start = offset;
             offset += source.len() + 1;
             let tool = source
@@ -568,11 +641,19 @@ fn layout<'a>(
                     }
                 }
             }
+            // 代码块之外，一行写完（后面已有换行）之后，追加的文字不会再改动它上面的行。
+            if resumable && fence.is_none() && offset <= text.len() {
+                out.checkpoint = Some((offset, out.lines.len()));
+            }
         }
         out.lines.push(Line::default());
     }
     // 末尾不留空行，最后一条消息贴近输入区。
     out.lines.pop();
+    // 检查点只对单条消息的排版有意义。
+    if laid_out != 1 {
+        out.checkpoint = None;
+    }
     out
 }
 
@@ -1000,6 +1081,113 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 手动测量：`cargo test --release --lib measure_ -- --ignored --nocapture`。
+    /// 流式消息每长一段，缓存就把这一条消息从头重排一次；这里量它在最坏情况下多贵。
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn measure_relayout_of_a_growing_message_in_a_full_history() {
+        let mut messages: Vec<ConversationItem> = (0..120)
+            .map(|index| {
+                let mut message = item("Agent", &"settled 中文 text with `code`\n".repeat(60));
+                message.id = format!("m{index}");
+                message
+            })
+            .collect();
+        let mut live = item("Agent", "");
+        live.id = "live".into();
+        messages.push(live);
+        let mut cache = ProjectionCache::default();
+        cache.viewport(messages.iter(), None, 118, 40, 0, false);
+        for size in [2, 8, 32] {
+            let last = messages.len() - 1;
+            messages[last].text =
+                "streamed **markdown** line with 中文 and `code`\n".repeat(size * 1024 / 48);
+            let rounds = 200;
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                messages[last].text.push_str("more ");
+                std::hint::black_box(cache.viewport(messages.iter(), None, 118, 40, 0, false));
+            }
+            println!(
+                "relayout of a {size} KiB streaming message: {:?} per delta",
+                start.elapsed() / rounds
+            );
+        }
+    }
+
+    #[test]
+    fn a_growing_message_relays_out_only_its_unsettled_tail_and_matches_a_full_layout() {
+        let pieces = [
+            "# Title\n",
+            "first paragraph with **bold** 中文 and `code` that wraps around the width\n",
+            "\n",
+            "- item one\n- item two 👋\n",
+            "\n```rust\nlet x = 1;\n",
+            "\n",
+            "let y = 2;\n```\n",
+            "\n",
+            "after the fence e\u{301}\u{7}\n",
+            "\n\n",
+            "tail without a newline",
+            " grows",
+            " and grows",
+        ];
+        for (role, width) in [("Agent", 40), ("Agent", 12), ("Reasoning", 30)] {
+            let mut message = item(role, "");
+            let mut cache = ProjectionCache::default();
+            let mut costs = Vec::new();
+            for piece in pieces {
+                message.text.push_str(piece);
+                PROJECTED_BYTES.with(|count| count.set(0));
+                let cached = cache
+                    .message(&message, None, width, ToolDisplay::Preview, false)
+                    .lines
+                    .clone();
+                costs.push(PROJECTED_BYTES.with(std::cell::Cell::get));
+                let full = transcript(std::iter::once(&message), None, width, false);
+                assert_eq!(
+                    cached.iter().map(text).collect::<Vec<_>>(),
+                    rows(&full),
+                    "{role} {width} after {piece:?}"
+                );
+                assert_eq!(cached, full.lines, "{role} {width} styles after {piece:?}");
+            }
+            // 最后两次追加只重排最后一个完整行之后的尾部，不是整条消息。
+            let whole = display_text(&message.text).len();
+            assert!(
+                costs[costs.len() - 1] <= "tail without a newline grows and grows".len()
+                    && costs[costs.len() - 1] * 4 < whole,
+                "{role} {width}: {costs:?} of {whole}"
+            );
+            // 代码块没有闭合时，块内的行不是检查点：从块之前重排。
+            // 思考一节不解析代码块，每一行写完都是检查点。
+            if role == "Agent" {
+                assert!(
+                    costs[5] > "let x = 1;\n\n".len(),
+                    "{role} {width}: {costs:?}"
+                );
+            }
+        }
+        // 文字被改写而不是追加、或者宽度变了：整条重排。
+        let mut message = item("Agent", "one\n\ntwo");
+        let mut cache = ProjectionCache::default();
+        cache.message(&message, None, 40, ToolDisplay::Preview, false);
+        message.text = "ONE\n\ntwo three".into();
+        PROJECTED_BYTES.with(|count| count.set(0));
+        let rewritten = cache
+            .message(&message, None, 40, ToolDisplay::Preview, false)
+            .lines
+            .clone();
+        assert_eq!(
+            PROJECTED_BYTES.with(std::cell::Cell::get),
+            message.text.len()
+        );
+        assert_eq!(
+            rewritten,
+            transcript(std::iter::once(&message), None, 40, false).lines
+        );
     }
 
     #[test]

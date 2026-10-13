@@ -1167,6 +1167,37 @@ mod tests {
         assert!(parse_todos(&serde_json::json!("not a list")).is_empty());
     }
 
+    /// 手动测量：`cargo test --release --lib measure_ -- --ignored --nocapture`。
+    /// 每个流式片段 Core 都发布一份完整快照；这里量历史写满时这一份有多贵。
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn measure_snapshot_publication_with_a_full_history() {
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        for index in 0..120 {
+            state.message(
+                "turn",
+                &format!("m{index}"),
+                &"中文 text ".repeat(170),
+                true,
+            );
+        }
+        let bytes: usize = state.view.messages.iter().map(|m| m.text.len()).sum();
+        let rounds = 2000;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            state.message("turn", "live", "delta ", false);
+            std::hint::black_box(state.snapshot());
+        }
+        let each = start.elapsed() / rounds;
+        println!(
+            "snapshot publication: {} messages, {} KiB of text -> {each:?} per delta",
+            state.view.messages.len(),
+            bytes / 1024
+        );
+    }
+
     #[test]
     fn retry_and_compaction_are_single_inline_notices_with_explicit_outcomes() {
         let mut state = SessionState::default();
