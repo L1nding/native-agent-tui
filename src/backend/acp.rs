@@ -986,6 +986,45 @@ impl AcpBridge {
                     Some(json!({"threadId":session,"turnId":turn,"stage":stage})),
                 ))?;
             }
+            Some("retry") => {
+                let (Some(turn), Some(retry)) = (self.turn_id.clone(), event["retry"].as_u64())
+                else {
+                    return Ok(());
+                };
+                let code = event["code"].as_str().filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 64
+                        && code
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                });
+                self.core.send(Envelope::notification(
+                    "turn/notice",
+                    Some(json!({"threadId":session,"turnId":turn,"kind":"retry",
+                        "retry":retry,"maxRetries":event["maxRetries"].as_u64(),
+                        "delayMs":event["delayMs"].as_u64(),"code":code})),
+                ))?;
+            }
+            Some("compaction") => {
+                let (Some(id), Some(state)) = (
+                    event["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128),
+                    event["state"]
+                        .as_str()
+                        .filter(|state| matches!(*state, "start" | "end" | "failed")),
+                ) else {
+                    return Ok(());
+                };
+                // 手动压缩发生在轮次之外；此时没有 turn，提示仍属于这个会话。
+                self.core.send(Envelope::notification(
+                    "turn/notice",
+                    Some(
+                        json!({"threadId":session,"turnId":self.turn_id,"kind":"compaction",
+                        "id":id,"state":state}),
+                    ),
+                ))?;
+            }
             Some("todos") => {
                 let Some(todos) = event["todos"].as_array() else {
                     return Ok(());
@@ -3124,6 +3163,62 @@ mod tests {
                 .is_some_and(|turn| !turn.is_empty()));
             assert_eq!(params["stage"], stage);
         }
+        // 重试只带计数和失败代码；压缩带身份和结果。供应商的报错文字不进入 Core。
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"retry","retry":1,"maxRetries":2,"delayMs":500,
+                "code":"rate_limit","message":"PRIVATE"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"retry","retry":2,"code":"has spaces PRIVATE"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"compaction","id":"c1","state":"failed"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"compaction","id":"c1","state":"invented"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event("other", json!({"type":"retry","retry":9})))
+            .unwrap();
+        let mut notices = Vec::new();
+        for _ in 0..3 {
+            let notice = core_client.recv().await.unwrap();
+            assert_eq!(notice.method.as_deref(), Some("turn/notice"));
+            notices.push(notice.params.unwrap());
+        }
+        assert!(!serde_json::to_string(&notices).unwrap().contains("PRIVATE"));
+        assert_eq!(
+            (
+                &notices[0]["kind"],
+                &notices[0]["retry"],
+                &notices[0]["maxRetries"]
+            ),
+            (&json!("retry"), &json!(1), &json!(2))
+        );
+        assert_eq!(
+            (&notices[0]["delayMs"], &notices[0]["code"]),
+            (&json!(500), &json!("rate_limit"))
+        );
+        assert_eq!(
+            (&notices[1]["retry"], &notices[1]["code"]),
+            (&json!(2), &json!(null))
+        );
+        assert_eq!(
+            (&notices[2]["kind"], &notices[2]["id"], &notices[2]["state"]),
+            (&json!("compaction"), &json!("c1"), &json!("failed"))
+        );
         // 其余事件都被丢弃：下一条到达 Core 的是之后的普通更新。
         acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
             "sessionUpdate":"agent_message_chunk", "messageId":"m", "content":{"type":"text","text":"ok"}}})))).unwrap();

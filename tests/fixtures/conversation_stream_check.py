@@ -59,7 +59,10 @@ def provider():
         # As in dsh, the answer arrives whole when it is committed; only the stage
         # events show that the model was answering for a while before that.
         event({"type": "stage", "stage": "waiting"})
+        event({"type": "compaction", "id": "compaction-1", "state": "start"})
+        event({"type": "retry", "retry": 1, "maxRetries": 2, "delayMs": 300, "code": "rate_limit"})
         time.sleep(.4)
+        event({"type": "compaction", "id": "compaction-1", "state": "end"})
         event({"type": "stage", "stage": "response"})
         todos("completed", "in_progress")
         time.sleep(.6)
@@ -126,6 +129,8 @@ def main():
         response = float(re.search(r"Response (\d+\.\d)s", frozen).group(1))
         assert 0.4 <= response <= 1.5, f"the answering stage must come from stage events, not from the whole-block arrival: {frozen}"
         assert "Todos" not in console.read(), "a finished todo list must leave the screen"
+        assert "Retrying model request (1/2) in 300ms: rate_limit" in console.read(), "the retry notice is missing"
+        assert "earlier context was compacted" in console.read() and "Compacting earlier context" not in console.read(), "compaction must end as one settled notice"
         time.sleep(1.2)
         assert timing.search(" ".join(console.read().split())).group() == frozen, "timing changed after the turn ended"
         (root / "completed-screen.txt").write_text(console.read(), encoding="utf-8")

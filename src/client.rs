@@ -956,6 +956,7 @@ impl Core {
             self.tool_details.execution_unavailable();
             self.state.finish_all_tool_lines();
             self.state.finish_all_reasoning();
+            self.state.finish_all_notices();
         }
         self.state.view.tool_details = self.tool_details.snapshot();
         self.state.view.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
@@ -3927,6 +3928,27 @@ impl Core {
                     self.state.turn_stream_stage(turn, stage, Instant::now());
                 }
             }
+            "turn/notice" => match params["kind"].as_str() {
+                Some("retry") => {
+                    if let (Some(turn), Some(retry)) = (turn, params["retry"].as_u64()) {
+                        self.state.retry_notice(
+                            turn,
+                            retry,
+                            params["maxRetries"].as_u64(),
+                            params["delayMs"].as_u64(),
+                            params["code"].as_str(),
+                        );
+                    }
+                }
+                Some("compaction") => {
+                    if let (Some(id), Some(state)) =
+                        (params["id"].as_str(), params["state"].as_str())
+                    {
+                        self.state.compaction_notice(turn, id, state);
+                    }
+                }
+                _ => {}
+            },
             "thread/todos/updated" => {
                 self.state.view.todos = crate::state::parse_todos(&params["todos"]);
             }
@@ -8582,6 +8604,48 @@ mod tests {
             .await
             .unwrap();
 
+        send(
+            &mut server,
+            json!({"method":"turn/notice","params":{"threadId":"root","turnId":"one",
+            "kind":"retry","retry":1,"maxRetries":2,"delayMs":500,"code":"rate_limit"}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/notice","params":{"threadId":"root","turnId":"old",
+            "kind":"retry","retry":7}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/notice","params":{"threadId":"root","turnId":null,
+            "kind":"compaction","id":"c1","state":"end"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|m| m.text.contains("compacted"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .messages
+                .iter()
+                .filter(|m| m.role == "Notice")
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Retrying model request (1/2) in 500ms: rate_limit",
+                "… earlier context was compacted …"
+            ]
+        );
         send(
             &mut server,
             json!({"method":"thread/todos/updated","params":{"threadId":"other","todos":[

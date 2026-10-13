@@ -752,6 +752,87 @@ impl SessionState {
         }
     }
 
+    /// 模型请求的一次重试：对话流里的一行，不弹面板。只描述 dsh 已经做出的决定。
+    pub fn retry_notice(
+        &mut self,
+        turn: &str,
+        retry: u64,
+        max_retries: Option<u64>,
+        delay_ms: Option<u64>,
+        code: Option<&str>,
+    ) {
+        if self.view.turn_id.as_deref() != Some(turn) {
+            return;
+        }
+        let mut text = match max_retries {
+            Some(max) => format!("Retrying model request ({retry}/{max})"),
+            None => format!("Retrying model request ({retry})"),
+        };
+        if let Some(delay) = delay_ms {
+            text.push_str(&format!(" in {delay}ms"));
+        }
+        if let Some(code) = code {
+            text.push_str(&format!(": {code}"));
+        }
+        self.notice_item(format!("retry:{turn}:{retry}"), turn, text, true);
+    }
+
+    /// 上下文压缩的开始与结果；同一次压缩始终是同一行。
+    pub fn compaction_notice(&mut self, turn: Option<&str>, id: &str, state: &str) {
+        let (text, complete) = match state {
+            "start" => ("Compacting earlier context…", false),
+            "end" => ("… earlier context was compacted …", true),
+            "failed" => ("Context compaction did not complete.", true),
+            _ => return,
+        };
+        self.notice_item(
+            format!("compaction:{id}"),
+            turn.unwrap_or_default(),
+            text.into(),
+            complete,
+        );
+    }
+
+    /// 执行不可用时，没有等到结果的压缩不能继续显示为进行中。
+    pub fn finish_all_notices(&mut self) {
+        for message in &mut self.view.messages {
+            if message.role == "Notice" && !message.complete {
+                message.text = "Context compaction ended, outcome unknown.".into();
+                message.complete = true;
+            }
+        }
+    }
+
+    fn notice_item(&mut self, id: String, turn: &str, text: String, complete: bool) {
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        match self
+            .view
+            .messages
+            .iter_mut()
+            .find(|m| m.role == "Notice" && m.thread_id == thread && m.id == id)
+        {
+            // 已有结果的提示不被迟到的“开始”改回进行中。
+            Some(item) if item.complete && !complete => {}
+            Some(item) => {
+                item.text = text;
+                item.complete = complete;
+            }
+            None => {
+                self.view.messages.push(ConversationItem {
+                    id,
+                    thread_id: thread,
+                    turn_id: turn.into(),
+                    role: "Notice".into(),
+                    text,
+                    complete,
+                    truncated: false,
+                    tools: Vec::new(),
+                });
+                self.bound_history();
+            }
+        }
+    }
+
     pub fn finish_all_reasoning(&mut self) {
         for message in &mut self.view.messages {
             if message.role == "Reasoning" {
@@ -988,6 +1069,50 @@ mod tests {
         assert_eq!(todos[1].content.len(), MAX_TODO_CHARS);
         assert!(!format!("{todos:?}").contains("scan"));
         assert!(parse_todos(&serde_json::json!("not a list")).is_empty());
+    }
+
+    #[test]
+    fn retry_and_compaction_are_single_inline_notices_with_explicit_outcomes() {
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        let notices = |state: &SessionState| -> Vec<(String, bool)> {
+            state
+                .view
+                .messages
+                .iter()
+                .filter(|m| m.role == "Notice")
+                .map(|m| (m.text.clone(), m.complete))
+                .collect()
+        };
+        state.retry_notice("turn", 1, Some(2), Some(500), Some("rate_limit"));
+        state.retry_notice("turn", 1, Some(2), Some(500), Some("rate_limit"));
+        state.retry_notice("turn", 2, None, None, None);
+        state.retry_notice("old", 3, None, None, None);
+        state.compaction_notice(Some("turn"), "c1", "start");
+        state.compaction_notice(Some("turn"), "c2", "start");
+        state.compaction_notice(Some("turn"), "c3", "start");
+        state.compaction_notice(Some("turn"), "c1", "end");
+        state.compaction_notice(Some("turn"), "c1", "start");
+        state.compaction_notice(Some("turn"), "c2", "failed");
+        state.compaction_notice(None, "c4", "invented");
+        state.finish_all_notices();
+        assert_eq!(
+            notices(&state),
+            [
+                (
+                    "Retrying model request (1/2) in 500ms: rate_limit".to_owned(),
+                    true
+                ),
+                ("Retrying model request (2)".to_owned(), true),
+                ("… earlier context was compacted …".to_owned(), true),
+                ("Context compaction did not complete.".to_owned(), true),
+                (
+                    "Context compaction ended, outcome unknown.".to_owned(),
+                    true
+                ),
+            ]
+        );
     }
 
     #[test]

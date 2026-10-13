@@ -333,7 +333,7 @@ pub(super) fn transcript<'a>(
         let text = display_text(&message.text);
         let is_tool = message.role == "Tool";
         // 耗时行和工具行一样没有标题，直接跟在这一步的内容后面。
-        if !is_tool && message.role != "Timing" {
+        if !is_tool && !matches!(message.role.as_str(), "Timing" | "Notice") {
             out.lines.push(header(message, theme));
         }
         let calls = message.tools.len();
@@ -361,7 +361,7 @@ pub(super) fn transcript<'a>(
             let (runs, hang, code) = match message.role.as_str() {
                 "Tool" => tool_runs(source, tool.map(|tool| tool.lifecycle), theme),
                 "You" => (vec![(source.len(), Style::default())], 0, false),
-                "Timing" => (
+                "Timing" | "Notice" => (
                     vec![(source.len(), Style::default().fg(theme.muted))],
                     0,
                     false,
@@ -741,6 +741,16 @@ mod tests {
         );
         let theme = theme::current();
         assert_eq!(view.lines[3].spans[1].style.fg, Some(theme.muted));
+        let notice = [item(
+            "Notice",
+            "Retrying model request (1/2) in 500ms: rate_limit",
+        )];
+        let view = transcript(notice.iter(), None, 80, false);
+        assert_eq!(
+            rows(&view),
+            ["  Retrying model request (1/2) in 500ms: rate_limit"]
+        );
+        assert_eq!(view.lines[0].spans[1].style.fg, Some(theme.muted));
         // 窄窗口按词换行，不丢阶段。
         let narrow = rows(&transcript(messages.iter(), None, 24, false)).join(" ");
         for stage in ["Model wait 1.0s", "Response 3.0s", "14:32:12 UTC"] {

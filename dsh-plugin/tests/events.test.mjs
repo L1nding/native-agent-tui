@@ -32,6 +32,26 @@ test('a stage is announced once per change and never carries model output', () =
   assert.ok(!JSON.stringify(sent).includes('PRIVATE'))
 })
 
+test('retries carry counts and the host failure code, compaction its outcome', () => {
+  const { sent, event } = host()
+  event('s', 'llm/retry', { retry: 1, maxRetries: 2, delayMs: 500, provider: 'p', failure: { code: 'rate_limit', message: 'PRIVATE key sk-123' } })
+  event('s', 'llm/retry', { retry: 2, delayMs: 1000, failure: { code: 'has spaces and PRIVATE text' } })
+  event('s', 'llm/retry', { retry: -1 })
+  event('s', 'compaction/start', { compactionId: 'c1', turn: 't' })
+  event('s', 'compaction/end', { compactionId: 'c1', turn: 't' })
+  event('s', 'compaction/end', { compactionId: 'c2', error: [{ message: 'PRIVATE' }] })
+  event('s', 'compaction/summary', { compactionId: 'c1', summary: 'PRIVATE' })
+  event('s', 'compaction/start', {})
+  assert.deepEqual(sent.map(frame => frame.params.event), [
+    { type: 'retry', retry: 1, maxRetries: 2, delayMs: 500, code: 'rate_limit' },
+    { type: 'retry', retry: 2, delayMs: 1000 },
+    { type: 'compaction', id: 'c1', state: 'start' },
+    { type: 'compaction', id: 'c1', state: 'end' },
+    { type: 'compaction', id: 'c2', state: 'failed' },
+  ])
+  assert.ok(!JSON.stringify(sent).includes('PRIVATE'))
+})
+
 test('a todo list is relayed whole, bounded, and without malformed items', () => {
   const { sent, event, stream } = host()
   event('s', 'todo/write', { todos: [
