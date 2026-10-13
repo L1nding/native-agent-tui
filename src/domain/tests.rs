@@ -676,3 +676,47 @@ fn private_fact_verification_checks_all_receipt_bindings_above_model_budget() {
         FactProjection::Superseded
     );
 }
+
+#[test]
+fn verified_source_groups_project_complete_counts_and_reject_malformed_groups() {
+    let mut facts = sequenced_facts();
+    let setup = facts.setup.as_ref().unwrap().clone();
+    let mut value = json!({"contract":"modeling-domain/v2","kind":"source_groups","ok":true,
+    "run_id":setup.run_id,"context_sha256":setup.context_sha256,"fact_sequence":4,
+    "scan_id":"scan-1","scene_sha256":"scene-1","total_groups":1,"total_objects":2,
+    "state_counts":{"pending_confirmation":2},"groups":[{
+        "group_id":"group.same","block":"凳-医生","instance_count":2,
+        "instances":[{"source_id":"a"},{"source_id":"b"}],
+        "category_counts":{"unresolved":2},"state_counts":{"pending_confirmation":2}
+    }]});
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let projection = facts.snapshot.groups.as_ref().unwrap();
+    assert_eq!(projection.total_objects, 2);
+    assert!(projection.rows[0].contains("凳-医生"));
+    value["fact_sequence"] = json!(5);
+    value["groups"][0]["instance_count"] = json!(3);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    assert_eq!(facts.snapshot.groups.as_ref().unwrap().total_objects, 2);
+    value["groups"][0]["instance_count"] = json!(2);
+    value["total_objects"] = json!(3);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+}
+
+#[test]
+fn source_group_assessment_count_requires_actual_bound_reasons() {
+    let mut facts = sequenced_facts();
+    let mut value = json!({"contract":CONTRACT,"kind":"source_groups","run_id":"run", "context_sha256":"ctx",
+    "fact_sequence":1,"ok":true,"scan_id":"scan","scene_sha256":"scene",
+    "total_objects":1,"total_groups":1,"assessed_groups":1,
+    "state_counts":{"pending_confirmation":1},"groups":[{
+        "group_id":"group.x","block":"ambiguous","instance_count":1,
+        "instances":[{"source_id":"source"}],"category_counts":{"unresolved":1},
+        "state_counts":{"pending_confirmation":1},"assessment":null
+    }]});
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    value["groups"][0]["assessment"] =
+        json!({"category":null,"reason":"unclear host; needs user review"});
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    assert_eq!(facts.snapshot.groups.as_ref().unwrap().assessed_groups, 1);
+    assert!(facts.snapshot.groups.as_ref().unwrap().rows[1].contains("unclear host"));
+}

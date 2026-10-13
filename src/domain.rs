@@ -156,6 +156,17 @@ pub struct SourceLedgerFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGroupsFact {
+    pub scan_id: String,
+    pub scene_sha256: String,
+    pub total_objects: usize,
+    pub total_groups: usize,
+    pub assessed_groups: usize,
+    pub rows: Vec<String>,
+    pub counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationFact {
     pub operation_id: String,
     pub state: String,
@@ -222,6 +233,7 @@ pub struct DomainSnapshot {
     pub floor_id: String,
     pub proposal: Option<ProposalFact>,
     pub ledger: Option<SourceLedgerFact>,
+    pub groups: Option<SourceGroupsFact>,
     pub application: Option<String>,
     pub operation: Option<OperationFact>,
     pub artifacts: Vec<ArtifactFact>,
@@ -359,6 +371,12 @@ impl DomainFacts {
                     }
                 }
             }
+            Some("source_groups") => {
+                if let Some(groups) = source_groups_fact(value) {
+                    self.snapshot.groups = Some(groups);
+                    accepted = true;
+                }
+            }
             Some("source_ledger") => {
                 if let Some(ledger) = source_ledger_fact(value) {
                     self.snapshot.ledger = Some(ledger);
@@ -474,7 +492,7 @@ impl DomainFacts {
                 self.fact_sequences.insert(fact_key, sequence);
             }
             FactProjection::Applied
-        } else if matches!(kind, "proposal" | "source_ledger") {
+        } else if matches!(kind, "proposal" | "source_ledger" | "source_groups") {
             FactProjection::Invalid
         } else {
             FactProjection::Unrelated
@@ -670,6 +688,79 @@ fn matches_proposal(snapshot: &DomainSnapshot, value: &Value) -> bool {
     snapshot.proposal.as_ref().is_some_and(|p| {
         value["proposal_id"] == p.binding.proposal_id
             && value["prepare_token"] == p.binding.prepare_token
+    })
+}
+
+fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
+    let groups = value["groups"].as_array()?;
+    let total_groups = usize::try_from(value["total_groups"].as_u64()?).ok()?;
+    let total_objects = usize::try_from(value["total_objects"].as_u64()?).ok()?;
+    let assessed_groups = value["assessed_groups"].as_u64().unwrap_or(0) as usize;
+    if assessed_groups > total_groups || groups.len() != total_groups || groups.len() > 1000 {
+        return None;
+    }
+    let mut sum = 0usize;
+    let mut assessed = 0usize;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    for group in groups {
+        let id = text(group, "group_id").ok()?;
+        let count = usize::try_from(group["instance_count"].as_u64()?).ok()?;
+        if !ids.insert(id.clone()) || count == 0 || group["instances"].as_array()?.len() != count {
+            return None;
+        }
+        sum = sum.checked_add(count)?;
+        let assessment = if group["assessment"].is_null() {
+            None
+        } else {
+            assessed += 1;
+            Some(text(&group["assessment"], "reason").ok()?)
+        };
+        let group_counts: BTreeMap<String, usize> =
+            serde_json::from_value(group["state_counts"].clone()).ok()?;
+        if group_counts
+            .values()
+            .try_fold(0usize, |n, c| n.checked_add(*c))?
+            != count
+        {
+            return None;
+        }
+        if ids.len() <= 100 {
+            rows.push(format!(
+                "{} · {} 个 · 类别 {} · 状态 {} · {}",
+                text(group, "block").ok()?,
+                count,
+                group["category_counts"],
+                group["state_counts"],
+                id
+            ));
+            if let Some(reason) = assessment {
+                rows.push(format!("评估依据／问题：{reason}"));
+            }
+        }
+    }
+    if assessed != assessed_groups {
+        return None;
+    }
+    let counts: BTreeMap<String, usize> =
+        serde_json::from_value(value["state_counts"].clone()).ok()?;
+    if sum != total_objects || counts.values().try_fold(0usize, |n, c| n.checked_add(*c))? != sum {
+        return None;
+    }
+    if total_groups > 100 {
+        rows.push(format!(
+            "其余 {} 组已封存，请查询完整分组事实",
+            total_groups - 100
+        ));
+    }
+    Some(SourceGroupsFact {
+        scan_id: text(value, "scan_id").ok()?,
+        scene_sha256: text(value, "scene_sha256").ok()?,
+        total_objects,
+        total_groups,
+        assessed_groups,
+        rows,
+        counts,
     })
 }
 

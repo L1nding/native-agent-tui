@@ -102,6 +102,7 @@ pub fn from_tool(
             receipt.kind.as_str(),
             "capabilities"
                 | "source_ledger"
+                | "source_groups"
                 | "source_interpretation"
                 | "source_disposition"
                 | "proposal"

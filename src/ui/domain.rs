@@ -31,6 +31,28 @@ fn business_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if let Some(groups) = &domain.groups {
+        lines.push(Line::from(format!(
+            "全层来源分组 · {} 组 · {} 实例 · 已评估 {} 组",
+            groups.total_groups, groups.total_objects, groups.assessed_groups
+        )));
+        lines.push(Line::from(format!(
+            "分组扫描 {} · 场景 {}",
+            groups.scan_id, groups.scene_sha256
+        )));
+        lines.push(Line::from(
+            groups
+                .counts
+                .iter()
+                .map(|(state, count)| format!("{state} {count}"))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        ));
+        lines.extend(groups.rows.iter().map(|row| Line::from(display_text(row))));
+        lines.push(Line::from(
+            "按相同来源几何分组；分类及参数依据由 Agent 评估，批准绑定具体方案。",
+        ));
+    }
     if let Some(ledger) = &domain.ledger {
         lines.push(Line::from(format!(
             "来源实例对账 · 扫描 {}",
