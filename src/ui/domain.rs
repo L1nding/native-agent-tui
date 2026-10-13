@@ -104,14 +104,44 @@ fn business_lines(snapshot: &CoreSnapshot, local: &LocalState, width: u16) -> Ve
             ));
         }
     }
-    lines.push(Line::from(format!(
-        "Blender 产物 {}",
-        domain.artifact.as_deref().unwrap_or("not_run")
-    )));
-    lines.push(Line::from(format!(
-        "产物验证 {}",
-        domain.artifact_validation.as_deref().unwrap_or("not_run")
-    )));
+    if domain.artifacts.is_empty() {
+        lines.push(Line::from("Blender 产物 not_run"));
+        lines.push(Line::from("产物验证 not_run"));
+    }
+    for artifact in domain.artifacts.iter().rev() {
+        lines.push(Line::from(format!(
+            "构建任务 {} · {}",
+            artifact.binding.build_id,
+            if artifact.binding.candidate {
+                "候选预览"
+            } else {
+                "已应用场景"
+            }
+        )));
+        let current = artifact
+            .current
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        lines.push(Line::from(format!(
+            "Blender 产物 {} · current={} · build_id={}",
+            artifact.state.as_str(),
+            current,
+            artifact.binding.build_id
+        )));
+        let valid = artifact
+            .valid
+            .map(|v| format!("valid={v}"))
+            .unwrap_or_else(|| "not_run".into());
+        lines.push(Line::from(format!(
+            "产物验证 {valid} · current={current} · build_id={}",
+            artifact.binding.build_id
+        )));
+        lines.push(Line::from(format!(
+            "产物位置 {}",
+            display_text(&artifact.binding.output)
+        )));
+        lines.push(Line::from("AI/人工复核未执行"));
+    }
     if domain.authorizing {
         lines.push(Line::from("正在记录具体版本批准…"));
     }
@@ -501,6 +531,97 @@ mod tests {
             assert!(screen.contains("candidate_present"), "{screen}");
             assert!(screen.contains("应用结果未确认"), "{screen}");
             assert!(screen.contains("当前场景"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn business_artifacts_show_success_and_failure_under_their_own_build_ids() {
+        use crate::domain::{ArtifactBinding, ArtifactFact, ArtifactState};
+        let binding = |id: &str| ArtifactBinding {
+            build_id: id.into(),
+            proposal_id: "proposal".into(),
+            revision: 3,
+            prepare_token: "token".into(),
+            candidate: true,
+            authority_sha256: "base".into(),
+            input_sha256: "candidate".into(),
+            output: format!("{id}.glb"),
+        };
+        let snapshot = CoreSnapshot {
+            domain: DomainSnapshot {
+                enabled: true,
+                proposal: Some(proposal(3)),
+                artifacts: vec![
+                    ArtifactFact {
+                        binding: binding("preview-valid"),
+                        state: ArtifactState::Built,
+                        current: Some(false),
+                        valid: Some(true),
+                    },
+                    ArtifactFact {
+                        binding: binding("build-failed"),
+                        state: ArtifactState::Failed,
+                        current: Some(true),
+                        valid: Some(false),
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = business_lines(&snapshot, &LocalState::default(), 180);
+        let screen = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let failed = screen
+            .split("构建任务 build-failed")
+            .nth(1)
+            .unwrap()
+            .split("构建任务 preview-valid")
+            .next()
+            .unwrap();
+        assert!(failed.contains("Blender 产物 failed"), "{screen}");
+        assert!(failed.contains("valid=false"), "{screen}");
+        assert!(!failed.contains("valid=true"), "{screen}");
+        let previous = screen.split("构建任务 preview-valid").nth(1).unwrap();
+        assert!(previous.contains("valid=true · current=false"), "{screen}");
+        // Exercise the real business renderer at both wide and narrow widths.
+        use ratatui::{backend::TestBackend, Terminal};
+        use unicode_width::UnicodeWidthStr;
+        for (width, height) in [(120, 45), (60, 45)] {
+            let mut local = LocalState {
+                domain_visible: true,
+                ..Default::default()
+            };
+            local.domain_scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw(f, f.area(), &snapshot, &local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut rendered = String::new();
+            for y in 0..height {
+                let mut x = 0;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    rendered.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+                rendered.push('\n');
+            }
+            assert!(rendered.contains("构建任务 build-failed"), "{rendered}");
+            assert!(rendered.contains("构建任务 preview-valid"), "{rendered}");
+            let failed = rendered
+                .split("构建任务 build-failed")
+                .nth(1)
+                .unwrap()
+                .split("构建任务 preview-valid")
+                .next()
+                .unwrap();
+            assert!(failed.contains("valid=false"), "{rendered}");
+            assert!(!failed.contains("valid=true"), "{rendered}");
         }
     }
 

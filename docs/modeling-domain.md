@@ -75,3 +75,18 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 保留首轮 `target/dsh-e2e-38749061`（5 通过／1 失败）：实际 UI 已清除不可批准方案的 displayed binding，按 Ctrl+Y 得到 UI 拒绝提示；验收只接受 Core 的另一条拒绝提示而误判。支持两条拒绝路径后用新副本重跑，授权／操作／writer 不增加的条件保持。首轮独立核对仅证明不确定已替换场景和旧有效预览保持，不作为完整恢复成功。
 
 本轮完整 `scripts/verify.py` 通过：549 项 Rust 测试通过，2 项可选 live 默认跳过，格式、编译、Clippy、doctest、release／examples 和终端／Windows 进程专项通过，日志 `target/c11-platform-final-verify-20261013.log`。真实 C11 独立执行。平台预览取消、后续编辑冲突和构建失败保留旧有效产物的组合路径仍待补齐；医院完整闭环、C08 跨层及视觉复核继续实施。
+
+
+## C11 同方案多个构建任务与失败后保留
+
+重新核对发现原独立 artifact／artifact_validation 字符串会混淆同一 proposal 的多个 build：A 已验证成功后，B 的 building 状态旁仍能保留 A 的 valid=true。回归先在原实现失败，修复为 Core 持有 `ArtifactBinding`／`ArtifactFact`／`ArtifactState`：完整核对 build_id、proposal、revision、token、candidate、authority/input SHA 和 output，状态／验证共享每作业事实水位。迟到 A 不替换 B；B 失败不继承 A 验证；错误字段和 ID 复用不污染序号。当前方案最多缓存32条构建事实，持久回执与旧有效产物保留；新方案和重载清空内存，再查询恢复。操作查询确认后来修改后，旧已应用产物保留 valid=true，同时标记 current=false。
+
+业务页逐任务显示状态、验证和产物位置；状态行及验证行各自包含 build_id，任务标题滚出视口时仍能确认归属。新增宽／窄假终端、同方案晚到成功／失败、身份拒绝、水位、缓存边界和场景后续编辑专项。Python 事实仍是来源，UI 不执行工作流或推断成功。
+
+真实 `--domain-case failure` 使用模型器 `scripts/prepare_complex_failure.py` 的新隔离 context，经键盘推进 `hi/gpt-6.1-sol`。Blender 门闩只绑定这个新运行的第二个作业，实际进入 Blender 后记录活体 PID／创建时间证据，由验收释放后抛出失败；测试编辑器在锁内验证并增加后续审阅 metadata。验收不直接 prepare／authorize／apply，也不调用 `_result` 制造事实。最终 `target/dsh-e2e-a57e53b6` 6项通过、0失败，进程清理通过，模型器独立 `verify_complex_platform_failure.py` 为 valid=true。
+
+具体批准只产生一份授权与一次任务 applied。`failure-valid-build` 完成实际构建／重建／GLB 和 Agent 验证；同提案 `platform-failed-build` 的真实失败验证序号14，默认业务页分别展示失败 valid=false 和旧构建 valid=true，旧 GLB／BLEND／报告哈希及已应用场景保持。独立后续编辑完成后，Agent 实际查询并沿原操作 `apply-chair-46505ec85ea341fdb00a5a06f7ca4df2-r1` 获取原回执，后续场景字节保持，旧产物 valid=true／current=false，未增加批准或构建。四项证据篡改（缺失败验证、失败行改成功、缺旧产物哈希、改后续编辑回执）全被拒绝，原成功证据保持。
+
+三次失败原样保留：`target/dsh-e2e-4fc35226`（1通过／1失败）扫描后准备超时；`target/dsh-e2e-31182daa`（4通过／1失败）失败任务标题滚出短视口，验收无法绑定；`target/dsh-e2e-c0aa7270`（3通过／1失败）带 ID 的实际 valid=true 位于末行，验收把终端边框纳入末尾匹配而拒绝。独立保留核验只记录各轮实际已完成范围，不改写为组合成功。拆分扫描／准备、每条状态绑定 ID、修正边框／相似 ID／Agent 回复匹配，并扩大 failure 场景的有界滚动范围后，使用新副本重跑。两项 `domain_failure_view_test.py` 接入默认 `scripts/verify.py`。
+
+最终 `scripts/verify.py` 全量通过：556项 Rust 测试通过、2项可选 live 默认跳过，日志 `target/c11-artifact-binding-final-verify-20261013.log`。领域／业务页28项专项通过；新视口匹配测试接入后 `--fixtures-only` 再通过，日志 `target/c11-failure-view-final-fixtures-20261013.log`。真实6项另行执行。平台预览取消、未完成应用的后续编辑冲突、C08 跨层、医院完整闭环及 AI／人工视觉复核仍未完成；不能把该子路径当成 C11 或整个计划完成。

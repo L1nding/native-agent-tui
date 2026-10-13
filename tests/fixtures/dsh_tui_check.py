@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure"], help="modeling scenario for --only domain")
     args = parser.parse_args()
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
@@ -589,7 +589,7 @@ def domain_checks(report, binary, common, args, workspace, root):
             if " · Failed · " in screen or " · Interrupted · " in screen:
                 raise Failed(f"{what}: domain turn ended without success")
             if time.monotonic() - last_move >= 1:
-                if page >= 10:
+                if page >= (40 if case == "failure" else 10):
                     tui.keys("\x1b[5~" * page, 0.1)
                     page = 0
                 else:
@@ -613,6 +613,10 @@ def domain_checks(report, binary, common, args, workspace, root):
         tui.console = Console(command, repository)
         return code
     try:
+        if case == "failure":
+            from domain_failure_check import run_failure_checks
+            run_failure_checks(report, tui, send, finished, fact, context, root)
+            return
         if case == "recovery":
             from domain_recovery_check import run_recovery_checks
             run_recovery_checks(report, tui, send, finished, fact, context, root, restart)

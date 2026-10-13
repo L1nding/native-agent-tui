@@ -150,6 +150,51 @@ pub struct OperationFact {
     pub current_sha256: String,
 }
 
+/// One immutable build input; validation belongs to this identity only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactBinding {
+    pub build_id: String,
+    pub proposal_id: String,
+    pub revision: u64,
+    pub prepare_token: String,
+    pub candidate: bool,
+    pub authority_sha256: String,
+    pub input_sha256: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactState {
+    Queued,
+    Building,
+    Unknown,
+    Cancelled,
+    Failed,
+    Built,
+}
+
+impl ArtifactState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Building => "building",
+            Self::Unknown => "unknown",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::Built => "built",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFact {
+    pub binding: ArtifactBinding,
+    pub state: ArtifactState,
+    /// Whether this job's authority is current at the last query; None is unknown.
+    pub current: Option<bool>,
+    pub valid: Option<bool>,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainSnapshot {
     pub enabled: bool,
@@ -158,8 +203,7 @@ pub struct DomainSnapshot {
     pub ledger: Option<SourceLedgerFact>,
     pub application: Option<String>,
     pub operation: Option<OperationFact>,
-    pub artifact: Option<String>,
-    pub artifact_validation: Option<String>,
+    pub artifacts: Vec<ArtifactFact>,
     pub authorizing: bool,
     pub notice: Option<String>,
 }
@@ -174,7 +218,7 @@ impl std::fmt::Debug for DomainSnapshot {
             )
             .field("state", &self.proposal.as_ref().map(|p| &p.state))
             .field("authorizing", &self.authorizing)
-            .field("has_artifact", &self.artifact.is_some())
+            .field("artifact_count", &self.artifacts.len())
             .finish()
     }
 }
@@ -233,10 +277,19 @@ impl DomainFacts {
         let Some(kind) = value["kind"].as_str() else {
             return;
         };
+        let artifact_kind = matches!(kind, "artifact" | "artifact_validation");
+        let fact_key = if artifact_kind {
+            let Some(id) = value["artifact"]["build_id"].as_str() else {
+                return;
+            };
+            format!("artifact:{id}")
+        } else {
+            kind.to_owned()
+        };
         let sequence = value["fact_sequence"].as_u64();
         if self
             .fact_sequences
-            .get(kind)
+            .get(&fact_key)
             .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
         {
             return;
@@ -255,14 +308,10 @@ impl DomainFacts {
                         if !same {
                             self.snapshot.application = None;
                             self.snapshot.operation = None;
-                            self.snapshot.artifact = None;
-                            self.snapshot.artifact_validation = None;
-                            for kind in [
-                                "application",
-                                "operation",
-                                "artifact",
-                                "artifact_validation",
-                            ] {
+                            self.snapshot.artifacts.clear();
+                            self.fact_sequences
+                                .retain(|key, _| !key.starts_with("artifact:"));
+                            for kind in ["application", "operation"] {
                                 self.fact_sequences.remove(kind);
                             }
                         }
@@ -290,6 +339,7 @@ impl DomainFacts {
                         value["receipt"]["candidate_sha256"] == operation.current_sha256
                     ));
                     self.snapshot.operation = Some(operation);
+                    self.invalidate_artifact_currency();
                     if let Some(proposal) = &mut self.snapshot.proposal {
                         proposal.ready = false;
                     }
@@ -314,6 +364,7 @@ impl DomainFacts {
                 self.snapshot.application = value["receipt"]["state"]
                     .as_str()
                     .map(|state| format!("{state} · current={}", value["current"]));
+                self.invalidate_artifact_currency();
                 if let Some(proposal) = &mut self.snapshot.proposal {
                     proposal.ready = false;
                 }
@@ -325,29 +376,51 @@ impl DomainFacts {
                 }
                 accepted = true;
             }
-            Some("artifact")
-                if matches_proposal(&self.snapshot, &value["artifact"])
-                    && !(value["artifact"]["candidate"] == true
-                        && self.snapshot.application.is_some()) =>
-            {
-                self.snapshot.artifact = Some(format!(
-                    "{} · current={} · {}",
-                    value["artifact"]["state"].as_str().unwrap_or("unknown"),
-                    value["artifact"]["current"],
-                    value["artifact"]["output"].as_str().unwrap_or("")
-                ));
-                accepted = true;
-            }
-            Some("artifact_validation")
-                if matches_proposal(&self.snapshot, &value["artifact"])
-                    && !(value["artifact"]["candidate"] == true
-                        && self.snapshot.application.is_some()) =>
-            {
-                self.snapshot.artifact_validation = Some(format!(
-                    "valid={} · current={} · AI/人工复核未执行",
-                    value["artifact"]["valid"], value["artifact"]["current"]
-                ));
-                accepted = true;
+            Some("artifact" | "artifact_validation") => {
+                if let Some(mut artifact) = self
+                    .snapshot
+                    .proposal
+                    .as_ref()
+                    .and_then(|p| artifact_fact(&value, &p.binding))
+                {
+                    if sequence.is_none_or(|seq| {
+                        self.fact_sequences
+                            .get("application")
+                            .is_some_and(|last| seq < *last)
+                    }) {
+                        artifact.current = self
+                            .snapshot
+                            .operation
+                            .as_ref()
+                            .filter(|operation| {
+                                operation.current_sha256 != artifact.binding.authority_sha256
+                            })
+                            .map(|_| false);
+                    }
+                    let existing = self
+                        .snapshot
+                        .artifacts
+                        .iter_mut()
+                        .find(|a| a.binding.build_id == artifact.binding.build_id);
+                    if let Some(old) = existing {
+                        if old.binding == artifact.binding {
+                            if kind == "artifact" && old.state == artifact.state {
+                                artifact.valid = old.valid;
+                            }
+                            *old = artifact;
+                            accepted = true;
+                        }
+                    } else {
+                        // Receipts remain durable in Python; bound the in-memory display history.
+                        if self.snapshot.artifacts.len() >= 32 {
+                            let evicted = self.snapshot.artifacts.remove(0);
+                            self.fact_sequences
+                                .remove(&format!("artifact:{}", evicted.binding.build_id));
+                        }
+                        self.snapshot.artifacts.push(artifact);
+                        accepted = true;
+                    }
+                }
             }
             Some("diagnostic") => {
                 self.snapshot.notice = value["diagnostics"][0]["message"]
@@ -359,7 +432,20 @@ impl DomainFacts {
         }
         if accepted {
             if let Some(sequence) = sequence {
-                self.fact_sequences.insert(kind.into(), sequence);
+                self.fact_sequences.insert(fact_key, sequence);
+            }
+        }
+    }
+
+    fn invalidate_artifact_currency(&mut self) {
+        for artifact in &mut self.snapshot.artifacts {
+            if self.snapshot.operation.as_ref().is_some_and(|operation| {
+                operation.current_sha256 != artifact.binding.authority_sha256
+            }) {
+                artifact.current = Some(false);
+            } else if artifact.binding.candidate {
+                // Applying without an inspected authority cannot prove preview currency.
+                artifact.current = None;
             }
         }
     }
@@ -392,6 +478,57 @@ impl DomainFacts {
                 .as_ref()
                 .is_some_and(|p| p.ready && p.binding == *binding)
     }
+}
+
+fn artifact_fact(value: &Value, proposal: &ProposalBinding) -> Option<ArtifactFact> {
+    let a = &value["artifact"];
+    let candidate = a["candidate"].as_bool()?;
+    let binding = ArtifactBinding {
+        build_id: text(a, "build_id").ok()?,
+        proposal_id: text(a, "proposal_id").ok()?,
+        revision: a["revision"].as_u64()?,
+        prepare_token: text(a, "prepare_token").ok()?,
+        candidate,
+        authority_sha256: text(a, "authority_sha256").ok()?,
+        input_sha256: text(a, "input_sha256").ok()?,
+        output: text(a, "output").ok()?,
+    };
+    if binding.proposal_id != proposal.proposal_id
+        || binding.revision != proposal.revision
+        || binding.prepare_token != proposal.prepare_token
+        || binding.input_sha256 != proposal.candidate_sha256
+        || binding.authority_sha256.as_str()
+            != if candidate {
+                proposal.base_sha256.as_str()
+            } else {
+                proposal.candidate_sha256.as_str()
+            }
+    {
+        return None;
+    }
+    let state = match a["state"].as_str()? {
+        "queued" => ArtifactState::Queued,
+        "building" => ArtifactState::Building,
+        "unknown" => ArtifactState::Unknown,
+        "cancelled" => ArtifactState::Cancelled,
+        "failed" => ArtifactState::Failed,
+        "built" => ArtifactState::Built,
+        _ => return None,
+    };
+    let valid = if value["kind"] == "artifact_validation" {
+        Some(a["valid"].as_bool()?)
+    } else {
+        None
+    };
+    if valid == Some(true) && state != ArtifactState::Built {
+        return None;
+    }
+    Some(ArtifactFact {
+        binding,
+        state,
+        current: a["current"].as_bool(),
+        valid,
+    })
 }
 
 fn operation_fact(value: &Value, binding: &ProposalBinding) -> Option<OperationFact> {

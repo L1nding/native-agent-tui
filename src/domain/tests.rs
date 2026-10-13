@@ -157,19 +157,16 @@ fn unrelated_historical_artifact_does_not_poison_current_artifact_sequence() {
     proposal["fact_sequence"] = json!(3);
     deliver_fact(&mut facts, "proposal", proposal);
     let mut artifact = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx","kind":"artifact",
-        "fact_sequence":100,"artifact":{"proposal_id":"old","prepare_token":"old","state":"built","output":"old.glb"}});
+        "fact_sequence":100,"artifact":{"proposal_id":"old","prepare_token":"old","build_id":"job","revision":2,"candidate":true,"authority_sha256":"base",
+        "input_sha256":"candidate","state":"built","output":"old.glb"}});
     deliver_fact(&mut facts, "old-artifact", artifact.clone());
     artifact["fact_sequence"] = json!(4);
     artifact["artifact"]["proposal_id"] = json!("proposal");
     artifact["artifact"]["prepare_token"] = json!("token");
     artifact["artifact"]["output"] = json!("current.glb");
     deliver_fact(&mut facts, "current-artifact", artifact);
-    assert!(facts
-        .snapshot
-        .artifact
-        .as_ref()
-        .unwrap()
-        .contains("current.glb"));
+    assert_eq!(facts.snapshot.artifacts.len(), 1);
+    assert_eq!(facts.snapshot.artifacts[0].binding.output, "current.glb");
 }
 
 fn hosted_proposal() -> Value {
@@ -313,4 +310,209 @@ fn foreign_or_malformed_operation_cannot_change_approval_or_its_watermark() {
         );
         assert!(!facts.can_authorize(&binding));
     }
+}
+
+#[test]
+fn a_new_build_cannot_display_the_previous_builds_validation() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    let validation = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"artifact_validation","fact_sequence":4,
+        "artifact":{"build_id":"build-a","proposal_id":"proposal","revision":2,
+        "prepare_token":"token","candidate":true,"authority_sha256":"base",
+        "input_sha256":"candidate","state":"built","output":"a.glb","valid":true,"current":true}});
+    deliver_fact(&mut facts, "a-valid", validation);
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    let building = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"artifact","fact_sequence":5,
+        "artifact":{"build_id":"build-b","proposal_id":"proposal","revision":2,
+        "prepare_token":"token","candidate":true,"authority_sha256":"base",
+        "input_sha256":"candidate","state":"building","output":"b.glb","current":true}});
+    deliver_fact(&mut facts, "b-building", building);
+    assert_eq!(facts.snapshot.artifacts.len(), 2);
+    assert_eq!(facts.snapshot.artifacts[0].binding.build_id, "build-a");
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    assert_eq!(facts.snapshot.artifacts[1].binding.build_id, "build-b");
+    assert_eq!(
+        facts.snapshot.artifacts[1].valid, None,
+        "build B inherited build A validation"
+    );
+}
+
+fn artifact_envelope(id: &str, sequence: u64, state: &str, valid: Option<bool>) -> Value {
+    let mut value = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":if valid.is_some() { "artifact_validation" } else { "artifact" },
+        "fact_sequence":sequence,
+        "artifact":{"build_id":id,"proposal_id":"proposal","revision":2,
+        "prepare_token":"token","candidate":true,"authority_sha256":"base",
+        "input_sha256":"candidate","state":state,"output":format!("{id}.glb"),"current":true}});
+    if let Some(valid) = valid {
+        value["artifact"]["valid"] = json!(valid);
+    }
+    value
+}
+
+#[test]
+fn late_success_and_failure_remain_bound_to_each_job_and_ignore_older_states() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    deliver_fact(
+        &mut facts,
+        "a-start",
+        artifact_envelope("a", 4, "building", None),
+    );
+    deliver_fact(
+        &mut facts,
+        "b-start",
+        artifact_envelope("b", 5, "building", None),
+    );
+    deliver_fact(
+        &mut facts,
+        "b-fail",
+        artifact_envelope("b", 9, "failed", Some(false)),
+    );
+    deliver_fact(
+        &mut facts,
+        "a-valid-delayed",
+        artifact_envelope("a", 8, "built", Some(true)),
+    );
+    deliver_fact(
+        &mut facts,
+        "b-old-state",
+        artifact_envelope("b", 6, "building", None),
+    );
+    assert_eq!(facts.snapshot.artifacts[0].state, ArtifactState::Built);
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    assert_eq!(facts.snapshot.artifacts[1].state, ArtifactState::Failed);
+    assert_eq!(facts.snapshot.artifacts[1].valid, Some(false));
+    // An inspect preserves the validation only for this same immutable job/state.
+    deliver_fact(
+        &mut facts,
+        "a-inspect",
+        artifact_envelope("a", 10, "built", None),
+    );
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+}
+
+#[test]
+fn malformed_build_binding_cannot_create_a_job_or_poison_its_sequence() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    let original = artifact_envelope("a", 100, "built", Some(true));
+    for (key, value) in [
+        ("revision", json!(9)),
+        ("prepare_token", json!("foreign")),
+        ("input_sha256", json!("different")),
+        ("authority_sha256", json!("different")),
+        ("candidate", json!(false)),
+        ("build_id", json!(null)),
+        ("state", json!("failed")),
+    ] {
+        let mut malformed = original.clone();
+        malformed["artifact"][key] = value;
+        deliver_fact(&mut facts, "malformed", malformed);
+        assert!(
+            facts.snapshot.artifacts.is_empty(),
+            "accepted invalid {key}"
+        );
+    }
+    deliver_fact(
+        &mut facts,
+        "a-valid",
+        artifact_envelope("a", 4, "built", Some(true)),
+    );
+    let mut reused = artifact_envelope("a", 101, "built", Some(true));
+    reused["artifact"]["output"] = json!("another.glb");
+    deliver_fact(&mut facts, "reused-id", reused);
+    deliver_fact(
+        &mut facts,
+        "a-validation-fails",
+        artifact_envelope("a", 5, "built", Some(false)),
+    );
+    assert_eq!(facts.snapshot.artifacts.len(), 1);
+    assert_eq!(facts.snapshot.artifacts[0].binding.output, "a.glb");
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(false));
+}
+
+#[test]
+fn application_keeps_preview_validation_but_invalidates_its_cached_currency() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    deliver_fact(
+        &mut facts,
+        "preview",
+        artifact_envelope("a", 4, "built", Some(true)),
+    );
+    deliver_fact(
+        &mut facts,
+        "apply",
+        json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"application","fact_sequence":7,"current":true,
+        "receipt":{"proposal_id":"proposal","prepare_token":"token","state":"applied"}}),
+    );
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    assert_eq!(facts.snapshot.artifacts[0].current, None);
+    // A delayed pre-apply query remains historical, never restores current=true.
+    deliver_fact(
+        &mut facts,
+        "delayed-validation",
+        artifact_envelope("a", 6, "built", Some(true)),
+    );
+    assert_eq!(facts.snapshot.artifacts[0].current, None);
+    let mut queried = artifact_envelope("a", 8, "built", Some(true));
+    queried["artifact"]["current"] = json!(false);
+    deliver_fact(&mut facts, "post-apply-validation", queried);
+    assert_eq!(facts.snapshot.artifacts[0].current, Some(false));
+}
+
+#[test]
+fn build_history_is_bounded_and_new_proposal_clears_its_job_bindings() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    for number in 0..40 {
+        deliver_fact(
+            &mut facts,
+            "job",
+            artifact_envelope(&format!("job-{number}"), number + 4, "built", Some(true)),
+        );
+    }
+    assert_eq!(facts.snapshot.artifacts.len(), 32);
+    assert_eq!(
+        facts
+            .fact_sequences
+            .keys()
+            .filter(|key| key.starts_with("artifact:"))
+            .count(),
+        32
+    );
+    let mut next = envelope();
+    next["fact_sequence"] = json!(50);
+    next["proposal"]["proposal_id"] = json!("next");
+    next["proposal"]["prepare_token"] = json!("next-token");
+    deliver_fact(&mut facts, "next", next);
+    assert!(facts.snapshot.artifacts.is_empty());
+    assert!(!facts
+        .fact_sequences
+        .keys()
+        .any(|key| key.starts_with("artifact:")));
+}
+
+#[test]
+fn actual_operation_query_marks_old_applied_artifact_noncurrent_after_later_edit() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", recovery_proposal());
+    let mut applied = artifact_envelope("applied-a", 4, "built", Some(true));
+    applied["artifact"]["candidate"] = json!(false);
+    applied["artifact"]["input_sha256"] = json!("b".repeat(64));
+    applied["artifact"]["authority_sha256"] = json!("b".repeat(64));
+    deliver_fact(&mut facts, "artifact", applied.clone());
+    assert_eq!(facts.snapshot.artifacts[0].current, Some(true));
+    let mut inspected = operation_envelope("applied", "not_required", 7);
+    inspected["receipt"]["current_sha256"] = json!("c".repeat(64));
+    deliver_fact(&mut facts, "later-edit", inspected);
+    assert_eq!(facts.snapshot.artifacts[0].current, Some(false));
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    applied["fact_sequence"] = json!(6);
+    deliver_fact(&mut facts, "old-query", applied);
+    assert_eq!(facts.snapshot.artifacts[0].current, Some(false));
 }
