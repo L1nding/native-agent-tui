@@ -1134,6 +1134,8 @@ def domain_checks(report, binary, common, args, workspace, root):
         completed_seen = False
         def visible(screen):
             nonlocal last_move, page, completed_seen
+            if case.startswith("hospital-floor") and "Needs your approval" in screen:
+                raise Failed(f"{what}: unexpected platform approval request; artifact waiting must use domain tools")
             if "领域事实同步失败" in screen:
                 if case in {"hospital", "hospital-floor", "hospital-floor-resume"}:
                     from domain_hospital_mixed_check import fact_sync_failure_is_terminal

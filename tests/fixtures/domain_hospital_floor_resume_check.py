@@ -34,8 +34,14 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
     binding = ("proposal_id", "revision", "prepare_token", "base_sha256", "candidate_sha256")
     expect(all(grant[k] == original[k] for k in binding), "existing grant differs from parent proposal")
     expect(grant["actor"] == "native-agent-tui:user", "original approval is not platform human")
-    expect(not list(directory.glob("operation-*.json")), "resume baseline already has an application")
-    expect(hashlib.sha256(scene.read_bytes()).hexdigest() == original["base_sha256"], "resume scene changed")
+    initial_operations = [json.loads(p.read_bytes()) for p in directory.glob("operation-*.json")]
+    expect(len(initial_operations) <= 1, "resume has unrelated applications")
+    existing_operation = initial_operations[0] if initial_operations else None
+    if existing_operation:
+        expect(existing_operation["state"] == "applied" and all(existing_operation[k] == original[k] for k in binding)
+               and existing_operation["authorization_id"] == grant["authorization_id"], "existing operation differs")
+    initial_sha = original["candidate_sha256"] if existing_operation else original["base_sha256"]
+    expect(hashlib.sha256(scene.read_bytes()).hexdigest() == initial_sha, "resume scene changed")
     stages = []
 
     def records(pattern):
@@ -64,7 +70,8 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
     lineage = {"context": str(context_path.resolve()), "context_sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
                "parent_evidence": str(parent), "parent_stages_sha256": hashlib.sha256(parent_stages_path.read_bytes()).hexdigest(),
                "original_proposal_id": proposal_id, "original_authorization_id": grant["authorization_id"],
-               "original_base_sha256": original["base_sha256"], "scope": "continue original approved floor batch; not full-floor completion"}
+               "original_base_sha256": original["base_sha256"], "initial_scene_sha256": initial_sha,
+               "existing_operation": existing_operation, "scope": "continue original approved floor batch; not full-floor completion"}
     (evidence / "hospital-floor-resume-lineage.json").write_text(json.dumps(lineage,ensure_ascii=False,indent=2),encoding="utf-8")
 
     def inspect():
@@ -73,10 +80,10 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
         tui.keys(ENTER, 0.5)
         if "目标 / 自然语言反馈" not in tui.screen():
             tui.keys(F6, 0.5)
-        fact("resume original approved version displayed",lambda s: proposal_id in business(s) and "prepared" in business(s),1800)
+        fact("resume original approved version displayed",lambda s: proposal_id in business(s) and ("applied" if existing_operation else "prepared") in business(s),1800)
         finished()
-        expect(hashlib.sha256(scene.read_bytes()).hexdigest() == original["base_sha256"], "inspection wrote scene")
-        expect(not list(directory.glob("operation-*.json")), "inspection created application")
+        expect(hashlib.sha256(scene.read_bytes()).hexdigest() == initial_sha, "inspection wrote scene")
+        expect(records("operation-*.json") == initial_operations, "inspection changed application records")
         checkpoint("original-approved-inspected")
 
     if not report.step("New platform owner inspects original hospital approval without writes", inspect, tui):
@@ -85,7 +92,10 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
     def apply_original():
         args = {k: original[k] for k in ("proposal_id","revision","prepare_token")}
         args.update(expected_sha256=original["base_sha256"], authorization_id=grant["authorization_id"], operation_id="hospital-floor-resume-batch-1")
-        send("继续此前Core具体批准的原版本；不是新批准。原批准记录仍有效，先核对绑定，再使用以下apply_change参数执行一次原方案；不修订或重新授权。参数中的expected_sha256是base_sha256，候选哈希仅用于核对应用结果：" + json.dumps(args,ensure_ascii=False))
+        if existing_operation:
+            send("原方案已经实际应用。只inspect_change和inspect_operation查询操作 " + existing_operation["operation_id"] + "，展示applied与当前场景；不调用apply_change，不重新授权，不修订、不重放writer。产物查询只用领域工具。")
+        else:
+            send("继续此前Core具体批准的原版本；不是新批准。原批准记录仍有效，先核对绑定，再使用以下apply_change参数执行一次原方案；不修订或重新授权。参数中的expected_sha256是base_sha256，候选哈希仅用于核对应用结果：" + json.dumps(args,ensure_ascii=False))
         fact("original approved hospital batch applied",lambda s: "场景应用 applied" in business(s),1800)
         finished()
         expect(hashlib.sha256(scene.read_bytes()).hexdigest() == original["candidate_sha256"], "original candidate not applied")
@@ -96,7 +106,9 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
         return
 
     def build_original():
-        send("构建刚恢复应用的原批次，build_id=hospital-floor-resumed-built-1，查询终态并验证；然后重新scan_source_groups展示全层状态与剩余请求。已有解释和CAD依据保持。先不准备下一批。")
+        artifact_path = directory / "artifacts/hospital-floor-resumed-built-1/build.json"
+        instruction = "只查询已有" if artifact_path.exists() else "构建刚恢复应用的"
+        send(instruction + "原批次，build_id=hospital-floor-resumed-built-1，inspect_artifact(wait_seconds=20)查询终态，再validate_artifact；然后scan_source_groups展示全层状态与剩余请求。只用领域工具等待和查询，不运行shell或Start-Sleep，不申请额外写权限。已有解释和CAD依据保持，先不准备下一批。")
         fact("resumed hospital batch actual build validated",lambda s: "hospital-floor-resumed-built-1" in business(s) and "产物验证 valid=true · current=true" in business(s),1800)
         finished()
         checkpoint("original-approved-built")
@@ -127,7 +139,7 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
         return
 
     def preview_next():
-        send("只预览当前下一批，build_id=hospital-floor-resumed-preview-2，查询终态并验证；先不批准、不应用。")
+        send("只预览当前下一批，build_id=hospital-floor-resumed-preview-2，用inspect_artifact(wait_seconds=20)查询终态并validate_artifact验证；只用领域工具等待，不运行shell。先不批准、不应用。")
         fact("next hospital batch preview validated",lambda s: "hospital-floor-resumed-preview-2" in business(s) and "产物验证 valid=true · current=true" in business(s),1800)
         finished()
         checkpoint("next-batch-preview")
@@ -141,7 +153,7 @@ def run_hospital_floor_resume(report, tui, send, finished, fact, context_path, e
         tui.keys(CTRL_Y,1)
         fact("next concrete hospital batch applied",lambda s: "场景应用 applied" in business(s),1800)
         finished()
-        send("构建新批准批次，build_id=hospital-floor-resumed-built-2，查询终态并验证，然后重扫全层分组展示每组已建、未决和剩余请求。本次批次成功仍不代表整层完成。")
+        send("构建新批准批次，build_id=hospital-floor-resumed-built-2，用inspect_artifact(wait_seconds=20)查询终态并validate_artifact验证；只用领域工具等待，不运行shell。然后重扫全层分组展示每组已建、未决和剩余请求。本次批次成功仍不代表整层完成。")
         fact("next hospital batch build validated",lambda s: "hospital-floor-resumed-built-2" in business(s) and "产物验证 valid=true · current=true" in business(s),1800)
         finished()
         checkpoint("next-batch-applied-built")
