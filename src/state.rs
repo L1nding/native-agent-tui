@@ -201,6 +201,8 @@ pub struct CoreSnapshot {
     /// dsh 自己的斜杠命令；`commands_loaded` 为假时还没有向 dsh 问过。
     pub commands: Vec<BackendCommand>,
     pub commands_loaded: bool,
+    /// 工作区当前的 git 分支；不是仓库或读不到时为空，不猜。
+    pub branch: Option<String>,
     /// 输入 `@路径` 时最近一次查询到的工作区路径。
     pub path_hints: crate::path_hints::PathHints,
     pub models: crate::models::ModelsSnapshot,

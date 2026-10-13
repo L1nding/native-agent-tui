@@ -146,6 +146,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             .unwrap_or(tr("model pending", "模型待定")),
         snapshot.cwd,
     );
+    if let Some(branch) = &snapshot.branch {
+        settings.push_str(" | ");
+        settings.push_str(branch);
+    }
     // 只显示 dsh 报告过的权限预设；没读到就不显示，不猜。
     if !snapshot.permission.current.is_empty() {
         settings.push_str(" | ");
@@ -222,35 +226,28 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     if compact_header {
         header.remove(0);
     }
-    frame.render_widget(
-        Paragraph::new(header).block(
-            theme::panel()
-                .borders(Borders::BOTTOM)
-                .padding(Padding::horizontal(1))
-                .title(if compact_header {
-                    Line::from(Span::styled(
-                        format!(
-                            " {} {}:{actions} {}:{attention}{} ",
-                            lang::phase(snapshot.phase),
-                            tr("action", "待处理"),
-                            tr("attention", "需关注"),
-                            if acknowledged > 0 {
-                                format!(" {}:{acknowledged}", tr("wait", "暂不提醒"))
-                            } else {
-                                String::new()
-                            }
-                        ),
-                        theme.phase(snapshot.phase),
-                    ))
+    let mut header_block = theme::panel()
+        .borders(Borders::BOTTOM)
+        .padding(Padding::horizontal(1));
+    // 产品名不是执行事实：平时没有标题行，这一行留给对话。只有矮窗口里
+    // 把阶段和计数压进标题时才用它。
+    if compact_header {
+        header_block = header_block.title(Line::from(Span::styled(
+            format!(
+                " {} {}:{actions} {}:{attention}{} ",
+                lang::phase(snapshot.phase),
+                tr("action", "待处理"),
+                tr("attention", "需关注"),
+                if acknowledged > 0 {
+                    format!(" {}:{acknowledged}", tr("wait", "暂不提醒"))
                 } else {
-                    Line::from(vec![
-                        Span::styled(" Native Agent TUI ", theme.heading()),
-                        Span::styled(concat!(env!("CARGO_PKG_VERSION"), " "), theme.faint()),
-                    ])
-                }),
-        ),
-        chunks[0],
-    );
+                    String::new()
+                }
+            ),
+            theme.phase(snapshot.phase),
+        )));
+    }
+    frame.render_widget(Paragraph::new(header).block(header_block), chunks[0]);
 
     if local.search.visible {
         local.search.draw(
@@ -1056,6 +1053,31 @@ mod tests {
             assert!(screen.contains("┆ Inspect the input carefully"), "{screen}");
             assert!(screen.contains("运行中"), "{screen}");
         });
+    }
+
+    #[test]
+    fn header_has_no_title_row_and_names_the_branch_beside_the_directory() {
+        let (mut snapshot, local) = running(vec![]);
+        snapshot.cwd = "D:/project/demo".into();
+        snapshot.branch = Some("feat/中文-branch".into());
+        let screen = rows(&snapshot, &local, 120, 30);
+        // 第一行就是执行状态；产品名不占常驻区。
+        assert!(screen[0].contains('●'), "{screen:#?}");
+        assert!(
+            screen[1].contains("D:/project/demo | feat/中文-branch"),
+            "{screen:#?}"
+        );
+        assert!(
+            !screen.iter().any(|row| row.contains("Native Agent TUI")),
+            "{screen:#?}"
+        );
+        // 不是仓库时不显示分支，也不留占位。
+        snapshot.branch = None;
+        let screen = rows(&snapshot, &local, 120, 30);
+        assert!(
+            screen[1].trim_end().ends_with("D:/project/demo"),
+            "{screen:#?}"
+        );
     }
 
     #[test]

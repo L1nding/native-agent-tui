@@ -10,6 +10,7 @@ pub mod diagnostics;
 pub mod domain;
 pub mod extensions;
 pub mod gate;
+pub mod git_branch;
 pub mod headless;
 pub mod history;
 pub mod interactions;

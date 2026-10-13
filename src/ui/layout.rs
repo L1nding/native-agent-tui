@@ -108,12 +108,9 @@ pub(super) fn main_layout(
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if area.height > 16 {
-                if has_activity {
-                    6
-                } else {
-                    4
-                }
+            // 状态行、设置行和下边框；有活动时多两行提醒与证据。没有标题行。
+            Constraint::Length(if area.height > 16 && has_activity {
+                5
             } else {
                 3
             }),
@@ -236,11 +233,11 @@ mod tests {
         assert_eq!(hidden[2].height, 0);
 
         let compact = main_layout(Rect::new(0, 0, 80, 20), false, StatusRows::Compact, 1);
-        assert_eq!(compact[0].height, 4);
+        assert_eq!(compact[0].height, 3);
         assert_eq!(compact[2].height, 2);
 
         let expanded = main_layout(Rect::new(0, 0, 80, 20), true, StatusRows::Expanded, 1);
-        assert_eq!(expanded[0].height, 6);
+        assert_eq!(expanded[0].height, 5);
         assert_eq!(expanded[2].height, 6);
     }
 

@@ -255,6 +255,7 @@ impl ClientHandle {
         CoreSnapshot {
             phase: SessionPhase::Launching,
             cwd: config.cwd.display().to_string(),
+            branch: crate::git_branch::current(&config.cwd),
             scheduler: crate::scheduler::SchedulerSnapshot {
                 native_slot_capacity: Some(config.max_native_turns.max(1)),
                 ..Default::default()
@@ -4135,6 +4136,8 @@ impl Core {
                     .then(|| crate::state::wall_clock_label(std::time::SystemTime::now()))
                     .flatten();
                 self.state.finish_turn_timing(Instant::now(), completed_at);
+                // 一轮里 Agent 可能切换了分支；轮次结束时重读一次。
+                self.state.view.branch = crate::git_branch::current(&self.config.cwd);
                 if let Some(steer) = self.steer.take() {
                     self.state.steer_notice(
                         &steer.notice_id,
