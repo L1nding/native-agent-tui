@@ -36,6 +36,7 @@ def provider():
         def update(value):
             send({"method": "session/update", "params": {"sessionId": session, "update": value}})
 
+        time.sleep(.3)
         update({"sessionUpdate": "agent_thought_chunk", "messageId": "shared", "content": {"type": "text", "text": "Inspect the probe"}})
         time.sleep(.7)
         update({"sessionUpdate": "tool_call", "toolCallId": "tool", "title": "pwsh", "kind": "other", "status": "in_progress", "rawInput": {"command": "echo STREAM_PROBE"}})
@@ -91,6 +92,8 @@ def main():
     try:
         console.wait(lambda screen: "Ready" in screen, "initial ready")
         console.write("probe\r")
+        console.wait(lambda screen: "Working" in screen, "activity while waiting for first output")
+        (root / "waiting-screen.txt").write_text(console.read(), encoding="utf-8")
         console.wait(lambda screen: "Thinking" in screen and "Inspect the probe" in screen, "server reasoning is visible")
         console.wait(lambda screen: "running · echo STREAM_PROBE" in screen, "tool call is visible while running")
         (root / "running-screen.txt").write_text(console.read(), encoding="utf-8")

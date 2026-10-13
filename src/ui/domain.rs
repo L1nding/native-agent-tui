@@ -223,13 +223,25 @@ pub(super) fn draw(
         );
     }
     frame.render_widget(
-        Paragraph::new(display_text(context.draft))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("目标 / 自然语言反馈"),
+        Paragraph::new(if let Some(label) = context.activity {
+            format!(
+                "{}{}",
+                context.activity_marker,
+                if context.draft.is_empty() {
+                    label.to_owned()
+                } else {
+                    display_text(context.draft)
+                }
             )
-            .wrap(Wrap { trim: false }),
+        } else {
+            display_text(context.draft)
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("目标 / 自然语言反馈"),
+        )
+        .wrap(Wrap { trim: false }),
         chunks[3],
     );
     frame.render_widget(Paragraph::new("Enter 发送反馈 · Ctrl+Y 批准已展示版本 · Ctrl+C 中断 · F6/Esc 返回会话 · PgUp/PgDn 滚动"), chunks[4]);

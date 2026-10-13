@@ -45,12 +45,13 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.provider_form.draw(frame, area, &snapshot.models.test);
         return;
     }
-    let extension_context = super::extensions::ViewContext::new(
+    let mut extension_context = super::extensions::ViewContext::new(
         snapshot,
         &local.extension,
         &local.editor.text,
         local.notice.as_deref(),
     );
+    extension_context.activity_marker = local.activity.marker();
     if super::extensions::REGISTRY.draw(frame, snapshot, &extension_context) {
         return;
     }
@@ -542,10 +543,18 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .saturating_sub(input_height.saturating_sub(1));
     let prompt_span = |row: usize| {
         Span::styled(
-            if row == 0 { "› " } else { "  " }
-                .chars()
-                .take(prompt)
-                .collect::<String>(),
+            if row == 0 {
+                if super::busy::label(snapshot).is_some() {
+                    local.activity.marker()
+                } else {
+                    "› "
+                }
+            } else {
+                "  "
+            }
+            .chars()
+            .take(prompt)
+            .collect::<String>(),
             theme.heading(),
         )
     };
@@ -556,6 +565,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 // 只有 UserInput 请求才把输入框当作回答；审批用快捷键决定。
                 if answering {
                     tr("Write an answer…", "输入回答…")
+                } else if let Some(label) = super::busy::label(snapshot) {
+                    label
                 } else {
                     tr(
                         "Write a task…  Ctrl+O for a new line",
@@ -904,11 +915,11 @@ mod tests {
     }
 
     #[test]
-    fn approval_keeps_the_task_prompt_and_only_user_input_asks_for_an_answer() {
+    fn approval_explains_the_wait_and_only_user_input_asks_for_an_answer() {
         let (snapshot, local) = running(vec![approval()]);
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
         assert!(!screen.contains("Write an answer"), "{screen}");
-        assert!(screen.contains("Write a task"), "{screen}");
+        assert!(screen.contains("Waiting for action"), "{screen}");
         assert!(screen.contains(" Root task "), "{screen}");
 
         let question = RequestView::decode(
@@ -1105,7 +1116,7 @@ mod tests {
             for expected in [
                 "运行中",
                 "待处理请求",
-                "输入任务",
+                "正在等待确认",
                 "Ctrl+Y 接受",
                 "Ctrl+N 拒绝",
             ] {

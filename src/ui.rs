@@ -12,6 +12,7 @@ use crate::state::CoreSnapshot;
 
 mod activity;
 mod attention;
+mod busy;
 mod commands;
 mod context;
 mod conversation;
@@ -121,6 +122,7 @@ struct LocalState {
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
+    activity: busy::ActivityIndicator,
     extension: extensions::ExtensionPanel,
     evidence_scroll: usize,
     skills: bool,

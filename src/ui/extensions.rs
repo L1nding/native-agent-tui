@@ -46,6 +46,8 @@ pub(super) struct ViewContext<'a> {
     pub reply: Option<&'a str>,
     pub draft: &'a str,
     pub notice: Option<&'a str>,
+    pub activity: Option<&'static str>,
+    pub activity_marker: &'static str,
     pub panel: &'a ExtensionPanel,
 }
 
@@ -63,6 +65,8 @@ impl<'a> ViewContext<'a> {
             panel,
             draft,
             notice,
+            activity: super::busy::label(snapshot),
+            activity_marker: "● ",
         }
     }
 }

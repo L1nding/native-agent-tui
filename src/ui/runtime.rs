@@ -23,6 +23,7 @@ struct RedrawSchedule {
     immediate: bool,
     stream_pending: bool,
     next_stream_frame: tokio::time::Instant,
+    next_activity_frame: tokio::time::Instant,
 }
 
 impl RedrawSchedule {
@@ -31,11 +32,25 @@ impl RedrawSchedule {
             immediate: true,
             stream_pending: false,
             next_stream_frame: now,
+            next_activity_frame: now,
         }
     }
 
     fn request(&mut self) {
         self.immediate = true;
+    }
+
+    fn activity_tick(&mut self, now: tokio::time::Instant, active: bool) -> bool {
+        if !active {
+            self.next_activity_frame = now;
+            return false;
+        }
+        if now < self.next_activity_frame {
+            return false;
+        }
+        self.next_activity_frame = now + Duration::from_millis(50);
+        self.request();
+        true
     }
 
     fn snapshot(&mut self, urgent: bool) {
@@ -206,6 +221,9 @@ pub async fn run_tasks_with_history(
                     redraw.snapshot(urgent);
                 }
                 _ = tick.tick() => {
+                    if redraw.activity_tick(tokio::time::Instant::now(), super::busy::label(&client.snapshots.borrow()).is_some()) {
+                        local.activity.advance();
+                    }
                     // Bound each input batch so snapshots and redraw remain responsive.
                     for _ in 0..128 {
                         let Some(event) = terminal.input.read_ready()? else { break; };
@@ -414,5 +432,23 @@ mod tests {
         redraw.drawn(now + Duration::from_millis(34));
         redraw.request();
         assert!(redraw.ready(now + Duration::from_millis(35)));
+    }
+
+    #[test]
+    fn activity_frames_are_bounded_and_idle_ticks_never_request_a_draw() {
+        let now = tokio::time::Instant::now();
+        let mut redraw = RedrawSchedule::new(now);
+        redraw.drawn(now);
+        for ms in 1..100 {
+            assert!(!redraw.activity_tick(now + Duration::from_millis(ms), false));
+            assert!(!redraw.ready(now + Duration::from_millis(ms)));
+        }
+        assert!(redraw.activity_tick(now + Duration::from_millis(100), true));
+        redraw.drawn(now + Duration::from_millis(100));
+        assert!(!redraw.activity_tick(now + Duration::from_millis(149), true));
+        assert!(redraw.activity_tick(now + Duration::from_millis(150), true));
+        redraw.drawn(now + Duration::from_millis(150));
+        assert!(!redraw.activity_tick(now + Duration::from_secs(30), false));
+        assert!(!redraw.ready(now + Duration::from_secs(30)));
     }
 }
