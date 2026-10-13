@@ -11,6 +11,19 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, McpServerConfig};
 use crate::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 
+pub(crate) mod receipt;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DomainFactData(pub(crate) Vec<u8>);
+
+impl std::fmt::Debug for DomainFactData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DomainFactData")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
 const CONTRACT: &str = "modeling-domain/v2";
 const SERVER: &str = "modeling_domain";
 const LIMIT: usize = 64 * 1024;
@@ -195,6 +208,14 @@ pub struct ArtifactFact {
     pub valid: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFact {
+    pub kind: String,
+    pub sequence: u64,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainSnapshot {
     pub enabled: bool,
@@ -206,6 +227,8 @@ pub struct DomainSnapshot {
     pub artifacts: Vec<ArtifactFact>,
     pub authorizing: bool,
     pub notice: Option<String>,
+    pub fact_sync_notice: Option<String>,
+    pub verified_fact: Option<VerifiedFact>,
 }
 
 impl std::fmt::Debug for DomainSnapshot {
@@ -223,11 +246,21 @@ impl std::fmt::Debug for DomainSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FactProjection {
+    Applied,
+    Superseded,
+    Unrelated,
+    Invalid,
+}
+
 pub struct DomainFacts {
     setup: Option<DomainSetup>,
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
     fact_sequences: BTreeMap<String, u64>,
+    pub(crate) synchronizing: bool,
+    synchronization_errors: BTreeMap<String, u64>,
 }
 
 impl DomainFacts {
@@ -245,15 +278,12 @@ impl DomainFacts {
             snapshot,
             control_messages: BTreeMap::new(),
             fact_sequences: BTreeMap::new(),
+            synchronizing: false,
+            synchronization_errors: BTreeMap::new(),
         }
     }
 
-    /// Consume a complete, identity-checked MCP completion before the display cache
-    /// clips tool details. The domain envelope has its own bounded decode budget.
     pub(crate) fn observe(&mut self, notice: &ObservedTool, item: &Value) {
-        let Some(setup) = self.setup.as_ref() else {
-            return;
-        };
         if notice.category != ToolCategory::Mcp
             || notice.outcome != Some(ObservedToolOutcome::Completed)
             || item["type"] != "mcpToolCall"
@@ -262,25 +292,34 @@ impl DomainFacts {
         {
             return;
         }
-        let Some(envelope) = unwrap_envelope(item["result"].clone(), 0) else {
-            return;
+        if let Some(envelope) = unwrap_envelope(item["result"].clone(), 0) {
+            if let Some(value) = serde_json::to_string(&envelope)
+                .ok()
+                .and_then(|raw| decode_envelope(&raw))
+            {
+                self.apply_verified_fact(&value);
+            }
+        }
+    }
+
+    /// Core calls this only after validating a bounded inline envelope or a sealed fact.
+    pub(crate) fn apply_verified_fact(&mut self, value: &Value) -> FactProjection {
+        let Some(setup) = self.setup.as_ref() else {
+            return FactProjection::Invalid;
         };
-        let Some(value) = serde_json::to_string(&envelope)
-            .ok()
-            .and_then(|raw| decode_envelope(&raw))
-        else {
-            return;
-        };
+        if value["contract"] != CONTRACT {
+            return FactProjection::Invalid;
+        }
         if value["run_id"] != setup.run_id || value["context_sha256"] != setup.context_sha256 {
-            return;
+            return FactProjection::Invalid;
         }
         let Some(kind) = value["kind"].as_str() else {
-            return;
+            return FactProjection::Invalid;
         };
         let artifact_kind = matches!(kind, "artifact" | "artifact_validation");
         let fact_key = if artifact_kind {
             let Some(id) = value["artifact"]["build_id"].as_str() else {
-                return;
+                return FactProjection::Invalid;
             };
             format!("artifact:{id}")
         } else {
@@ -292,12 +331,12 @@ impl DomainFacts {
             .get(&fact_key)
             .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
         {
-            return;
+            return FactProjection::Superseded;
         }
         let mut accepted = false;
         match Some(kind) {
             Some("proposal") => {
-                if let Some(proposal) = proposal_fact(&value) {
+                if let Some(proposal) = proposal_fact(value) {
                     let old = self.snapshot.proposal.as_ref();
                     let same = old.is_some_and(|p| p.binding == proposal.binding);
                     let parent = value["proposal"]["parent_id"].as_str();
@@ -321,7 +360,7 @@ impl DomainFacts {
                 }
             }
             Some("source_ledger") => {
-                if let Some(ledger) = source_ledger_fact(&value) {
+                if let Some(ledger) = source_ledger_fact(value) {
                     self.snapshot.ledger = Some(ledger);
                     accepted = true;
                 }
@@ -331,7 +370,7 @@ impl DomainFacts {
                     .snapshot
                     .proposal
                     .as_ref()
-                    .and_then(|p| operation_fact(&value, &p.binding))
+                    .and_then(|p| operation_fact(value, &p.binding))
                 {
                     self.snapshot.application = Some(format!(
                         "{} · current={}",
@@ -357,7 +396,7 @@ impl DomainFacts {
                     .snapshot
                     .proposal
                     .as_ref()
-                    .and_then(|p| operation_fact(&value, &p.binding))
+                    .and_then(|p| operation_fact(value, &p.binding))
                 {
                     self.snapshot.operation = Some(operation);
                 }
@@ -381,7 +420,7 @@ impl DomainFacts {
                     .snapshot
                     .proposal
                     .as_ref()
-                    .and_then(|p| artifact_fact(&value, &p.binding))
+                    .and_then(|p| artifact_fact(value, &p.binding))
                 {
                     if sequence.is_none_or(|seq| {
                         self.fact_sequences
@@ -434,6 +473,51 @@ impl DomainFacts {
             if let Some(sequence) = sequence {
                 self.fact_sequences.insert(fact_key, sequence);
             }
+            FactProjection::Applied
+        } else if matches!(kind, "proposal" | "source_ledger") {
+            FactProjection::Invalid
+        } else {
+            FactProjection::Unrelated
+        }
+    }
+
+    pub(crate) fn synchronization_failed(&mut self, kind: &str, sequence: u64, reason: String) {
+        self.synchronization_errors
+            .entry(kind.into())
+            .and_modify(|last| *last = (*last).max(sequence))
+            .or_insert(sequence);
+        self.snapshot.notice = Some(format!("领域事实同步失败：{reason}；请重新检查当前方案"));
+        self.snapshot
+            .fact_sync_notice
+            .clone_from(&self.snapshot.notice);
+    }
+
+    pub(crate) fn synchronization_finished(&mut self, receipt: &receipt::FactReceipt) {
+        for key in [receipt.kind.as_str(), "transport"] {
+            if self
+                .synchronization_errors
+                .get(key)
+                .is_some_and(|last| *last <= receipt.fact_sequence)
+            {
+                self.synchronization_errors.remove(key);
+            }
+        }
+        if self
+            .snapshot
+            .verified_fact
+            .as_ref()
+            .is_none_or(|fact| fact.sequence <= receipt.fact_sequence)
+        {
+            self.snapshot.verified_fact = Some(VerifiedFact {
+                kind: receipt.kind.clone(),
+                sequence: receipt.fact_sequence,
+                sha256: receipt.fact_sha256.clone(),
+                bytes: receipt.fact_bytes,
+            });
+        }
+        if self.synchronization_errors.is_empty() {
+            self.snapshot.notice = None;
+            self.snapshot.fact_sync_notice = None;
         }
     }
 
@@ -470,7 +554,9 @@ impl DomainFacts {
     }
 
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
-        !self.snapshot.authorizing
+        !self.synchronizing
+            && self.synchronization_errors.is_empty()
+            && !self.snapshot.authorizing
             && self.snapshot.operation.is_none()
             && self
                 .snapshot

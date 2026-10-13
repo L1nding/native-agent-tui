@@ -132,9 +132,19 @@ fn business_lines(
     if domain.authorizing {
         lines.push(Line::from("正在记录具体版本批准…"));
     }
-    for notice in [domain.notice.as_deref(), context.notice]
-        .into_iter()
-        .flatten()
+    if let Some(fact) = &domain.verified_fact {
+        lines.push(Line::from(format!(
+            "已核验完整事实 · {} · 序号 {} · {} bytes",
+            fact.kind, fact.sequence, fact.bytes
+        )));
+    }
+    for notice in [
+        domain.notice.as_deref(),
+        domain.fact_sync_notice.as_deref(),
+        context.notice,
+    ]
+    .into_iter()
+    .flatten()
     {
         lines.push(Line::from(display_text(notice)));
     }
@@ -275,7 +285,7 @@ impl ExtensionView for ModelingView {
     }
     fn confirmation(&self, snapshot: &ExtensionSnapshot) -> Option<ExtensionConfirmation> {
         let domain = snapshot.modeling()?;
-        if domain.authorizing {
+        if domain.fact_sync_notice.is_some() || domain.authorizing {
             return None;
         }
         domain

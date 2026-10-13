@@ -43,6 +43,11 @@ pub enum Command {
         binding: crate::domain::ProposalBinding,
         outcome: Result<String, String>,
     },
+    DomainFactReadFinished {
+        attempt_id: u64,
+        generation: u64,
+        outcome: Result<crate::domain::DomainFactData, String>,
+    },
     QueueRootTasks {
         tasks: Vec<RootTaskSpec>,
     },
@@ -295,6 +300,9 @@ impl ClientHandle {
                 domain: crate::domain::DomainFacts::new(config.domain_setup.clone()),
                 domain_authorization_task: None,
                 domain_generation: 0,
+                domain_fact_attempt: 0,
+                domain_fact_task: None,
+                domain_fact_queue: VecDeque::new(),
                 config,
                 server,
                 command_rx,
@@ -450,6 +458,9 @@ struct Core {
     domain: crate::domain::DomainFacts,
     domain_authorization_task: Option<JoinHandle<()>>,
     domain_generation: u64,
+    domain_fact_attempt: u64,
+    domain_fact_task: Option<PendingDomainFact>,
+    domain_fact_queue: VecDeque<(u64, crate::domain::receipt::FactReceipt)>,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -473,6 +484,13 @@ struct PendingTool {
     parent_turn: String,
     generation: u64,
     token: WaitToken,
+}
+
+struct PendingDomainFact {
+    attempt_id: u64,
+    generation: u64,
+    receipt: crate::domain::receipt::FactReceipt,
+    task: JoinHandle<()>,
 }
 
 fn persistence_state(
@@ -821,6 +839,12 @@ impl Core {
             task.abort();
             let _ = task.await;
         }
+        if let Some(pending) = self.domain_fact_task.take() {
+            pending.task.abort();
+            let _ = pending.task.await;
+        }
+        self.domain_fact_queue.clear();
+        self.domain.synchronizing = false;
         self.domain.snapshot.authorizing = false;
         self.unknown_pending_outbox();
         let outcome = self.state.view.phase;
@@ -1327,6 +1351,13 @@ impl Core {
                     },
                 );
             }
+            Command::DomainFactReadFinished {
+                attempt_id,
+                generation,
+                outcome,
+            } => {
+                self.finish_domain_fact_read(attempt_id, generation, outcome);
+            }
             Command::ConfirmExtension { confirmation } => match confirmation {
                 crate::extensions::ExtensionConfirmation::Modeling(binding) => {
                     self.approve_domain_change(binding)
@@ -1647,6 +1678,11 @@ impl Core {
         }
         self.domain_generation = self.domain_generation.wrapping_add(1);
         self.domain = crate::domain::DomainFacts::new(self.config.domain_setup.clone());
+        if let Some(pending) = self.domain_fact_task.take() {
+            pending.task.abort();
+        }
+        self.domain_fact_attempt = self.domain_fact_attempt.wrapping_add(1);
+        self.domain_fact_queue.clear();
         self.session_ready = false;
         self.state.view.phase = SessionPhase::Initializing;
     }
@@ -1810,6 +1846,116 @@ impl Core {
                     .await;
             }
         });
+    }
+
+    fn queue_domain_fact(&mut self, receipt: crate::domain::receipt::FactReceipt) {
+        if self
+            .domain_fact_task
+            .as_ref()
+            .is_some_and(|pending| pending.receipt == receipt)
+            || self
+                .domain_fact_queue
+                .iter()
+                .any(|(_, queued)| queued == &receipt)
+        {
+            return;
+        }
+        if self.domain_fact_queue.len() >= 32 {
+            self.domain.synchronization_failed(
+                &receipt.kind,
+                receipt.fact_sequence,
+                "读取队列已满".into(),
+            );
+            return;
+        }
+        self.domain_fact_queue.push_back((self.generation, receipt));
+        self.domain.synchronizing = true;
+        self.domain.snapshot.fact_sync_notice = Some("正在同步完整领域事实".into());
+        self.start_domain_fact_read();
+    }
+
+    fn start_domain_fact_read(&mut self) {
+        if self.domain_fact_task.is_some() {
+            return;
+        }
+        let Some((generation, receipt)) = self.domain_fact_queue.pop_front() else {
+            self.domain.synchronizing = false;
+            return;
+        };
+        let Some(setup) = self.config.domain_setup.clone() else {
+            return;
+        };
+        self.domain_fact_attempt = self.domain_fact_attempt.wrapping_add(1);
+        let attempt_id = self.domain_fact_attempt;
+        let commands = self.command_tx.clone();
+        let pending = receipt.clone();
+        let task = tokio::spawn(async move {
+            let outcome = crate::domain::receipt::read(setup, pending)
+                .await
+                .map(crate::domain::DomainFactData);
+            if let Some(commands) = commands.upgrade() {
+                let _ = commands
+                    .send(Command::DomainFactReadFinished {
+                        attempt_id,
+                        generation,
+                        outcome,
+                    })
+                    .await;
+            }
+        });
+        self.domain_fact_task = Some(PendingDomainFact {
+            attempt_id,
+            generation,
+            receipt,
+            task,
+        });
+    }
+
+    fn finish_domain_fact_read(
+        &mut self,
+        attempt_id: u64,
+        generation: u64,
+        outcome: Result<crate::domain::DomainFactData, String>,
+    ) {
+        if !self.domain_fact_task.as_ref().is_some_and(|pending| {
+            pending.attempt_id == attempt_id && pending.generation == generation
+        }) {
+            return;
+        }
+        let pending = self.domain_fact_task.take().unwrap();
+        let result = if generation != self.generation {
+            Err("读取结果属于已结束的执行代次".into())
+        } else {
+            outcome.and_then(|raw| {
+                self.config
+                    .domain_setup
+                    .as_ref()
+                    .ok_or_else(|| "建模会话已结束".to_owned())
+                    .and_then(|setup| {
+                        crate::domain::receipt::verify(setup, &pending.receipt, &raw.0)
+                    })
+            })
+        };
+        match result {
+            Ok(value) => {
+                if self.domain.apply_verified_fact(&value) == crate::domain::FactProjection::Invalid
+                {
+                    self.domain.synchronization_failed(
+                        &pending.receipt.kind,
+                        pending.receipt.fact_sequence,
+                        "完整事实不能投影为当前领域状态".into(),
+                    );
+                } else {
+                    self.domain.synchronization_finished(&pending.receipt);
+                }
+            }
+            Err(reason) => self.domain.synchronization_failed(
+                &pending.receipt.kind,
+                pending.receipt.fact_sequence,
+                reason,
+            ),
+        }
+        self.start_domain_fact_read();
     }
 
     fn approve_domain_change(&mut self, binding: crate::domain::ProposalBinding) {
@@ -3062,7 +3208,13 @@ impl Core {
         else {
             return;
         };
-        self.domain.observe(notice, &params["item"]);
+        if let Some(setup) = self.config.domain_setup.as_ref() {
+            match crate::domain::receipt::from_tool(setup, notice, &params["item"]) {
+                Ok(Some(receipt)) => self.queue_domain_fact(receipt),
+                Err(reason) => self.domain.synchronization_failed("transport", 0, reason),
+                Ok(None) => self.domain.observe(notice, &params["item"]),
+            }
+        }
         let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
         if notice.outcome.is_none() {
             self.tool_details
