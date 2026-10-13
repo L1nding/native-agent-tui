@@ -59,6 +59,37 @@ fn authorization_must_match_exact_binding_and_cannot_repeat_while_pending() {
 }
 
 #[test]
+fn preview_facts_supply_missing_tool_results_and_reject_old_or_foreign_bindings() {
+    let setup = DomainSetup {
+        context_path: "context".into(),
+        repository: ".".into(),
+        python: "python".into(),
+        run_id: "run".into(),
+        context_sha256: "ctx".into(),
+        floor_id: "floor".into(),
+    };
+    let mut facts = DomainFacts::new(Some(setup));
+    let first = proposal_fact(&envelope()).unwrap();
+    facts.observe_preview(1, first.clone());
+    assert_eq!(facts.snapshot.proposal, Some(first.clone()));
+    assert!(facts.can_authorize(&first.binding));
+    let mut newer = first.clone();
+    newer.binding.revision = 3;
+    newer.binding.proposal_id = "next".into();
+    facts.observe_preview(2, newer.clone());
+    facts.observe_preview(1, first.clone());
+    assert_eq!(facts.snapshot.proposal, Some(newer.clone()));
+    let mut foreign = newer.clone();
+    foreign.binding.run_id = "other".into();
+    facts.observe_preview(3, foreign);
+    assert_eq!(facts.snapshot.proposal, Some(newer.clone()));
+    newer.ready = false;
+    facts.observe_preview(3, newer.clone());
+    assert!(!facts.can_authorize(&newer.binding));
+    assert!(!facts.snapshot.authorizing);
+}
+
+#[test]
 fn a_current_new_proposal_family_can_restart_at_revision_one_without_reviving_stale_facts() {
     use crate::observation::ActivityIdentity;
     use crate::protocol::{ObservedToolDetails, ToolCategory};

@@ -299,6 +299,7 @@ impl ClientHandle {
                 domain_generation: 0,
                 preview_bridge: None,
                 preview_epoch: 0,
+                preview_target: None,
                 config,
                 server,
                 command_rx,
@@ -456,6 +457,7 @@ struct Core {
     domain_generation: u64,
     preview_bridge: Option<crate::preview::Bridge>,
     preview_epoch: u64,
+    preview_target: Option<crate::preview::WorkTarget>,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -933,6 +935,28 @@ impl Core {
         }
         self.state.view.tool_details = self.tool_details.snapshot();
         self.domain.observe(&self.state.view.tool_details);
+        if let (Some(bridge), Some(setup)) = (&self.preview_bridge, &self.config.domain_setup) {
+            let preparing = self
+                .state
+                .view
+                .thread_id
+                .as_deref()
+                .zip(self.state.view.turn_id.as_deref())
+                .and_then(|(thread, turn)| {
+                    crate::preview::prepare_target(
+                        &self.domain.snapshot,
+                        &self.state.view.tool_details,
+                        thread,
+                        turn,
+                    )
+                });
+            bridge.activity(
+                setup,
+                self.state.view.phase,
+                self.preview_target.as_ref().or(preparing.as_ref()),
+                !self.state.view.requests.is_empty(),
+            );
+        }
         self.state.view.domain = self.domain.snapshot.clone();
         self.domain
             .project_control_messages(&mut self.state.view.messages);
@@ -1344,6 +1368,8 @@ impl Core {
                     }
                     crate::preview::Event::Closed => {
                         self.domain.snapshot.preview_connection = None;
+                        self.domain.snapshot.preview_selection = None;
+                        self.preview_target = None;
                         self.domain.snapshot.notice =
                             Some("Blender 预览已断开；场景与产物保持原状态".into());
                     }
@@ -1357,6 +1383,12 @@ impl Core {
                         };
                         match outcome {
                             Ok(text) => {
+                                self.preview_target = Some(crate::preview::WorkTarget {
+                                    binding: feedback.binding.clone(),
+                                    snapshot_id: Some(feedback.snapshot_id.clone()),
+                                    parts: feedback.object_ids.clone(),
+                                    instances: feedback.instances.clone(),
+                                });
                                 self.domain.remember_control(&text);
                                 let before = self.state.view.root_start_requests;
                                 self.command(Command::SubmitRootInput { text });
@@ -1381,6 +1413,31 @@ impl Core {
                                 self.domain.snapshot.notice = Some(reason);
                             }
                         }
+                    }
+                    crate::preview::Event::Selection(selection) => {
+                        let old = self.domain.snapshot.preview_selection.as_ref();
+                        if selection.valid(&self.domain.snapshot)
+                            && old.is_none_or(|s| {
+                                s.client_id != selection.client_id
+                                    || s.sequence < selection.sequence
+                            })
+                        {
+                            self.domain.snapshot.preview_selection = Some(*selection);
+                        }
+                    }
+                    crate::preview::Event::SelectionClosed { client_id } => {
+                        if self
+                            .domain
+                            .snapshot
+                            .preview_selection
+                            .as_ref()
+                            .is_some_and(|s| s.client_id == client_id)
+                        {
+                            self.domain.snapshot.preview_selection = None;
+                        }
+                    }
+                    crate::preview::Event::Proposal { sequence, fact } => {
+                        self.domain.observe_preview(sequence, *fact)
                     }
                 }
             }
@@ -1445,6 +1502,24 @@ impl Core {
                         "Wait for the current turn to finish, or interrupt it with Ctrl+C.".into(),
                     );
                     return;
+                }
+                let mut text = text;
+                if !self.domain.is_control_message(&text) {
+                    self.preview_target = None;
+                    if let Some(selection) = &self.domain.snapshot.preview_selection {
+                        if let Some(bound) =
+                            crate::preview::selected_input(&text, selection, &self.domain.snapshot)
+                        {
+                            if bound.len() > MESSAGE_BYTES {
+                                self.state.view.notice =
+                                    Some("对象上下文与意见超过消息预算，请缩短意见".into());
+                                return;
+                            }
+                            self.preview_target = Some(crate::preview::WorkTarget::from(selection));
+                            self.domain.remember_control(&bound);
+                            text = bound;
+                        }
+                    }
                 }
                 let mut spec = RootTaskSpec::input(text);
                 if self.wait.is_some() {
@@ -1709,6 +1784,8 @@ impl Core {
 
     fn start_preview(&mut self) {
         self.preview_bridge.take();
+        self.preview_target = None;
+        self.domain.snapshot.preview_selection = None;
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
         if self.config.domain_preview {
             if let Some(setup) = self.config.domain_setup.clone() {

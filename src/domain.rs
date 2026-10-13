@@ -126,7 +126,8 @@ pub struct ProposalBinding {
     pub candidate_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProposalFact {
     pub binding: ProposalBinding,
     pub state: String,
@@ -135,6 +136,18 @@ pub struct ProposalFact {
     pub assumptions: Vec<String>,
     pub diagnostics: Vec<String>,
     pub ready: bool,
+}
+
+impl std::fmt::Debug for ProposalFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProposalFact")
+            .field("revision", &self.binding.revision)
+            .field("state", &self.state)
+            .field("objects", &self.objects.len())
+            .field("diagnostics", &self.diagnostics.len())
+            .field("ready", &self.ready)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -148,6 +161,7 @@ pub struct DomainSnapshot {
     pub authorizing: bool,
     pub notice: Option<String>,
     pub preview_connection: Option<String>,
+    pub preview_selection: Option<crate::preview::Selection>,
 }
 
 impl std::fmt::Debug for DomainSnapshot {
@@ -170,6 +184,7 @@ pub struct DomainFacts {
     seen: BTreeMap<String, u64>,
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
+    preview_fact_sequence: u64,
 }
 
 impl DomainFacts {
@@ -187,6 +202,7 @@ impl DomainFacts {
             seen: BTreeMap::new(),
             snapshot,
             control_messages: BTreeMap::new(),
+            preview_fact_sequence: 0,
         }
     }
 
@@ -233,6 +249,9 @@ impl DomainFacts {
             self.seen.insert(key, detail.revision);
             match value["kind"].as_str() {
                 Some("proposal") => {
+                    if self.preview_fact_sequence > 0 {
+                        continue;
+                    }
                     if let Some(proposal) = proposal_fact(&value) {
                         let old = self.snapshot.proposal.as_ref();
                         let same = old.is_some_and(|p| p.binding == proposal.binding);
@@ -248,6 +267,13 @@ impl DomainFacts {
                                 self.snapshot.artifact_validation = None;
                             }
                             self.snapshot.proposal = Some(proposal);
+                            if self.snapshot.preview_selection.as_ref().is_some_and(|s| {
+                                s.binding.revision
+                                    <= self.snapshot.proposal.as_ref().unwrap().binding.revision
+                                    && s.binding != self.snapshot.proposal.as_ref().unwrap().binding
+                            }) {
+                                self.snapshot.preview_selection = None;
+                            }
                         }
                     }
                 }
@@ -289,10 +315,61 @@ impl DomainFacts {
             let key = self.control_messages.keys().next().cloned().unwrap();
             self.control_messages.remove(&key);
         }
+        let opinion = text
+            .rsplit_once('\n')
+            .filter(|(_, payload)| {
+                serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .is_some_and(|v| {
+                        matches!(
+                            v["user_action"].as_str(),
+                            Some("revise_preview_selection" | "selected_preview_context")
+                        )
+                    })
+            })
+            .map(|(visible, _)| visible);
         self.control_messages.insert(
             text.into(),
-            text.lines().next().unwrap_or("具体版本已批准").into(),
+            opinion
+                .unwrap_or_else(|| text.lines().next().unwrap_or("具体版本已批准"))
+                .into(),
         );
+    }
+
+    pub fn is_control_message(&self, text: &str) -> bool {
+        self.control_messages.contains_key(text)
+    }
+
+    pub fn observe_preview(&mut self, sequence: u64, fact: ProposalFact) {
+        let Some(setup) = &self.setup else {
+            return;
+        };
+        if sequence <= self.preview_fact_sequence
+            || fact.binding.run_id != setup.run_id
+            || fact.binding.context_sha256 != setup.context_sha256
+        {
+            return;
+        }
+        self.preview_fact_sequence = sequence;
+        if self
+            .snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|p| p.binding != fact.binding)
+        {
+            self.snapshot.application = None;
+            self.snapshot.artifact = None;
+            self.snapshot.artifact_validation = None;
+            if self
+                .snapshot
+                .preview_selection
+                .as_ref()
+                .is_some_and(|s| s.binding != fact.binding)
+            {
+                self.snapshot.preview_selection = None;
+            }
+        }
+        self.snapshot.proposal = Some(fact);
     }
 
     pub fn project_control_messages(&self, messages: &mut [crate::state::ConversationItem]) {

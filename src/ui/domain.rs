@@ -30,6 +30,17 @@ pub(super) fn draw(
         chunks[0],
     );
     let mut lines = Vec::new();
+    if let Some(selection) = &domain.preview_selection {
+        lines.extend(
+            selection
+                .details()
+                .into_iter()
+                .map(|line| Line::from(display_text(&line))),
+        );
+        lines.push(Line::from(
+            "输入意见会携带该选中对象及版本上下文；选择不会启动 Agent。",
+        ));
+    }
     if let Some(path) = &domain.preview_connection {
         lines.push(Line::from(format!(
             "Blender 连接文件：{}",
@@ -197,5 +208,51 @@ mod tests {
             }
         );
         assert!(local.editor.text.is_empty());
+    }
+
+    #[test]
+    fn selected_object_information_is_visible_in_conversation_and_business_views() {
+        let selection:crate::preview::Selection = serde_json::from_value(serde_json::json!({
+            "client_id":"gui", "sequence":1, "binding":proposal(1).binding,
+            "snapshot_id":"a".repeat(64), "active_part_id":"bed.1.mattress", "active_layer":"candidate",
+            "objects":[{"part_id":"bed.1.mattress", "entity_id":"bed.1.mattress", "instance_id":"bed.1",
+            "category":"bed", "floor_id":"floor.ground", "source_ids":[], "feedback_targets":["bed.1.mattress"],
+            "layer":"candidate", "diff":"added", "center":["1.5","1.7","0.5"], "dimensions":["0.9","2","0.2"], "diagnostics":[]}]})).unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            domain: DomainSnapshot {
+                enabled: true,
+                proposal: Some(proposal(1)),
+                preview_selection: Some(selection),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for business in [false, true] {
+            let backend = ratatui::backend::TestBackend::new(100, 40);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let local = LocalState {
+                domain_visible: business,
+                ..Default::default()
+            };
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                text.replace(' ', "").contains("Blender选中bed.1"),
+                "{business}: {text}"
+            );
+            assert!(text.contains("bed.1.mattress"));
+            if business {
+                assert!(text.replace(' ', "").contains("尺寸0.9/2/0.2m"));
+            }
+        }
     }
 }
