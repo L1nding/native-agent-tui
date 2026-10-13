@@ -277,8 +277,8 @@ src/view.ts
 | 2.5 steering | `agent.steer(message)` 在下一步边界生效；`followup` 排到下一轮 | 未做：插件加请求，Core 加类型化命令和 `GatePending` 拒绝 |
 | 2.6 plan 评审 | `plan/mode` 事件；`exit_plan_mode` 经“用户提问”通道发起评审 | 未确认 ACP 会话下是否有这个通道 |
 | 3.5 `/compact` 与插件命令 | `commands` 服务的 `list(agent)` 和 `execute(agent, line)` | 未做 |
-| 3.7 重试提示 | 持久事件 `llm/retry`：第几次、上限、延迟、失败原因 | 未做 |
-| 3.7 压缩提示 | `compaction/start`、`end`、`summary`、`prune` | 未做 |
+| 3.7 重试提示 | 持久事件 `llm/retry`：第几次、上限、延迟、失败原因 | 已接：对话流里的一行提示，只带 dsh 的失败代码 |
+| 3.7 压缩提示 | `compaction/start`、`end`、`summary`、`prune` | 已接：同一次压缩一行，显示结果 |
 
 ### 约束
 
