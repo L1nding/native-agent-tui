@@ -22,6 +22,8 @@ export interface SessionRow {
   title?: string
   /** Loaded in this dsh process right now. */
   live: boolean
+  /** Only with `all`: whether the session belongs to the asked workspace. */
+  here?: boolean
 }
 
 export interface HistoryMessage {
@@ -59,7 +61,7 @@ function isChild(header: SessionHeader): boolean {
  * @param ctx - host context.
  * @param cwd - when given, only sessions of this workspace.
  */
-export async function listSessions(ctx: HostContext, cwd: string | undefined): Promise<{
+export async function listSessions(ctx: HostContext, cwd: string | undefined, all = false): Promise<{
   sessions: SessionRow[]
   titles: 'available' | 'unavailable'
 }> {
@@ -69,7 +71,7 @@ export async function listSessions(ctx: HostContext, cwd: string | undefined): P
       ? (await ctx.sessionPersistence.list()).map(({ header }) => ({ header, live: false }))
       : (await query.listSessions()).map(({ header, live }) => ({ header, live }))
   const visible = headers.filter(
-    ({ header }) => !isChild(header) && (cwd === undefined || (header.cwd !== undefined && sameDirectory(header.cwd, cwd))),
+    ({ header }) => !isChild(header) && (all || cwd === undefined || (header.cwd !== undefined && sameDirectory(header.cwd, cwd))),
   )
   const titles = new Map<string, { title: string; updatedAt: number }>()
   if (query !== undefined && visible.length > 0) {
@@ -85,6 +87,7 @@ export async function listSessions(ctx: HostContext, cwd: string | undefined): P
     return {
       id: header.id,
       live,
+      ...(all && cwd !== undefined ? { here: header.cwd !== undefined && sameDirectory(header.cwd, cwd) } : {}),
       ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
       ...(header.createdAt === undefined ? {} : { createdAt: header.createdAt }),
       ...(updatedAt === 0 ? {} : { updatedAt }),

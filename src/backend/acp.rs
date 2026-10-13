@@ -867,7 +867,8 @@ impl AcpBridge {
                 self.acp.send(with_jsonrpc(Envelope::request(
                     id,
                     "zf/session/list",
-                    Some(json!({"cwd": self.cwd})),
+                    // 列出所有工作区的会话，每条标明是否属于这里；范围由界面切换。
+                    Some(json!({"cwd": self.cwd, "all": true})),
                 )))?;
             }
             (Some("thread/history"), Some(id)) => {

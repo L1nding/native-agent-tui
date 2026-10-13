@@ -109,7 +109,8 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
     }),
 
     /** Root sessions with dsh's titles, newest first; `cwd` narrows to one workspace. */
-    'zf/session/list': (params) => listSessions(ctx, typeof params['cwd'] === 'string' ? params['cwd'] : undefined),
+    'zf/session/list': (params) =>
+      listSessions(ctx, typeof params['cwd'] === 'string' ? params['cwd'] : undefined, params['all'] === true),
 
     /** Skills every installed provider offers for one workspace; bodies are not loaded. */
     'zf/skills/list': async (params) => {
