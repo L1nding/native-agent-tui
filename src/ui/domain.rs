@@ -178,10 +178,26 @@ pub(super) fn draw(
     let domain = &snapshot.domain;
     frame.render_widget(
         Paragraph::new(format!(
-            "建模 · {} · {:?} · 平台模型 {}",
+            "建模 · {} · {:?} · 平台模型 {}\n{}",
             domain.floor_id,
             snapshot.phase,
-            snapshot.model.as_deref().unwrap_or("default")
+            snapshot.model.as_deref().unwrap_or("default"),
+            domain
+                .fact_sync_notice
+                .as_ref()
+                .map(|notice| display_text(notice))
+                .unwrap_or_else(|| {
+                    domain
+                        .verified_fact
+                        .as_ref()
+                        .map(|fact| {
+                            format!(
+                                "Core事实 {} · seq {} · {} B · SHA256 {}",
+                                fact.kind, fact.sequence, fact.bytes, fact.sha256
+                            )
+                        })
+                        .unwrap_or_default()
+                })
         )),
         chunks[0],
     );

@@ -585,14 +585,24 @@ def domain_checks(report, binary, common, args, workspace, root):
         # The ledger and plan share a scrollable business view. Search its bounded
         # viewport range instead of assuming a fact is on the first screen.
         last_move, page = time.monotonic(), 0
+        completed_seen = False
         def visible(screen):
-            nonlocal last_move, page
+            nonlocal last_move, page, completed_seen
+            if "领域事实同步失败" in screen:
+                raise Failed(f"{what}: Core independent fact synchronization failed")
             if predicate(screen):
                 return True
             if " · Failed · " in screen or " · Interrupted · " in screen:
                 raise Failed(f"{what}: domain turn ended without success")
+            if case == "vertical" and " · Completed · " in screen and not completed_seen:
+                completed_seen = True
+                tui.keys("\x1b[5~" * 40, 0.1)
+                page, last_move = 0, time.monotonic()
+                return False
             if time.monotonic() - last_move >= 1:
                 if page >= (40 if case in {"failure", "cancel", "conflict", "vertical"} else 10):
+                    if case == "vertical" and completed_seen and " · Completed · " in screen:
+                        raise Failed(f"{what}: completed Agent turn has no required Core fact after full viewport scan")
                     tui.keys("\x1b[5~" * page, 0.1)
                     page = 0
                 else:

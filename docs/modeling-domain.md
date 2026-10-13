@@ -6,7 +6,9 @@
 
 --domain-context 在 config 中注入 stdio modeling_domain MCP。领域会话的通用工具必须 read-only，resume/reload/new 后重新确认；失败不启动 turn。普通 TUI 默认显示建模业务页，可 F6/Esc 返回会话、Enter 发反馈、Ctrl+Y 批准、PgUp/PgDn 查看依据及各阶段。小终端、平台问答和其他覆盖面板不会记录可批准的展示 binding。
 
-Core 从已校验线程／回合身份、带 registry-derived MCP identity 的 completed 事件读取完整领域事实，先于通用工具详情 result 的 8 KiB 展示截断。独立领域 envelope 上限为 64 KiB，并核对 run/context SHA 和 fact_sequence；失败、超限、错身份或 shell 标题模拟结果都不能成为批准事实。事实投影不进入日志/诊断全文。授权 CLI 由 Core 独立拥有 10 秒 deadline、kill_on_drop 和 generation/attempt 检查；结果绑定具体 proposal/revision/token/hash 后交给同一 Agent。中断留 unknown，不自动补发。
+Core 从已校验线程／回合身份、带 registry-derived MCP identity 的 completed 事件读取 modeling-fact-receipt/v1 小回执，再使用自己持有的 Python domain-read-fact 通道取完整封存事实。小回执含 run/context SHA、kind、ok、fact_sequence、fact_sha256、fact_bytes、具体绑定和模型摘要；模型摘要最多6,000字节，省略部分由 Agent 经 read_fact_view 分页读取。Core 逐项核对完整事实的字节数、SHA256、上下文、序号和绑定后投影；生产路径不再将模型所见完整 envelope 作为事实输入。回执接收上限16KiB，完整事实读取上限8MiB；stdout/stderr在读取过程中有界。单个读取任务及最多32条等待回执由Core持有，10秒deadline、kill_on_drop、会话重置／shutdown取消、执行generation及读取attempt拒绝迟到结果。
+
+读取中或校验失败时，保留已有事实供对照并拒绝批准；固定页眉显示状态，成功显示序号、字节数和SHA256。读取失败不会自动重放建模写入。授权仍由独立domain-authorize CLI完成，并核对具体版本。普通展示／日志缓存继续使用自己的预算，事实全文不进入诊断。新Python服务与TUI需配套重启；旧envelope或被spill改写的文本显示回执缺失，不会静默留下可批准旧状态。
 
 产物为受控异步 job。Python scene lock 只捕获封存快照；worker 和 artifact lock 管实际 Blender。Core 不持权威锁或执行模型调度。应用与构建分开，失败不回滚已应用场景。业务视图区分领域、场景应用、产物与验证；未执行的 AI/人工视觉复核明确显示 not_run。
 
@@ -130,3 +132,12 @@ ACP边界现在分别返回32KiB有界展示文本与64KiB有界完整JSON回执
 MCP包装规范化补充（2026-10-13）：第5轮target/dsh-e2e-447307c5再次通过扫描和标高冲突；Agent持久化同链prepared修订2（实际事实sequence5），UI未显示新事实，验收失败。场景／CAD保持，无授权／操作，verified-failure-retention.json保留。边界进一步展开单个文本内容块、ACP content包装及标准MCP structuredContent；包装读取限256KiB，展开后的完整逻辑JSON仍限64KiB，Core独立64KiB检查保持。明确错误和超限内层不能退回短内容冒充完整事实。
 
 本地纯序列化核对未调用领域工具：第4轮44,800字节逻辑envelope经当前FastMCP转成52,397字节文本、60,182字节MCP包装（无structured output schema，单个文本块）。新增回归覆盖文本块对象／数组、JSON编码数组、双份标准包装、内层超限及错误标记。最终完整scripts/verify.py通过564项Rust测试、2项可选live默认跳过及全部native fixtures，日志outputs/c08-acp-wrapper-complete-check-20261013.log。第6轮真实跨层仍在运行。
+
+## 小回执与独立事实通道验证（2026-10-13）
+
+真实 dsh 将大模型结果按 spill-policy 改写后才经 dsh-acp 发送，rawOutput／structuredContent 分支和扩大 Rust 上限无法恢复丢失字节。第7轮使用的二进制已包含846698e，失败不能归因于未更新二进制。第4轮旧记录的32KiB归因未独立复核，保留为当时假设。
+
+新增回归验证：大于64KiB的事实使用小文本回执经Core私有Python进程进入可批准投影；逐字段篡改／缺失文件拒绝、同步失败可见、读取恢复、旧序号无法清除新失败、stdout/stderr资源边界，以及超时／取消后真实子进程退出。全量567项Rust测试通过、2项可选live默认跳过；release和全部native fixtures通过。第9轮独立通道扫描通过，后续提案摘要遇到大量短字段的大字典，返回fact_view_too_large，未进入预期冲突展示。摘要器已补字典省略和稳定字段分页，并只读重放该轮12,789字节blocked事实，合法proposal小回执为1,620字节。无授权或场景写入。第10轮使用新隔离输入及hi/gpt-6.1-sol，记录独立事实页眉、封存字节及14个检查点；在独立核验完成前保持未完成。
+
+
+跨层第10轮进一步核对：小回执与Core独立读取已支持45,171字节同链修订、依赖完整子方案、真实预览与具体批准应用／有效构建。模型在领域成功后遇到upstream_http2_stream_error，该轮按失败保留；独立verify-partial证据核对仅一次授权／应用和真实几何，不能代替完整井道连续增补。其他provider实际调用及最新状态见领域事实独立通道文档。整体复杂计划保持实施中。

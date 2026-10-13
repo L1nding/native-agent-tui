@@ -61,11 +61,23 @@ def run_vertical_checks(report, tui, send, finished, fact, context_path, evidenc
         expect(key in sequences()["facts"],"actual Agent validation fact missing")
         return actual,key
     def checkpoint(name,screen,**extra):
+        pattern=r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B · SHA256 ([a-f0-9]{64})"
+        screen=tui.wait("Core independently verified complete fact",lambda s:bool(re.search(pattern,s)),15)
+        match=re.search(pattern,screen)
+        kind,sequence,size,sha=match.groups()
+        raw=(directory/"facts"/(sha+".json")).read_bytes()
+        expect(len(raw)==int(size) and hashlib.sha256(raw).hexdigest()==sha,"Core fact marker disagrees with sealed bytes")
+        sealed=json.loads(raw)
+        expect(sealed["kind"]==kind and sealed["fact_sequence"]==int(sequence),"Core fact marker identity differs")
+        archive=evidence/"core-facts"
+        archive.mkdir(exist_ok=True)
+        (archive/(sha+".json")).write_bytes(raw)
+        core_fact={"kind":kind,"sequence":int(sequence),"bytes":int(size),"sha256":sha}
         row={"stage":name,"time_ns":time.time_ns(),"tui_pid":int(tui.console.process.pid),
             "scene_sha256":hashlib.sha256(scene.read_bytes()).hexdigest(),
             "source_hashes":{p:hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in source_hashes},
             "proposals":proposals(),"authorizations":records("authorization-*.json"),"operations":records("operation-*.json"),
-            "tasks":records("tasks/*.json"),"artifacts":records("artifacts/*/build.json"),"fact_sequences":sequences(),**extra}
+            "tasks":records("tasks/*.json"),"artifacts":records("artifacts/*/build.json"),"fact_sequences":sequences(),"core_fact":core_fact,**extra}
         expect(row["source_hashes"]==source_hashes,"Agent changed authoritative CAD")
         if len(stages)<7:
             expect(row["scene_sha256"]==baseline,"Agent wrote before concrete stair approval")

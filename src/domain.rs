@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, McpServerConfig};
 use crate::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 
+pub(crate) mod receipt;
+
 const CONTRACT: &str = "modeling-domain/v2";
 const SERVER: &str = "modeling_domain";
 const LIMIT: usize = 64 * 1024;
@@ -195,6 +197,14 @@ pub struct ArtifactFact {
     pub valid: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFact {
+    pub kind: String,
+    pub sequence: u64,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainSnapshot {
     pub enabled: bool,
@@ -206,6 +216,8 @@ pub struct DomainSnapshot {
     pub artifacts: Vec<ArtifactFact>,
     pub authorizing: bool,
     pub notice: Option<String>,
+    pub fact_sync_notice: Option<String>,
+    pub verified_fact: Option<VerifiedFact>,
 }
 
 impl std::fmt::Debug for DomainSnapshot {
@@ -228,6 +240,8 @@ pub struct DomainFacts {
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
     fact_sequences: BTreeMap<String, u64>,
+    pub(crate) synchronizing: bool,
+    synchronization_errors: BTreeMap<String, u64>,
 }
 
 impl DomainFacts {
@@ -245,15 +259,13 @@ impl DomainFacts {
             snapshot,
             control_messages: BTreeMap::new(),
             fact_sequences: BTreeMap::new(),
+            synchronizing: false,
+            synchronization_errors: BTreeMap::new(),
         }
     }
 
-    /// Consume a complete, identity-checked MCP completion before the display cache
-    /// clips tool details. The domain envelope has its own bounded decode budget.
-    pub(crate) fn observe(&mut self, notice: &ObservedTool, item: &Value) {
-        let Some(setup) = self.setup.as_ref() else {
-            return;
-        };
+    #[cfg(test)]
+    fn observe(&mut self, notice: &ObservedTool, item: &Value) {
         if notice.category != ToolCategory::Mcp
             || notice.outcome != Some(ObservedToolOutcome::Completed)
             || item["type"] != "mcpToolCall"
@@ -262,15 +274,19 @@ impl DomainFacts {
         {
             return;
         }
-        let Some(envelope) = unwrap_envelope(item["result"].clone(), 0) else {
+        if let Some(value) = unwrap_envelope(item["result"].clone(), 0) {
+            self.apply_verified_fact(&value);
+        }
+    }
+
+    /// Only the Core private-channel verifier calls this projection in production.
+    pub(crate) fn apply_verified_fact(&mut self, value: &Value) {
+        let Some(setup) = self.setup.as_ref() else {
             return;
         };
-        let Some(value) = serde_json::to_string(&envelope)
-            .ok()
-            .and_then(|raw| decode_envelope(&raw))
-        else {
+        if value["contract"] != CONTRACT {
             return;
-        };
+        }
         if value["run_id"] != setup.run_id || value["context_sha256"] != setup.context_sha256 {
             return;
         }
@@ -437,6 +453,46 @@ impl DomainFacts {
         }
     }
 
+    pub(crate) fn synchronization_failed(&mut self, kind: &str, sequence: u64, reason: String) {
+        self.synchronization_errors
+            .entry(kind.into())
+            .and_modify(|last| *last = (*last).max(sequence))
+            .or_insert(sequence);
+        self.snapshot.notice = Some(format!("领域事实同步失败：{reason}；请重新检查当前方案"));
+        self.snapshot
+            .fact_sync_notice
+            .clone_from(&self.snapshot.notice);
+    }
+
+    pub(crate) fn synchronization_finished(&mut self, receipt: &receipt::FactReceipt) {
+        for key in [receipt.kind.as_str(), "transport"] {
+            if self
+                .synchronization_errors
+                .get(key)
+                .is_some_and(|last| *last <= receipt.fact_sequence)
+            {
+                self.synchronization_errors.remove(key);
+            }
+        }
+        if self
+            .snapshot
+            .verified_fact
+            .as_ref()
+            .is_none_or(|fact| fact.sequence <= receipt.fact_sequence)
+        {
+            self.snapshot.verified_fact = Some(VerifiedFact {
+                kind: receipt.kind.clone(),
+                sequence: receipt.fact_sequence,
+                sha256: receipt.fact_sha256.clone(),
+                bytes: receipt.fact_bytes,
+            });
+        }
+        if self.synchronization_errors.is_empty() {
+            self.snapshot.notice = None;
+            self.snapshot.fact_sync_notice = None;
+        }
+    }
+
     fn invalidate_artifact_currency(&mut self) {
         for artifact in &mut self.snapshot.artifacts {
             if self.snapshot.operation.as_ref().is_some_and(|operation| {
@@ -470,7 +526,9 @@ impl DomainFacts {
     }
 
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
-        !self.snapshot.authorizing
+        !self.synchronizing
+            && self.synchronization_errors.is_empty()
+            && !self.snapshot.authorizing
             && self.snapshot.operation.is_none()
             && self
                 .snapshot
@@ -779,6 +837,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     })
 }
 
+#[cfg(test)]
 fn decode_envelope(raw: &str) -> Option<Value> {
     if raw.len() > LIMIT {
         return None;
@@ -786,6 +845,7 @@ fn decode_envelope(raw: &str) -> Option<Value> {
     unwrap_envelope(serde_json::from_str(raw).ok()?, 0)
 }
 
+#[cfg(test)]
 fn unwrap_envelope(value: Value, depth: usize) -> Option<Value> {
     if depth > 4 {
         return None;

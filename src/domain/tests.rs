@@ -588,3 +588,78 @@ fn vertical_anchor_proof_contract_keeps_concrete_approval_bound() {
         proposal_fact(&vertical_proposal()).unwrap().binding
     );
 }
+
+fn private_receipt(value: &Value) -> receipt::FactReceipt {
+    let raw = serde_json::to_vec(value).unwrap();
+    receipt::FactReceipt {
+        contract: "modeling-fact-receipt/v1".into(),
+        run_id: "run".into(),
+        context_sha256: "ctx".into(),
+        kind: value["kind"].as_str().unwrap().into(),
+        ok: true,
+        fact_sha256: format!("{:x}", Sha256::digest(&raw)),
+        fact_bytes: raw.len(),
+        fact_sequence: value["fact_sequence"].as_u64().unwrap(),
+        binding: json!({"proposal_id":"proposal","revision":2,"prepare_token":"token",
+            "base_sha256":"base","candidate_sha256":"candidate"}),
+    }
+}
+
+#[test]
+fn private_fact_verification_checks_all_receipt_bindings_above_model_budget() {
+    let mut value = envelope();
+    value["fact_sequence"] = json!(7);
+    value["ok"] = json!(true);
+    value["proposal"]["large_evidence"] = json!("测量依据".repeat(10000));
+    let raw = serde_json::to_vec(&value).unwrap();
+    assert!(raw.len() > 64 * 1024);
+    let receipt = private_receipt(&value);
+    let setup = DomainSetup {
+        context_path: "context".into(),
+        repository: ".".into(),
+        python: "python".into(),
+        run_id: "run".into(),
+        context_sha256: "ctx".into(),
+        floor_id: "floor".into(),
+    };
+    assert_eq!(receipt::verify(&setup, &receipt, &raw).unwrap(), value);
+    for key in [
+        "run_id",
+        "context_sha256",
+        "kind",
+        "fact_sequence",
+        "binding",
+        "ok",
+        "fact_bytes",
+        "fact_sha256",
+    ] {
+        let mut changed = serde_json::to_value(&receipt).unwrap();
+        changed[key] = match key {
+            "fact_sequence" => json!(8),
+            "fact_bytes" => json!(raw.len() + 1),
+            "binding" => json!({"proposal_id":"other"}),
+            "ok" => json!(false),
+            _ => json!("foreign"),
+        };
+        let changed = serde_json::from_value(changed).unwrap();
+        assert!(receipt::verify(&setup, &changed, &raw).is_err(), "{key}");
+    }
+    let mut corrupt = raw.clone();
+    corrupt[1] = b'x';
+    assert!(receipt::verify(&setup, &receipt, &corrupt).is_err());
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&value);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(facts.can_authorize(&binding));
+    facts.synchronizing = true;
+    assert!(!facts.can_authorize(&binding));
+    facts.synchronizing = false;
+    facts.synchronization_failed("proposal", 8, "missing file".into());
+    assert!(!facts.can_authorize(&binding));
+    facts.synchronization_finished(&receipt);
+    assert!(!facts.can_authorize(&binding)); // Old success cannot clear a newer failure.
+    let mut newer = receipt;
+    newer.fact_sequence = 8;
+    facts.synchronization_finished(&newer);
+    assert!(facts.can_authorize(&binding));
+}
