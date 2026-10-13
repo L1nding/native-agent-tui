@@ -80,11 +80,6 @@ fn business_lines(
         lines.push(Line::from(display_text(&p.summary)));
         lines.push(Line::from(format!("场景基线 {}", p.binding.base_sha256)));
         lines.push(Line::from(format!("候选 {}", p.binding.candidate_sha256)));
-        lines.push(Line::from("构件位置与依据"));
-        lines.extend(p.objects.iter().map(|s| Line::from(display_text(s))));
-        lines.push(Line::from("假设：批准后仍保留假设标签"));
-        lines.extend(p.assumptions.iter().map(|s| Line::from(display_text(s))));
-        lines.extend(p.diagnostics.iter().map(|s| Line::from(display_text(s))));
         lines.push(Line::from(format!(
             "领域校验 {} · 场景应用 {}",
             if p.diagnostics.is_empty()
@@ -153,6 +148,13 @@ fn business_lines(
     }
     if domain.authorizing {
         lines.push(Line::from("正在记录具体版本批准…"));
+    }
+    if let Some(p) = &domain.proposal {
+        lines.push(Line::from("构件位置与依据"));
+        lines.extend(p.objects.iter().map(|s| Line::from(display_text(s))));
+        lines.push(Line::from("假设：批准后仍保留假设标签"));
+        lines.extend(p.assumptions.iter().map(|s| Line::from(display_text(s))));
+        lines.extend(p.diagnostics.iter().map(|s| Line::from(display_text(s))));
     }
     if let Some(fact) = &domain.verified_fact {
         lines.push(Line::from(format!(

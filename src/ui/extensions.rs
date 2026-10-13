@@ -206,6 +206,12 @@ impl Registry<'_> {
             KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 panel.reply_scroll_from_bottom = panel.reply_scroll_from_bottom.saturating_sub(8);
             }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                panel.scroll = 0;
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                panel.scroll = view.max_scroll(projection, &context, area);
+            }
             KeyCode::PageUp | KeyCode::PageDown => {
                 let max_scroll = view.max_scroll(projection, &context, area);
                 let current = panel.scroll.min(max_scroll);
