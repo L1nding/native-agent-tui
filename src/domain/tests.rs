@@ -798,3 +798,25 @@ fn drained_fact_queue_preserves_specific_unresolved_failures_and_blocks_approval
     assert!(facts.snapshot.fact_sync_notice.is_none());
     assert!(facts.can_authorize(&binding));
 }
+
+#[test]
+fn readonly_recovery_of_older_applied_artifact_uses_verified_operation_authority() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", recovery_proposal());
+    deliver_fact(
+        &mut facts,
+        "readonly-operation",
+        operation_envelope("applied", "not_required", 7),
+    );
+    let mut applied = artifact_envelope("applied-a", 4, "built", Some(true));
+    applied["artifact"]["candidate"] = json!(false);
+    applied["artifact"]["input_sha256"] = json!("b".repeat(64));
+    applied["artifact"]["authority_sha256"] = json!("b".repeat(64));
+    deliver_fact(&mut facts, "existing-validation", applied);
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    assert_eq!(
+        facts.snapshot.artifacts[0].current,
+        Some(true),
+        "later read of the same applied authority must not erase current build status"
+    );
+}

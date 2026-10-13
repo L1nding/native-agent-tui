@@ -450,14 +450,17 @@ impl DomainFacts {
                             .get("application")
                             .is_some_and(|last| seq < *last)
                     }) {
-                        artifact.current = self
-                            .snapshot
-                            .operation
-                            .as_ref()
-                            .filter(|operation| {
-                                operation.current_sha256 != artifact.binding.authority_sha256
-                            })
-                            .map(|_| false);
+                        artifact.current = self.snapshot.operation.as_ref().and_then(|operation| {
+                            if operation.current_sha256 != artifact.binding.authority_sha256 {
+                                Some(false)
+                            } else if !artifact.binding.candidate {
+                                // A later read of the same applied authority proves that
+                                // the sealed older build still belongs to this scene.
+                                Some(true)
+                            } else {
+                                None
+                            }
+                        });
                     }
                     let existing = self
                         .snapshot
