@@ -209,8 +209,11 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel", "conflict"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel", "conflict", "vertical"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-timeout", type=int, default=0, help="Minimum per-phase observation timeout in seconds (0 keeps case defaults; maximum 1800)")
     args = parser.parse_args()
+    if not 0 <= args.domain_timeout <= 1800:
+        parser.error("--domain-timeout must be between 0 and 1800")
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
     binary = args.binary.resolve()
@@ -575,7 +578,7 @@ def domain_checks(report, binary, common, args, workspace, root):
     def finished():
         screen = tui.wait("domain turn completed", lambda s: any(state in s for state in
                           (" · Completed · ", " · Failed · ", " · Interrupted · "))
-                          and "A turn is running" not in s, 240)
+                          and "A turn is running" not in s, max(240, getattr(args, "domain_timeout", 0)))
         expect(" · Completed · " in screen, "domain turn ended without success")
         return screen
     def fact(what, predicate, timeout=300):
@@ -589,7 +592,7 @@ def domain_checks(report, binary, common, args, workspace, root):
             if " · Failed · " in screen or " · Interrupted · " in screen:
                 raise Failed(f"{what}: domain turn ended without success")
             if time.monotonic() - last_move >= 1:
-                if page >= (40 if case in {"failure", "cancel", "conflict"} else 10):
+                if page >= (40 if case in {"failure", "cancel", "conflict", "vertical"} else 10):
                     tui.keys("\x1b[5~" * page, 0.1)
                     page = 0
                 else:
@@ -597,7 +600,7 @@ def domain_checks(report, binary, common, args, workspace, root):
                     page += 1
                 last_move = time.monotonic()
             return False
-        screen = tui.wait(what, visible, timeout)
+        screen = tui.wait(what, visible, max(timeout, getattr(args, "domain_timeout", 0)))
         (root / (what.replace(" ", "-") + ".txt")).write_text(screen, encoding="utf-8")
         return screen
     def send(prompt):
@@ -613,6 +616,10 @@ def domain_checks(report, binary, common, args, workspace, root):
         tui.console = Console(command, repository)
         return code
     try:
+        if case == "vertical":
+            from domain_vertical_check import run_vertical_checks
+            run_vertical_checks(report, tui, send, finished, fact, context, root)
+            return
         if case == "conflict":
             from domain_conflict_check import run_conflict_checks
             run_conflict_checks(report, tui, send, finished, fact, context, root, restart)
