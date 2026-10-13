@@ -110,3 +110,10 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 新平台owner先拒绝旧批准绑定，只读查询显示原operation_id的applying／对账conflict；沿原授权和操作真实调用apply_change，领域层拒绝并产生实际diagnostic fact sequence16。原grant／operation／proposal／task字节保持，Agent场景writer1次、独立编辑1次、恢复writer0次；旧有效预览valid=true／current=false。`/model` Ctrl+R清空旧绑定后，再读取冲突与验证事实，保持修改。新增路由纳入隔离检查；本轮复用现有Core投影，无Rust生产修改。
 
 真实 `target/dsh-e2e-0ee78bd8` 10项通过、0失败，native清理通过；模型器独立 `verify_complex_platform_conflict.py` valid=true。四项证据副本负例（缺实际拒绝、writer重放、错误编辑回执、UI伪造candidate_present）及单部件漂移核验负例全拒绝，原证据保持。首轮 `target/dsh-e2e-9e3ad7a0` 复合准备／预览步骤超时（2通过／1失败）按实际范围保留；拆回合、明确必填request后用新输入重跑，未重写失败。`scripts/verify.py --fixtures-only`通过（`target/c11-conflict-fixtures-20261013.log`）。C08跨层、医院完整闭环和视觉复核仍未完成。
+
+
+## 双层楼梯／井道事实投影
+
+2026-10-13：来源能力 floor-components/5、关系能力 relations/3 接通受控 connections 路线。平台 Agent 仍独占推进；Python 新增授权下层台阶／井道墙，引用两层已有洞口，上层和楼板只读。Rust Core 从真实 MCP 提案的 elements 读取部件轮廓、底标高、高度、服务楼层、洞口与来源位置，展示参数依据及未检查项。无效几何／缺少 typed connection 不能成为批准事实；批准仍绑定原具体版本。UI 沿现有 snapshot.objects 展示，不增加工作流主控或场景写入口。
+
+确定性领域与真实 Blender／重复构建／GLB 已有专项证据；台阶顶面20条与井道全高内腔9条射线检查实际几何。Core 新增两项解析／具体绑定测试。真实 dsh/TUI 跨层验收、建筑净空、结构／规范、电梯与视觉复核仍未完成，不能把上述证据替代真实平台闭环。

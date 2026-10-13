@@ -640,6 +640,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         candidate_sha256: p["candidate_sha256"].as_str().unwrap_or("").to_owned(),
     };
     let mut objects = Vec::new();
+    let mut seen_connections = std::collections::BTreeSet::new();
     for op in p["draft"]["operations"].as_array()?.iter().take(512) {
         if op["collection"] == "openings" {
             let opening: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
@@ -677,6 +678,52 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     .as_str()
                     .unwrap_or("unknown")
             ));
+            continue;
+        }
+        if op["collection"] == "elements" {
+            let element: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+            let role = element["role"].as_str()?;
+            let boundary = element["boundary"].as_array()?;
+            if !matches!(role, "stair_step" | "shaft_wall")
+                || element["metadata"]["relation_validator"] != "vertical-connection/1"
+                || element["height"].as_f64()? <= 0.0
+                || element["base_z"].as_f64().is_none()
+                || boundary.len() < 3
+                || boundary.len() > 512
+                || boundary
+                    .iter()
+                    .any(|p| p["x"].as_f64().is_none() || p["y"].as_f64().is_none())
+            {
+                return None;
+            }
+            objects.push(format!(
+                "{} · {} · 轮廓(m) {} · 底标高 {} · 高 {} · {}",
+                element["id"].as_str()?,
+                role,
+                element["boundary"],
+                element["base_z"],
+                element["height"],
+                op["basis"].as_str().unwrap_or("unknown")
+            ));
+            let component = element["metadata"]["component_id"].as_str()?;
+            if seen_connections.insert(component.to_owned()) {
+                let connection = p["component_plan"]["connections"]
+                    .as_array()?
+                    .iter()
+                    .find(|c| c["component_id"].as_str() == Some(component))?;
+                let source = element["metadata"]["source_instance_id"].as_str()?;
+                objects.push(format!(
+                    "服务楼层 {} · 既有洞口 {} · 来源位置 {} · 台阶参数依据 {}",
+                    connection["served_floors"],
+                    connection["openings"],
+                    p["vertical_sources"][source]["origin_m"],
+                    element["metadata"]["step_dimension_basis"]
+                ));
+                objects.push(format!(
+                    "未检查：{}",
+                    element["metadata"]["not_checked"].as_str()?
+                ));
+            }
             continue;
         }
         if op["collection"] != "solids" {

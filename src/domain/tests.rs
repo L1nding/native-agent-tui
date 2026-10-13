@@ -516,3 +516,54 @@ fn actual_operation_query_marks_old_applied_artifact_noncurrent_after_later_edit
     deliver_fact(&mut facts, "old-query", applied);
     assert_eq!(facts.snapshot.artifacts[0].current, Some(false));
 }
+
+fn vertical_proposal() -> Value {
+    let mut value = envelope();
+    let element = json!({"id":"stair.1.step.01","role":"stair_step",
+        "boundary":[{"x":2,"y":2},{"x":2.3,"y":2},{"x":2.3,"y":3.2},{"x":2,"y":3.2}],
+        "base_z":0,"height":0.15,"source_ids":["source.stair"],
+        "metadata":{"relation_validator":"vertical-connection/1","component_id":"stair.1",
+            "source_instance_id":"source.stair","step_dimension_basis":"assumed",
+            "not_checked":"headroom; structural design; building-code compliance; elevator"}});
+    value["proposal"]["draft"]["operations"] = json!([{
+        "collection":"elements","basis":"assumed","value_json":element.to_string()}]);
+    value["proposal"]["component_plan"] = json!({"connections":[{
+        "component_id":"stair.1","served_floors":["floor.lower","floor.upper"],
+        "openings":[{"floor_id":"floor.upper","slab_id":"slab.upper","hole_index":0}]}]});
+    value["proposal"]["vertical_sources"] = json!({"source.stair":{"origin_m":[2,2]}});
+    value
+}
+
+#[test]
+fn vertical_elements_show_actual_geometry_read_only_dependencies_and_unchecked_rules() {
+    let fact = proposal_fact(&vertical_proposal()).unwrap();
+    assert!(fact.ready);
+    assert!(fact.objects[0].contains("stair.1.step.01 · stair_step"));
+    assert!(fact.objects[0].contains("底标高 0 · 高 0.15 · assumed"));
+    assert!(fact.objects[1].contains("floor.lower"));
+    assert!(fact.objects[1].contains("slab.upper"));
+    assert!(fact.objects[2].contains("headroom; structural design"));
+    let mut facts = DomainFacts::new(None);
+    facts.snapshot.proposal = Some(fact.clone());
+    assert!(facts.can_authorize(&fact.binding));
+    let mut stale = fact.binding;
+    stale.revision = 1;
+    assert!(!facts.can_authorize(&stale));
+}
+
+#[test]
+fn malformed_vertical_geometry_cannot_become_an_approval_fact() {
+    let mut value = vertical_proposal();
+    let mut element: Value = serde_json::from_str(
+        value["proposal"]["draft"]["operations"][0]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    element["height"] = json!("unknown");
+    value["proposal"]["draft"]["operations"][0]["value_json"] = json!(element.to_string());
+    assert!(proposal_fact(&value).is_none());
+    let mut missing = vertical_proposal();
+    missing["proposal"]["component_plan"] = json!({});
+    assert!(proposal_fact(&missing).is_none());
+}
