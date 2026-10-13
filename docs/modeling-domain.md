@@ -44,3 +44,19 @@ Core 在既有领域提案事实中投影 Opening，展示稳定对象 ID、门�
 保留 `eb0e16b8`、`04d90bad`、`8f4ace6f` 三次失败：两次暴露具体提问措辞谓词过窄，一次真实 Blender 拒绝新增门扇遮挡受保护既有洞口，促成领域准备／应用阶段的反向影响检查。`04d90bad/verified-failure-retention.json` 仅证明构建失败保留已应用场景，未覆盖取消／断连恢复或旧有效产物保留。
 
 全量 `scripts/verify.py` 通过：545 项 Rust 测试通过，2 项可选 live 默认跳过；格式、编译、Clippy、doctest、release、终端和进程专项通过。以上真实验收独立执行。关系能力 `relations/2` 仅在专用门窗路线开放宿主和真实开口，楼梯／井道跨层仍缺验证器；C09–C11 其余真实专项及医院完整闭环继续实施。AI／人工视觉复核仍为 not_run。
+
+
+## C09 异步版本交错验收
+
+`tests/fixtures/dsh_tui_check.py --only domain --domain-case async` 经键盘推进同一平台 Agent，依次扫描、准备并启动 V1、修订 V2 并先完成、修订 V3 并先完成、最后验证历史 V1、浏览 V3 的实际产物及具体方案，最后 Ctrl+Y 批准和构建。门闩由实际 Blender 内的模型器测试脚本持有，只控制隔离副本的时序；验收脚本读取证据并操作键盘，准备、授权、应用和构建沿既有平台／领域工具执行。
+
+模型器 `scripts/prepare_complex_async.py` 生成新的隔离 context，设置 `MODELING_COMPLEX_ROOT` 和 `MODELING_COMPLEX_CONTEXT` 后运行此入口。`async-stages.json` 保存九个业务阶段、实际方案链、来源／场景哈希、授权／操作、实际产物／门闩和 fact sequences；屏幕分别保存方案绑定和产物事实，避免要求两处信息同时出现在小视口。只读 `scripts/verify_complex_async.py` 核对 V2／V3／V1 完成顺序、历史结果隔离、实际展示版本与具体授权绑定，以及应用后的真实构建／重建／GLB 回读；Agent 实际验证 envelope 的 SHA 必须存在于其工具事实记录，核验脚本不发布事实。
+
+保留失败 `target/dsh-e2e-2e9b2af8`、`target/dsh-e2e-762ca25d` 和 `target/dsh-e2e-a1851937`：分别暴露同时可见条件过严、业务滚动越界和 Agent 在修订时丢失 scan_id。滚动修复 `75899f7` 保证到边界仍显示事实、一次 PgUp 即返回内容；后者通过明确读取完整 component_plan 并保留来源绑定重新验收，领域检查保持。失败运行无具体批准、无场景应用，独立来源／基线字节核对已保存。
+
+最终真实证据 `target/dsh-e2e-0b74cd96`：9 步通过、0 失败，进程清理通过。输入为模型器 `outputs/complex-async-c09-final-20261013/context.json`；独立 `verified-async.json` 为 valid=true，实际完成顺序 V2→V3→V1，V1/V2 保留历史归属，只有 V3 获得具体批准及唯一应用。应用构建 `applied-chair-v3-build-001` 的实际 Agent 验证事实序号为 22；三阶段对象 ID、包围盒和体积及 GLB 回读通过。四类伪造证据（历史 V1 变当前、完成顺序、缺预览验证、缺应用后验证）均被独立核验拒绝，原始阶段证据字节保持。
+
+C09 代表真实平台路径已完成；C11 平台断连／恢复、C08 跨层关系和医院完整闭环继续推进。AI／人工视觉复核为 not_run。
+
+
+本轮提交前完整 `scripts/verify.py` 通过，日志 `target/c09-final-verify-20261013.log`：格式、所有目标编译、Clippy、546 项 Rust 测试（2 项可选 live 默认跳过）、doctest、release／examples，以及终端输入、历史／重放、流式对话和 Windows 进程专项通过。真实 C09 验收独立执行。
