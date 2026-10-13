@@ -811,26 +811,57 @@ Enter a new task to continue; F8 retries a failed workflow task."
         match &request.kind {
             RequestKind::UserInput { questions } => {
                 let question = &questions[local.question_index.min(questions.len() - 1)];
-                let options = question
-                    .options
-                    .as_ref()
-                    .map(|values| {
+                let values = question.options.as_deref().unwrap_or_default();
+                // 面板在标题下只有四行。问题有多行（例如待评审的计划）、可以多选或
+                // 选项超过三个时，选项压成带编号的一行放在问题前面，不让它们被挤到
+                // 看不见的地方；说明文字留给 F2 详情。
+                let compact = !values.is_empty()
+                    && (question.multi_select
+                        || question.question.contains('\n')
+                        || values.len() > 3);
+                let choices = if compact {
+                    format!(
+                        "{}{}\n",
+                        if question.multi_select {
+                            tr(
+                                "Type one or more, separated by commas: ",
+                                "输入一项或多项，用逗号分隔：",
+                            )
+                        } else {
+                            tr("Type one: ", "输入其中一项：")
+                        },
                         values
                             .iter()
-                            .map(|v| format!("{}: {}", v.label, v.description))
+                            .enumerate()
+                            .map(|(index, v)| format!("{} {}", index + 1, v.label))
                             .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                format!(
-                    "{} · {} ({}/{})\n{}\n{}",
-                    agent_label(snapshot, &request.thread_id),
-                    question.header,
-                    local.question_index + 1,
-                    questions.len(),
-                    question.question,
-                    options
-                )
+                            .join(" | ")
+                    )
+                } else {
+                    String::new()
+                };
+                let options = if compact {
+                    String::new()
+                } else {
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, v)| {
+                            format!("{} {}", requests::option_line(index, v), v.description)
+                                .trim_end()
+                                .to_owned()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let mut title = agent_label(snapshot, &request.thread_id).to_owned();
+                if !question.header.trim().is_empty() {
+                    title = format!("{title} · {}", question.header);
+                }
+                if questions.len() > 1 {
+                    title = format!("{title} ({}/{})", local.question_index + 1, questions.len());
+                }
+                format!("{title}\n{choices}{}\n{options}", question.question)
             }
             _ => format!(
                 "{} · {}\n{}",
@@ -982,6 +1013,65 @@ mod tests {
         assert!(screen.contains("Write an answer"), "{screen}");
         assert!(screen.contains(" Answer "), "{screen}");
         assert!(screen.contains("Enter answer"), "{screen}");
+        assert!(!screen.contains("Type one"), "{screen}");
+
+        // 待评审的计划比面板长：可选的回答仍然在看得见的那几行里。
+        let review = RequestView::decode(
+            RpcId::Number(3),
+            "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root","turnId":"turn","questions":[{
+                "id":"plan","header":"Plan review",
+                "question":format!("Approve this plan?\n\n{}", "1. a long step\n".repeat(30)),
+                "options":[{"label":"Approve","description":"Leave plan mode"},
+                           {"label":"Keep planning","description":"Stay in plan mode"}]}]}),
+        )
+        .unwrap();
+        let (snapshot, local) = running(vec![review]);
+        let screen = rows(&snapshot, &local, 120, 30).join("\n");
+        assert!(
+            screen.contains("Type one: 1 Approve | 2 Keep planning"),
+            "{screen}"
+        );
+
+        // 模型提的选择题：选项带编号；可多选时说明怎么选。
+        let choice = RequestView::decode(
+            RpcId::Number(4),
+            "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root","turnId":"turn","questions":[{
+                "id":"colour","header":"Colour","question":"Which colours?","multiSelect":true,
+                "options":[{"label":"Crimson","description":"Warm"},
+                           {"label":"Indigo","description":""}]}]}),
+        )
+        .unwrap();
+        let (snapshot, local) = running(vec![choice]);
+        let screen = rows(&snapshot, &local, 120, 30).join("\n");
+        assert!(
+            screen.contains("Type one or more, separated by commas: 1 Crimson | 2 Indigo"),
+            "{screen}"
+        );
+        // 单选、选项少：逐行列出，带说明；没有标题和题号时不留空位。
+        let short = RequestView::decode(
+            RpcId::Number(5),
+            "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root","turnId":"turn","questions":[{
+                "id":"colour","header":"","question":"Which colour?",
+                "options":[{"label":"Crimson","description":"Warm"},
+                           {"label":"Indigo","description":""}]}]}),
+        )
+        .unwrap();
+        let (snapshot, local) = running(vec![short]);
+        let screen = rows(&snapshot, &local, 120, 30).join("\n");
+        assert!(screen.contains("1. Crimson: Warm"), "{screen}");
+        assert!(
+            screen.contains("2. Indigo") && !screen.contains("2. Indigo:"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("Type one")
+                && !screen.contains("(1/1)")
+                && !screen.contains("▎ root · "),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -76,7 +76,7 @@ export function answerQuestions(
         header: text(question['header'], 200),
         // The reviewed text, e.g. the plan, is part of what the user is asked.
         question: detail === '' ? text(question['question']) : `${text(question['question'], 400)}\n\n${detail}`,
-        ...(options.length === 0 ? {} : { options }),
+        ...(options.length === 0 ? {} : { options, multiSelect: question['multiSelect'] === true }),
       }
     })
     const id = `zf-ask-${++next}`

@@ -25,7 +25,9 @@ test('a question becomes one request to the TUI and its reply is converted for t
   assert.equal(params.sessionId, 's')
   assert.equal(params.questions[0].question, 'Approve this plan?\n\n# Plan\n1. scan')
   assert.deepEqual(params.questions[0].options.map(option => option.label), ['Approve', 'Keep planning'])
+  assert.equal(params.questions[0].multiSelect, false)
   assert.equal(params.questions[1].options, undefined)
+  assert.equal(params.questions[1].multiSelect, undefined)
   // Frames that are not the reply are left for the ACP server.
   assert.equal(questions.settle({ id: 'other', result: {} }), false)
   assert.equal(questions.settle({ id, method: 'something', params: {} }), false)

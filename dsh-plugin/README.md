@@ -41,6 +41,7 @@ dsh plugin --profile zf-tui add link:D:/project/native-agent-tui/dsh-plugin
 
 - 模板自带的 `@deepseek-ai/dsh-acp-app` 必须去掉：它和本插件都要独占 stdout。
 - 用 `link:` 而不是 `file:`。`file:` 会在安装时复制一份，之后的构建结果不会生效。
+- 本插件的 `cordis.patch.yml` 同时装入 `@deepseek-ai/dsh-tool-ask-user`：`dsh-base` 不带模型的提问工具 `ask_user_question`，而本插件能把问题送到 TUI 的请求面板，所以由它带上。问题里的 `multiSelect` 原样转给 TUI。
 - 模型 provider 配在 profile 自己的 `cordis.patch.yml` 里，和 dsh 其他 profile 的写法相同；凭据在 `~/.dsh/.credentials.yaml`，各 profile 共用。
 
 ## 方法

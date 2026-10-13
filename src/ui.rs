@@ -1017,9 +1017,10 @@ fn handle_key_inner(
                         );
                         return false;
                     }
+                    let question = &questions[local.question_index];
                     local
                         .answers
-                        .insert(questions[local.question_index].id.clone(), vec![text]);
+                        .insert(question.id.clone(), question.answer(&text));
                     if let Err(error) = request.validate_input_answers(
                         &local.answers,
                         local.question_index + 1 == questions.len(),
