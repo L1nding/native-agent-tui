@@ -61,7 +61,7 @@ def run_vertical_checks(report, tui, send, finished, fact, context_path, evidenc
         expect(key in sequences()["facts"],"actual Agent validation fact missing")
         return actual,key
     def checkpoint(name,screen,**extra):
-        pattern=r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B · SHA256 ([a-f0-9]{64})"
+        pattern=r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B(?: · |\s+)SHA256 ([a-f0-9]{64})"
         screen=tui.wait("Core independently verified complete fact",lambda s:bool(re.search(pattern,s)),15)
         match=re.search(pattern,screen)
         kind,sequence,size,sha=match.groups()

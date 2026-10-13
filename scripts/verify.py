@@ -57,6 +57,7 @@ def main():
     run([sys.executable, str(fixtures / "observation_consumer.py")], input=generated.stdout)
     if os.name == "nt":
         run([sys.executable, str(fixtures / "dsh_check_dispatch_test.py")])
+        run([sys.executable, str(fixtures / "domain_run_lease_test.py")])
         run([sys.executable, str(fixtures / "domain_failure_view_test.py")])
         run([sys.executable, str(fixtures / "domain_vertical_view_test.py")])
         run([sys.executable, str(fixtures / "domain_hospital_view_test.py")])

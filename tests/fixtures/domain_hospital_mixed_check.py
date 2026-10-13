@@ -74,7 +74,7 @@ def run_hospital_checks(report, tui, send, finished, fact, context_path, evidenc
         return matches[0] if len(matches) == 1 else None
 
     def checkpoint(name, screen):
-        pattern = r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B · SHA256 ([a-f0-9]{64})"
+        pattern = r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B(?: · |\s+)SHA256 ([a-f0-9]{64})"
         screen = tui.wait(
             "hospital Core private fact synchronized", lambda s: bool(re.search(pattern, s)), 20
         )

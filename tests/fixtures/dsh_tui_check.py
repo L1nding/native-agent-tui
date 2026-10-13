@@ -29,6 +29,7 @@ from conpty import Console  # noqa: E402
 ENTER, ESC, TAB = "\r", "\x1b", "\t"
 UP, DOWN, RIGHT, LEFT = "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"
 F6 = "\x1b[17~"
+CTRL_HOME = "\x1b[1;5H"
 CTRL_C, CTRL_E, CTRL_N, CTRL_Q, CTRL_R, CTRL_S, CTRL_T, CTRL_U, CTRL_Y = (
     "\x03", "\x05", "\x0e", "\x11", "\x12", "\x13", "\x14", "\x15", "\x19")
 PROBE_PROVIDER = "zf-e2e"
@@ -1118,7 +1119,19 @@ def domain_checks(report, binary, common, args, workspace, root):
     command = [str(binary), "--cwd", str(repository), "--domain-context", str(context),
                "--model", args.model, "--journal-dir", str(domain_journal),
                "--dsh", args.dsh, "--profile", args.profile]
-    tui = Tui(command, repository, report.evidence)
+    from domain_run_lease import acquire
+    binding = json.loads(context.read_text(encoding="utf-8"))
+    try:
+        lease = acquire(Path(__file__).resolve().parents[2] / "target/domain-run-locks",
+                        repository / binding["scene_path"])
+    except RuntimeError as error:
+        report.step("isolated scene has one acceptance owner", lambda: expect(False, str(error)))
+        return
+    try:
+        tui = Tui(command, repository, report.evidence)
+    except Exception:
+        lease.close()
+        raise
     mixed = case == "mixed"
     hospital = "floor.f08.trial" in context.read_text(encoding="utf-8")
     def finished():
@@ -1152,7 +1165,7 @@ def domain_checks(report, binary, common, args, workspace, root):
                 raise Failed(f"{what}: domain turn ended without success")
             if case in {"vertical", "hospital", "hospital-floor", "hospital-floor-resume"} and " · Completed · " in screen and not completed_seen:
                 completed_seen = True
-                tui.keys("\x1b[5~" * 40, 0.1)
+                tui.keys(CTRL_HOME, 0.2)
                 page, last_move = 0, time.monotonic()
                 return False
             if time.monotonic() - last_move >= 1:
@@ -1344,7 +1357,10 @@ def domain_checks(report, binary, common, args, workspace, root):
             finished()
         report.step("concrete UI approval applies and builds the revised components", apply_and_build, tui)
     finally:
-        tui.close()
+        try:
+            tui.close()
+        finally:
+            lease.close()
 
 def cli_checks(report, binary, common, args, workspace, journal, root):
     def run(arguments, **kwargs):

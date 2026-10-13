@@ -15,7 +15,7 @@ fn sections(area: Rect, has_reply: bool) -> [Rect; 5] {
         0
     };
     let chunks = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(reply_height),
         Constraint::Length(4),
@@ -221,7 +221,8 @@ pub(super) fn draw(
                         .as_ref()
                         .map(|fact| {
                             format!(
-                                "Core事实 {} · seq {} · {} B · SHA256 {}",
+                                "Core事实 {} · seq {} · {} B
+SHA256 {}",
                                 fact.kind, fact.sequence, fact.bytes, fact.sha256
                             )
                         })
@@ -837,5 +838,39 @@ mod tests {
             }
         );
         assert!(local.editor.text.is_empty());
+    }
+    #[test]
+    fn long_fact_kind_and_sequence_keep_entire_sha_visible_in_real_acceptance_width() {
+        use crate::domain::VerifiedFact;
+        use ratatui::{backend::TestBackend, Terminal};
+        let digest = "ab".repeat(32);
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
+                enabled: true,
+                verified_fact: Some(VerifiedFact {
+                    kind: "artifact_validation".into(),
+                    sequence: 123456,
+                    bytes: 8_388_608,
+                    sha256: digest.clone(),
+                }),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &snapshot, &local))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let header: String = (0..3)
+            .flat_map(|y| (0..120).map(move |x| buffer[(x, y)].symbol().to_owned()))
+            .collect();
+        assert!(header.contains("artifact_validation"));
+        assert!(header.contains("123456"));
+        assert!(header.contains(&digest), "{header}");
     }
 }

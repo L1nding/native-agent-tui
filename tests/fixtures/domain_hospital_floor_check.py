@@ -53,7 +53,7 @@ def run_hospital_floor_checks(report, tui, send, finished, fact, context_path, e
     def checkpoint(name):
         screen = tui.screen()
         match = re.search(
-            r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B · SHA256 ([a-f0-9]{64})", screen
+            r"Core事实 ([a-z_]+) · seq (\d+) · (\d+) B(?: · |\s+)SHA256 ([a-f0-9]{64})", screen
         )
         expect(match is not None, "checkpoint missing private Core fact header")
         kind, sequence, size, sha = match.groups()
