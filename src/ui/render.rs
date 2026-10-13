@@ -989,6 +989,7 @@ mod tests {
                 text: text.into(),
                 complete: false,
                 truncated: false,
+                tools: Vec::new(),
             });
         }
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
@@ -1025,6 +1026,21 @@ mod tests {
                 .join("\n"),
             complete: true,
             truncated: false,
+            tools: (1..=6)
+                .map(|index| crate::tool_details::ConversationTool {
+                    item_id: index.to_string(),
+                    category: crate::protocol::ToolCategory::Shell,
+                    lifecycle: crate::tool_details::ToolLifecycle::Completed,
+                    name: None,
+                    command: None,
+                    cwd: None,
+                    target: None,
+                    exit_code: Some(0),
+                    output_lines: None,
+                    added_lines: None,
+                    removed_lines: None,
+                })
+                .collect(),
         });
         local.editor.insert("draft");
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
@@ -1080,6 +1096,7 @@ mod tests {
             text: "Review the layout".into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         for width in [40, 64, 100, 140] {
             let screen = lang::with_zh(|| rows(&snapshot, &local, width, 30));
@@ -1129,6 +1146,7 @@ mod tests {
             text: "word ".repeat(400),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         let wide = rows(&snapshot, &local, 160, 40);
         let title = wide
@@ -1175,6 +1193,7 @@ mod tests {
             text: vec!["LEAKWORD ".repeat(12); 40].join("\n"),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         let plain = rows(&snapshot, &LocalState::default(), 120, 30).join("\n");
         assert!(plain.contains("LEAKWORD"), "fixture must fill the screen");

@@ -30,6 +30,15 @@ export interface HistoryMessage {
   turnId?: string
   text: string
   truncated: boolean
+  tool?: {
+    itemId: string
+    category: 'shell' | 'file' | 'dynamic'
+    lifecycle: 'unknown' | 'completed' | 'failed' | 'endedUnknown'
+    name?: string
+    command?: string
+    cwd?: string
+    target?: string
+  }
 }
 
 /** Windows paths differ in separators and letter case for the same directory. */
@@ -133,7 +142,36 @@ function messagesOf(event: SessionEvent): HistoryMessage[] {
     const block = record(raw)
     if (block?.type === 'tool-call' && event.type === 'assistant/message') {
       const callId = identity(block.id)
-      if (callId !== undefined) messages.push(messageOf('tool', `▸ unknown · ${toolLabel(block)}`, data, callId))
+      if (callId !== undefined) {
+        const message = messageOf('tool', `▸ unknown · ${toolLabel(block)}`, data, callId)
+        let input = block.arguments
+        if (typeof input === 'string') {
+          try { input = JSON.parse(input) } catch { input = undefined }
+        }
+        const fields = record(input)
+        const command = fields?.command ?? fields?.cmd
+        const target = fields?.file_path ?? fields?.path
+        const cwd = fields?.workdir ?? fields?.cwd
+        const short = (value: unknown): string | undefined => {
+          if (typeof value !== 'string') return undefined
+          let end = Math.min(512, value.length)
+          if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1]!)) end--
+          return value.slice(0, end)
+        }
+        const commandText = short(Array.isArray(command) && command.every(part => typeof part === 'string') ? command.join(' ') : command)
+        const nameText = short(block.name)
+        const targetText = short(target)
+        const cwdText = short(cwd)
+        message.tool = {
+          itemId: callId, lifecycle: 'unknown',
+          category: command !== undefined ? 'shell' : target !== undefined ? 'file' : 'dynamic',
+          ...(nameText === undefined ? {} : { name: nameText }),
+          ...(commandText === undefined ? {} : { command: commandText }),
+          ...(targetText === undefined ? {} : { target: targetText }),
+          ...(cwdText === undefined ? {} : { cwd: cwdText }),
+        }
+        messages.push(message)
+      }
       continue
     }
     if (typeof block?.text !== 'string' || block.text.trim() === '') continue
@@ -214,10 +252,11 @@ export async function readHistory(query: SessionQuery, sessionId: string): Promi
       const id = identity(result?.toolCallId)
       if (id === undefined) continue
       const message = tools.get(toolKey(data.turn, id))
-      if (message === undefined || !message.text.startsWith('▸ unknown')) continue
+      if (message === undefined || message.tool?.lifecycle !== 'unknown') continue
       const status = record(data.error)?.code === 'TOOL_OUTCOME_UNKNOWN' ? 'ended, outcome unknown'
         : result?.isError === true ? 'failed'
         : result?.isError === false || result?.isError === undefined ? 'done' : 'unknown'
+      message.tool.lifecycle = status === 'done' ? 'completed' : status === 'failed' ? 'failed' : status === 'ended, outcome unknown' ? 'endedUnknown' : 'unknown'
       const final = bounded(message.text.replace('▸ unknown', `▸ ${status}`))
       message.text = final.text
       message.truncated ||= final.truncated

@@ -378,7 +378,7 @@ fn serialization_excludes_task_titles_messages_configuration_and_private_request
         phase: SessionPhase::Failed,
         observation: state.observation.clone(),
         model: Some("PRIVATE_MODEL".into()), cwd: "PRIVATE_PATH".into(), last_error: Some("PRIVATE_TOKEN".into()),
-        messages: vec![crate::state::ConversationItem { id: "message".into(), thread_id: "root-thread".into(), turn_id: "turn".into(), role: "Agent".into(), text: "PRIVATE_OUTPUT".into(), complete: true, truncated: false }],
+        messages: vec![crate::state::ConversationItem { id: "message".into(), thread_id: "root-thread".into(), turn_id: "turn".into(), role: "Agent".into(), text: "PRIVATE_OUTPUT".into(), complete: true, truncated: false, tools: Vec::new() }],
         requests: vec![crate::interactions::RequestView::decode(crate::protocol::RpcId::Number(7), "item/commandExecution/requestApproval", &serde_json::json!({"threadId":"root-thread","turnId":"turn","command":"PRIVATE_COMMAND"})).unwrap()],
         ..Default::default()
     };
@@ -638,6 +638,7 @@ fn confirmed_usage_and_budget_replay_without_starting_execution_or_exposing_priv
         text: "PRIVATE_PROMPT_AND_OUTPUT".into(),
         complete: true,
         truncated: false,
+        tools: Vec::new(),
     });
 
     let captured = StoredSnapshot::capture(&core);

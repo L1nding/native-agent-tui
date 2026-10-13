@@ -18,7 +18,8 @@ pub struct ToolDetailLocator {
     pub item_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ToolLifecycle {
     Running,
     Completed,
@@ -26,6 +27,78 @@ pub enum ToolLifecycle {
     Interrupted,
     EndedUnknown,
     Unknown,
+}
+
+/// 有界对话摘要，不保留原始工具输出、参数或结果。
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationTool {
+    pub item_id: String,
+    pub category: ToolCategory,
+    pub lifecycle: ToolLifecycle,
+    pub name: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub target: Option<String>,
+    pub exit_code: Option<i64>,
+    pub output_lines: Option<usize>,
+    pub added_lines: Option<usize>,
+    pub removed_lines: Option<usize>,
+}
+
+impl fmt::Debug for ConversationTool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConversationTool")
+            .field("item_id", &self.item_id)
+            .field("category", &self.category)
+            .field("lifecycle", &self.lifecycle)
+            .field("exit_code", &self.exit_code)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConversationTool {
+    pub(crate) fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.item_id.len()
+            + [&self.name, &self.command, &self.cwd, &self.target]
+                .iter()
+                .map(|field| field.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+    }
+
+    pub fn from_detail(detail: &ToolDetail) -> Self {
+        let bounded = |text: &str| {
+            let end = text
+                .char_indices()
+                .nth(512)
+                .map_or(text.len(), |(end, _)| end);
+            crate::state::display_text(&text[..end])
+        };
+        Self {
+            item_id: detail.locator.item_id.clone(),
+            category: detail.category,
+            lifecycle: detail.lifecycle,
+            name: detail.name.as_deref().map(bounded),
+            command: detail.command.as_deref().map(bounded),
+            cwd: detail.cwd.as_deref().map(bounded),
+            target: detail
+                .target
+                .as_deref()
+                .or_else(|| {
+                    detail
+                        .result
+                        .as_deref()
+                        .filter(|_| detail.category == ToolCategory::File)
+                })
+                .map(bounded),
+            exit_code: detail.exit_code,
+            output_lines: (detail.output_source != ToolTextSource::Unavailable)
+                .then(|| detail.output.lines().count()),
+            added_lines: detail.diff.map(|diff| diff.added),
+            removed_lines: detail.diff.map(|diff| diff.removed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +118,14 @@ pub struct ToolDetail {
     pub name: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
+    pub target: Option<String>,
     pub parameters: Option<String>,
     pub result: Option<String>,
     pub output: String,
     pub output_source: ToolTextSource,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<u64>,
+    pub diff: Option<crate::protocol::DiffStats>,
     pub bytes_observed: usize,
     pub bytes_retained: usize,
     pub clipped: bool,
@@ -78,6 +153,7 @@ impl ToolDetail {
             + self.name.as_ref().map_or(0, String::capacity)
             + self.command.as_ref().map_or(0, String::capacity)
             + self.cwd.as_ref().map_or(0, String::capacity)
+            + self.target.as_ref().map_or(0, String::capacity)
             + self.parameters.as_ref().map_or(0, String::capacity)
             + self.result.as_ref().map_or(0, String::capacity)
             + self.output.capacity()
@@ -103,8 +179,20 @@ pub fn summary_line(detail: &ToolDetail) -> String {
                 .then(|| detail.result.clone())
                 .flatten()
         })
+        .or_else(|| {
+            detail.target.as_ref().map(|target| {
+                detail
+                    .name
+                    .as_ref()
+                    .map_or_else(|| target.clone(), |name| format!("{name} {target}"))
+            })
+        })
         .or_else(|| detail.name.clone())
         .unwrap_or_else(|| format!("{:?}", detail.category));
+    let what = match what.char_indices().nth(96) {
+        Some((end, _)) => format!("{}…", &what[..end]),
+        None => what,
+    };
     let state = match detail.lifecycle {
         ToolLifecycle::Running => "running",
         ToolLifecycle::Completed => "done",
@@ -199,19 +287,39 @@ impl ToolDetails {
                 return;
             }
             let changed = (existing.command.is_none() && fields.command.is_some())
+                || existing.category != category
+                || (existing.name.is_none() && fields.name.is_some())
                 || (existing.cwd.is_none() && fields.cwd.is_some())
+                || (existing.target.is_none() && fields.target.is_some())
+                || (fields.diff.is_some() && fields.diff != existing.diff)
+                || fields
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| *output != existing.output)
                 || (existing.parameters.is_none() && fields.parameters.is_some());
             if existing.command.is_none() {
                 existing.command = fields.command;
             }
+            existing.category = category;
             if existing.name.is_none() {
                 existing.name = fields.name;
             }
             if existing.cwd.is_none() {
                 existing.cwd = fields.cwd;
             }
+            if existing.target.is_none() {
+                existing.target = fields.target;
+            }
+            if let Some(output) = fields.output {
+                existing.bytes_observed = existing.bytes_observed.saturating_add(output.len());
+                existing.output = output;
+                existing.output_source = ToolTextSource::CommandAggregate;
+            }
             if existing.parameters.is_none() {
                 existing.parameters = fields.parameters;
+            }
+            if fields.diff.is_some() {
+                existing.diff = fields.diff;
             }
             normalize_detail(existing);
             if changed {
@@ -220,7 +328,7 @@ impl ToolDetails {
             self.rebalance();
             return;
         }
-        let detail = ToolDetail {
+        let mut detail = ToolDetail {
             locator,
             revision: 1,
             category,
@@ -228,17 +336,24 @@ impl ToolDetails {
             name: fields.name,
             command: fields.command,
             cwd: fields.cwd,
+            target: fields.target,
             parameters: fields.parameters,
             result: None,
             output: String::new(),
             output_source: ToolTextSource::Unavailable,
             exit_code: None,
             duration_ms: None,
+            diff: fields.diff,
             bytes_observed: 0,
             bytes_retained: 0,
             clipped: false,
             authoritative: false,
         };
+        if let Some(output) = fields.output {
+            detail.bytes_observed = output.len();
+            detail.output = output;
+            detail.output_source = ToolTextSource::CommandAggregate;
+        }
         self.insert(detail);
     }
 
@@ -262,12 +377,14 @@ impl ToolDetails {
                 name: fields.name,
                 command: fields.command,
                 cwd: fields.cwd,
+                target: fields.target,
                 parameters: fields.parameters,
                 result: fields.result,
                 output: String::new(),
                 output_source: ToolTextSource::Unavailable,
                 exit_code: fields.exit_code,
                 duration_ms: fields.duration_ms,
+                diff: fields.diff,
                 bytes_observed: 0,
                 bytes_retained: 0,
                 clipped: false,
@@ -302,17 +419,25 @@ impl ToolDetails {
             fields.result.as_deref()
         };
         let changed = detail.lifecycle != lifecycle
+            || detail.category != category
+            || (detail.name.is_none() && fields.name.is_some())
             || detail.result.as_deref() != next_result
             || (detail.command.is_none() && fields.command.is_some())
             || (detail.cwd.is_none() && fields.cwd.is_some())
+            || (detail.target.is_none() && fields.target.is_some())
             || (detail.parameters.is_none() && fields.parameters.is_some())
             || fields.exit_code != detail.exit_code
             || fields.duration_ms != detail.duration_ms
+            || fields.diff != detail.diff
             || authoritative != detail.authoritative
             || (fields.output.as_ref().is_some_and(|output| {
                 detail.output != *output || detail.output_source != ToolTextSource::CommandAggregate
             }));
         detail.lifecycle = lifecycle;
+        detail.category = category;
+        if detail.name.is_none() {
+            detail.name = fields.name;
+        }
         detail.result = if category == ToolCategory::Shell {
             None
         } else {
@@ -324,11 +449,15 @@ impl ToolDetails {
         if detail.cwd.is_none() {
             detail.cwd = fields.cwd;
         }
+        if detail.target.is_none() {
+            detail.target = fields.target;
+        }
         if detail.parameters.is_none() {
             detail.parameters = fields.parameters;
         }
         detail.exit_code = fields.exit_code;
         detail.duration_ms = fields.duration_ms;
+        detail.diff = fields.diff;
         detail.authoritative = authoritative;
         if let Some(output) = fields.output {
             detail.bytes_observed = detail.bytes_observed.saturating_add(output.len());
@@ -460,8 +589,10 @@ fn append_text(detail: &mut ToolDetail, text: &str) {
 
 fn normalize_detail(detail: &mut ToolDetail) {
     for value in [
+        &mut detail.name,
         &mut detail.command,
         &mut detail.cwd,
+        &mut detail.target,
         &mut detail.parameters,
         &mut detail.result,
     ]

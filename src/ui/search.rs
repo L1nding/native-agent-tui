@@ -1367,6 +1367,7 @@ mod tests {
             text: text.into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         }
     }
 
@@ -1419,12 +1420,14 @@ mod tests {
             name: None,
             command: Some("needle 中文".into()),
             cwd: None,
+            target: None,
             parameters: None,
             result: None,
             output: "private output".into(),
             output_source: ToolTextSource::OutputDelta,
             exit_code: None,
             duration_ms: None,
+            diff: None,
             bytes_observed: 14,
             bytes_retained: 14,
             clipped: false,

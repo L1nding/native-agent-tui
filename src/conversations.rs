@@ -31,6 +31,7 @@ pub struct SavedMessage {
     pub turn_id: Option<String>,
     pub text: String,
     pub truncated: bool,
+    pub tool: Option<crate::tool_details::ConversationTool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -102,6 +103,27 @@ pub fn parse_history(result: &Value) -> Option<History> {
                 turn_id: identity("turnId"),
                 text,
                 truncated: truncated || row.get("truncated").and_then(Value::as_bool) == Some(true),
+                tool: row.get("tool").and_then(|value| {
+                    let mut tool: crate::tool_details::ConversationTool =
+                        serde_json::from_value(value.clone()).ok()?;
+                    if role != "tool"
+                        || Some(tool.item_id.as_str()) != row.get("id").and_then(Value::as_str)
+                    {
+                        return None;
+                    }
+                    for text in [
+                        &mut tool.name,
+                        &mut tool.command,
+                        &mut tool.cwd,
+                        &mut tool.target,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        *text = crate::state::display_text(&cut(text, 2048).0);
+                    }
+                    Some(tool)
+                }),
             })
         })
         .collect();
@@ -166,6 +188,29 @@ mod tests {
         assert_eq!(history.messages[1].id.as_deref(), Some("tool-1"));
         assert_eq!(history.messages[1].turn_id.as_deref(), Some("turn"));
         assert_eq!(history.messages[0].id, history.messages[2].id);
+    }
+
+    #[test]
+    fn restored_tool_facts_require_matching_identity_and_bound_private_fields() {
+        let tool = json!({"itemId":"tool","category":"shell","lifecycle":"failed",
+            "command":"界".repeat(3000),"exitCode":1});
+        let history = parse_history(&json!({"messages":[
+            {"role":"tool","id":"tool","text":"▸ done · misleading", "tool":tool},
+            {"role":"tool","id":"other","text":"▸ failed · x", "tool":tool},
+            {"role":"assistant","id":"tool","text":"answer", "tool":tool},
+            {"role":"tool","id":"legacy","text":"▸ done · x"},
+        ]}))
+        .unwrap();
+        let restored = history.messages[0].tool.as_ref().unwrap();
+        assert_eq!(
+            restored.lifecycle,
+            crate::tool_details::ToolLifecycle::Failed
+        );
+        assert!(restored.command.as_ref().unwrap().len() <= 2048);
+        assert!(history.messages[1..]
+            .iter()
+            .all(|message| message.tool.is_none()));
+        assert!(!format!("{restored:?}").contains('界'));
     }
 
     #[test]

@@ -9,6 +9,8 @@ use thiserror::Error;
 
 use crate::config::McpServerConfig;
 use crate::protocol::{Envelope, RpcId};
+mod tools;
+pub use tools::{FileDiff, ToolKind};
 
 pub const INITIALIZE: &str = "initialize";
 pub const SESSION_NEW: &str = "session/new";
@@ -49,8 +51,9 @@ pub enum Update {
     },
     ToolCall {
         item_id: String,
-        title: String,
-        kind: Option<String>,
+        name: String,
+        kind: ToolKind,
+        diffs: Vec<FileDiff>,
         /// 保留给之后只带 toolCallId 的权限请求查回命令、理由和申请的权限。
         input: ToolInput,
         mcp: Option<Box<McpCall>>,
@@ -58,9 +61,7 @@ pub enum Update {
     ToolCallUpdate {
         item_id: String,
         status: ToolStatus,
-        output: Option<String>,
-        /// Complete bounded JSON for registered MCP completions; never display text.
-        structured_output: Option<Value>,
+        content: ToolContent,
     },
     Usage {
         input_tokens: Option<u64>,
@@ -71,6 +72,16 @@ pub enum Update {
     Unknown {
         kind: String,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolContent {
+    pub output: Option<String>,
+    /// Complete JSON is separate from bounded display text.
+    pub structured_output: Option<Value>,
+    pub diffs: Vec<FileDiff>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,46 +375,55 @@ pub fn update(params: &Value) -> Result<(String, Update), AcpProtocolError> {
             item_id: item_id()?,
             input: tool_input(payload),
             mcp: mcp_call(payload),
-            // dsh 的 title 只是工具名（如 pwsh），真正的命令在 rawInput.command。
-            title: {
-                let input = tool_input(payload);
-                input.command.unwrap_or_else(|| {
-                    let name = payload
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("ACP tool call");
-                    let text = match input.target {
-                        Some(target) => format!("{name} {target}"),
-                        None => name.to_owned(),
-                    };
-                    text.chars().take(MAX_TEXT_BYTES).collect()
-                })
-            },
-            kind: payload
-                .get("kind")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            name: tools::bounded(
+                payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ACP tool call"),
+                512,
+            ),
+            kind: tools::kind(payload, &tool_input(payload)),
+            diffs: tools::diffs(payload, tools::kind(payload, &tool_input(payload))),
         },
         "tool_call_update" => Update::ToolCallUpdate {
             item_id: item_id()?,
-            status: tool_status(payload.get("status").and_then(Value::as_str)),
-            // 工具输出（如读取整个文件）常超过上限；截断保留开头，不让整轮失败。
-            output: payload
-                .get("content")
-                .and_then(truncated_text)
-                .or_else(|| payload.get("rawOutput").and_then(truncated_text)),
-            structured_output: (tool_status(payload.get("status").and_then(Value::as_str))
-                == ToolStatus::Completed)
-                .then(|| {
-                    if payload["rawOutput"]["isError"] == true {
-                        return Some(json!({"isError": true}));
-                    }
-                    match payload.get("rawOutput").filter(|value| !value.is_null()) {
-                        Some(raw) => bounded_json_result(raw),
-                        None => payload.get("content").and_then(bounded_content_result),
-                    }
-                })
-                .flatten(),
+            status: if payload
+                .pointer("/rawOutput/isError")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                ToolStatus::Failed
+            } else {
+                tool_status(payload.get("status").and_then(Value::as_str))
+            },
+            content: ToolContent {
+                diffs: tools::diffs(payload, ToolKind::Generic),
+                exit_code: payload
+                    .get("exitCode")
+                    .or_else(|| payload.pointer("/rawOutput/exitCode"))
+                    .and_then(Value::as_i64),
+                duration_ms: payload
+                    .get("durationMs")
+                    .or_else(|| payload.pointer("/rawOutput/durationMs"))
+                    .and_then(Value::as_u64),
+                // 工具输出（如读取整个文件）常超过上限；截断保留开头，不让整轮失败。
+                output: payload
+                    .get("content")
+                    .and_then(truncated_text)
+                    .or_else(|| payload.get("rawOutput").and_then(truncated_text)),
+                structured_output: (tool_status(payload.get("status").and_then(Value::as_str))
+                    == ToolStatus::Completed)
+                    .then(|| {
+                        if payload["rawOutput"]["isError"] == true {
+                            return Some(json!({"isError": true}));
+                        }
+                        match payload.get("rawOutput").filter(|value| !value.is_null()) {
+                            Some(raw) => bounded_json_result(raw),
+                            None => payload.get("content").and_then(bounded_content_result),
+                        }
+                    })
+                    .flatten(),
+            },
         },
         "usage_update" => Update::Usage {
             input_tokens: number(payload, &["inputTokens", "input_tokens", "input"]),
@@ -514,7 +534,7 @@ pub fn tool_input(tool: &Value) -> ToolInput {
                     .join(" "),
                 _ => return None,
             };
-            (!text.trim().is_empty()).then(|| text.chars().take(MAX_TEXT_BYTES).collect())
+            (!text.trim().is_empty()).then(|| tools::bounded(&text, MAX_TEXT_BYTES))
         })
     };
     ToolInput {
@@ -630,20 +650,25 @@ mod tests {
         );
         assert_eq!(input.reason.as_deref(), Some("需要写入文件"));
         assert_eq!(input.cwd.as_deref(), Some("D:\\ws"));
-        let Ok((_, Update::ToolCall { title, .. })) =
+        let Ok((_, Update::ToolCall { input, .. })) =
             update(&json!({"sessionId":"s","update":tool}))
         else {
             panic!()
         };
-        assert_eq!(title, "Set-Content -Path probe.txt -Value 'hi'");
+        assert_eq!(
+            input.command.as_deref(),
+            Some("Set-Content -Path probe.txt -Value 'hi'")
+        );
         assert_eq!(tool_input(&json!({"title":"pwsh"})), ToolInput::default());
-        let Ok((_, Update::ToolCall { title, .. })) = update(&json!({"sessionId":"s","update":{
+        let Ok((_, Update::ToolCall { name, input, .. })) =
+            update(&json!({"sessionId":"s","update":{
             "sessionUpdate":"tool_call","toolCallId":"r","title":"read",
             "rawInput":{"file_path":"calc.py"}}}))
         else {
             panic!()
         };
-        assert_eq!(title, "read calc.py");
+        assert_eq!(name, "read");
+        assert_eq!(input.target.as_deref(), Some("calc.py"));
     }
 
     #[test]
@@ -710,7 +735,13 @@ mod tests {
             Err(AcpProtocolError::TextTooLarge)
         ));
         let large = "中".repeat(MAX_TEXT_BYTES);
-        let Ok((_, Update::ToolCallUpdate { output, .. })) = update(&json!({"sessionId":"s",
+        let Ok((
+            _,
+            Update::ToolCallUpdate {
+                content: ToolContent { output, .. },
+                ..
+            },
+        )) = update(&json!({"sessionId":"s",
             "update":{"sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed",
                 "content":[{"type":"content","content":{"type":"text","text":large}}]}}))
         else {
@@ -744,7 +775,13 @@ mod tests {
 
     #[test]
     fn decodes_tool_content_arrays_without_retaining_raw_blocks() {
-        let (_, Update::ToolCallUpdate { output, .. }) = update(&json!({
+        let (
+            _,
+            Update::ToolCallUpdate {
+                content: ToolContent { output, .. },
+                ..
+            },
+        ) = update(&json!({
             "sessionId":"s",
             "update": {
                 "sessionUpdate":"tool_call_update",
@@ -753,7 +790,8 @@ mod tests {
                 "content":[{"type":"content","content":{"type":"text","text":"result"}}]
             }
         }))
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!()
         };
         assert_eq!(output.as_deref(), Some("result"));
@@ -792,8 +830,12 @@ mod structured_result_tests {
             let (
                 _,
                 Update::ToolCallUpdate {
-                    output,
-                    structured_output,
+                    content:
+                        ToolContent {
+                            output,
+                            structured_output,
+                            ..
+                        },
                     ..
                 },
             ) = update(&payload).unwrap()
@@ -810,7 +852,10 @@ mod structured_result_tests {
         let (
             _,
             Update::ToolCallUpdate {
-                structured_output, ..
+                content: ToolContent {
+                    structured_output, ..
+                },
+                ..
             },
         ) = update(&json!({
             "sessionId":"s","update":{"sessionUpdate":"tool_call_update",
@@ -830,7 +875,10 @@ mod structured_result_tests {
         let (
             _,
             Update::ToolCallUpdate {
-                structured_output, ..
+                content: ToolContent {
+                    structured_output, ..
+                },
+                ..
             },
         ) = update(&json!({
             "sessionId":"s","update":{"sessionUpdate":"tool_call_update",
@@ -855,7 +903,7 @@ mod structured_result_tests {
             ("completed", "{broken".to_owned()),
             ("failed", "{\"ok\":true}".to_owned()),
         ] {
-            let (_, Update::ToolCallUpdate { structured_output, .. }) = update(&json!({"sessionId":"s","update":{
+            let (_, Update::ToolCallUpdate { content: ToolContent { structured_output, .. }, .. }) = update(&json!({"sessionId":"s","update":{
                 "sessionUpdate":"tool_call_update","toolCallId":"t","status":status,"rawOutput":receipt}})).unwrap() else { panic!() };
             assert!(structured_output.is_none());
         }

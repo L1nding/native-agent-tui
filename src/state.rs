@@ -87,6 +87,8 @@ pub struct ConversationItem {
     pub text: String,
     pub complete: bool,
     pub truncated: bool,
+    /// Core 提供工具事实；UI 不从摘要文本推断生命周期。
+    pub tools: Vec<crate::tool_details::ConversationTool>,
 }
 
 impl std::fmt::Debug for ConversationItem {
@@ -229,7 +231,7 @@ pub(crate) struct SessionState {
 pub(crate) struct ToolLines {
     thread_id: String,
     turn_id: String,
-    lines: VecDeque<(String, String)>,
+    lines: VecDeque<(crate::tool_details::ConversationTool, String)>,
     dropped: usize,
 }
 
@@ -265,7 +267,13 @@ impl SessionState {
     }
 
     /// 用一条 "Tool" 消息汇总一个轮次内的工具调用，避免每次调用占用一条历史。
-    pub fn tool_line(&mut self, thread: &str, turn: &str, item: &str, line: String) {
+    pub fn tool_line(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        tool: crate::tool_details::ConversationTool,
+        line: String,
+    ) {
         let index = match self
             .tool_lines
             .iter()
@@ -285,10 +293,14 @@ impl SessionState {
             }
         };
         let group = &mut self.tool_lines[index];
-        match group.lines.iter_mut().find(|(id, _)| id == item) {
-            Some((_, existing)) => *existing = line,
+        match group
+            .lines
+            .iter_mut()
+            .find(|(existing, _)| existing.item_id == tool.item_id)
+        {
+            Some(existing) => *existing = (tool, line),
             None => {
-                group.lines.push_back((item.into(), line));
+                group.lines.push_back((tool, line));
                 if group.lines.len() > TOOL_LINES_PER_TURN {
                     group.lines.pop_front();
                     group.dropped += 1;
@@ -318,9 +330,10 @@ impl SessionState {
 
     fn finish_tool_group(&mut self, index: usize) {
         let mut changed = false;
-        for (_, line) in &mut self.tool_lines[index].lines {
-            if let Some(rest) = line.strip_prefix("▸ running") {
-                *line = format!("▸ ended, outcome unknown{rest}");
+        for (tool, line) in &mut self.tool_lines[index].lines {
+            if tool.lifecycle == crate::tool_details::ToolLifecycle::Running {
+                tool.lifecycle = crate::tool_details::ToolLifecycle::EndedUnknown;
+                *line = line.replacen("▸ running", "▸ ended, outcome unknown", 1);
                 changed = true;
             }
         }
@@ -353,13 +366,17 @@ impl SessionState {
                 ),
         );
         let id = format!("tools:{turn}");
+        let tools = group.lines.iter().map(|(tool, _)| tool.clone()).collect();
         match self
             .view
             .messages
             .iter_mut()
             .find(|m| m.thread_id == thread && m.turn_id == turn && m.id == id)
         {
-            Some(message) => message.text = text,
+            Some(message) => {
+                message.text = text;
+                message.tools = tools;
+            }
             None => self.view.messages.push(ConversationItem {
                 id,
                 thread_id: thread,
@@ -368,6 +385,7 @@ impl SessionState {
                 text,
                 complete: true,
                 truncated: false,
+                tools,
             }),
         }
         self.bound_history();
@@ -385,6 +403,7 @@ impl SessionState {
             text: text.to_owned(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         self.bound_history();
     }
@@ -496,6 +515,7 @@ impl SessionState {
                         text: String::new(),
                         complete: false,
                         truncated: false,
+                        tools: Vec::new(),
                     });
                     self.view.messages.last_mut().unwrap()
                 }
@@ -535,7 +555,13 @@ impl SessionState {
                 .view
                 .messages
                 .iter()
-                .map(|m| m.text.len())
+                .map(|m| {
+                    m.text.len()
+                        + m.tools
+                            .iter()
+                            .map(crate::tool_details::ConversationTool::bytes)
+                            .sum::<usize>()
+                })
                 .sum::<usize>()
                 > HISTORY_BYTES
         {
@@ -570,6 +596,25 @@ pub fn display_text(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn tool(
+        item: &str,
+        lifecycle: crate::tool_details::ToolLifecycle,
+    ) -> crate::tool_details::ConversationTool {
+        crate::tool_details::ConversationTool {
+            item_id: item.into(),
+            category: crate::protocol::ToolCategory::Shell,
+            lifecycle,
+            name: None,
+            command: None,
+            cwd: None,
+            target: None,
+            exit_code: None,
+            output_lines: None,
+            added_lines: None,
+            removed_lines: None,
+        }
+    }
+
     #[test]
     fn final_item_corrects_deltas_without_duplicates_and_old_turn_is_ignored() {
         let mut state = SessionState::default();
@@ -590,11 +635,19 @@ mod tests {
             state.tool_line(
                 "root",
                 "turn",
-                &format!("item-{index}"),
+                tool(
+                    &format!("item-{index}"),
+                    crate::tool_details::ToolLifecycle::Running,
+                ),
                 format!("▸ step {index}"),
             );
         }
-        state.tool_line("root", "turn", "item-44", "▸ step 44 · done".into());
+        state.tool_line(
+            "root",
+            "turn",
+            tool("item-44", crate::tool_details::ToolLifecycle::Completed),
+            "▸ step 44 · done".into(),
+        );
         let tools: Vec<_> = state
             .view
             .messages
@@ -606,7 +659,12 @@ mod tests {
         assert_eq!(lines[0], "… 5 earlier tool calls (Ctrl+T)");
         assert_eq!(lines.len(), 41);
         assert_eq!(lines[40], "▸ step 44 · done");
-        state.tool_line("root", "next", "item-0", "▸ next".into());
+        state.tool_line(
+            "root",
+            "next",
+            tool("item-0", crate::tool_details::ToolLifecycle::Unknown),
+            "▸ next".into(),
+        );
         assert_eq!(
             state
                 .view
@@ -621,8 +679,18 @@ mod tests {
     #[test]
     fn unfinished_tool_lines_become_unknown_when_the_turn_ends() {
         let mut state = SessionState::default();
-        state.tool_line("root", "turn", "a", "▸ done · exit 0 · ls".into());
-        state.tool_line("root", "turn", "b", "▸ running · Start-Sleep 90".into());
+        state.tool_line(
+            "root",
+            "turn",
+            tool("a", crate::tool_details::ToolLifecycle::Completed),
+            "▸ done · exit 0 · ls".into(),
+        );
+        state.tool_line(
+            "root",
+            "turn",
+            tool("b", crate::tool_details::ToolLifecycle::Running),
+            "▸ running · Start-Sleep 90".into(),
+        );
         state.finish_tool_lines("root", "turn");
         let tools = state
             .view

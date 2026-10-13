@@ -390,6 +390,8 @@ struct AcpBridge {
     /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
     tool_inputs: HashMap<String, acp_protocol::ToolInput>,
     mcp_calls: HashMap<String, acp_protocol::McpCall>,
+    tool_presentations:
+        HashMap<String, (acp_protocol::ToolKind, String, Vec<acp_protocol::FileDiff>)>,
 }
 
 impl AcpBridge {
@@ -418,6 +420,7 @@ impl AcpBridge {
             startup_stderr: None,
             tool_inputs: HashMap::new(),
             mcp_calls: HashMap::new(),
+            tool_presentations: HashMap::new(),
         }
     }
 
@@ -577,6 +580,7 @@ impl AcpBridge {
         self.message_text.clear();
         self.tool_inputs.clear();
         self.mcp_calls.clear();
+        self.tool_presentations.clear();
         self.last_message_id = None;
         self.reloaded(core_id, session, result)
     }
@@ -673,6 +677,7 @@ impl AcpBridge {
                 self.message_text.clear();
                 self.tool_inputs.clear();
                 self.mcp_calls.clear();
+                self.tool_presentations.clear();
                 self.last_message_id = None;
                 self.turn_id = Some(format!("acp-turn-{}", id_text(&id)));
                 self.turn_started = true;
@@ -949,14 +954,63 @@ impl AcpBridge {
         &self,
         item_id: &str,
         status: &str,
-        output: Option<String>,
-        structured_output: Option<Value>,
+        content: acp_protocol::ToolContent,
     ) -> Value {
+        let acp_protocol::ToolContent {
+            output,
+            structured_output,
+            diffs,
+            exit_code,
+            duration_ms,
+        } = content;
+        let diffs = diffs.as_slice();
         if let Some(call) = self.mcp_calls.get(item_id) {
-            let result = structured_output.or_else(|| output.map(Value::String));
-            json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"status":status,"result":result})
+            let result = structured_output
+                .or_else(|| output.as_ref().map(|output| Value::String(output.clone())));
+            json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"status":status,"result":result,
+                "aggregatedOutput":output,"exitCode":exit_code,"durationMs":duration_ms})
         } else {
-            json!({"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output})
+            let input = self.tool_inputs.get(item_id);
+            let presentation = self.tool_presentations.get(item_id);
+            let kind = if !diffs.is_empty() {
+                acp_protocol::ToolKind::File
+            } else {
+                presentation.map_or(acp_protocol::ToolKind::Generic, |value| value.0)
+            };
+            let name = presentation.map_or("ACP tool call", |value| value.1.as_str());
+            let diffs = if diffs.is_empty() {
+                presentation.map_or(diffs, |value| value.2.as_slice())
+            } else {
+                diffs
+            };
+            let patch = (!diffs.is_empty()).then(|| {
+                diffs
+                    .iter()
+                    .map(|diff| format!("--- {}\n+++ {}\n{}", diff.path, diff.path, diff.patch))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            let mut item = json!({"id":item_id,"status":status,"tool":name,
+                "cwd":input.and_then(|input| input.cwd.as_deref()),
+                "target":input.and_then(|input| input.target.as_deref()).or_else(|| diffs.first().map(|diff| diff.path.as_str())),
+                "exitCode":exit_code,"durationMs":duration_ms,"aggregatedOutput":patch.or(output)});
+            match kind {
+                acp_protocol::ToolKind::Shell => {
+                    item["type"] = json!("commandExecution");
+                    item["command"] = json!(input
+                        .and_then(|input| input.command.as_deref())
+                        .unwrap_or(name));
+                }
+                acp_protocol::ToolKind::File => {
+                    item["type"] = json!("fileChange");
+                    if !diffs.is_empty() {
+                        item["changes"] = json!(diffs.iter().map(|diff|
+                        json!({"path":diff.path,"kind":{"type":"update"},"diff":diff.patch})).collect::<Vec<_>>());
+                    }
+                }
+                acp_protocol::ToolKind::Generic => item["type"] = json!("dynamicToolCall"),
+            }
+            item
         }
     }
 
@@ -1383,22 +1437,26 @@ impl AcpBridge {
             Update::AgentThought { item_id, text } => self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?,
             Update::ToolCall {
                 item_id,
-                title,
+                name,
                 kind,
+                diffs,
                 input,
                 mcp,
             } => {
                 if self.tool_inputs.len() < 256 {
                     self.tool_inputs.insert(item_id.clone(), input);
                 }
+                if self.tool_presentations.len() < 256 {
+                    self.tool_presentations.insert(item_id.clone(), (kind, name, diffs));
+                }
                 let item = if let Some(call) = mcp {
                     let item = json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"arguments":call.arguments,"status":"inProgress"});
                     if self.mcp_calls.len() < 256 { self.mcp_calls.insert(item_id.clone(), *call); }
                     item
-                } else { json!({"id":item_id,"type":"commandExecution","command":title,"kind":kind}) };
+                } else { self.acp_tool_item(&item_id, "inProgress", acp_protocol::ToolContent::default()) };
                 self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
             }
-            Update::ToolCallUpdate { item_id, status, output, structured_output } => {
+            Update::ToolCallUpdate { item_id, status, mut content } => {
                 match status {
                     ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
                         let status = match status {
@@ -1407,11 +1465,12 @@ impl AcpBridge {
                             ToolStatus::Cancelled => "cancelled",
                             _ => unreachable!(),
                         };
-                        let item = self.acp_tool_item(&item_id, status, output, structured_output);
+                        let item = self.acp_tool_item(&item_id, status, content);
                         self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                     ToolStatus::InProgress | ToolStatus::Unknown => {
-                        let item = self.acp_tool_item(&item_id, "inProgress", output, None);
+                        content.structured_output = None;
+                        let item = self.acp_tool_item(&item_id, "inProgress", content);
                         self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                 }
@@ -2953,7 +3012,7 @@ mod tests {
         acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
             "sessionUpdate":"tool_call_update", "toolCallId":"unregistered", "status":"completed", "rawOutput":result.to_string()}})))).unwrap();
         let event = core_client.recv().await.unwrap().params.unwrap();
-        assert_eq!(event["item"]["type"], "commandExecution");
+        assert_eq!(event["item"]["type"], "dynamicToolCall");
         assert!(event["item"].get("result").is_none());
         assert!(event["item"]["aggregatedOutput"]
             .as_str()
@@ -2961,5 +3020,75 @@ mod tests {
             .ends_with("[output truncated]"));
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn acp_tool_presentations_keep_command_directory_output_exit_and_diff_facts() {
+        let (mut core_client, core_bridge) = pair();
+        let (_, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge.turn_id = Some("turn".into());
+        bridge.turn_started = true;
+        bridge
+            .update(
+                json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"shell",
+            "title":"pwsh","kind":"other","rawInput":{"command":"echo probe","workdir":"C:/ws"}}}),
+            )
+            .await
+            .unwrap();
+        let item = core_client.recv().await.unwrap().params.unwrap()["item"].clone();
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["command"], "echo probe");
+        assert_eq!(item["cwd"], "C:/ws");
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"shell",
+            "status":"completed","exitCode":7,"durationMs":12,"content":[{"type":"content","content":{"type":"text","text":"line1\nline2"}}]}})).await.unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        let item = &params["item"];
+        assert_eq!(item["command"], "echo probe");
+        assert_eq!(item["cwd"], "C:/ws");
+        assert_eq!(item["exitCode"], 7);
+        assert_eq!(item["durationMs"], 12);
+        assert_eq!(item["aggregatedOutput"], "line1\nline2");
+        let notice = crate::protocol::decode_observed_tool("item/completed", &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notice.outcome,
+            Some(crate::protocol::ObservedToolOutcome::Failed)
+        );
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"edit",
+            "title":"edit","kind":"other","rawInput":{"file_path":"src/a.rs","old_string":"same\nold\n","new_string":"same\nnew\n"}}})).await.unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(params["item"]["type"], "fileChange");
+        assert_eq!(params["item"]["target"], "src/a.rs");
+        let fields = crate::protocol::decode_observed_tool_details(
+            &params["item"],
+            crate::protocol::ToolCategory::File,
+        );
+        assert_eq!(
+            fields.diff,
+            Some(crate::protocol::DiffStats {
+                added: 1,
+                removed: 1
+            })
+        );
+        assert!(fields.output.unwrap().contains("-old\n+new"));
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"edit","status":"failed"}})).await.unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(params["item"]["status"], "failed");
+        assert_eq!(params["item"]["target"], "src/a.rs");
+        assert!(params["item"]["exitCode"].is_null());
+        bridge
+            .update(
+                json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"read",
+            "title":"read","kind":"read","rawInput":{"file_path":"a.txt"}}}),
+            )
+            .await
+            .unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(params["item"]["type"], "dynamicToolCall");
+        assert_eq!(params["item"]["target"], "a.txt");
+        assert!(params["item"].get("command").is_none());
     }
 }

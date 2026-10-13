@@ -9,6 +9,35 @@ const PRIVATE_MARKERS: [&str; 5] = [
 ];
 
 #[tokio::test]
+async fn conversation_file_tool_reports_diff_statistics_without_retaining_the_patch() {
+    let (mut client, mut server) = harness().await;
+    running_root(&mut client, &mut server).await;
+    observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{
+        "threadId":"root","turnId":"root-turn","item":{"id":"edit-1","type":"fileChange","status":"completed",
+        "changes":[{"path":"src/main.rs","kind":{"type":"update"},"diff":"--- a\n+++ b\n-old\n+new\n+extra"}]}
+    }})).await;
+    let snapshot = client.snapshots.borrow().clone();
+    let tool = &snapshot
+        .messages
+        .iter()
+        .find(|message| message.role == "Tool")
+        .unwrap()
+        .tools[0];
+    assert_eq!(tool.category, protocol::ToolCategory::File);
+    assert_eq!(tool.lifecycle, ToolLifecycle::Completed);
+    assert_eq!(tool.target.as_deref(), Some("1 file: src/main.rs"));
+    assert_eq!(tool.added_lines, Some(2));
+    assert_eq!(tool.removed_lines, Some(1));
+    assert_eq!(tool.output_lines, Some(5));
+    assert!(!snapshot
+        .messages
+        .iter()
+        .any(|message| message.text.contains("+extra")));
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
 async fn root_tool_details_follow_exact_identity_stay_volatile_and_retire_with_turn() {
     let (mut client, mut server) = harness().await;
     running_root(&mut client, &mut server).await;
@@ -44,6 +73,19 @@ async fn root_tool_details_follow_exact_identity_stay_volatile_and_retire_with_t
     assert_eq!(detail.lifecycle, ToolLifecycle::Completed);
     assert_eq!(detail.output, "PRIVATE_AGGREGATE");
     assert!(!detail.output.contains("PRIVATE_DELTA_ONE"));
+    let tool = &snapshot
+        .messages
+        .iter()
+        .find(|message| message.role == "Tool")
+        .unwrap()
+        .tools[0];
+    assert_eq!(tool.item_id, "shell-1");
+    assert_eq!(tool.category, protocol::ToolCategory::Shell);
+    assert_eq!(tool.lifecycle, ToolLifecycle::Completed);
+    assert_eq!(tool.command.as_deref(), Some("PRIVATE_COMMAND"));
+    assert_eq!(tool.cwd.as_deref(), Some("PRIVATE_CWD"));
+    assert_eq!(tool.exit_code, Some(0));
+    assert_eq!(tool.output_lines, Some(1));
     let timeline_item = snapshot
         .timeline
         .entries
@@ -68,6 +110,11 @@ async fn root_tool_details_follow_exact_identity_stay_volatile_and_retire_with_t
     let current = client.snapshots.borrow().clone();
     assert_eq!(current.tool_details.entries.len(), 1);
     assert_eq!(current.tool_details.entries[0].locator, detail.locator);
+    assert!(current
+        .messages
+        .iter()
+        .flat_map(|message| &message.tools)
+        .all(|tool| tool.item_id != "spoofed"));
 
     let stored = StoredSnapshot::capture(&current);
     let serialized = serde_json::to_string(&stored).unwrap();

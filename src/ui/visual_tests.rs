@@ -26,7 +26,7 @@ fn fixture(phase: SessionPhase) -> CoreSnapshot {
             ("Tool", "▸ done · exit 0 · 0.2s · rg -n \"fn draw\" src/ui\n▸ done · exit 0 · 0.1s · Get-Content src/ui/render.rs\n▸ done · exit 0 · 0.1s · Get-Content src/ui/layout.rs\n▸ failed · exit 101 · 8.4s · cargo test --locked ui::layout\n▸ done · exit 0 · 3.9s · cargo check --locked --all-targets\n▸ done · exit 0 · 0.3s · git diff --stat"),
             ("Agent", "The interface already has useful navigation tools. The next step is a calmer visual hierarchy with clear focus and readable status information.\n\nUse `workspace_layout` for both painting and search, so **one geometry** drives every view:\n\n```rust\nlet (agents, conversation) = workspace_layout(area, has_agents);\nlet (width, height) = conversation_content_size(conversation);\n```\n\n> 中文与 emoji 🙂 也按显示宽度换行。"),
         ] {
-            snapshot.messages.push(ConversationItem { id: snapshot.messages.len().to_string(), thread_id: "root".into(), turn_id: "turn-1".into(), role: role.into(), text: text.into(), complete: true, truncated: false });
+            snapshot.messages.push(ConversationItem { id: snapshot.messages.len().to_string(), thread_id: "root".into(), turn_id: "turn-1".into(), role: role.into(), text: text.into(), complete: true, truncated: false, tools: Vec::new() });
         }
         snapshot.agents.push(AgentSnapshot {
             info: AgentInfo {

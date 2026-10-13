@@ -266,6 +266,7 @@ mod tests {
             text: text.into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         }
     }
 

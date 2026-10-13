@@ -99,6 +99,11 @@ impl ProjectionCache {
             + message.thread_id.len()
             + message.turn_id.len()
             + message.role.len()
+            + message
+                .tools
+                .iter()
+                .map(crate::tool_details::ConversationTool::bytes)
+                .sum::<usize>()
             + transcript.lines.capacity() * std::mem::size_of::<Line<'static>>()
             + transcript
                 .lines
@@ -263,28 +268,30 @@ pub(super) fn transcript<'a>(
         if !is_tool {
             out.lines.push(header(message, theme));
         }
-        let calls = text
-            .split('\n')
-            .filter(|line| line.starts_with(TOOL_MARKER))
-            .count();
+        let calls = message.tools.len();
         let foldable = is_tool && calls > TOOL_FOLD_LIMIT;
         let folded = foldable && !expand_tools && target.is_none();
         if foldable {
             out.foldable += 1;
             out.lines
-                .push(tool_summary(&text, calls, folded, indent, theme));
+                .push(tool_summary(&message.tools, calls, folded, indent, theme));
         }
-        let shown = folded.then(|| folded_rows(&text));
+        let shown = folded.then(|| folded_rows(&text, &message.tools));
         let mut fence = None;
         let mut offset = 0;
+        let mut tools = message.tools.iter();
         for (index, source) in text.split('\n').enumerate() {
             let start = offset;
             offset += source.len() + 1;
+            let tool = source
+                .starts_with(TOOL_MARKER)
+                .then(|| tools.next())
+                .flatten();
             if shown.as_ref().is_some_and(|rows| !rows.contains(&index)) {
                 continue;
             }
             let (runs, hang, code) = match message.role.as_str() {
-                "Tool" => tool_runs(source, theme),
+                "Tool" => tool_runs(source, tool.map(|tool| tool.lifecycle), theme),
                 "You" => (vec![(source.len(), Style::default())], 0, false),
                 _ => markdown_runs(source, &mut fence, theme),
             };
@@ -350,27 +357,11 @@ fn code_style(theme: Theme) -> Style {
     Style::default().fg(theme.foreground).bg(theme.surface)
 }
 
-/// The state word Core wrote at the start of a tool summary line.
-fn tool_state(line: &str) -> Option<(&str, Option<ToolLifecycle>)> {
-    let rest = line.strip_prefix(TOOL_MARKER)?;
-    let word = rest.split(" · ").next().unwrap_or(rest);
-    let lifecycle = match word {
-        "running" => Some(ToolLifecycle::Running),
-        "done" => Some(ToolLifecycle::Completed),
-        "failed" => Some(ToolLifecycle::Failed),
-        "interrupted" => Some(ToolLifecycle::Interrupted),
-        "ended, outcome unknown" => Some(ToolLifecycle::EndedUnknown),
-        "unknown" => Some(ToolLifecycle::Unknown),
-        // 不认识的状态词保持中性样式，不猜测它的含义。
-        _ => None,
-    };
-    Some((word, lifecycle))
-}
-
-fn tool_runs(line: &str, theme: Theme) -> (Runs, usize, bool) {
-    let Some((word, lifecycle)) = tool_state(line) else {
+fn tool_runs(line: &str, lifecycle: Option<ToolLifecycle>, theme: Theme) -> (Runs, usize, bool) {
+    let Some(rest) = line.strip_prefix(TOOL_MARKER) else {
         return (vec![(line.len(), theme.secondary())], 0, false);
     };
+    let word = rest.split(" · ").next().unwrap_or(rest);
     let state = lifecycle.map_or_else(|| theme.secondary(), |value| theme.lifecycle(value));
     let mut end = TOOL_MARKER.len() + word.len();
     let mut runs = vec![(end, state)];
@@ -398,13 +389,17 @@ fn tool_runs(line: &str, theme: Theme) -> (Runs, usize, bool) {
 
 /// Lines kept while a tool group is folded: Core's own notices, the most recent
 /// calls that are not `done`, and the latest call.
-fn folded_rows(text: &str) -> Vec<usize> {
+fn folded_rows(text: &str, tools: &[crate::tool_details::ConversationTool]) -> Vec<usize> {
     let lines: Vec<_> = text.split('\n').collect();
+    let mut tools = tools.iter();
     let pending: Vec<_> = lines
         .iter()
         .enumerate()
         .filter(|(_, line)| {
-            tool_state(line).is_some_and(|(_, state)| state != Some(ToolLifecycle::Completed))
+            line.starts_with(TOOL_MARKER)
+                && tools
+                    .next()
+                    .is_some_and(|tool| tool.lifecycle != ToolLifecycle::Completed)
         })
         .map(|(index, _)| index)
         .collect();
@@ -427,7 +422,7 @@ fn folded_rows(text: &str) -> Vec<usize> {
 }
 
 fn tool_summary(
-    text: &str,
+    tools: &[crate::tool_details::ConversationTool],
     calls: usize,
     folded: bool,
     indent: usize,
@@ -455,10 +450,9 @@ fn tool_summary(
         (tr("running", "运行中"), &[ToolLifecycle::Running]),
         (tr("done", "已完成"), &[ToolLifecycle::Completed]),
     ] {
-        let count = text
-            .split('\n')
-            .filter_map(tool_state)
-            .filter(|(_, state)| state.is_some_and(|state| states.contains(&state)))
+        let count = tools
+            .iter()
+            .filter(|tool| states.contains(&tool.lifecycle))
             .count();
         if count > 0 {
             spans.push(Span::styled(" · ", theme.faint()));
@@ -604,6 +598,35 @@ mod tests {
             text: text.into(),
             complete: true,
             truncated: false,
+            tools: if role == "Tool" {
+                text.lines()
+                    .filter_map(|line| {
+                        let word = line.strip_prefix("▸ ")?.split(" · ").next()?;
+                        let lifecycle = match word {
+                            "running" => ToolLifecycle::Running,
+                            "done" => ToolLifecycle::Completed,
+                            "failed" => ToolLifecycle::Failed,
+                            "ended, outcome unknown" => ToolLifecycle::EndedUnknown,
+                            _ => ToolLifecycle::Unknown,
+                        };
+                        Some(crate::tool_details::ConversationTool {
+                            item_id: word.into(),
+                            category: crate::protocol::ToolCategory::Shell,
+                            lifecycle,
+                            name: None,
+                            command: None,
+                            cwd: None,
+                            target: None,
+                            exit_code: None,
+                            output_lines: None,
+                            added_lines: None,
+                            removed_lines: None,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -813,6 +836,24 @@ mod tests {
         let state = &transcript.lines[3].spans[1];
         assert_eq!(state.content, "▸ failed");
         assert!(state.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tool_styles_and_folding_use_core_facts_even_when_summary_words_disagree() {
+        let mut tool = item("Tool", &"▸ done · ambiguous command\n".repeat(6));
+        tool.tools[0].lifecycle = ToolLifecycle::Failed;
+        tool.tools[5].lifecycle = ToolLifecycle::Running;
+        let projected = transcript([&tool].into_iter(), None, 100, false);
+        assert!(rows(&projected)[0].contains("1 failed"));
+        assert!(rows(&projected)[0].contains("1 running"));
+        assert_eq!(
+            projected.lines[1].spans[1].style,
+            theme::current().lifecycle(ToolLifecycle::Failed)
+        );
+        tool.tools.clear();
+        let legacy = transcript([&tool].into_iter(), None, 100, false);
+        assert_eq!(legacy.foldable, 0);
+        assert_eq!(legacy.lines[0].spans[1].style, theme::current().secondary());
     }
 
     fn long_group() -> ConversationItem {

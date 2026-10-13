@@ -374,6 +374,7 @@ mod tests {
             text: "partial".into(),
             complete: false,
             truncated: false,
+            tools: Vec::new(),
         });
         let mut after = before.clone();
         after.version += 1;

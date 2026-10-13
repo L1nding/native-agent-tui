@@ -1199,6 +1199,7 @@ mod tests {
                         .join("\n"),
                     complete: false,
                     truncated: false,
+                    tools: Vec::new(),
                 });
             }
             let mut local = LocalState {
@@ -1266,6 +1267,7 @@ mod tests {
                 .join("\n"),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         let mut local = LocalState::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1321,6 +1323,7 @@ mod tests {
                     .repeat(12),
                 complete: true,
                 truncated: false,
+                tools: Vec::new(),
             });
         }
         let local = LocalState::default();
@@ -3099,6 +3102,7 @@ mod tests {
                 text: format!("line {index}"),
                 complete: true,
                 truncated: false,
+                tools: Vec::new(),
             })
             .collect();
         let snapshot = CoreSnapshot {
@@ -4827,6 +4831,7 @@ mod tests {
                 text: text.into(),
                 complete: true,
                 truncated: false,
+                tools: Vec::new(),
             });
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -5263,6 +5268,7 @@ mod tests {
             text: "READY 中文".into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         for (width, height) in [(80, 24), (160, 45), (40, 12)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
