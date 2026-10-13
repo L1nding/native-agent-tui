@@ -142,6 +142,14 @@ pub struct SourceLedgerFact {
     pub counts: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationFact {
+    pub operation_id: String,
+    pub state: String,
+    pub recovery: String,
+    pub current_sha256: String,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainSnapshot {
     pub enabled: bool,
@@ -149,6 +157,7 @@ pub struct DomainSnapshot {
     pub proposal: Option<ProposalFact>,
     pub ledger: Option<SourceLedgerFact>,
     pub application: Option<String>,
+    pub operation: Option<OperationFact>,
     pub artifact: Option<String>,
     pub artifact_validation: Option<String>,
     pub authorizing: bool,
@@ -245,9 +254,15 @@ impl DomainFacts {
                     if same || follows {
                         if !same {
                             self.snapshot.application = None;
+                            self.snapshot.operation = None;
                             self.snapshot.artifact = None;
                             self.snapshot.artifact_validation = None;
-                            for kind in ["application", "artifact", "artifact_validation"] {
+                            for kind in [
+                                "application",
+                                "operation",
+                                "artifact",
+                                "artifact_validation",
+                            ] {
                                 self.fact_sequences.remove(kind);
                             }
                         }
@@ -262,7 +277,40 @@ impl DomainFacts {
                     accepted = true;
                 }
             }
+            Some("operation") if matches_proposal(&self.snapshot, &value["receipt"]) => {
+                if let Some(operation) = self
+                    .snapshot
+                    .proposal
+                    .as_ref()
+                    .and_then(|p| operation_fact(&value, &p.binding))
+                {
+                    self.snapshot.application = Some(format!(
+                        "{} · current={}",
+                        operation.state,
+                        value["receipt"]["candidate_sha256"] == operation.current_sha256
+                    ));
+                    self.snapshot.operation = Some(operation);
+                    if let Some(proposal) = &mut self.snapshot.proposal {
+                        proposal.ready = false;
+                    }
+                    if let Some(sequence) = sequence {
+                        for kind in ["proposal", "application"] {
+                            let watermark = self.fact_sequences.entry(kind.into()).or_default();
+                            *watermark = (*watermark).max(sequence);
+                        }
+                    }
+                    accepted = true;
+                }
+            }
             Some("application") if matches_proposal(&self.snapshot, &value["receipt"]) => {
+                if let Some(operation) = self
+                    .snapshot
+                    .proposal
+                    .as_ref()
+                    .and_then(|p| operation_fact(&value, &p.binding))
+                {
+                    self.snapshot.operation = Some(operation);
+                }
                 self.snapshot.application = value["receipt"]["state"]
                     .as_str()
                     .map(|state| format!("{state} · current={}", value["current"]));
@@ -270,8 +318,10 @@ impl DomainFacts {
                     proposal.ready = false;
                 }
                 if let Some(sequence) = sequence {
-                    let watermark = self.fact_sequences.entry("proposal".into()).or_default();
-                    *watermark = (*watermark).max(sequence);
+                    for kind in ["proposal", "operation"] {
+                        let watermark = self.fact_sequences.entry(kind.into()).or_default();
+                        *watermark = (*watermark).max(sequence);
+                    }
                 }
                 accepted = true;
             }
@@ -335,12 +385,62 @@ impl DomainFacts {
 
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
         !self.snapshot.authorizing
+            && self.snapshot.operation.is_none()
             && self
                 .snapshot
                 .proposal
                 .as_ref()
                 .is_some_and(|p| p.ready && p.binding == *binding)
     }
+}
+
+fn operation_fact(value: &Value, binding: &ProposalBinding) -> Option<OperationFact> {
+    let receipt = &value["receipt"];
+    if receipt["revision"] != binding.revision
+        || receipt["base_sha256"] != binding.base_sha256
+        || receipt["candidate_sha256"] != binding.candidate_sha256
+    {
+        return None;
+    }
+    let operation_id = text(receipt, "operation_id").ok()?;
+    if operation_id.len() > 80
+        || !operation_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let state = text(receipt, "state").ok()?;
+    if !matches!(
+        state.as_str(),
+        "applying" | "applied" | "built" | "rejected" | "failed"
+    ) {
+        return None;
+    }
+    let recovery = receipt["recovery"].as_str().unwrap_or("not_required");
+    if !matches!(
+        recovery,
+        "candidate_present"
+            | "base_present"
+            | "conflict"
+            | "not_required"
+            | "reconciled_without_replay"
+    ) || (state == "applying" && recovery == "not_required")
+    {
+        return None;
+    }
+    let current_sha256 = receipt["current_sha256"]
+        .as_str()
+        .or_else(|| value["current_authority_sha256"].as_str())?;
+    if current_sha256.len() != 64 || !current_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(OperationFact {
+        operation_id,
+        state,
+        recovery: recovery.into(),
+        current_sha256: current_sha256.into(),
+    })
 }
 
 fn matches_proposal(snapshot: &DomainSnapshot, value: &Value) -> bool {

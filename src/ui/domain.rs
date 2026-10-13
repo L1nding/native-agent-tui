@@ -92,6 +92,18 @@ fn business_lines(snapshot: &CoreSnapshot, local: &LocalState, width: u16) -> Ve
             "等待平台 Agent 读取楼层并准备方案。可直接输入目标和修改意见。",
         ));
     }
+    if let Some(operation) = &domain.operation {
+        lines.push(Line::from(format!(
+            "操作 {} · {} · 对账 {}",
+            operation.operation_id, operation.state, operation.recovery
+        )));
+        lines.push(Line::from(format!("当前场景 {}", operation.current_sha256)));
+        if operation.state == "applying" {
+            lines.push(Line::from(
+                "应用结果未确认；先查询操作与场景，再沿原操作恢复。",
+            ));
+        }
+    }
     lines.push(Line::from(format!(
         "Blender 产物 {}",
         domain.artifact.as_deref().unwrap_or("not_run")
@@ -443,6 +455,53 @@ mod tests {
             assert!(render(&local).contains("方案 proposal-3"));
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn interrupted_operation_displays_its_receipt_and_actual_authority() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use unicode_width::UnicodeWidthStr;
+        let snapshot = CoreSnapshot {
+            domain: DomainSnapshot {
+                enabled: true,
+                proposal: Some(proposal(3)),
+                application: Some("applying".into()),
+                operation: Some(crate::domain::OperationFact {
+                    operation_id: "apply-one".into(),
+                    state: "applying".into(),
+                    recovery: "candidate_present".into(),
+                    current_sha256: "b".repeat(64),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for (width, height) in [(120, 34), (60, 24)] {
+            let mut local = LocalState {
+                domain_visible: true,
+                ..Default::default()
+            };
+            local.domain_scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw(f, f.area(), &snapshot, &local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..height {
+                let mut x = 0;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    screen.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+                screen.push('\n');
+            }
+            assert!(screen.contains("操作 apply-one"), "{screen}");
+            assert!(screen.contains("candidate_present"), "{screen}");
+            assert!(screen.contains("应用结果未确认"), "{screen}");
+            assert!(screen.contains("当前场景"), "{screen}");
+        }
     }
 
     #[test]

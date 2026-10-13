@@ -216,3 +216,101 @@ fn malformed_hosted_dimensions_cannot_become_an_approval_fact() {
     value["proposal"]["draft"]["operations"][0]["value_json"] = json!(opening.to_string());
     assert!(proposal_fact(&value).is_none());
 }
+
+fn recovery_proposal() -> Value {
+    let mut value = envelope();
+    value["fact_sequence"] = json!(1);
+    value["proposal"]["base_sha256"] = json!("a".repeat(64));
+    value["proposal"]["candidate_sha256"] = json!("b".repeat(64));
+    value
+}
+
+fn operation_envelope(state: &str, recovery: &str, sequence: u64) -> Value {
+    json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"operation","fact_sequence":sequence,"receipt":{
+            "operation_id":"apply-one","proposal_id":"proposal","revision":2,
+            "prepare_token":"token","base_sha256":"a".repeat(64),
+            "candidate_sha256":"b".repeat(64),"state":state,"recovery":recovery,
+            "current_sha256":"b".repeat(64)}})
+}
+
+#[test]
+fn interrupted_operation_blocks_new_approval_and_late_facts_cannot_undo_recovery() {
+    let mut facts = sequenced_facts();
+    let prepared = recovery_proposal();
+    deliver_fact(&mut facts, "prepare", prepared.clone());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(facts.can_authorize(&binding));
+    let applying = operation_envelope("applying", "candidate_present", 2);
+    deliver_fact(&mut facts, "inspect-operation", applying.clone());
+    assert_eq!(
+        facts.snapshot.operation.as_ref().unwrap().recovery,
+        "candidate_present"
+    );
+    assert_eq!(
+        facts.snapshot.application.as_deref(),
+        Some("applying · current=true")
+    );
+    assert!(!facts.can_authorize(&binding));
+    // Even a freshly inspected prepared record must not make a second grant legal.
+    let mut still_prepared = prepared.clone();
+    still_prepared["fact_sequence"] = json!(3);
+    deliver_fact(&mut facts, "still-prepared", still_prepared);
+    assert!(!facts.can_authorize(&binding));
+    let mut recovered = operation_envelope("applied", "reconciled_without_replay", 4);
+    recovered["kind"] = json!("application");
+    recovered["current"] = json!(true);
+    recovered["current_authority_sha256"] = json!("b".repeat(64));
+    deliver_fact(&mut facts, "recover", recovered);
+    deliver_fact(&mut facts, "late-operation", applying);
+    deliver_fact(&mut facts, "late-prepare", prepared.clone());
+    assert_eq!(facts.snapshot.operation.as_ref().unwrap().state, "applied");
+    assert_eq!(
+        facts.snapshot.operation.as_ref().unwrap().recovery,
+        "reconciled_without_replay"
+    );
+    assert!(!facts.can_authorize(&binding));
+    let mut next = prepared;
+    next["fact_sequence"] = json!(5);
+    next["proposal"]["proposal_id"] = json!("next");
+    next["proposal"]["prepare_token"] = json!("next-token");
+    next["proposal"]["parent_id"] = json!("proposal");
+    next["proposal"]["revision"] = json!(3);
+    deliver_fact(&mut facts, "next", next);
+    assert!(facts.snapshot.operation.is_none());
+    assert!(facts.can_authorize(&facts.snapshot.proposal.as_ref().unwrap().binding));
+}
+
+#[test]
+fn foreign_or_malformed_operation_cannot_change_approval_or_its_watermark() {
+    for (field, invalid) in [
+        ("operation_id", json!("../other")),
+        ("proposal_id", json!("other")),
+        ("prepare_token", json!("foreign")),
+        ("revision", json!(3)),
+        ("base_sha256", json!("c".repeat(64))),
+        ("candidate_sha256", json!("c".repeat(64))),
+        ("current_sha256", json!("invalid")),
+        ("state", json!("success")),
+        ("recovery", json!("not_required")),
+    ] {
+        let mut facts = sequenced_facts();
+        deliver_fact(&mut facts, "prepared", recovery_proposal());
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        let mut invalid_operation = operation_envelope("applying", "candidate_present", 999);
+        invalid_operation["receipt"][field] = invalid;
+        deliver_fact(&mut facts, "invalid", invalid_operation);
+        assert!(facts.snapshot.operation.is_none(), "{field}");
+        assert!(facts.can_authorize(&binding), "{field}");
+        deliver_fact(
+            &mut facts,
+            "actual",
+            operation_envelope("applying", "candidate_present", 2),
+        );
+        assert_eq!(
+            facts.snapshot.operation.as_ref().unwrap().operation_id,
+            "apply-one"
+        );
+        assert!(!facts.can_authorize(&binding));
+    }
+}

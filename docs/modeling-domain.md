@@ -60,3 +60,18 @@ C09 代表真实平台路径已完成；C11 平台断连／恢复、C08 跨层�
 
 
 本轮提交前完整 `scripts/verify.py` 通过，日志 `target/c09-final-verify-20261013.log`：格式、所有目标编译、Clippy、546 项 Rust 测试（2 项可选 live 默认跳过）、doctest、release／examples，以及终端输入、历史／重放、流式对话和 Windows 进程专项通过。真实 C09 验收独立执行。
+
+
+## C11 操作发现、断连恢复与重载
+
+用户只指定恢复楼层时，Agent 可从 `describe_capabilities.operation_index` 发现持久操作，先 `inspect_change` 再 `inspect_operation`。索引最多20条、未完成操作优先，返回 total／truncated 和状态摘要；完整原授权绑定仍从显式操作查询读取。Python 对 candidate_present 的恢复沿原授权对账，不重放场景 writer；base_present／conflict 保留不确定状态。
+
+Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 绑定、操作 ID、状态、恢复判断和实际哈希。默认业务页展示回执及当前场景，applying 明确显示结果未确认。当前方案已有操作时不再批准；操作和应用抬高提案／操作序号，迟到的 prepared 或 applying 事实不能恢复可批准状态或覆盖已对账结果。新的候选版本清除旧操作投影，重载／新 owner 清空事实并重新确认 read-only，查询后才恢复展示。
+
+`--domain-case recovery` 通过键盘运行真实 Agent，使用模型器 `scripts/prepare_complex_recovery.py` 的新隔离 context 和 `gated-dsh.cmd`。门闩只在此绑定 context 的实际 MCP 内调用生产 writer 后暂停，脚本核对进程祖先链和创建时间后终止本次验收自己的 dsh，使 Core 实际收到 EOF。脚本不准备、授权或应用方案；重启同一 TUI 对象的底层控制台后，用自然语言要求恢复楼层，所有对账和构建仍经真实领域工具。
+
+最终 `target/dsh-e2e-3eaa58e3`：8 步通过、0 失败，进程清理通过。实际 Scene IR 替换后回执 applying、任务 checked；新执行进程没有旧批准绑定，Agent 发现并显示 candidate_present，只读阶段不写。继续后沿原操作 `recovery-chair-apply-v1`／原授权对账，writer 总数1、任务 applied 历史1；旧有效预览保持，实际 `recovery-applied-build` 的构建／重建／GLB 和 Agent 验证（事实序号16）通过。Ctrl+R 重载后先拒绝旧批准绑定，再查询恢复操作与当前产物，journal 证明两个平台执行进程和后续 root generation。模型器 `scripts/verify_complex_platform_recovery.py` 独立 valid=true；四项伪造证据（writer 重放、错误 dsh 身份、缺操作查询、缺实际构建验证）全部拒绝。
+
+保留首轮 `target/dsh-e2e-38749061`（5 通过／1 失败）：实际 UI 已清除不可批准方案的 displayed binding，按 Ctrl+Y 得到 UI 拒绝提示；验收只接受 Core 的另一条拒绝提示而误判。支持两条拒绝路径后用新副本重跑，授权／操作／writer 不增加的条件保持。首轮独立核对仅证明不确定已替换场景和旧有效预览保持，不作为完整恢复成功。
+
+本轮完整 `scripts/verify.py` 通过：549 项 Rust 测试通过，2 项可选 live 默认跳过，格式、编译、Clippy、doctest、release／examples 和终端／Windows 进程专项通过，日志 `target/c11-platform-final-verify-20261013.log`。真实 C11 独立执行。平台预览取消、后续编辑冲突和构建失败保留旧有效产物的组合路径仍待补齐；医院完整闭环、C08 跨层及视觉复核继续实施。

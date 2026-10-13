@@ -209,7 +209,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "cli", "domain"], help="run only TUI, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery"], help="modeling scenario for --only domain")
     args = parser.parse_args()
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
@@ -605,7 +605,18 @@ def domain_checks(report, binary, common, args, workspace, root):
         tui.keys(CTRL_U)
         tui.type(prompt)
         tui.keys(ENTER, 0.5)
+    def restart():
+        code = tui.exited()
+        if code is None:
+            code = tui.quit()
+        tui.close()
+        tui.console = Console(command, repository)
+        return code
     try:
+        if case == "recovery":
+            from domain_recovery_check import run_recovery_checks
+            run_recovery_checks(report, tui, send, finished, fact, context, root, restart)
+            return
         if case == "async":
             from domain_async_check import run_async_checks
             run_async_checks(report, tui, send, finished, fact, context, root)
