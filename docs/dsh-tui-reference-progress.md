@@ -21,7 +21,7 @@
 | 2.2 活动指示 | 普通对话和领域视图输入区显示活动标记；提示同时包含 Working／等待确认／等待子 Agent 等文字，动画是本地状态，50 ms 限流 | mono 的 TestBackend 验证文字与帧变化；runtime 验证空闲 tick 不请求绘制。ConPTY 的 `waiting-screen.txt` 证明等待首字时可见，默认完整验证含该夹具 |
 | 2.3 分阶段耗时 | Core 按事件到达时间把 root 轮次分成等首字、思考、输出、工具四段，写成该步最末尾的 `Timing` 对话项；运行中随事件和 1 秒观察时钟更新，轮次结束后固定。服务端确认完成时附完成时刻（无时区数据，标注 UTC）；断连、停止等没有服务端终态的结束只固定数值。工具运行期间穿插的输出不结束工具阶段。UI 只显示：无标题、弱化颜色 | `turn_timing_accumulates_each_stage_and_freezes_when_the_turn_ends` 用确定性时钟覆盖累计、并行工具、旧轮次事件、排位和冻结；`timing_row_is_a_muted_line_without_a_title_after_the_step` 覆盖渲染与窄窗口；ConPTY 夹具断言四段与完成时刻都出现且结束 1.2 秒后不变，屏幕在 `target/conversation-stream-579de06b`。尚缺：子 Agent 轮次不计时；恢复的历史没有耗时行 |
 | 2.4 todo / plan | todo 已接：插件从 `todo/write` 补发整份列表，桥接再次限界后交给 Core，快照字段 `todos`；对话区底部显示紧凑面板（进度、当前项、ASCII 状态标记），全部完成后隐藏，新建或切换会话时清空。plan 模式未做 | 插件、桥接、Core、面板各有专项测试；真实 dsh 跑通一轮（两次 `todo_write` 都推到 TUI 一侧）；ConPTY 夹具断言面板出现和消失。尚缺：子 Agent 的列表不显示；恢复会话后不回放列表 |
-| 2.5 steering | 未实现 | 已核对安装的 `dsh-acp` 0.2.0-rc.2：`prompt()` 明确拒绝并发 prompt；`dsh-agent` 的 `Agent.steer(message)` 在下一 step 边界消费。需专用 bridge 请求、Core typed 命令与 GatePending 拒绝专项 |
+| 2.5 steering | 已接：`/steer <文字>` 发 `Command::SteerRoot`；Core 只在 root 轮次 Running 时接受，`GatePending`、空闲和上一条未确认时拒绝且不发请求。桥接只为当前绑定的轮次转发；插件只在轮次开始与结束之间接受，用宿主的 `createUserMessage` 构造消息后调用 `agent.steer`。对话里先显示占位提示，dsh 确认投递后换成用户消息；被拒绝、超时未确认、轮次先结束、执行不可用各有明确结果，不重发 | 插件、桥接、Core 各有专项测试，含 `GatePending` 拒绝；真实 dsh（`hi/gpt-6-luna`）直接走协议验证：轮次中途被接受、收到投递事件、回答里出现引导要求的标记词，空闲和轮次结束后被拒绝；ConPTY 夹具断言引导变成用户消息。尚缺：没有用真实 dsh 在界面里操作过；只支持纯文本；子 Agent 不能引导 |
 | 2.6 plan 评审 | 未实现 | 需复用审批面板并保留绑定与请求生命周期 |
 | 3.1 工具卡片 / 三档显示 | 未实现 | 需终端、diff、通用三种卡片与预览/展开/隐藏的 TestBackend 断言 |
 | 3.2 内嵌思考 | 未实现 | 需助手回答内小节，保留来源事实 |
@@ -48,3 +48,5 @@
 2026-10-13 续（Codex 会话因用量上限中断后接手）：补完事实通道的投影结果判定与测试移植，实现 2.3 分阶段耗时。cargo test --locked --all-targets 577 项库测试、6 项集成测试通过，2 项可选测试跳过；Clippy 无警告。完整验证日志见 	arget/dsh-reference-timing-verify.log。
 
 2026-10-13 再续：调研确认 dsh 的 ACP 只转发已提交的整条消息，2.3 的思考与输出两段在真实 dsh 下会接近 0。插件新增 `zf/session/event` 通知补发模型阶段和 todo 列表；耗时在收到阶段事件后改用它们划分，整块到达的输出不再改写阶段。真实 dsh（`hi/gpt-6-luna`）跑一轮确认事件到达；ConPTY 夹具改成 dsh 的真实到达方式后通过，屏幕在 `target/conversation-stream-c658f4c1`。调研结论写入迭代计划的“dsh 能力调研”一节。
+
+2026-10-13 三续：接通 2.5 steering 和 3.7 重试、压缩提示。`python scripts/verify.py --cargo-test` 与插件 `pnpm test` 的结果见提交说明对应的验证日志 `target/dsh-reference-steer-verify.log`。

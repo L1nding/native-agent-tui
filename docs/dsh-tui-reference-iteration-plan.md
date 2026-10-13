@@ -274,7 +274,7 @@ src/view.ts
 | 2.3 耗时的阶段划分 | `agent/assistant-stream` 帧的类型：开始、思考增量、正文增量 | 已接：插件推 `zf/session/event` 的 `stage`，只在阶段变化时推一次 |
 | 2.4 todo 面板 | 持久事件 `todo/write`，载荷是整份列表 | 已接：插件推 `todos`，Core 进快照，对话区底部显示 |
 | 逐字流式、3.3 块顺序 | 同一批流式帧，带 turn、step 和修订号 | 未做：需要转发文本增量，并在提交时用权威内容替换 |
-| 2.5 steering | `agent.steer(message)` 在下一步边界生效；`followup` 排到下一轮 | 未做：插件加请求，Core 加类型化命令和 `GatePending` 拒绝 |
+| 2.5 steering | `agent.steer(message)` 在下一步边界生效；`followup` 排到下一轮 | 已接：插件 `zf/session/steer` 只在轮次进行中接受，投递由 `steer` 事件确认；界面入口是 `/steer` |
 | 2.6 plan 评审 | `plan/mode` 事件；`exit_plan_mode` 经“用户提问”通道发起评审 | 未确认 ACP 会话下是否有这个通道 |
 | 3.5 `/compact` 与插件命令 | `commands` 服务的 `list(agent)` 和 `execute(agent, line)` | 未做 |
 | 3.7 重试提示 | 持久事件 `llm/retry`：第几次、上限、延迟、失败原因 | 已接：对话流里的一行提示，只带 dsh 的失败代码 |
@@ -289,7 +289,7 @@ src/view.ts
 ## 待确认的问题
 
 1. ACP 会话下 `exit_plan_mode` 的评审能否发起。2.6 依赖它。
-2. 插件调用 `agent.steer` 前需要复用官方控制器的哪些步骤（附件准入、消息封装），以及它在审批等待期间的行为。
+2. steering 在审批等待期间的行为。纯文本引导已接通：消息用宿主自己的 `createUserMessage` 构造，不走附件准入；带附件的引导没有做。
 3. 领域会话路线能否覆盖独立入口的全部建模阶段。它决定 `--modeling` 何时可以删除。
 4. 真实模型是否发思考增量。实测的 `hi/gpt-6-luna` 没有发，思考阶段没有被观察到。
 
