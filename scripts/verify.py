@@ -59,6 +59,7 @@ def main():
         run([sys.executable, str(fixtures / "dsh_check_dispatch_test.py")])
         run([sys.executable, str(fixtures / "domain_failure_view_test.py")])
         run([sys.executable, str(fixtures / "domain_vertical_view_test.py")])
+        run([sys.executable, str(fixtures / "domain_hospital_view_test.py")])
         run([sys.executable, str(fixtures / "windows_terminal_input_check.py"), "--fixture", str(binary.parent / "examples/input_fixture.exe")])
         run([sys.executable, str(fixtures / "conversation_stream_check.py"), "--binary", str(binary)])
         run([sys.executable, str(fixtures / "process_identity_check.py")])
