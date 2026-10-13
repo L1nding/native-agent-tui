@@ -659,7 +659,28 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 (tr("F2 details", "F2 详情"), 2),
             ]);
         } else {
-            hints.push((tr("Enter send", "Enter 发送"), 0));
+            // 提示只列当前状态下真的可用的操作。
+            use crate::state::SessionPhase::*;
+            match snapshot.phase {
+                Running => hints.extend([
+                    (tr("/steer guide", "/steer 引导"), 0),
+                    (tr("Ctrl+S queue", "Ctrl+S 排队"), 7),
+                    (tr("Ctrl+C interrupt", "Ctrl+C 中断"), 6),
+                ]),
+                GatePending => hints.extend([
+                    (tr("Enter queue", "Enter 排队"), 0),
+                    (tr("Ctrl+C interrupt", "Ctrl+C 中断"), 6),
+                ]),
+                Ready | Completed | Interrupted | Failed => {
+                    hints.push((tr("Enter send", "Enter 发送"), 0))
+                }
+                Created | Launching | Initializing | CheckingShell | StartingTurn => {
+                    hints.push((tr("starting…", "正在启动…"), 0))
+                }
+                Stopping | ClosingTransport | Stopped | Disconnected | Unknown => {
+                    hints.push((tr("session ended", "会话已结束"), 0))
+                }
+            }
         }
         hints.extend([
             (tr("Ctrl+P commands", "Ctrl+P 命令"), 3),
@@ -973,9 +994,20 @@ mod tests {
                 let hints = all.last().unwrap();
                 // 行尾是完整的标签，说明这一行没有被右边界裁掉。
                 assert!(
-                    ["send", "keys", "quit", "decline", "details", "no"]
-                        .iter()
-                        .any(|label| hints.trim_end().ends_with(label)),
+                    // 运行中的提示以 /steer guide 开头，不再是 Enter send。
+                    [
+                        "send",
+                        "keys",
+                        "quit",
+                        "decline",
+                        "details",
+                        "no",
+                        "guide",
+                        "queue",
+                        "interrupt"
+                    ]
+                    .iter()
+                    .any(|label| hints.trim_end().ends_with(label)),
                     "{width}: {hints:?}"
                 );
                 if approving {
@@ -984,7 +1016,8 @@ mod tests {
                         "{width}: {hints:?}"
                     );
                 } else {
-                    assert!(hints.contains("Enter send"), "{width}: {hints:?}");
+                    // 运行中最重要的操作是引导，它在任何宽度下都保留。
+                    assert!(hints.contains("/steer guide"), "{width}: {hints:?}");
                 }
                 assert!(!hints.contains("Ctrl+Q") || hints.contains("Ctrl+Q quit"));
             }
@@ -1053,6 +1086,38 @@ mod tests {
             assert!(screen.contains("┆ Inspect the input carefully"), "{screen}");
             assert!(screen.contains("运行中"), "{screen}");
         });
+    }
+
+    #[test]
+    fn key_hints_follow_what_the_session_can_do_now() {
+        let (mut snapshot, local) = running(vec![]);
+        let hints = |snapshot: &CoreSnapshot| rows(snapshot, &local, 140, 30).pop().unwrap();
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("/steer guide") && row.contains("Ctrl+C interrupt"),
+            "{row}"
+        );
+        assert!(!row.contains("Enter send"), "{row}");
+        snapshot.phase = SessionPhase::GatePending;
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("Enter queue") && !row.contains("/steer"),
+            "{row}"
+        );
+        snapshot.phase = SessionPhase::Completed;
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("Enter send") && !row.contains("interrupt"),
+            "{row}"
+        );
+        snapshot.phase = SessionPhase::Disconnected;
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("session ended") && !row.contains("Enter send"),
+            "{row}"
+        );
+        snapshot.phase = SessionPhase::Initializing;
+        assert!(hints(&snapshot).contains("starting…"));
     }
 
     #[test]
