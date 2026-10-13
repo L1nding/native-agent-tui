@@ -101,3 +101,12 @@ Core 的 `OperationFact` 校验具体提案／版本／token／base／candidate 
 `/model` Ctrl+R 重载先拒绝旧批准绑定，再仅凭楼层读取索引并查询／验证 built与cancelled；请求原ID重试后取消文件哈希保持，无新作业。native PID／creation time与完整实际TUI祖先链、业务页按任务展示、root generation及最后进程清理均核验。四项证据伪造（缺取消验证fact、错误owner创建时间、缺旧产物哈希、取消UI改成功）被拒绝，成功证据未改变。本次只添加验收路由／fixture／文档，`scripts/verify.py --fixtures-only` 通过（`target/c11-cancel-fixtures-20261013.log`）；此前556项Rust完整基线保持。
 
 未完成应用遇到后续编辑冲突、C08跨层、医院完整闭环及AI／人工视觉复核仍未完成，不能把该路径作为完整C11或整个计划完成。
+
+
+## C11 applying遇到后续几何编辑：实际拒绝与重载
+
+新增 `--domain-case conflict`，绑定模型器 `prepare_complex_conflict.py` 的新隔离输入／专属MCP写入门闩。键盘驱动真实 `hi/gpt-6.1-sol`：独立回合扫描、准备、实际旧预览验证，再由具体Ctrl+Y批准。候选原子替换后终止当前TUI祖先链中的自有dsh host，Core接收EOF，原operation=applying／task=checked。独立测试编辑器将新椅子6个部件统一X平移0.25m，记录来源／理由并保留所有其他实体与原记录。
+
+新平台owner先拒绝旧批准绑定，只读查询显示原operation_id的applying／对账conflict；沿原授权和操作真实调用apply_change，领域层拒绝并产生实际diagnostic fact sequence16。原grant／operation／proposal／task字节保持，Agent场景writer1次、独立编辑1次、恢复writer0次；旧有效预览valid=true／current=false。`/model` Ctrl+R清空旧绑定后，再读取冲突与验证事实，保持修改。新增路由纳入隔离检查；本轮复用现有Core投影，无Rust生产修改。
+
+真实 `target/dsh-e2e-0ee78bd8` 10项通过、0失败，native清理通过；模型器独立 `verify_complex_platform_conflict.py` valid=true。四项证据副本负例（缺实际拒绝、writer重放、错误编辑回执、UI伪造candidate_present）及单部件漂移核验负例全拒绝，原证据保持。首轮 `target/dsh-e2e-9e3ad7a0` 复合准备／预览步骤超时（2通过／1失败）按实际范围保留；拆回合、明确必填request后用新输入重跑，未重写失败。`scripts/verify.py --fixtures-only`通过（`target/c11-conflict-fixtures-20261013.log`）。C08跨层、医院完整闭环和视觉复核仍未完成。
