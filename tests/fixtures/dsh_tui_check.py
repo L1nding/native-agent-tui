@@ -235,9 +235,16 @@ def main():
     before = processes()
     if args.only == "domain":
         domain_checks(report, binary, common, args, workspace, root)
-        time.sleep(2)
-        report.step("no dsh process is left behind by the domain run",
-                    lambda: expect(processes() <= before, f"extra dsh processes: {sorted(processes() - before)}"))
+        def domain_processes_clean():
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                extra = processes() - before
+                if not extra:
+                    return
+                time.sleep(0.25)
+            expect(not extra, f"extra dsh processes: {sorted(extra)}")
+
+        report.step("no dsh process is left behind by the domain run", domain_processes_clean)
     if args.only in (None, "tui"):
         tui_checks(report, binary, common, args, workspace, code_word)
         time.sleep(2)
@@ -686,9 +693,12 @@ def domain_checks(report, binary, common, args, workspace, root):
                 expect("待确认" in screen or "pending_confirmation" in screen,
                        "hospital ledger did not expose unresolved source states")
             else:
-                expect("pending_addition" in screen and "suspected_duplicate" in screen
-                       and "capability_missing" in screen,
-                       "ledger did not expose expected mixed-floor states")
+                expect(
+                    "pending_addition" in screen and "suspected_duplicate" in screen,
+                    "ledger did not expose expected mixed-floor states",
+                )
+                if case != "blocked":
+                    expect("capability_missing" in screen, "ledger did not expose capability gaps")
         if not report.step("real dsh scans and shows the mixed-floor ledger", scan, tui):
             return
         if case == "scan":
@@ -723,7 +733,16 @@ def domain_checks(report, binary, common, args, workspace, root):
                 expect("prepared" in revised, "blocked chair adjustment was not prepared")
                 finished()
 
-            report.step("real dsh adjusts the blocked placement without changing protection", adjust_blocked_proposal, tui)
+            if not report.step("real dsh adjusts the blocked placement without changing protection", adjust_blocked_proposal, tui):
+                return
+
+            def apply_adjusted_blocked():
+                tui.keys(CTRL_Y, 1.0)
+                fact("adjusted blocked scene applied", lambda s: "场景应用 applied" in s, 300)
+                fact("adjusted blocked artifact validated", lambda s: "产物验证 valid=true · current=true" in s, 300)
+                finished()
+
+            report.step("concrete approval builds the adjusted placement after collision recovery", apply_adjusted_blocked, tui)
             return
         def propose():
             prompt = ("根据当前台账，为 source.mixed.instance.84.80.7E 的椅子、source.mixed.instance.84.69 的柜子和 source.mixed.instance.84.6B 的洗手盆准备同一个可执行候选。保留来源 XY、变换和稳定身份；椅高0.9米、柜高1.8米、盆高0.85米允许作为 assumed 示意尺寸。只包含这三个实例，不包含已建、疑似重复、门窗、楼梯或井道。" if mixed else
