@@ -1030,7 +1030,9 @@ mod tests {
         }
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
         assert!(
-            screen.contains("Thinking") && screen.contains("Inspect the input"),
+            // 思考过程是回答里的一节：竖线标出，与回答共用一个标题。
+            screen.contains("┆ Inspect the input")
+                && screen.lines().filter(|row| row.trim() == "Agent").count() == 1,
             "{screen}"
         );
         assert!(screen.contains("running · echo probe"), "{screen}");
@@ -1044,7 +1046,9 @@ mod tests {
         assert!(!screen.contains("running · echo probe"), "{screen}");
         lang::with_zh(|| {
             let screen = rows(&snapshot, &local, 120, 30).join("\n");
-            assert!(screen.contains("思考过程"), "{screen}");
+            // 换界面语言后缓存的行重新排版；思考一节不依赖文字标签。
+            assert!(screen.contains("┆ Inspect the input carefully"), "{screen}");
+            assert!(screen.contains("运行中"), "{screen}");
         });
     }
 

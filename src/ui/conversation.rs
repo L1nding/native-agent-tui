@@ -57,31 +57,43 @@ fn shown(message: &ConversationItem, display: ToolDisplay, focus: Option<&Focus>
         || focus.is_some_and(|focus| focus.matches(message))
 }
 
-fn continues(previous: Option<&ConversationItem>, message: &ConversationItem) -> bool {
-    previous.is_some_and(|previous| {
-        previous.role == "Agent"
-            && message.role == "Agent"
-            && previous.thread_id == message.thread_id
-            && previous.turn_id == message.turn_id
-    })
+/// Which messages continue the answer above them and so carry no title.
+///
+/// Thinking is part of the agent's answer: what follows it in the same turn
+/// continues under the same title, even across that step's tool rows. With
+/// tools hidden, the later steps of one answer do not repeat the title either.
+#[derive(Default)]
+struct Flow<'a> {
+    /// The last message with a speaker; tool rows, notices and timing have none.
+    speaker: Option<&'a ConversationItem>,
 }
 
-/// With tools hidden, the later steps of one answer do not repeat its title.
+impl<'a> Flow<'a> {
+    fn continues(&mut self, message: &'a ConversationItem, display: ToolDisplay) -> bool {
+        if !matches!(message.role.as_str(), "Agent" | "Reasoning" | "You") {
+            return false;
+        }
+        let continued = message.role != "You"
+            && self.speaker.is_some_and(|previous| {
+                previous.thread_id == message.thread_id
+                    && previous.turn_id == message.turn_id
+                    && (previous.role == "Reasoning"
+                        || (previous.role == "Agent" && display == ToolDisplay::Hidden))
+            });
+        self.speaker = Some(message);
+        continued
+    }
+}
+
 fn continued<'a>(
     messages: impl Iterator<Item = &'a ConversationItem>,
     display: ToolDisplay,
 ) -> std::collections::HashSet<*const ConversationItem> {
-    let mut set = std::collections::HashSet::new();
-    if display == ToolDisplay::Hidden {
-        let mut previous = None;
-        for message in messages {
-            if continues(previous, message) {
-                set.insert(std::ptr::from_ref(message));
-            }
-            previous = Some(message);
-        }
-    }
-    set
+    let mut flow = Flow::default();
+    messages
+        .filter(|message| flow.continues(message, display))
+        .map(std::ptr::from_ref)
+        .collect()
 }
 
 pub(super) struct Transcript {
@@ -469,16 +481,14 @@ fn layout<'a>(
         focused: None,
         foldable: 0,
     };
-    let mut previous: Option<&ConversationItem> = None;
+    let mut flow = Flow::default();
     let mut first = true;
     for message in messages {
         if !shown(message, display, focus) {
             continue;
         }
-        let continued = (first && first_continued)
-            || (display == ToolDisplay::Hidden && continues(previous, message));
+        let continued = flow.continues(message, display) || (first && first_continued);
         first = false;
-        previous = Some(message);
         #[cfg(test)]
         PROJECTED_MESSAGES.with(|count| count.set(count.get() + 1));
         let target = focus
@@ -515,7 +525,7 @@ fn layout<'a>(
             let (runs, hang, code) = match message.role.as_str() {
                 "Tool" => tool_runs(source, tool.map(|tool| tool.lifecycle), theme),
                 "You" => (vec![(source.len(), Style::default())], 0, false),
-                "Timing" | "Notice" => (
+                "Timing" | "Notice" | "Reasoning" => (
                     vec![(source.len(), Style::default().fg(theme.muted))],
                     0,
                     false,
@@ -530,10 +540,11 @@ fn layout<'a>(
                 }
                 let mut spans = Vec::new();
                 if indent > 0 {
-                    spans.push(if message.role == "You" {
-                        Span::styled("▎ ", Style::default().fg(theme.accent))
-                    } else {
-                        Span::raw("  ")
+                    spans.push(match message.role.as_str() {
+                        "You" => Span::styled("▎ ", Style::default().fg(theme.accent)),
+                        // 思考过程是回答里的一节：用竖线标出，不依赖颜色也能分辨。
+                        "Reasoning" => Span::styled("┆ ", Style::default().fg(theme.muted)),
+                        _ => Span::raw("  "),
                     });
                 }
                 if row > 0 && hang > 0 {
@@ -569,13 +580,14 @@ fn header(message: &ConversationItem, theme: Theme) -> Line<'static> {
     let color = match message.role.as_str() {
         "You" => theme.accent,
         "Agent" => theme.agent,
-        "Reasoning" => theme.muted,
+        "Reasoning" => theme.agent,
         _ => theme.foreground,
     };
     // 角色名由 Core 写入；这里只换成界面语言的称呼，不改消息内容。
     let role = match message.role.as_str() {
         "You" => tr("You", "你"),
-        "Reasoning" => tr("Thinking", "思考过程"),
+        // 思考过程属于助手的回答，共用它的标题。
+        "Reasoning" => "Agent",
         other => other,
     };
     let mut spans = vec![Span::styled(
@@ -952,7 +964,7 @@ mod tests {
             ]
         );
 
-        // 搜索焦点落在被隐藏的工具组里时，这一组照常显示，标题也随之恢复。
+        // 搜索焦点落在被隐藏的工具组里时，这一组照常显示；同一轮的回答仍是一个标题。
         let focus = focus_at(&messages[1], "edit src");
         let focused = rows(&transcript(
             messages.iter(),
@@ -961,7 +973,16 @@ mod tests {
             ToolDisplay::Hidden,
         ));
         assert!(focused.contains(&"  ▸ failed · edit src/view.rs".to_owned()));
-        assert_eq!(focused.iter().filter(|row| *row == "Agent").count(), 3);
+        assert_eq!(focused.iter().filter(|row| *row == "Agent").count(), 2);
+
+        // 思考过程是回答里的一节：竖线标出，其后的正文不重复标题，隔着工具行也一样。
+        let mut thought = item("Reasoning", "weigh the options");
+        thought.id = "r1".into();
+        let answer = [thought, messages[1].clone(), messages[0].clone()];
+        let inline = rows(&transcript(answer.iter(), None, 80, ToolDisplay::Preview));
+        assert_eq!(&inline[..2], ["Agent", "┆ weigh the options"]);
+        assert_eq!(inline.iter().filter(|row| *row == "Agent").count(), 1);
+        assert_eq!(inline.last().unwrap(), "  first step");
 
         // 缓存的视口与整篇排版逐行一致，三档和窄宽度都如此。
         let mut cache = ProjectionCache::default();
