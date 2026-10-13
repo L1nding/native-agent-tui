@@ -134,7 +134,7 @@ Model wait 1.0s · Thinking 2.0s · Response 3.0s · Completed 14:32:12
 ### 2.4 todo 与计划面板
 
 - 作用：一直显示“现在在哪一步”。
-- 前提：确认 dsh 通过 ACP 给出计划更新。本仓库目前没有处理这类事件。
+- 数据来源：dsh 的 ACP 不提供计划更新（见“dsh 能力调研”）。todo 列表由 `zf-tui-bridge` 插件从持久事件 `todo/write` 补发，整份替换。
 
 ### 2.5 steering
 
@@ -251,9 +251,46 @@ src/view.ts
 - 不确定的外部结果明确显示为 unknown，不自动重试副作用。
 - 新会话、插件、配置能力优先复用 dsh，不自建平行体系。
 
+## dsh 能力调研（2026-10-13）
+
+对象是本机安装的 dsh 0.2.0-rc.2 发布包。“ACP 只转发整条消息”和“插件能订阅事件”用真实 dsh 跑过一轮确认，其余只读了源码。
+
+### ACP 只转发已提交的整条消息
+
+- `dsh-acp` 只监听四种持久事件：`assistant/message`、`tool/call`、`tool/result`、`turn/end`。
+- 它发出的更新只有六种：思考块、正文块、工具开始、工具结束、用量、配置变更。
+- `agent_message_chunk` 是一条已提交消息里的一个完整内容块，不是逐字片段。
+- 逐字帧是进程内事件 `agent/assistant-stream`，`dsh-acp` 没有使用它。
+- 实测：一次真实回答在提交时一次到达；同一请求的“开始输出”比它早约 0.5 秒。
+
+后果：只看 ACP 无法区分等首字、思考和输出；流式相关的优化在真实 dsh 下触发得比预想少。
+
+### 插件通道可以补上缺口
+
+`dsh-plugin` 夹在 dsh 的 ACP 服务和 TUI 之间，自己掌握帧的收发，既能答 `zf/*` 请求，也能主动推通知。实测它能订阅 `session/event` 和 `agent/assistant-stream`。
+
+| 计划项 | dsh 里已有的事实 | 状态 |
+| --- | --- | --- |
+| 2.3 耗时的阶段划分 | `agent/assistant-stream` 帧的类型：开始、思考增量、正文增量 | 已接：插件推 `zf/session/event` 的 `stage`，只在阶段变化时推一次 |
+| 2.4 todo 面板 | 持久事件 `todo/write`，载荷是整份列表 | 已接：插件推 `todos`，Core 进快照，对话区底部显示 |
+| 逐字流式、3.3 块顺序 | 同一批流式帧，带 turn、step 和修订号 | 未做：需要转发文本增量，并在提交时用权威内容替换 |
+| 2.5 steering | `agent.steer(message)` 在下一步边界生效；`followup` 排到下一轮 | 未做：插件加请求，Core 加类型化命令和 `GatePending` 拒绝 |
+| 2.6 plan 评审 | `plan/mode` 事件；`exit_plan_mode` 经“用户提问”通道发起评审 | 未确认 ACP 会话下是否有这个通道 |
+| 3.5 `/compact` 与插件命令 | `commands` 服务的 `list(agent)` 和 `execute(agent, line)` | 未做 |
+| 3.7 重试提示 | 持久事件 `llm/retry`：第几次、上限、延迟、失败原因 | 未做 |
+| 3.7 压缩提示 | `compaction/start`、`end`、`summary`、`prune` | 未做 |
+
+### 约束
+
+- 新增的通知对旧版 TUI 无害：桥接忽略不认识的通知方法。
+- 阶段事件不带模型输出，只是标签；todo 内容限 100 条、每条 512 字符，插件和桥接各限一次。
+- `zf-tui` profile 直接链接本仓库的 `dsh-plugin`，改插件会影响所有使用这个 profile 的运行。
+
 ## 待确认的问题
 
-1. dsh 是否通过 ACP 提供计划更新、块序号和重试事件。2.4、3.3、3.7 依赖它。
-2. dsh 的 steering 接口形态，以及它在审批等待期间的行为。
+1. ACP 会话下 `exit_plan_mode` 的评审能否发起。2.6 依赖它。
+2. 插件调用 `agent.steer` 前需要复用官方控制器的哪些步骤（附件准入、消息封装），以及它在审批等待期间的行为。
 3. 领域会话路线能否覆盖独立入口的全部建模阶段。它决定 `--modeling` 何时可以删除。
-4. 滚动漂移是否在真实终端里存在。
+4. 真实模型是否发思考增量。实测的 `hi/gpt-6-luna` 没有发，思考阶段没有被观察到。
+
+已回答：dsh 不通过 ACP 提供计划更新、块序号和重试事件，这些由插件通道补发；滚动漂移在真实终端里存在，已修复。
