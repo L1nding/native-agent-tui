@@ -48,10 +48,6 @@ fn business_lines(
                 .collect::<Vec<_>>()
                 .join(" · "),
         ));
-        lines.extend(groups.rows.iter().map(|row| Line::from(display_text(row))));
-        lines.push(Line::from(
-            "按相同来源几何分组；分类及参数依据由 Agent 评估，批准绑定具体方案。",
-        ));
     }
     if let Some(ledger) = &domain.ledger {
         lines.push(Line::from(format!(
@@ -66,10 +62,6 @@ fn business_lines(
                 .map(|(state, count)| format!("{state} {count}"))
                 .collect::<Vec<_>>()
                 .join(" · "),
-        ));
-        lines.extend(ledger.rows.iter().map(|row| Line::from(display_text(row))));
-        lines.push(Line::from(
-            "跳过、待确认及缺能力对象保留在台账中。可输入类别或实例的采纳意见。",
         ));
     }
     if let Some(p) = &domain.proposal {
@@ -148,6 +140,20 @@ fn business_lines(
     }
     if domain.authorizing {
         lines.push(Line::from("正在记录具体版本批准…"));
+    }
+    if let Some(groups) = &domain.groups {
+        lines.push(Line::from("来源分组明细"));
+        lines.extend(groups.rows.iter().map(|row| Line::from(display_text(row))));
+        lines.push(Line::from(
+            "按相同来源几何分组；分类及参数依据由 Agent 评估，批准绑定具体方案。",
+        ));
+    }
+    if let Some(ledger) = &domain.ledger {
+        lines.push(Line::from("来源实例明细"));
+        lines.extend(ledger.rows.iter().map(|row| Line::from(display_text(row))));
+        lines.push(Line::from(
+            "跳过、待确认及缺能力对象保留在台账中。可输入类别或实例的采纳意见。",
+        ));
     }
     if let Some(p) = &domain.proposal {
         lines.push(Line::from("构件位置与依据"));
@@ -872,5 +878,79 @@ mod tests {
         assert!(header.contains("artifact_validation"));
         assert!(header.contains("123456"));
         assert!(header.contains(&digest), "{header}");
+    }
+    #[test]
+    fn execution_state_precedes_large_group_ledger_and_component_detail_lists() {
+        use crate::domain::{
+            ArtifactBinding, ArtifactFact, ArtifactState, SourceGroupsFact, SourceLedgerFact,
+        };
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
+                enabled: true,
+                proposal: Some(proposal(1)),
+                application: Some("applied".into()),
+                groups: Some(SourceGroupsFact {
+                    scan_id: "scan".into(),
+                    scene_sha256: "base".into(),
+                    total_objects: 1000,
+                    total_groups: 200,
+                    assessed_groups: 200,
+                    rows: (0..200).map(|i| format!("GROUP_ROW_{i}")).collect(),
+                    counts: Default::default(),
+                }),
+                ledger: Some(SourceLedgerFact {
+                    scan_id: "scan".into(),
+                    scene_sha256: "base".into(),
+                    rows: (0..1000).map(|i| format!("LEDGER_ROW_{i}")).collect(),
+                    counts: Default::default(),
+                }),
+                artifacts: vec![ArtifactFact {
+                    binding: ArtifactBinding {
+                        build_id: "current-build".into(),
+                        proposal_id: "proposal-1".into(),
+                        revision: 1,
+                        prepare_token: "token-1".into(),
+                        candidate: false,
+                        authority_sha256: "candidate".into(),
+                        input_sha256: "candidate".into(),
+                        output: "model.glb".into(),
+                    },
+                    state: ArtifactState::Built,
+                    current: Some(true),
+                    valid: Some(true),
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let lines = business_lines(
+            snapshot.extensions[0].modeling().unwrap(),
+            &ViewContext::new(&snapshot, &ExtensionPanel::default(), "", None),
+            120,
+        );
+        let rows: Vec<_> = lines.iter().map(|line| line.to_string()).collect();
+        let validation = rows
+            .iter()
+            .position(|line| line.contains("valid=true · current=true"))
+            .unwrap();
+        assert!(
+            validation < 30,
+            "critical build result hidden after {validation} rows"
+        );
+        assert!(
+            rows.iter()
+                .position(|line| line.contains("GROUP_ROW_0"))
+                .unwrap()
+                > validation
+        );
+        assert!(
+            rows.iter()
+                .position(|line| line.contains("LEDGER_ROW_0"))
+                .unwrap()
+                > validation
+        );
+        assert!(rows.iter().any(|line| line.contains("GROUP_ROW_199")));
+        assert!(rows.iter().any(|line| line.contains("LEDGER_ROW_999")));
+        assert!(rows.iter().any(|line| line.contains("bed.1.body")));
     }
 }
