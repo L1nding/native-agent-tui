@@ -24,14 +24,8 @@ fn current_reply(snapshot: &CoreSnapshot) -> Option<&str> {
         .map(|item| item.text.as_str())
 }
 
-pub(super) fn draw(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    snapshot: &CoreSnapshot,
-    local: &LocalState,
-) {
-    let reply = current_reply(snapshot);
-    let reply_height = if reply.is_some() && area.height >= 20 {
+fn sections(area: Rect, has_reply: bool) -> [Rect; 5] {
+    let reply_height = if has_reply && area.height >= 20 {
         (area.height / 3).clamp(6, 10)
     } else {
         0
@@ -44,16 +38,11 @@ pub(super) fn draw(
         Constraint::Length(2),
     ])
     .split(area);
+    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
+}
+
+fn business_lines(snapshot: &CoreSnapshot, local: &LocalState, width: u16) -> Vec<Line<'static>> {
     let domain = &snapshot.domain;
-    frame.render_widget(
-        Paragraph::new(format!(
-            "建模 · {} · {:?} · 平台模型 {}",
-            domain.floor_id,
-            snapshot.phase,
-            snapshot.model.as_deref().unwrap_or("default")
-        )),
-        chunks[0],
-    );
     let mut lines = Vec::new();
     if let Some(ledger) = &domain.ledger {
         lines.push(Line::from(format!(
@@ -120,6 +109,41 @@ pub(super) fn draw(
     {
         lines.push(Line::from(display_text(notice)));
     }
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_text(&line.to_string(), usize::from(width.max(1))))
+        .map(Line::from)
+        .collect()
+}
+
+pub(super) fn max_scroll(snapshot: &CoreSnapshot, local: &LocalState, area: Rect) -> u16 {
+    let business = sections(area, current_reply(snapshot).is_some())[1];
+    business_lines(snapshot, local, business.width.saturating_sub(2))
+        .len()
+        .saturating_sub(usize::from(business.height.saturating_sub(2)))
+        .min(usize::from(u16::MAX)) as u16
+}
+
+pub(super) fn draw(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &CoreSnapshot,
+    local: &LocalState,
+) {
+    let reply = current_reply(snapshot);
+    let chunks = sections(area, reply.is_some());
+    let reply_height = chunks[2].height;
+    let domain = &snapshot.domain;
+    frame.render_widget(
+        Paragraph::new(format!(
+            "建模 · {} · {:?} · 平台模型 {}",
+            domain.floor_id,
+            snapshot.phase,
+            snapshot.model.as_deref().unwrap_or("default")
+        )),
+        chunks[0],
+    );
+    let lines = business_lines(snapshot, local, chunks[1].width.saturating_sub(2));
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -127,8 +151,10 @@ pub(super) fn draw(
                     .borders(Borders::ALL)
                     .title("方案与执行事实"),
             )
-            .wrap(Wrap { trim: false })
-            .scroll((local.domain_scroll, 0)),
+            .scroll((
+                local.domain_scroll.min(max_scroll(snapshot, local, area)),
+                0,
+            )),
         chunks[1],
     );
     if let Some(reply) = reply.filter(|_| reply_height > 0) {
@@ -331,6 +357,92 @@ mod tests {
             rx.try_recv().unwrap(),
             Command::SubmitRootInput { .. }
         ));
+    }
+
+    #[test]
+    fn business_scroll_stays_readable_at_the_bottom_and_returns_with_one_page_up() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use unicode_width::UnicodeWidthStr;
+        let mut prepared = proposal(3);
+        prepared.objects = (0..24)
+            .map(|i| {
+                format!(
+                    "OBJECT_{i:02} 来源尺寸与位置依据 {}",
+                    "confirmed ".repeat(8)
+                )
+            })
+            .collect();
+        let snapshot = CoreSnapshot {
+            domain: DomainSnapshot {
+                enabled: true,
+                proposal: Some(prepared),
+                notice: Some("BOTTOM_FACT".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let render = |local: &LocalState| {
+            let area = local.viewport;
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|f| draw(f, f.area(), &snapshot, local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..area.height {
+                let mut x = 0;
+                while x < area.width {
+                    let symbol = buffer[(x, y)].symbol();
+                    screen.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+                screen.push('\n');
+            }
+            screen
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut local = LocalState {
+            domain_visible: true,
+            ..Default::default()
+        };
+        for (width, height) in [(120, 34), (40, 24)] {
+            local.viewport = Rect::new(0, 0, width, height);
+            local.domain_scroll = 0;
+            for _ in 0..200 {
+                super::super::handle_key(
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &snapshot,
+                    &mut local,
+                    &tx,
+                );
+            }
+            let bottom = max_scroll(&snapshot, &local, local.viewport);
+            assert!(bottom > 8);
+            assert_eq!(local.domain_scroll, bottom);
+            assert!(render(&local).contains("BOTTOM_FACT"));
+            // A restored offset or a resize must also clamp during rendering.
+            local.domain_scroll = u16::MAX;
+            assert!(render(&local).contains("BOTTOM_FACT"));
+            super::super::handle_key(
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+            assert_eq!(local.domain_scroll, bottom - 8);
+            assert!(render(&local).contains("OBJECT_"));
+            for _ in 0..200 {
+                super::super::handle_key(
+                    KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                    &snapshot,
+                    &mut local,
+                    &tx,
+                );
+            }
+            assert_eq!(local.domain_scroll, 0);
+            assert!(render(&local).contains("方案 proposal-3"));
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

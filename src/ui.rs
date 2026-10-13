@@ -659,11 +659,18 @@ fn handle_key(
                 return false;
             }
             KeyCode::PageUp => {
-                local.domain_scroll = local.domain_scroll.saturating_sub(8);
+                local.domain_scroll = local
+                    .domain_scroll
+                    .min(domain::max_scroll(snapshot, local, local.viewport))
+                    .saturating_sub(8);
                 return false;
             }
             KeyCode::PageDown => {
-                local.domain_scroll = local.domain_scroll.saturating_add(8);
+                local.domain_scroll = local
+                    .domain_scroll
+                    .min(domain::max_scroll(snapshot, local, local.viewport))
+                    .saturating_add(8)
+                    .min(domain::max_scroll(snapshot, local, local.viewport));
                 return false;
             }
             KeyCode::Char('y') if control => {
