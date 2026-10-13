@@ -375,6 +375,11 @@ fn detail_rows(rows: &mut Vec<Row>, detail: &ToolDetail) {
             Field::optional(label, value.as_deref()).zh(zh)
         ]));
     }
+    if let Some(target) = &detail.target {
+        rows.push(Row::Fields(vec![
+            Field::new("Target", target.clone()).zh("目标")
+        ]));
+    }
     rows.push(Row::Fields(vec![
         Field::new("Output source", format!("{:?}", detail.output_source))
             .zh("输出来源")
@@ -598,12 +603,14 @@ mod tests {
             name: None,
             command: Some("echo hi".into()),
             cwd: None,
+            target: None,
             parameters: None,
             result: None,
             output: "plain output".into(),
             output_source: ToolTextSource::CommandAggregate,
             exit_code: Some(0),
             duration_ms: Some(5),
+            diff: None,
             bytes_observed: 12,
             bytes_retained: 12,
             clipped: false,

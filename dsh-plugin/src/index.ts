@@ -16,9 +16,12 @@
  */
 
 import { createInterface } from 'node:readline'
-import { loadHostAcp, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
+import { listCommands, runCommand } from './commands.js'
+import { relayEvents } from './events.js'
+import { loadCreateUserMessage, loadHostAcp, loadQuestionDismissal, type Frame, type FrameId, type FrameStream, type HostContext } from './host.js'
 import { describePermission, setPermission } from './permission.js'
 import { listProviders, removeProvider, saveProvider } from './providers.js'
+import { answerQuestions } from './questions.js'
 import { listSessions, readHistory } from './sessions.js'
 
 export const name = 'zf-tui-bridge'
@@ -57,6 +60,11 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
   const reply = (id: FrameId, result: unknown): void => send({ jsonrpc: '2.0', id, result })
   const fail = (id: FrameId, code: number, message: string): void =>
     send({ jsonrpc: '2.0', id, error: { code, message } })
+
+  const turns = relayEvents(ctx, send)
+  let dismissed: ((message: string) => Error) | undefined
+  void loadQuestionDismissal().then((build) => { dismissed = build })
+  const questions = answerQuestions(ctx, send, (message) => dismissed?.(message) ?? new Error(message))
 
   // dsh's ACP server reads client frames from `toAcp` and writes its own to `fromAcp`.
   const toAcp = new TransformStream<Frame, Frame>()
@@ -101,7 +109,8 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
     }),
 
     /** Root sessions with dsh's titles, newest first; `cwd` narrows to one workspace. */
-    'zf/session/list': (params) => listSessions(ctx, typeof params['cwd'] === 'string' ? params['cwd'] : undefined),
+    'zf/session/list': (params) =>
+      listSessions(ctx, typeof params['cwd'] === 'string' ? params['cwd'] : undefined, params['all'] === true),
 
     /** Skills every installed provider offers for one workspace; bodies are not loaded. */
     'zf/skills/list': async (params) => {
@@ -194,6 +203,34 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       return removeProvider(ctx, provider)
     },
 
+    /**
+     * Guide the running turn of a live session: the text reaches the model at
+     * the next step. Refused when no turn is running.
+     */
+    'zf/session/steer': async (params) => {
+      const sessionId = params['sessionId']
+      const text = params['text']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      if (typeof text !== 'string') throw new Error('text is required')
+      return turns.steer(sessionId, text, await loadCreateUserMessage())
+    },
+
+    /** dsh's slash commands for one live session. */
+    'zf/commands/list': (params) => {
+      const sessionId = params['sessionId']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      return listCommands(ctx, sessionId)
+    },
+
+    /** Run one of dsh's slash commands on an idle session and return its result. */
+    'zf/commands/run': (params) => {
+      const sessionId = params['sessionId']
+      const line = params['line']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      if (typeof line !== 'string' || line.length > 4096) throw new Error('line is required')
+      return runCommand(ctx, sessionId, line)
+    },
+
     /** Conversation text, server reasoning and tool summaries for a resumed session. */
     'zf/session/history': (params) => {
       const sessionId = params['sessionId']
@@ -236,6 +273,8 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       handleOwn(frame)
       return
     }
+    // The TUI's answer to a question this bridge forwarded.
+    if (questions.settle(frame)) return
     if (acp === 'unavailable') {
       if (frame.id !== undefined && frame.method !== undefined) {
         fail(frame.id, -32603, `ACP is unavailable: ${acpFailure}`)

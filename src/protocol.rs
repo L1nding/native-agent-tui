@@ -52,11 +52,19 @@ pub struct ObservedToolDetails {
     pub name: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
+    pub target: Option<String>,
     pub parameters: Option<String>,
     pub result: Option<String>,
     pub output: Option<String>,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<u64>,
+    pub diff: Option<DiffStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffStats {
+    pub added: usize,
+    pub removed: usize,
 }
 
 const DETAIL_BYTES: usize = 64 * 1024;
@@ -87,9 +95,8 @@ pub fn decode_observed_tool_details(item: &Value, category: ToolCategory) -> Obs
     let command = (category == ToolCategory::Shell)
         .then(|| bounded_text(item.get("command")))
         .flatten();
-    let cwd = (category == ToolCategory::Shell)
-        .then(|| bounded_text(item.get("cwd")))
-        .flatten();
+    let cwd = bounded_text(item.get("cwd"));
+    let target = bounded_text(item.get("target"));
     let parameters = match category {
         ToolCategory::Mcp | ToolCategory::Dynamic => bounded_json(item.get("arguments")),
         _ => None,
@@ -122,9 +129,19 @@ pub fn decode_observed_tool_details(item: &Value, category: ToolCategory) -> Obs
         ToolCategory::Dynamic => bounded_json(item.get("contentItems")),
         _ => bounded_text(item.get("error")),
     };
-    let output = (category == ToolCategory::Shell)
-        .then(|| bounded_text(item.get("aggregatedOutput")))
-        .flatten();
+    let output = bounded_text(item.get("aggregatedOutput")).or_else(|| {
+        if category != ToolCategory::File {
+            return None;
+        }
+        let changes = item.get("changes")?.as_array()?;
+        let patches: Vec<_> = changes
+            .iter()
+            .filter_map(|change| change.get("diff").and_then(Value::as_str))
+            .collect();
+        (!patches.is_empty())
+            .then(|| bounded_text(Some(&Value::String(patches.join("\n")))))
+            .flatten()
+    });
     let exit_code = item.get("exitCode").and_then(Value::as_i64);
     let duration_ms = item.get("durationMs").and_then(Value::as_u64);
     let name = match category {
@@ -136,17 +153,47 @@ pub fn decode_observed_tool_details(item: &Value, category: ToolCategory) -> Obs
             (_, tool) => tool,
         },
         ToolCategory::Dynamic => bounded_text(item.get("tool")),
-        _ => None,
+        _ => bounded_text(item.get("tool")),
     };
+    let diff = (category == ToolCategory::File)
+        .then(|| {
+            let changes = item.get("changes")?.as_array()?;
+            let mut stats = DiffStats {
+                added: 0,
+                removed: 0,
+            };
+            for change in changes {
+                let diff = change.get("diff")?.as_str()?;
+                let mut in_hunk = false;
+                for line in diff.lines() {
+                    if line.starts_with("diff --git ") {
+                        in_hunk = false;
+                    }
+                    if line.starts_with("@@ ") {
+                        in_hunk = true;
+                    }
+                    stats.added += usize::from(
+                        line.starts_with('+') && (in_hunk || !line.starts_with("+++ ")),
+                    );
+                    stats.removed += usize::from(
+                        line.starts_with('-') && (in_hunk || !line.starts_with("--- ")),
+                    );
+                }
+            }
+            Some(stats)
+        })
+        .flatten();
     ObservedToolDetails {
         name,
         command,
         cwd,
+        target,
         parameters,
         result,
         output,
         exit_code,
         duration_ms,
+        diff,
     }
 }
 
@@ -724,9 +771,9 @@ mod tests {
         let mcp = serde_json::json!({"type":"mcpToolCall","server":"docs","tool":"search"});
         let details = super::decode_observed_tool_details(&mcp, super::ToolCategory::Mcp);
         assert_eq!(details.name.as_deref(), Some("docs/search"));
-        let shell = serde_json::json!({"type":"commandExecution","tool":"ignored","command":"ls"});
+        let shell = serde_json::json!({"type":"commandExecution","tool":"pwsh","command":"ls"});
         let details = super::decode_observed_tool_details(&shell, super::ToolCategory::Shell);
-        assert_eq!(details.name, None);
+        assert_eq!(details.name.as_deref(), Some("pwsh"));
     }
 
     #[test]

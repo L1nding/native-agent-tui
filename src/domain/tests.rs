@@ -648,7 +648,7 @@ fn private_fact_verification_checks_all_receipt_bindings_above_model_budget() {
     corrupt[1] = b'x';
     assert!(receipt::verify(&setup, &receipt, &corrupt).is_err());
     let mut facts = DomainFacts::new(Some(setup));
-    facts.apply_verified_fact(&value);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
     assert!(facts.can_authorize(&binding));
     facts.synchronizing = true;
@@ -662,4 +662,17 @@ fn private_fact_verification_checks_all_receipt_bindings_above_model_budget() {
     newer.fact_sequence = 8;
     facts.synchronization_finished(&newer);
     assert!(facts.can_authorize(&binding));
+    // A sealed fact that passes hashing but cannot be projected is not a silent no-op.
+    let mut unusable = value;
+    unusable["fact_sequence"] = json!(9);
+    unusable["proposal"]["summary"] = json!(null);
+    assert_eq!(
+        facts.apply_verified_fact(&unusable),
+        FactProjection::Invalid
+    );
+    unusable["fact_sequence"] = json!(1);
+    assert_eq!(
+        facts.apply_verified_fact(&unusable),
+        FactProjection::Superseded
+    );
 }

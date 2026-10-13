@@ -34,6 +34,8 @@ struct Row {
     live: bool,
     state: String,
     updated_at_ms: u64,
+    /// The workspace this session belongs to when it is not this one.
+    elsewhere: Option<String>,
 }
 
 #[derive(Default)]
@@ -41,6 +43,11 @@ pub(super) struct SessionsPanel {
     pub visible: bool,
     selected: usize,
     pub notice: Option<String>,
+    /// Sessions of every workspace instead of this one only.
+    all: bool,
+    /// Title filter; `searching` while keys edit it.
+    filter: String,
+    searching: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,6 +94,8 @@ impl SessionsPanel {
         self.visible = true;
         self.selected = 0;
         self.notice = None;
+        self.filter.clear();
+        self.searching = false;
     }
 
     /// Rows in display order: the session that waits for an answer, then the
@@ -98,6 +107,14 @@ impl SessionsPanel {
             .conversations
             .iter()
             .filter(|conversation| conversation.id == live_id || !conversation.title.is_empty())
+            .filter(|conversation| self.all || conversation.elsewhere.is_none())
+            .filter(|conversation| {
+                self.filter.is_empty()
+                    || conversation
+                        .title
+                        .to_lowercase()
+                        .contains(&self.filter.to_lowercase())
+            })
             .map(|conversation| {
                 let live = conversation.id == live_id;
                 // 只有当前进程里的会话才可能有等待回答的请求。
@@ -110,6 +127,14 @@ impl SessionsPanel {
                     }
                 } else if live {
                     tr("open here", "当前对话").to_owned()
+                } else if let Some(workspace) = &conversation.elsewhere {
+                    // 只留目录名，完整路径在选中后的说明里。
+                    let name = workspace
+                        .trim_end_matches(['/', '\\'])
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(workspace);
+                    format!("{} {name}", tr("in", "位于"))
                 } else {
                     String::new()
                 };
@@ -128,6 +153,7 @@ impl SessionsPanel {
                     live,
                     state,
                     updated_at_ms: conversation.updated_at_ms,
+                    elsewhere: conversation.elsewhere.clone(),
                 }
             })
             .collect();
@@ -140,8 +166,39 @@ impl SessionsPanel {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let rows = self.rows(snapshot);
         self.selected = self.selected.min(rows.len());
+        if self.searching {
+            // 搜索时字母是过滤词的一部分，不是快捷键。
+            match key.code {
+                KeyCode::Char(c) if !control => {
+                    if self.filter.chars().count() < 64 {
+                        self.filter.push(c);
+                    }
+                    self.selected = 1;
+                    return SessionsEvent::Consumed;
+                }
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    return SessionsEvent::Consumed;
+                }
+                KeyCode::Esc => {
+                    self.searching = false;
+                    self.filter.clear();
+                    return SessionsEvent::Consumed;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('q' | 'd') if control => return SessionsEvent::Quit,
+            KeyCode::Char('/') if !control => {
+                self.searching = true;
+                self.notice = None;
+            }
+            KeyCode::Char('w') if !control => {
+                self.all = !self.all;
+                self.selected = 0;
+                self.notice = None;
+            }
             KeyCode::Esc | KeyCode::Right => {
                 self.visible = false;
                 return SessionsEvent::Close;
@@ -157,6 +214,17 @@ impl SessionsPanel {
                     return SessionsEvent::New;
                 }
                 if let Some(row) = rows.get(self.selected.min(rows.len()) - 1) {
+                    if let Some(workspace) = &row.elsewhere {
+                        // 会话的工具在它自己的工作目录里运行；在这里恢复会让它指向错的目录。
+                        self.notice = Some(if lang::zh() {
+                            format!("这个会话属于 {workspace}；请在那个目录启动后恢复。")
+                        } else {
+                            format!(
+                                "This session belongs to {workspace}; start there to resume it."
+                            )
+                        });
+                        return SessionsEvent::Consumed;
+                    }
                     self.visible = false;
                     // 当前对话就在主页面，回去即可。
                     return if row.live {
@@ -180,7 +248,11 @@ impl SessionsPanel {
         }
         let block = theme::focus_panel()
             .borders(Borders::ALL)
-            .title(tr(" Sessions in this workspace ", " 本工作区的会话 "));
+            .title(if self.all {
+                tr(" Sessions in all workspaces ", " 所有工作区的会话 ")
+            } else {
+                tr(" Sessions in this workspace ", " 本工作区的会话 ")
+            });
         let inner = block.inner(area);
         let width = inner.width as usize;
         let rows = self.rows(snapshot);
@@ -189,6 +261,16 @@ impl SessionsPanel {
         if let Some(notice) = &self.notice {
             lines.push(Line::from(clip_spans(
                 vec![Span::styled(notice.clone(), tone(theme.warning))],
+                width,
+            )));
+        }
+        if self.searching || !self.filter.is_empty() {
+            lines.push(Line::from(clip_spans(
+                vec![
+                    Span::styled(tr("Search: ", "搜索："), theme.key()),
+                    Span::raw(self.filter.clone()),
+                    Span::styled(if self.searching { "▏" } else { "" }, theme.secondary()),
+                ],
                 width,
             )));
         }
@@ -219,10 +301,14 @@ impl SessionsPanel {
         if rows.is_empty() {
             listed.push((
                 Line::from(Span::styled(
-                    tr(
-                        "No sessions yet. One appears here after its first message.",
-                        "还没有会话。发出第一条消息后，它会出现在这里。",
-                    ),
+                    if self.filter.is_empty() {
+                        tr(
+                            "No sessions yet. One appears here after its first message.",
+                            "还没有会话。发出第一条消息后，它会出现在这里。",
+                        )
+                    } else {
+                        tr("No session title matches.", "没有标题匹配的会话。")
+                    },
                     theme.secondary(),
                 )),
                 None,
@@ -312,10 +398,17 @@ impl SessionsPanel {
             width,
         )));
         lines.push(hint_row(
-            tr(
-                "↑/↓ select | Enter resume | n new session | r refresh | → or Esc back",
-                "↑/↓ 选择 | Enter 恢复对话 | n 新建会话 | r 刷新 | → 或 Esc 返回",
-            ),
+            if self.searching {
+                tr(
+                    "type to filter by title | ↑/↓ select | Enter resume | Esc clear",
+                    "输入文字按标题过滤 | ↑/↓ 选择 | Enter 恢复对话 | Esc 清除",
+                )
+            } else {
+                tr(
+                    "↑/↓ select | Enter resume | / search | w workspaces | n new session | r refresh | → or Esc back",
+                    "↑/↓ 选择 | Enter 恢复对话 | / 搜索 | w 切换工作区 | n 新建 | r 刷新 | → 或 Esc 返回",
+                )
+            },
             width,
         ));
         frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -327,11 +420,77 @@ mod tests {
     use super::*;
     use crate::conversations::ConversationSummary;
 
+    #[test]
+    fn search_filters_by_title_and_other_workspaces_are_listed_but_not_resumed() {
+        let (mut panel, mut snapshot) = fixture();
+        let mut far = conversation("far-1", "Refactor the exporter", 5);
+        far.elsewhere = Some("D:\\project\\other-repo".into());
+        snapshot.conversations.push(far);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let titles = |panel: &SessionsPanel| -> Vec<String> {
+            panel
+                .rows(&snapshot)
+                .into_iter()
+                .map(|row| row.title)
+                .collect()
+        };
+        // 默认只列本工作区；w 切到所有工作区，其他工作区的会话标出所在目录。
+        assert!(!titles(&panel)
+            .iter()
+            .any(|title| title.contains("exporter")));
+        assert_eq!(
+            panel.key(press(KeyCode::Char('w')), &snapshot),
+            SessionsEvent::Consumed
+        );
+        let rows = panel.rows(&snapshot);
+        let far = rows.iter().find(|row| row.id == "far-1").unwrap();
+        assert_eq!(far.state, "in other-repo");
+
+        // 搜索时字母进入过滤词，不触发 n、r、w 这些快捷键；大小写不敏感。
+        panel.key(press(KeyCode::Char('/')), &snapshot);
+        for c in "refactor".chars() {
+            assert_eq!(
+                panel.key(press(KeyCode::Char(c)), &snapshot),
+                SessionsEvent::Consumed
+            );
+        }
+        assert_eq!(
+            titles(&panel),
+            ["Refactor the parser", "Refactor the exporter"]
+        );
+        // 其他工作区的会话不能在这里恢复：留在页面并说明原因。
+        panel.key(press(KeyCode::Down), &snapshot);
+        assert_eq!(
+            panel.key(press(KeyCode::Enter), &snapshot),
+            SessionsEvent::Consumed
+        );
+        assert!(panel.visible);
+        assert!(panel
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("D:\\project\\other-repo"));
+        panel.key(press(KeyCode::Backspace), &snapshot);
+        panel.key(press(KeyCode::Char('x')), &snapshot);
+        assert!(titles(&panel).is_empty());
+        // Esc 先清除搜索，再按一次才离开页面。
+        assert_eq!(
+            panel.key(press(KeyCode::Esc), &snapshot),
+            SessionsEvent::Consumed
+        );
+        assert!(panel.visible && titles(&panel).len() > 2);
+        assert_eq!(
+            panel.key(press(KeyCode::Esc), &snapshot),
+            SessionsEvent::Close
+        );
+    }
+
     fn conversation(id: &str, title: &str, minutes_ago: u64) -> ConversationSummary {
         ConversationSummary {
             id: id.into(),
             title: title.into(),
             updated_at_ms: now_ms().unwrap() - minutes_ago * 60_000 - 5_000,
+            elsewhere: None,
         }
     }
 

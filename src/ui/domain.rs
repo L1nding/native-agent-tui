@@ -3,26 +3,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::extensions::{ExtensionView, ViewContext};
 use super::layout::wrap_text;
-use super::LocalState;
-use crate::state::{display_text, CoreSnapshot};
-
-// Reply text is conversation content, never an approval or execution fact.
-fn current_reply(snapshot: &CoreSnapshot) -> Option<&str> {
-    let thread = snapshot.thread_id.as_deref()?;
-    let turn = snapshot.turn_id.as_deref()?;
-    snapshot
-        .messages
-        .iter()
-        .rev()
-        .find(|item| {
-            item.thread_id == thread
-                && item.turn_id == turn
-                && item.role == "Agent"
-                && !item.text.trim().is_empty()
-        })
-        .map(|item| item.text.as_str())
-}
+use crate::extensions::{ExtensionConfirmation, ExtensionId, ExtensionSnapshot};
+use crate::state::display_text;
 
 fn sections(area: Rect, has_reply: bool) -> [Rect; 5] {
     let reply_height = if has_reply && area.height >= 20 {
@@ -41,8 +25,11 @@ fn sections(area: Rect, has_reply: bool) -> [Rect; 5] {
     [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
-fn business_lines(snapshot: &CoreSnapshot, local: &LocalState, width: u16) -> Vec<Line<'static>> {
-    let domain = &snapshot.domain;
+fn business_lines(
+    domain: &crate::domain::DomainSnapshot,
+    context: &ViewContext<'_>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(ledger) = &domain.ledger {
         lines.push(Line::from(format!(
@@ -145,9 +132,19 @@ fn business_lines(snapshot: &CoreSnapshot, local: &LocalState, width: u16) -> Ve
     if domain.authorizing {
         lines.push(Line::from("正在记录具体版本批准…"));
     }
-    for notice in [domain.notice.as_deref(), local.notice.as_deref()]
-        .into_iter()
-        .flatten()
+    if let Some(fact) = &domain.verified_fact {
+        lines.push(Line::from(format!(
+            "已核验完整事实 · {} · 序号 {} · {} bytes",
+            fact.kind, fact.sequence, fact.bytes
+        )));
+    }
+    for notice in [
+        domain.notice.as_deref(),
+        domain.fact_sync_notice.as_deref(),
+        context.notice,
+    ]
+    .into_iter()
+    .flatten()
     {
         lines.push(Line::from(display_text(notice)));
     }
@@ -158,30 +155,38 @@ fn business_lines(snapshot: &CoreSnapshot, local: &LocalState, width: u16) -> Ve
         .collect()
 }
 
-pub(super) fn max_scroll(snapshot: &CoreSnapshot, local: &LocalState, area: Rect) -> u16 {
-    let business = sections(area, current_reply(snapshot).is_some())[1];
-    business_lines(snapshot, local, business.width.saturating_sub(2))
-        .len()
-        .saturating_sub(usize::from(business.height.saturating_sub(2)))
-        .min(usize::from(u16::MAX)) as u16
+pub(super) fn max_scroll(
+    snapshot: &ExtensionSnapshot,
+    context: &ViewContext<'_>,
+    area: Rect,
+) -> u16 {
+    let business = sections(area, context.reply.is_some())[1];
+    business_lines(
+        snapshot.modeling().expect("registered modeling projection"),
+        context,
+        business.width.saturating_sub(2),
+    )
+    .len()
+    .saturating_sub(usize::from(business.height.saturating_sub(2)))
+    .min(usize::from(u16::MAX)) as u16
 }
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    snapshot: &CoreSnapshot,
-    local: &LocalState,
+    snapshot: &ExtensionSnapshot,
+    context: &ViewContext<'_>,
 ) {
-    let reply = current_reply(snapshot);
+    let domain = snapshot.modeling().expect("registered modeling projection");
+    let reply = context.reply;
     let chunks = sections(area, reply.is_some());
     let reply_height = chunks[2].height;
-    let domain = &snapshot.domain;
     frame.render_widget(
         Paragraph::new(format!(
             "建模 · {} · {:?} · 平台模型 {}\n{}",
             domain.floor_id,
-            snapshot.phase,
-            snapshot.model.as_deref().unwrap_or("default"),
+            context.phase,
+            context.model.unwrap_or("default"),
             domain
                 .fact_sync_notice
                 .as_ref()
@@ -201,7 +206,7 @@ pub(super) fn draw(
         )),
         chunks[0],
     );
-    let lines = business_lines(snapshot, local, chunks[1].width.saturating_sub(2));
+    let lines = business_lines(domain, context, chunks[1].width.saturating_sub(2));
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -210,7 +215,10 @@ pub(super) fn draw(
                     .title("方案与执行事实"),
             )
             .scroll((
-                local.domain_scroll.min(max_scroll(snapshot, local, area)),
+                context
+                    .panel
+                    .scroll
+                    .min(max_scroll(snapshot, context, area)),
                 0,
             )),
         chunks[1],
@@ -220,7 +228,7 @@ pub(super) fn draw(
         let max_scroll = reply_lines
             .len()
             .saturating_sub(usize::from(reply_height - 2));
-        let scroll = max_scroll.saturating_sub(usize::from(local.domain_reply_scroll_from_bottom));
+        let scroll = max_scroll.saturating_sub(usize::from(context.panel.reply_scroll_from_bottom));
         frame.render_widget(
             Paragraph::new(reply_lines.into_iter().map(Line::from).collect::<Vec<_>>())
                 .block(
@@ -233,21 +241,100 @@ pub(super) fn draw(
         );
     }
     frame.render_widget(
-        Paragraph::new(display_text(&local.editor.text))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("目标 / 自然语言反馈"),
+        Paragraph::new(if let Some(label) = context.activity {
+            format!(
+                "{}{}",
+                context.activity_marker,
+                if context.draft.is_empty() {
+                    label.to_owned()
+                } else {
+                    display_text(context.draft)
+                }
             )
-            .wrap(Wrap { trim: false }),
+        } else {
+            display_text(context.draft)
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("目标 / 自然语言反馈"),
+        )
+        .wrap(Wrap { trim: false }),
         chunks[3],
     );
     frame.render_widget(Paragraph::new("Enter 发送反馈 · Ctrl+Y 批准已展示版本 · Ctrl+C 中断 · F6/Esc 返回会话 · PgUp/PgDn 滚动"), chunks[4]);
 }
 
+pub(super) struct ModelingView;
+
+impl ExtensionView for ModelingView {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::Modeling
+    }
+    fn available(&self, snapshot: &ExtensionSnapshot) -> bool {
+        snapshot.modeling().is_some_and(|domain| domain.enabled)
+    }
+    fn max_scroll(
+        &self,
+        snapshot: &ExtensionSnapshot,
+        context: &ViewContext<'_>,
+        area: Rect,
+    ) -> u16 {
+        max_scroll(snapshot, context, area)
+    }
+    fn draw(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        snapshot: &ExtensionSnapshot,
+        context: &ViewContext<'_>,
+    ) {
+        draw(frame, area, snapshot, context);
+    }
+    fn confirmation(&self, snapshot: &ExtensionSnapshot) -> Option<ExtensionConfirmation> {
+        let domain = snapshot.modeling()?;
+        if domain.fact_sync_notice.is_some() || domain.authorizing {
+            return None;
+        }
+        domain
+            .proposal
+            .as_ref()
+            .filter(|proposal| proposal.ready)
+            .map(|proposal| ExtensionConfirmation::Modeling(proposal.binding.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        extensions::{current_reply, ExtensionPanel},
+        LocalState,
+    };
     use super::*;
+    use crate::state::CoreSnapshot;
+    fn draw(
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        snapshot: &CoreSnapshot,
+        local: &LocalState,
+    ) {
+        let context = ViewContext::new(
+            snapshot,
+            &local.extension,
+            &local.editor.text,
+            local.notice.as_deref(),
+        );
+        super::draw(frame, area, &snapshot.extensions[0], &context);
+    }
+    fn max_scroll(snapshot: &CoreSnapshot, local: &LocalState, area: Rect) -> u16 {
+        let context = ViewContext::new(
+            snapshot,
+            &local.extension,
+            &local.editor.text,
+            local.notice.as_deref(),
+        );
+        super::max_scroll(&snapshot.extensions[0], &context, area)
+    }
     use crate::client::Command;
     use crate::domain::{DomainSnapshot, ProposalBinding, ProposalFact};
     use crate::state::SessionPhase;
@@ -282,6 +369,7 @@ mod tests {
             text: text.into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         }
     }
 
@@ -292,10 +380,10 @@ mod tests {
             phase: SessionPhase::Completed,
             thread_id: Some("root".into()),
             turn_id: Some("current".into()),
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 ..Default::default()
-            },
+            })],
             messages: vec![
                 message("root", "old", "OLD_QUESTION"),
                 message("root", "current", "请选择椅子 A、B 或 C；高度尚未确认。"),
@@ -304,7 +392,7 @@ mod tests {
             ..Default::default()
         };
         let mut local = LocalState {
-            domain_visible: true,
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
             ..Default::default()
         };
         for (width, height) in [(120, 34), (60, 24)] {
@@ -363,15 +451,15 @@ mod tests {
             phase: SessionPhase::Completed,
             thread_id: Some("root".into()),
             turn_id: Some("current".into()),
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 ..Default::default()
-            },
+            })],
             messages: vec![message("root", "current", &(details + "请提供整体高度？"))],
             ..Default::default()
         };
         let mut local = LocalState {
-            domain_visible: true,
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
             ..Default::default()
         };
         let render = |local: &LocalState| {
@@ -399,7 +487,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert_eq!(local.domain_scroll, 0);
+        assert_eq!(local.extension.scroll, 0);
         assert!(!render(&local).contains("请提供整体高度？"));
         assert!(render(&local).contains("DETAIL_12"));
         assert!(rx.try_recv().is_err());
@@ -410,7 +498,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert_eq!(local.domain_reply_scroll_from_bottom, 0);
+        assert_eq!(local.extension.reply_scroll_from_bottom, 0);
         assert!(matches!(
             rx.try_recv().unwrap(),
             Command::SubmitRootInput { .. }
@@ -431,12 +519,12 @@ mod tests {
             })
             .collect();
         let snapshot = CoreSnapshot {
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 proposal: Some(prepared),
                 notice: Some("BOTTOM_FACT".into()),
                 ..Default::default()
-            },
+            })],
             ..Default::default()
         };
         let render = |local: &LocalState| {
@@ -460,12 +548,12 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut local = LocalState {
-            domain_visible: true,
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
             ..Default::default()
         };
         for (width, height) in [(120, 34), (40, 24)] {
             local.viewport = Rect::new(0, 0, width, height);
-            local.domain_scroll = 0;
+            local.extension.scroll = 0;
             for _ in 0..200 {
                 super::super::handle_key(
                     KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
@@ -476,10 +564,10 @@ mod tests {
             }
             let bottom = max_scroll(&snapshot, &local, local.viewport);
             assert!(bottom > 8);
-            assert_eq!(local.domain_scroll, bottom);
+            assert_eq!(local.extension.scroll, bottom);
             assert!(render(&local).contains("BOTTOM_FACT"));
             // A restored offset or a resize must also clamp during rendering.
-            local.domain_scroll = u16::MAX;
+            local.extension.scroll = u16::MAX;
             assert!(render(&local).contains("BOTTOM_FACT"));
             super::super::handle_key(
                 KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
@@ -487,7 +575,7 @@ mod tests {
                 &mut local,
                 &tx,
             );
-            assert_eq!(local.domain_scroll, bottom - 8);
+            assert_eq!(local.extension.scroll, bottom - 8);
             assert!(render(&local).contains("OBJECT_"));
             for _ in 0..200 {
                 super::super::handle_key(
@@ -497,7 +585,7 @@ mod tests {
                     &tx,
                 );
             }
-            assert_eq!(local.domain_scroll, 0);
+            assert_eq!(local.extension.scroll, 0);
             assert!(render(&local).contains("方案 proposal-3"));
         }
         assert!(rx.try_recv().is_err());
@@ -508,7 +596,7 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         use unicode_width::UnicodeWidthStr;
         let snapshot = CoreSnapshot {
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 proposal: Some(proposal(3)),
                 application: Some("applying".into()),
@@ -519,15 +607,15 @@ mod tests {
                     current_sha256: "b".repeat(64),
                 }),
                 ..Default::default()
-            },
+            })],
             ..Default::default()
         };
         for (width, height) in [(120, 34), (60, 24)] {
             let mut local = LocalState {
-                domain_visible: true,
+                extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
                 ..Default::default()
             };
-            local.domain_scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
+            local.extension.scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|f| draw(f, f.area(), &snapshot, &local))
@@ -564,7 +652,7 @@ mod tests {
             output: format!("{id}.glb"),
         };
         let snapshot = CoreSnapshot {
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 proposal: Some(proposal(3)),
                 artifacts: vec![
@@ -582,10 +670,14 @@ mod tests {
                     },
                 ],
                 ..Default::default()
-            },
+            })],
             ..Default::default()
         };
-        let lines = business_lines(&snapshot, &LocalState::default(), 180);
+        let lines = business_lines(
+            snapshot.extensions[0].modeling().unwrap(),
+            &ViewContext::new(&snapshot, &ExtensionPanel::default(), "", None),
+            180,
+        );
         let screen = lines
             .iter()
             .map(|line| line.to_string())
@@ -608,10 +700,10 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
         for (width, height) in [(120, 45), (60, 45)] {
             let mut local = LocalState {
-                domain_visible: true,
+                extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
                 ..Default::default()
             };
-            local.domain_scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
+            local.extension.scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|f| draw(f, f.area(), &snapshot, &local))
@@ -662,18 +754,20 @@ mod tests {
         let snapshot = CoreSnapshot {
             phase: SessionPhase::Completed,
             thread_id: Some("root".into()),
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 proposal: Some(proposal(2)),
                 ..Default::default()
-            },
+            })],
             ..Default::default()
         };
         let mut local = LocalState {
-            domain_visible: true,
-            displayed_domain_binding: Some(displayed.binding.clone()),
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
             ..Default::default()
         };
+        local
+            .extension
+            .displayed(ExtensionConfirmation::Modeling(displayed.binding.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         super::super::handle_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -683,8 +777,8 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv().unwrap(),
-            Command::ApproveDomainChange {
-                binding: displayed.binding
+            Command::ConfirmExtension {
+                confirmation: ExtensionConfirmation::Modeling(displayed.binding)
             }
         );
     }
@@ -694,14 +788,14 @@ mod tests {
         let snapshot = CoreSnapshot {
             phase: SessionPhase::Completed,
             thread_id: Some("root".into()),
-            domain: DomainSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 ..Default::default()
-            },
+            })],
             ..Default::default()
         };
         let mut local = LocalState {
-            domain_visible: true,
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
             ..Default::default()
         };
         local.editor.insert("移到右侧并保留墙体");

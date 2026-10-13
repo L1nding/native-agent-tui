@@ -21,6 +21,9 @@ pub struct ConversationSummary {
     pub title: String,
     /// Zero when dsh gave no time.
     pub updated_at_ms: u64,
+    /// The workspace of a session that belongs elsewhere; `None` for this one.
+    /// Such a session is listed but cannot be resumed from here.
+    pub elsewhere: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +34,7 @@ pub struct SavedMessage {
     pub turn_id: Option<String>,
     pub text: String,
     pub truncated: bool,
+    pub tool: Option<crate::tool_details::ConversationTool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -55,27 +59,54 @@ fn cut(text: &str, limit: usize) -> (String, bool) {
 /// result without the list is malformed.
 pub fn parse_list(result: &Value) -> Option<Vec<ConversationSummary>> {
     let rows = result.get("sessions")?.as_array()?;
-    Some(
-        rows.iter()
-            .filter_map(|row| {
-                let id = row.get("id")?.as_str()?;
-                if id.is_empty() || id.len() > MAX_ID_BYTES {
-                    return None;
-                }
-                let title = row.get("title").and_then(Value::as_str).unwrap_or("");
-                Some(ConversationSummary {
-                    id: id.to_owned(),
-                    title: cut(title.trim(), MAX_TITLE_BYTES).0,
-                    updated_at_ms: row
-                        .get("updatedAt")
-                        .or_else(|| row.get("createdAt"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                })
+    let mut listed: Vec<ConversationSummary> = rows
+        .iter()
+        .take(4096)
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?;
+            if id.is_empty() || id.len() > MAX_ID_BYTES {
+                return None;
+            }
+            let title = row.get("title").and_then(Value::as_str).unwrap_or("");
+            Some(ConversationSummary {
+                id: id.to_owned(),
+                title: cut(title.trim(), MAX_TITLE_BYTES).0,
+                updated_at_ms: row
+                    .get("updatedAt")
+                    .or_else(|| row.get("createdAt"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                // 没有标明归属的回答来自只列本工作区的旧插件。
+                elsewhere: (row.get("here").and_then(Value::as_bool) == Some(false)).then(|| {
+                    cut(
+                        row.get("cwd").and_then(Value::as_str).unwrap_or("?"),
+                        MAX_TITLE_BYTES,
+                    )
+                    .0
+                }),
             })
-            .take(MAX_CONVERSATIONS)
-            .collect(),
-    )
+        })
+        .collect();
+    // 上限先留给本工作区的会话；两部分各自保持 dsh 给出的时间顺序。
+    let here = listed
+        .iter()
+        .filter(|row| row.elsewhere.is_none())
+        .count()
+        .min(MAX_CONVERSATIONS);
+    let mut others = MAX_CONVERSATIONS - here;
+    let mut kept = 0;
+    listed.retain(|row| {
+        if row.elsewhere.is_none() {
+            kept += 1;
+            kept <= here
+        } else if others > 0 {
+            others -= 1;
+            true
+        } else {
+            false
+        }
+    });
+    Some(listed)
 }
 
 /// Reads a `thread/history` result, keeping the newest messages.
@@ -102,6 +133,27 @@ pub fn parse_history(result: &Value) -> Option<History> {
                 turn_id: identity("turnId"),
                 text,
                 truncated: truncated || row.get("truncated").and_then(Value::as_bool) == Some(true),
+                tool: row.get("tool").and_then(|value| {
+                    let mut tool: crate::tool_details::ConversationTool =
+                        serde_json::from_value(value.clone()).ok()?;
+                    if role != "tool"
+                        || Some(tool.item_id.as_str()) != row.get("id").and_then(Value::as_str)
+                    {
+                        return None;
+                    }
+                    for text in [
+                        &mut tool.name,
+                        &mut tool.command,
+                        &mut tool.cwd,
+                        &mut tool.target,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        *text = crate::state::display_text(&cut(text, 2048).0);
+                    }
+                    Some(tool)
+                }),
             })
         })
         .collect();
@@ -138,15 +190,27 @@ mod tests {
                 ConversationSummary {
                     id: "a".into(),
                     title: "修复登录".into(),
-                    updated_at_ms: 20
+                    updated_at_ms: 20,
+                    elsewhere: None,
                 },
                 ConversationSummary {
                     id: "b".into(),
                     title: String::new(),
-                    updated_at_ms: 5
+                    updated_at_ms: 5,
+                    elsewhere: None,
                 },
             ]
         );
+        // 其他工作区的会话带上它的目录；本工作区的会话优先占用上限。
+        let mut sessions: Vec<Value> = (0..MAX_CONVERSATIONS + 20)
+            .map(|index| json!({"id":format!("far-{index}"),"title":"t","here":false,"cwd":"D:/other"}))
+            .collect();
+        sessions.push(json!({"id":"near","title":"t","here":true,"cwd":"D:/here"}));
+        let listed = parse_list(&json!({"sessions":sessions})).unwrap();
+        assert_eq!(listed.len(), MAX_CONVERSATIONS);
+        assert_eq!(listed[0].elsewhere.as_deref(), Some("D:/other"));
+        let near = listed.iter().find(|row| row.id == "near").unwrap();
+        assert_eq!(near.elsewhere, None);
         assert_eq!(parse_list(&json!({})), None);
         assert_eq!(parse_list(&json!({"sessions":"x"})), None);
     }
@@ -166,6 +230,29 @@ mod tests {
         assert_eq!(history.messages[1].id.as_deref(), Some("tool-1"));
         assert_eq!(history.messages[1].turn_id.as_deref(), Some("turn"));
         assert_eq!(history.messages[0].id, history.messages[2].id);
+    }
+
+    #[test]
+    fn restored_tool_facts_require_matching_identity_and_bound_private_fields() {
+        let tool = json!({"itemId":"tool","category":"shell","lifecycle":"failed",
+            "command":"界".repeat(3000),"exitCode":1});
+        let history = parse_history(&json!({"messages":[
+            {"role":"tool","id":"tool","text":"▸ done · misleading", "tool":tool},
+            {"role":"tool","id":"other","text":"▸ failed · x", "tool":tool},
+            {"role":"assistant","id":"tool","text":"answer", "tool":tool},
+            {"role":"tool","id":"legacy","text":"▸ done · x"},
+        ]}))
+        .unwrap();
+        let restored = history.messages[0].tool.as_ref().unwrap();
+        assert_eq!(
+            restored.lifecycle,
+            crate::tool_details::ToolLifecycle::Failed
+        );
+        assert!(restored.command.as_ref().unwrap().len() <= 2048);
+        assert!(history.messages[1..]
+            .iter()
+            .all(|message| message.tool.is_none()));
+        assert!(!format!("{restored:?}").contains('界'));
     }
 
     #[test]

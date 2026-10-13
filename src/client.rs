@@ -33,8 +33,22 @@ pub enum Command {
     SubmitRootInput {
         text: String,
     },
-    ApproveDomainChange {
-        binding: crate::domain::ProposalBinding,
+    /// 列出工作区里能补全 `@路径` 的条目；只读，限一层目录。
+    CompletePath {
+        query: String,
+    },
+    /// 向 dsh 询问它自己的斜杠命令。
+    ListBackendCommands,
+    /// 在空闲的会话上执行一条 dsh 斜杠命令，例如 `/compact`。
+    RunBackendCommand {
+        line: String,
+    },
+    /// 引导正在运行的 root 轮次；不开始新轮次，也不排队。
+    SteerRoot {
+        text: String,
+    },
+    ConfirmExtension {
+        confirmation: crate::extensions::ExtensionConfirmation,
     },
     DomainAuthorizationFinished {
         attempt_id: u64,
@@ -46,7 +60,7 @@ pub enum Command {
     DomainFactReadFinished {
         attempt_id: u64,
         generation: u64,
-        outcome: Result<Vec<u8>, String>,
+        outcome: Result<crate::domain::DomainFactData, String>,
     },
     QueueRootTasks {
         tasks: Vec<RootTaskSpec>,
@@ -241,6 +255,7 @@ impl ClientHandle {
         CoreSnapshot {
             phase: SessionPhase::Launching,
             cwd: config.cwd.display().to_string(),
+            branch: crate::git_branch::current(&config.cwd),
             scheduler: crate::scheduler::SchedulerSnapshot {
                 native_slot_capacity: Some(config.max_native_turns.max(1)),
                 ..Default::default()
@@ -252,7 +267,9 @@ impl ClientHandle {
             },
             observation: observer.snapshot_at(0, Instant::now()),
             timeline: observer.timeline_snapshot(),
-            domain: crate::domain::DomainFacts::new(config.domain_setup.clone()).snapshot,
+            extensions: vec![crate::extensions::ExtensionSnapshot::Modeling(
+                crate::domain::DomainFacts::new(config.domain_setup.clone()).snapshot,
+            )],
             ..Default::default()
         }
     }
@@ -301,6 +318,10 @@ impl ClientHandle {
                 domain_fact_attempt: 0,
                 domain_fact_task: None,
                 domain_fact_queue: VecDeque::new(),
+                steer: None,
+                steer_count: 0,
+                backend_command: None,
+                backend_command_count: 0,
                 config,
                 server,
                 command_rx,
@@ -311,6 +332,7 @@ impl ClientHandle {
                     agents: AgentRegistry::with_limits(agent_limits),
                     usage_facts: Default::default(),
                     tool_lines: Default::default(),
+                    turn_timing: None,
                 },
                 pending: HashMap::new(),
                 next_id: 1,
@@ -373,6 +395,14 @@ enum RpcKind {
         force_reload: bool,
         source: SkillRefreshSource,
     },
+    /// Guidance for the running root turn.
+    Steer {
+        generation: u64,
+    },
+    /// dsh's own slash commands for this session.
+    CommandList,
+    /// One of dsh's slash commands, running on the idle session.
+    CommandRun,
     ModelList,
     /// dsh's permission presets and this session's choice.
     PermissionDescribe,
@@ -393,10 +423,19 @@ enum RpcKind {
 impl RpcKind {
     fn generation(self) -> Option<u64> {
         match self {
-            Self::StartTurn { generation } | Self::Interrupt { generation } => Some(generation),
+            Self::StartTurn { generation }
+            | Self::Interrupt { generation }
+            | Self::Steer { generation } => Some(generation),
             _ => None,
         }
     }
+}
+
+struct PendingSteer {
+    notice_id: String,
+    text: String,
+    /// dsh 给这条消息的身份；应答到达前未知。
+    message_id: Option<String>,
 }
 
 struct PendingRpc {
@@ -457,13 +496,14 @@ struct Core {
     domain_authorization_task: Option<JoinHandle<()>>,
     domain_generation: u64,
     domain_fact_attempt: u64,
-    domain_fact_task: Option<(
-        u64,
-        u64,
-        crate::domain::receipt::FactReceipt,
-        JoinHandle<()>,
-    )>,
+    domain_fact_task: Option<PendingDomainFact>,
     domain_fact_queue: VecDeque<(u64, crate::domain::receipt::FactReceipt)>,
+    /// 已提交、尚未确认送达的一次引导；同一时刻只允许一个。
+    steer: Option<PendingSteer>,
+    steer_count: u64,
+    /// 正在执行的 dsh 命令：(对话里的提示 id, 命令行)。同一时刻只有一条。
+    backend_command: Option<(String, String)>,
+    backend_command_count: u64,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -487,6 +527,13 @@ struct PendingTool {
     parent_turn: String,
     generation: u64,
     token: WaitToken,
+}
+
+struct PendingDomainFact {
+    attempt_id: u64,
+    generation: u64,
+    receipt: crate::domain::receipt::FactReceipt,
+    task: JoinHandle<()>,
 }
 
 fn persistence_state(
@@ -794,6 +841,27 @@ impl Core {
                             self.state.view.notice = Some(
                                 "Resumed; its earlier messages were not loaded in time.".into(),
                             );
+                        } else if matches!(kind, RpcKind::CommandList) {
+                            self.state.view.notice =
+                                Some("dsh commands were not listed in time.".into());
+                        } else if matches!(kind, RpcKind::CommandRun) {
+                            // 没有答复：命令可能仍在执行或已经生效；不重发。
+                            if let Some((notice, line)) = self.backend_command.take() {
+                                self.state.command_notice(
+                                    &notice,
+                                    format!("{line} was not confirmed in time; it may still finish."),
+                                    true,
+                                );
+                            }
+                        } else if matches!(kind, RpcKind::Steer { .. }) {
+                            // 没有答复：dsh 可能已经收下，也可能没有；不重发。
+                            if let Some(steer) = self.steer.take() {
+                                self.state.steer_notice(
+                                    &steer.notice_id,
+                                    "Steering was not confirmed in time; it may still reach the model.".into(),
+                                    true,
+                                );
+                            }
                         } else if matches!(kind, RpcKind::NewThread) {
                             self.state.view.creating_conversation = false;
                             self.state.error(SessionPhase::Unknown,
@@ -835,9 +903,9 @@ impl Core {
             task.abort();
             let _ = task.await;
         }
-        if let Some((_, _, _, task)) = self.domain_fact_task.take() {
-            task.abort();
-            let _ = task.await;
+        if let Some(pending) = self.domain_fact_task.take() {
+            pending.task.abort();
+            let _ = pending.task.await;
         }
         self.domain_fact_queue.clear();
         self.domain.synchronizing = false;
@@ -913,6 +981,15 @@ impl Core {
         self.state.view.scheduler = self.scheduler.snapshot();
         self.update_token_budget_snapshot();
         self.reconcile_observation();
+        if matches!(
+            self.state.view.phase,
+            SessionPhase::Running | SessionPhase::GatePending
+        ) {
+            self.state.refresh_turn_timing(Instant::now());
+        } else {
+            // 断连、停止等没有服务端终态的结束：固定数值，不写完成时刻。
+            self.state.finish_turn_timing(Instant::now(), None);
+        }
         self.state.view.observation = self
             .observer
             .snapshot_at(self.state.view.version + 1, Instant::now());
@@ -942,9 +1019,14 @@ impl Core {
             self.tool_details.execution_unavailable();
             self.state.finish_all_tool_lines();
             self.state.finish_all_reasoning();
+            self.state.finish_all_notices();
+            self.steer = None;
+            self.backend_command = None;
         }
         self.state.view.tool_details = self.tool_details.snapshot();
-        self.state.view.domain = self.domain.snapshot.clone();
+        self.state.view.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
+            self.domain.snapshot.clone(),
+        )];
         self.domain
             .project_control_messages(&mut self.state.view.messages);
         let transport = self.pipe.stats();
@@ -1219,6 +1301,19 @@ impl Core {
                 self.state.view.thread_id.as_deref().unwrap_or(""),
                 self.state.view.turn_id.as_deref().unwrap_or(""),
             ),
+            RpcKind::Steer { .. } => app_server::turn_steer(
+                id.clone(),
+                self.state.view.thread_id.as_deref().unwrap_or(""),
+                self.state.view.turn_id.as_deref().unwrap_or(""),
+                self.steer.as_ref().map_or("", |steer| steer.text.as_str()),
+            ),
+            RpcKind::CommandList => app_server::backend_commands_list(id.clone()),
+            RpcKind::CommandRun => app_server::backend_command_run(
+                id.clone(),
+                self.backend_command
+                    .as_ref()
+                    .map_or("", |(_, line)| line.as_str()),
+            ),
             RpcKind::ModelList => app_server::model_list(id.clone()),
             RpcKind::BackendReload => app_server::backend_reload(id.clone()),
             RpcKind::ThreadResume => app_server::thread_resume(
@@ -1248,14 +1343,15 @@ impl Core {
         let outbox_id = self.send_effect(envelope, None)?;
         let skills_cwd = matches!(kind, RpcKind::SkillsList { .. })
             .then(|| self.config.cwd.display().to_string());
-        self.expect_response(
-            id,
-            outbox_id,
-            PendingRpc {
-                skills_cwd,
-                ..PendingRpc::new(kind)
-            },
-        );
+        let mut pending = PendingRpc {
+            skills_cwd,
+            ..PendingRpc::new(kind)
+        };
+        if matches!(kind, RpcKind::CommandRun) {
+            // 手动压缩要等模型写完摘要，比普通请求慢得多。
+            pending.deadline = Instant::now() + Duration::from_secs(300);
+        }
+        self.expect_response(id, outbox_id, pending);
         Ok(())
     }
 
@@ -1352,9 +1448,11 @@ impl Core {
             } => {
                 self.finish_domain_fact_read(attempt_id, generation, outcome);
             }
-            Command::ApproveDomainChange { binding } => {
-                self.approve_domain_change(binding);
-            }
+            Command::ConfirmExtension { confirmation } => match confirmation {
+                crate::extensions::ExtensionConfirmation::Modeling(binding) => {
+                    self.approve_domain_change(binding)
+                }
+            },
             Command::DomainAuthorizationFinished {
                 attempt_id,
                 generation,
@@ -1516,6 +1614,27 @@ impl Core {
                         Some(format!("Conversation was not resumed: {reason}"));
                 }
             }
+            Command::CompletePath { query } => {
+                self.state.view.path_hints = crate::path_hints::complete(&self.config.cwd, &query);
+            }
+            Command::ListBackendCommands => {
+                if self.session_ready && self.state.view.thread_id.is_some() {
+                    if let Err(error) = self.send_rpc(RpcKind::CommandList) {
+                        self.state.view.notice =
+                            Some(format!("dsh commands were not listed: {error}"));
+                    }
+                }
+            }
+            Command::RunBackendCommand { line } => {
+                if let Err(reason) = self.run_backend_command(line) {
+                    self.state.view.notice = Some(format!("The command was not run: {reason}"));
+                }
+            }
+            Command::SteerRoot { text } => {
+                if let Err(reason) = self.steer_root(text) {
+                    self.state.view.notice = Some(format!("Steering was not sent: {reason}"));
+                }
+            }
             Command::NewConversation => {
                 if let Err(reason) = self.start_new_conversation() {
                     self.state.view.notice =
@@ -1668,13 +1787,13 @@ impl Core {
         if let Some(task) = self.domain_authorization_task.take() {
             task.abort();
         }
-        if let Some((_, _, _, task)) = self.domain_fact_task.take() {
-            task.abort();
+        self.domain_generation = self.domain_generation.wrapping_add(1);
+        self.domain = crate::domain::DomainFacts::new(self.config.domain_setup.clone());
+        if let Some(pending) = self.domain_fact_task.take() {
+            pending.task.abort();
         }
         self.domain_fact_attempt = self.domain_fact_attempt.wrapping_add(1);
         self.domain_fact_queue.clear();
-        self.domain_generation = self.domain_generation.wrapping_add(1);
-        self.domain = crate::domain::DomainFacts::new(self.config.domain_setup.clone());
         self.session_ready = false;
         self.state.view.phase = SessionPhase::Initializing;
     }
@@ -1780,6 +1899,68 @@ impl Core {
         Ok(())
     }
 
+    /// dsh 的命令会改变会话状态（压缩历史、切换计划模式），只在会话空闲时执行。
+    fn run_backend_command(&mut self, line: String) -> Result<(), String> {
+        let line = line.trim().to_owned();
+        if !line.starts_with('/') || line.len() > 4096 {
+            return Err("it is not a command line.".into());
+        }
+        if !self.idle_for_backend_change() || self.scheduler.snapshot().queued_roots > 0 {
+            return Err("wait for the current turn and queued tasks to finish first.".into());
+        }
+        if self.backend_command.is_some() {
+            return Err("another command is still running.".into());
+        }
+        self.backend_command_count += 1;
+        let notice = format!("command:{}", self.backend_command_count);
+        self.backend_command = Some((notice.clone(), line.clone()));
+        if let Err(error) = self.send_rpc(RpcKind::CommandRun) {
+            self.backend_command = None;
+            return Err(error.to_string());
+        }
+        self.state
+            .command_notice(&notice, format!("Running {line}…"), false);
+        Ok(())
+    }
+
+    /// 引导只在 root 轮次运行中有效。等待子 Agent 时不接受：那时 root 没有
+    /// 可以消费引导的下一步，放行只会让它在门释放后才被处理。
+    fn steer_root(&mut self, text: String) -> Result<(), String> {
+        let text = text.trim().to_owned();
+        if text.is_empty() || text.len() > crate::state::MESSAGE_BYTES {
+            return Err("the guidance is empty or too long.".into());
+        }
+        match self.state.view.phase {
+            SessionPhase::Running if self.state.view.turn_id.is_some() => {}
+            SessionPhase::GatePending => {
+                return Err("the turn is waiting for child agents.".into());
+            }
+            _ => return Err("no turn is running; send it as a task instead.".into()),
+        }
+        if self.steer.is_some() {
+            return Err("the previous guidance is still being delivered.".into());
+        }
+        self.steer_count += 1;
+        let notice_id = format!("steer:{}", self.steer_count);
+        self.steer = Some(PendingSteer {
+            notice_id: notice_id.clone(),
+            text,
+            message_id: None,
+        });
+        if let Err(error) = self.send_rpc(RpcKind::Steer {
+            generation: self.generation,
+        }) {
+            self.steer = None;
+            return Err(error.to_string());
+        }
+        self.state.steer_notice(
+            &notice_id,
+            "Steering queued for the next step…".into(),
+            false,
+        );
+        Ok(())
+    }
+
     fn start_new_conversation(&mut self) -> Result<(), String> {
         if self.state.view.creating_conversation {
             return Err("another new conversation is already starting.".into());
@@ -1844,7 +2025,7 @@ impl Core {
         if self
             .domain_fact_task
             .as_ref()
-            .is_some_and(|(_, _, active, _)| active == &receipt)
+            .is_some_and(|pending| pending.receipt == receipt)
             || self
                 .domain_fact_queue
                 .iter()
@@ -1862,11 +2043,7 @@ impl Core {
         }
         self.domain_fact_queue.push_back((self.generation, receipt));
         self.domain.synchronizing = true;
-        self.domain.snapshot.notice = Some("正在通过 Core 独立通道同步完整领域事实".into());
-        self.domain
-            .snapshot
-            .fact_sync_notice
-            .clone_from(&self.domain.snapshot.notice);
+        self.domain.snapshot.fact_sync_notice = Some("正在同步完整领域事实".into());
         self.start_domain_fact_read();
     }
 
@@ -1886,7 +2063,9 @@ impl Core {
         let commands = self.command_tx.clone();
         let pending = receipt.clone();
         let task = tokio::spawn(async move {
-            let outcome = crate::domain::receipt::read(setup, pending).await;
+            let outcome = crate::domain::receipt::read(setup, pending)
+                .await
+                .map(crate::domain::DomainFactData);
             if let Some(commands) = commands.upgrade() {
                 let _ = commands
                     .send(Command::DomainFactReadFinished {
@@ -1897,25 +2076,26 @@ impl Core {
                     .await;
             }
         });
-        self.domain_fact_task = Some((attempt_id, generation, receipt, task));
+        self.domain_fact_task = Some(PendingDomainFact {
+            attempt_id,
+            generation,
+            receipt,
+            task,
+        });
     }
 
     fn finish_domain_fact_read(
         &mut self,
         attempt_id: u64,
         generation: u64,
-        outcome: Result<Vec<u8>, String>,
+        outcome: Result<crate::domain::DomainFactData, String>,
     ) {
-        if !self
-            .domain_fact_task
-            .as_ref()
-            .is_some_and(|(id, active_generation, _, _)| {
-                *id == attempt_id && *active_generation == generation
-            })
-        {
+        if !self.domain_fact_task.as_ref().is_some_and(|pending| {
+            pending.attempt_id == attempt_id && pending.generation == generation
+        }) {
             return;
         }
-        let (_, _, receipt, _) = self.domain_fact_task.take().unwrap();
+        let pending = self.domain_fact_task.take().unwrap();
         let result = if generation != self.generation {
             Err("读取结果属于已结束的执行代次".into())
         } else {
@@ -1924,18 +2104,29 @@ impl Core {
                     .domain_setup
                     .as_ref()
                     .ok_or_else(|| "建模会话已结束".to_owned())
-                    .and_then(|setup| crate::domain::receipt::verify(setup, &receipt, &raw))
+                    .and_then(|setup| {
+                        crate::domain::receipt::verify(setup, &pending.receipt, &raw.0)
+                    })
             })
         };
         match result {
             Ok(value) => {
-                self.domain.synchronization_finished(&receipt);
-                self.domain.apply_verified_fact(&value);
+                if self.domain.apply_verified_fact(&value) == crate::domain::FactProjection::Invalid
+                {
+                    self.domain.synchronization_failed(
+                        &pending.receipt.kind,
+                        pending.receipt.fact_sequence,
+                        "完整事实不能投影为当前领域状态".into(),
+                    );
+                } else {
+                    self.domain.synchronization_finished(&pending.receipt);
+                }
             }
-            Err(reason) => {
-                self.domain
-                    .synchronization_failed(&receipt.kind, receipt.fact_sequence, reason)
-            }
+            Err(reason) => self.domain.synchronization_failed(
+                &pending.receipt.kind,
+                pending.receipt.fact_sequence,
+                reason,
+            ),
         }
         self.start_domain_fact_read();
     }
@@ -2287,6 +2478,7 @@ impl Core {
             }
         } else if self.state.view.phase == SessionPhase::StartingTurn {
             self.state.turn_started(id.into());
+            self.state.begin_turn_timing(Instant::now());
         }
         if let Some(attempt) = self.scheduler.active_root() {
             if let Err(error) = self.scheduler.started_root(
@@ -2424,6 +2616,34 @@ impl Core {
                         .and_then(Value::as_str)
                         .unwrap_or("RPC failed")
                         .to_owned();
+                    if matches!(pending.kind, RpcKind::CommandList) {
+                        let message: String = message.chars().take(200).collect();
+                        self.state.view.notice =
+                            Some(format!("dsh commands were not listed: {message}"));
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::CommandRun) {
+                        if let Some((notice, line)) = self.backend_command.take() {
+                            let reason: String = message.chars().take(400).collect();
+                            self.state.command_notice(
+                                &notice,
+                                format!("{line} was not run: {reason}"),
+                                true,
+                            );
+                        }
+                        return;
+                    }
+                    if matches!(pending.kind, RpcKind::Steer { .. }) {
+                        if let Some(steer) = self.steer.take() {
+                            let reason: String = message.chars().take(200).collect();
+                            self.state.steer_notice(
+                                &steer.notice_id,
+                                format!("Steering was not accepted: {reason}"),
+                                true,
+                            );
+                        }
+                        return;
+                    }
                     if matches!(pending.kind, RpcKind::Interrupt { .. }) {
                         // Rejection proves the interrupt was not accepted, not that the turn ended.
                         self.interrupt_requested = false;
@@ -2666,6 +2886,11 @@ impl Core {
                     self.state.view.phase = SessionPhase::Initializing;
                     self.state.view.creating_conversation = false;
                     self.state.view.messages.clear();
+                    self.state.view.todos.clear();
+                    self.steer = None;
+                    self.backend_command = None;
+                    self.state.view.commands.clear();
+                    self.state.view.commands_loaded = false;
                     self.state.view.requests.clear();
                     self.state.view.permission = Default::default();
                     self.state.view.turn_id = None;
@@ -2702,6 +2927,57 @@ impl Core {
                     return;
                 };
                 self.bind_turn(id);
+                None
+            }
+            RpcKind::CommandList => {
+                match crate::state::parse_backend_commands(&result) {
+                    Some(commands) => {
+                        self.state.view.commands = commands;
+                        self.state.view.commands_loaded = true;
+                    }
+                    None => {
+                        self.state.view.notice =
+                            Some("dsh commands were not listed: the answer was malformed.".into())
+                    }
+                }
+                None
+            }
+            RpcKind::CommandRun => {
+                if let Some((notice, line)) = self.backend_command.take() {
+                    let text: String = result["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(2000)
+                        .collect();
+                    let outcome = match (result["kind"].as_str(), text.is_empty()) {
+                        (Some("success"), true) => format!("{line}: done."),
+                        (Some("success"), false) => format!("{line}: {text}"),
+                        (_, true) => format!("{line} failed."),
+                        (_, false) => format!("{line} failed: {text}"),
+                    };
+                    self.state.command_notice(&notice, outcome, true);
+                }
+                None
+            }
+            RpcKind::Steer { .. } => {
+                // 应答只说明 dsh 收下了；送达由之后的事件确认。
+                match result["messageId"].as_str().filter(|id| id.len() <= 128) {
+                    Some(id) => {
+                        if let Some(steer) = &mut self.steer {
+                            steer.message_id = Some(id.to_owned());
+                        }
+                    }
+                    None => {
+                        if let Some(steer) = self.steer.take() {
+                            self.state.steer_notice(
+                                &steer.notice_id,
+                                "Steering was not confirmed by dsh.".into(),
+                                true,
+                            );
+                        }
+                    }
+                }
                 None
             }
             RpcKind::Interrupt { .. } => None, // An RPC acknowledgement is not a terminal turn event.
@@ -2823,6 +3099,11 @@ impl Core {
                 self.reset_domain_session();
                 self.state.view.permission = Default::default();
                 self.state.view.messages.clear();
+                self.state.view.todos.clear();
+                self.steer = None;
+                self.backend_command = None;
+                self.state.view.commands.clear();
+                self.state.view.commands_loaded = false;
                 self.state.tool_lines.clear();
                 self.state.view.history_truncated = false;
                 self.state.view.thread_id = Some(thread);
@@ -2862,6 +3143,7 @@ impl Core {
                                 text: message.text,
                                 complete: true,
                                 truncated: message.truncated,
+                                tools: message.tool.into_iter().collect(),
                             })
                             .collect();
                         self.state.view.notice = Some(format!("Resumed: {label}"));
@@ -3193,7 +3475,7 @@ impl Core {
             match crate::domain::receipt::from_tool(setup, notice, &params["item"]) {
                 Ok(Some(receipt)) => self.queue_domain_fact(receipt),
                 Err(reason) => self.domain.synchronization_failed("transport", 0, reason),
-                Ok(None) => {}
+                Ok(None) => self.domain.observe(notice, &params["item"]),
             }
         }
         let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
@@ -3222,8 +3504,12 @@ impl Core {
             // 工作目录内的路径显示为相对路径，摘要更短。
             let prefix = format!("{}{}", self.config.cwd.display(), std::path::MAIN_SEPARATOR);
             let line = crate::tool_details::summary_line(&detail).replace(&prefix, "");
-            self.state
-                .tool_line(&notice.thread_id, &notice.turn_id, &notice.item_id, line);
+            self.state.tool_line(
+                &notice.thread_id,
+                &notice.turn_id,
+                crate::tool_details::ConversationTool::from_detail(&detail),
+                line,
+            );
         }
     }
 
@@ -3631,7 +3917,17 @@ impl Core {
                 if let Some(notice) = protocol::decode_observed_tool(method, &params) {
                     match notice {
                         Ok(notice) => match self.observer.tool(&notice, Instant::now()) {
-                            Ok(true) => self.observe_tool_detail_event(&notice, &params),
+                            Ok(true) => {
+                                if Some(thread) == self.state.view.thread_id.as_deref() {
+                                    self.state.turn_tool(
+                                        turn,
+                                        &notice.item_id,
+                                        notice.outcome.is_none(),
+                                        Instant::now(),
+                                    );
+                                }
+                                self.observe_tool_detail_event(&notice, &params)
+                            }
                             Ok(false) => {}
                             Err(error) => {
                                 self.state.error(SessionPhase::Unknown, error.to_string());
@@ -3665,6 +3961,13 @@ impl Core {
                                     &output.text,
                                     false,
                                 ) {
+                                    if Some(thread) == self.state.view.thread_id.as_deref() {
+                                        self.state.turn_stage(
+                                            turn,
+                                            crate::state::TurnStage::Thinking,
+                                            Instant::now(),
+                                        );
+                                    }
                                     self.observe_output(
                                         thread,
                                         turn,
@@ -3829,6 +4132,19 @@ impl Core {
                 if let Some(thread) = self.state.view.thread_id.clone() {
                     self.retire_turn_evidence(&thread, id.unwrap());
                 }
+                let completed_at = (self.state.view.phase == SessionPhase::Completed)
+                    .then(|| crate::state::wall_clock_label(std::time::SystemTime::now()))
+                    .flatten();
+                self.state.finish_turn_timing(Instant::now(), completed_at);
+                // 一轮里 Agent 可能切换了分支；轮次结束时重读一次。
+                self.state.view.branch = crate::git_branch::current(&self.config.cwd);
+                if let Some(steer) = self.steer.take() {
+                    self.state.steer_notice(
+                        &steer.notice_id,
+                        "Steering was not delivered: the turn ended first.".into(),
+                        true,
+                    );
+                }
                 self.state.view.notice = None;
                 self.interrupt_requested = false;
                 self.interrupt_sent = false;
@@ -3853,11 +4169,76 @@ impl Core {
                     }
                 }
             }
+            "turn/stage" => {
+                let stage = match params["stage"].as_str() {
+                    Some("waiting") => crate::state::TurnStage::ModelWait,
+                    Some("thinking") => crate::state::TurnStage::Thinking,
+                    Some("response") => crate::state::TurnStage::Response,
+                    _ => return,
+                };
+                if let Some(turn) = turn.filter(|turn| {
+                    Some(*turn) == self.state.view.turn_id.as_deref()
+                        && matches!(
+                            self.state.view.phase,
+                            SessionPhase::Running | SessionPhase::GatePending
+                        )
+                }) {
+                    self.state.turn_stream_stage(turn, stage, Instant::now());
+                }
+            }
+            "item/discarded" => {
+                if let (Some(turn), Some(id)) = (turn, params["itemId"].as_str()) {
+                    self.state.discard_item(turn, id);
+                }
+            }
+            "turn/steer/delivered" => {
+                let current = turn.is_some() && turn == self.state.view.turn_id.as_deref();
+                let known = self.steer.as_ref().is_some_and(|steer| {
+                    // 投递事件可能先于应答到达；同一时刻只有一个待确认的引导。
+                    steer
+                        .message_id
+                        .as_deref()
+                        .is_none_or(|id| params["id"] == id)
+                });
+                if current && known {
+                    let steer = self.steer.take().unwrap();
+                    self.state.steer_delivered(&steer.notice_id, &steer.text);
+                }
+            }
+            "turn/notice" => match params["kind"].as_str() {
+                Some("retry") => {
+                    if let (Some(turn), Some(retry)) = (turn, params["retry"].as_u64()) {
+                        self.state.retry_notice(
+                            turn,
+                            retry,
+                            params["maxRetries"].as_u64(),
+                            params["delayMs"].as_u64(),
+                            params["code"].as_str(),
+                        );
+                    }
+                }
+                Some("compaction") => {
+                    if let (Some(id), Some(state)) =
+                        (params["id"].as_str(), params["state"].as_str())
+                    {
+                        self.state.compaction_notice(turn, id, state);
+                    }
+                }
+                _ => {}
+            },
+            "thread/todos/updated" => {
+                self.state.view.todos = crate::state::parse_todos(&params["todos"]);
+            }
             "item/agentMessage/delta" => {
                 if let (Some(turn), Some(id), Some(delta)) =
                     (turn, params["itemId"].as_str(), params["delta"].as_str())
                 {
                     if self.state.message(turn, id, delta, false) {
+                        self.state.turn_stage(
+                            turn,
+                            crate::state::TurnStage::Response,
+                            Instant::now(),
+                        );
                         let thread = self.state.view.thread_id.clone().unwrap_or_default();
                         self.observe_output(&thread, turn, id, delta.len(), false);
                     }
@@ -8451,6 +8832,465 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_preview_is_dropped_when_the_committed_message_replaces_it() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let texts = |snapshot: &crate::state::CoreSnapshot| -> Vec<(String, String)> {
+            snapshot
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role.as_str(), "Agent" | "Reasoning"))
+                .map(|m| (m.id.clone(), m.text.clone()))
+                .collect()
+        };
+        send(&mut server, json!({"method":"item/reasoning/textDelta","params":{"threadId":"root","turnId":"root-turn","itemId":"live:thinking:0","delta":"weigh"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"live:text:1","delta":"Hel"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| texts(snapshot).len() == 2)
+            .await
+            .unwrap();
+        // 只有预览可以撤掉；其他轮次或权威消息的身份不受影响。
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"m0","delta":"kept"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"root-turn","itemId":"m0"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"old","itemId":"live:text:1"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"root-turn","itemId":"live:thinking:0"}})).await;
+        send(&mut server, json!({"method":"item/discarded","params":{"threadId":"root","turnId":"root-turn","itemId":"live:text:1"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":"m1","delta":"Hello"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                texts(snapshot)
+                    == [
+                        ("m0".to_owned(), "kept".to_owned()),
+                        ("m1".to_owned(), "Hello".to_owned()),
+                    ]
+            })
+            .await
+            .unwrap();
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_commands_run_only_when_idle_and_quote_the_backend_outcome() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        let notices = |snapshot: &crate::state::CoreSnapshot| -> Vec<String> {
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role == "Notice")
+                .map(|message| message.text.clone())
+                .collect()
+        };
+        client
+            .commands
+            .send(Command::ListBackendCommands)
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "backend/commands/list");
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"commands":[
+            {"name":"compact","description":"Summarise earlier history"},
+            {"name":"plan","description":"Plan mode","hint":"on|off"},
+            {"name":"Bad Name","description":"dropped"}]}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.commands_loaded)
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(
+                snapshot
+                    .commands
+                    .iter()
+                    .map(|command| command.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["compact", "plan"]
+            );
+            assert_eq!(snapshot.commands[1].hint.as_deref(), Some("on|off"));
+        }
+        let run = |line: &str| Command::RunBackendCommand { line: line.into() };
+        client.commands.send(run(" /compact ")).await.unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "backend/command/run");
+        assert_eq!(request["params"], json!({"line":"/compact"}));
+        client
+            .snapshots
+            .wait_for(|snapshot| notices(snapshot) == ["Running /compact…"])
+            .await
+            .unwrap();
+        // 上一条没有结果前不执行第二条。
+        client.commands.send(run("/plan off")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("another command is still running"))
+            })
+            .await
+            .unwrap();
+        send(&mut server, json!({"id":request["id"],"result":{"kind":"success","text":"Compacted 3 history items."}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| notices(snapshot) == ["/compact: Compacted 3 history items."])
+            .await
+            .unwrap();
+        client.commands.send(run("/plan off")).await.unwrap();
+        let request = next(&mut server).await;
+        send(&mut server, json!({"id":request["id"],"error":{"code":-32603,"message":"dsh has no command /plan"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                notices(snapshot).last().map(String::as_str)
+                    == Some("/plan off was not run: dsh has no command /plan")
+            })
+            .await
+            .unwrap();
+        client.commands.send(run("not a command")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("not a command line"))
+            })
+            .await
+            .unwrap();
+
+        // 轮次运行中不执行，也不向 dsh 发请求。
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "work".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        client.commands.send(run("/compact")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("wait for the current turn"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steering_reaches_only_a_running_root_turn_and_shows_its_real_outcome() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let steer = |text: &str| Command::SteerRoot { text: text.into() };
+        let notices = |snapshot: &crate::state::CoreSnapshot| -> Vec<String> {
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role == "Notice")
+                .map(|message| message.text.clone())
+                .collect()
+        };
+        client
+            .commands
+            .send(steer("  use 中文 names "))
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(
+            request["params"],
+            json!({"threadId":"root","turnId":"root-turn","text":"use 中文 names"})
+        );
+        client
+            .snapshots
+            .wait_for(|snapshot| notices(snapshot) == ["Steering queued for the next step…"])
+            .await
+            .unwrap();
+        // 上一条还没确认时不接受第二条，也不向 dsh 发送。
+        client.commands.send(steer("second")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("still being delivered"))
+            })
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"messageId":"m1"}}),
+        )
+        .await;
+        // 别的消息身份和旧轮次的投递事件不算数。
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"root-turn","id":"other"}})).await;
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"old","id":"m1"}})).await;
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"root-turn","id":"m1"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                // 耗时行始终排在这一步的最末尾，引导消息在它之前。
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|m| m.role == "You" && m.text == "use 中文 names")
+            })
+            .await
+            .unwrap();
+        assert!(notices(&client.snapshots.borrow()).is_empty());
+
+        // dsh 拒绝时显示它给的原因；没有送达的引导不变成用户消息。
+        client.commands.send(steer("rejected")).await.unwrap();
+        let request = next(&mut server).await;
+        assert_eq!(request["method"], "turn/steer");
+        send(&mut server, json!({"id":request["id"],"error":{"code":-32603,"message":"no turn is running; send this as a new task"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                notices(snapshot)
+                    == ["Steering was not accepted: no turn is running; send this as a new task"]
+            })
+            .await
+            .unwrap();
+
+        // 被接受但轮次先结束：明确显示没有送达。
+        client.commands.send(steer("too late")).await.unwrap();
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"messageId":"m3"}}),
+        )
+        .await;
+        send(&mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        phase(&mut client, SessionPhase::Completed).await;
+        assert_eq!(
+            notices(&client.snapshots.borrow()).last().unwrap(),
+            "Steering was not delivered: the turn ended first."
+        );
+        assert!(!client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.text == "too late" || m.text == "rejected"));
+        send(&mut server, json!({"method":"turn/steer/delivered","params":{"threadId":"root","turnId":"root-turn","id":"m3"}})).await;
+
+        // 没有运行中的轮次：Core 自己拒绝，不发请求。
+        client.commands.send(steer("idle")).await.unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("no turn is running"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert!(!client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.text == "too late"));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn steering_is_refused_while_the_root_turn_waits_at_a_gate() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        child(&mut server, "a", "a-1").await;
+        wait_call(&mut server, "steer-wait", vec!["a"]).await;
+        phase(&mut client, SessionPhase::GatePending).await;
+        client
+            .commands
+            .send(Command::SteerRoot {
+                text: "hurry".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("waiting for child agents"))
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next(&mut server))
+                .await
+                .is_err()
+        );
+        let snapshot = client.snapshots.borrow().clone();
+        assert_eq!(snapshot.phase, SessionPhase::GatePending);
+        assert!(!snapshot.messages.iter().any(|m| m.role == "Notice"));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_stage_and_todo_events_update_the_current_root_turn_only() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "first".into(),
+            })
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        let timing = |snapshot: &crate::state::CoreSnapshot| {
+            snapshot
+                .messages
+                .iter()
+                .find(|message| message.role == "Timing")
+                .map(|message| message.text.clone())
+                .unwrap_or_default()
+        };
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"one","stage":"thinking"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| timing(snapshot).contains("Thinking"))
+            .await
+            .unwrap();
+        // 旧轮次、未知阶段和整块到达的正文都不改变当前阶段。
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"old","stage":"response"}})).await;
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"one","stage":"invented"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"one","itemId":"a","delta":"answer"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.messages.iter().any(|m| m.text == "answer"))
+            .await
+            .unwrap();
+        assert!(!timing(&client.snapshots.borrow()).contains("Response"));
+        send(&mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"one","stage":"response"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| timing(snapshot).contains("Response"))
+            .await
+            .unwrap();
+
+        send(
+            &mut server,
+            json!({"method":"turn/notice","params":{"threadId":"root","turnId":"one",
+            "kind":"retry","retry":1,"maxRetries":2,"delayMs":500,"code":"rate_limit"}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/notice","params":{"threadId":"root","turnId":"old",
+            "kind":"retry","retry":7}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"turn/notice","params":{"threadId":"root","turnId":null,
+            "kind":"compaction","id":"c1","state":"end"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|m| m.text.contains("compacted"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .snapshots
+                .borrow()
+                .messages
+                .iter()
+                .filter(|m| m.role == "Notice")
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Retrying model request (1/2) in 500ms: rate_limit",
+                "… earlier context was compacted …"
+            ]
+        );
+        send(
+            &mut server,
+            json!({"method":"thread/todos/updated","params":{"threadId":"other","todos":[
+            {"content":"foreign","status":"pending"}]}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"thread/todos/updated","params":{"threadId":"root","todos":[
+            {"content":"scan","status":"completed"},{"content":"build","status":"in_progress"},
+            {"content":"bad","status":"done"}]}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| !snapshot.todos.is_empty())
+            .await
+            .unwrap();
+        {
+            let snapshot = client.snapshots.borrow();
+            assert_eq!(snapshot.todos.len(), 2);
+            assert_eq!(snapshot.todos[1].content, "build");
+            assert_eq!(
+                snapshot.todos[1].status,
+                crate::state::TodoStatus::InProgress
+            );
+            let stored = serde_json::to_string(&StoredSnapshot::capture(&snapshot)).unwrap();
+            assert!(!stored.contains("build"));
+        }
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn notifications_before_rpc_response_are_preserved_and_old_turns_cannot_finish_new_turn()
     {
         let (mut client, mut server) = harness().await;
@@ -8477,10 +9317,17 @@ mod tests {
         )
         .await;
         phase(&mut client, SessionPhase::Completed).await;
-        assert_eq!(
-            client.snapshots.borrow().messages.last().unwrap().text,
-            "中文"
-        );
+        {
+            let snapshot = client.snapshots.borrow();
+            let [.., answer, timing] = snapshot.messages.as_slice() else {
+                panic!("the answer and its timing row are missing");
+            };
+            assert_eq!(answer.text, "中文");
+            // 耗时行排在这一步的最末尾，服务端确认完成后固定并带完成时刻。
+            assert_eq!((timing.role.as_str(), timing.complete), ("Timing", true));
+            assert!(timing.text.contains("Response "), "{}", timing.text);
+            assert!(timing.text.contains(" · Completed "), "{}", timing.text);
+        }
         client
             .commands
             .send(Command::SubmitRootInput {
@@ -8499,9 +9346,11 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(3),
             client.snapshots.wait_for(|s| {
-                s.messages
-                    .last()
-                    .is_some_and(|m| m.text == "second" && m.role == "Agent")
+                // 运行中的耗时行跟在回答之后，还没有固定。
+                matches!(s.messages.as_slice(), [.., answer, timing]
+                    if answer.text == "second" && answer.role == "Agent"
+                        && timing.role == "Timing" && !timing.complete
+                        && timing.turn_id == "two")
             }),
         )
         .await

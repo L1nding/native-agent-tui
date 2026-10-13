@@ -80,3 +80,18 @@ test('legacy saved tool results keep their top-level outcome and call identity',
   ]), 'session')
   assert.deepEqual(history.messages.map(m => m.text), ['▸ done · ok', '▸ failed · fail'])
 })
+
+test('history supplies structured tool facts without copying raw results', async () => {
+  const history = await readHistory(query([
+    call('shell', 'echo probe'), result('shell', true),
+    assistant('file-message', [{ type: 'tool-call', id: 'file', name: 'edit', arguments: { file_path: 'src/main.rs' } }]),
+    result('file'),
+  ]), 'session')
+  assert.deepEqual(history.messages[0].tool, {
+    itemId: 'shell', category: 'shell', lifecycle: 'failed', name: 'pwsh', command: 'echo probe',
+  })
+  assert.deepEqual(history.messages[1].tool, {
+    itemId: 'file', category: 'file', lifecycle: 'completed', name: 'edit', target: 'src/main.rs',
+  })
+  assert.ok(!JSON.stringify(history).includes('raw output'))
+})

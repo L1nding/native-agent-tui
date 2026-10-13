@@ -374,6 +374,13 @@ struct AcpBridge {
     permissions: HashMap<RpcId, Permission>,
     message_text: HashMap<String, String>,
     last_message_id: Option<String>,
+    /// 正在接收的内容块：(messageId, 是否思考, 序号)。同一条消息里思考与正文
+    /// 交替出现时各成一段，保留先后关系。
+    block: Option<(String, bool, u32)>,
+    /// 正在生成的预览段的 item id；提交后的权威内容到达前由它们占位。
+    live_items: Vec<String>,
+    /// 这次请求已经提交：下一条权威更新到达时撤掉预览。
+    live_settled: bool,
     model: Option<String>,
     /// `model` 来自保存的偏好：agent 不再提供它时沿用 agent 当前模型，不让启动失败。
     model_is_preference: bool,
@@ -390,6 +397,10 @@ struct AcpBridge {
     /// 本轮工具调用的输入，按 toolCallId 索引；权限请求可能只带 id。
     tool_inputs: HashMap<String, acp_protocol::ToolInput>,
     mcp_calls: HashMap<String, acp_protocol::McpCall>,
+    /// 插件转来、Core 尚未回答的提问。
+    asks: std::collections::HashSet<RpcId>,
+    tool_presentations:
+        HashMap<String, (acp_protocol::ToolKind, String, Vec<acp_protocol::FileDiff>)>,
 }
 
 impl AcpBridge {
@@ -408,6 +419,9 @@ impl AcpBridge {
             permissions: HashMap::new(),
             message_text: HashMap::new(),
             last_message_id: None,
+            block: None,
+            live_items: Vec::new(),
+            live_settled: false,
             model: config.model.clone(),
             model_is_preference: config.model_is_preference,
             models: Vec::new(),
@@ -418,6 +432,8 @@ impl AcpBridge {
             startup_stderr: None,
             tool_inputs: HashMap::new(),
             mcp_calls: HashMap::new(),
+            asks: Default::default(),
+            tool_presentations: HashMap::new(),
         }
     }
 
@@ -577,7 +593,11 @@ impl AcpBridge {
         self.message_text.clear();
         self.tool_inputs.clear();
         self.mcp_calls.clear();
+        self.tool_presentations.clear();
         self.last_message_id = None;
+        self.block = None;
+        self.live_items.clear();
+        self.live_settled = false;
         self.reloaded(core_id, session, result)
     }
 
@@ -673,7 +693,11 @@ impl AcpBridge {
                 self.message_text.clear();
                 self.tool_inputs.clear();
                 self.mcp_calls.clear();
+                self.tool_presentations.clear();
                 self.last_message_id = None;
+                self.block = None;
+                self.live_items.clear();
+                self.live_settled = false;
                 self.turn_id = Some(format!("acp-turn-{}", id_text(&id)));
                 self.turn_started = true;
                 self.core.send(Envelope::notification(
@@ -750,6 +774,58 @@ impl AcpBridge {
                     self.mcp_servers.clone(),
                 ))?;
             }
+            // 引导只对桥接当前绑定的轮次有效；dsh 在下一步边界把它交给模型。
+            (Some("turn/steer"), Some(id)) => {
+                let params = message.params.unwrap_or(Value::Null);
+                let (Some(session), Some(text)) = (
+                    self.session_id.clone().filter(|_| {
+                        self.turn_id.is_some()
+                            && params["turnId"].as_str() == self.turn_id.as_deref()
+                    }),
+                    params["text"].as_str(),
+                ) else {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "no turn is running",
+                    ));
+                };
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp.send(with_jsonrpc(Envelope::request(
+                    id,
+                    "zf/session/steer",
+                    Some(json!({"sessionId":session,"text":text})),
+                )))?;
+            }
+            // dsh 自己的斜杠命令；只在没有进行中的轮次时执行。
+            (Some(method @ ("backend/commands/list" | "backend/command/run")), Some(id)) => {
+                let Some(session) = self.session_id.clone() else {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "ACP session is not ready",
+                    ));
+                };
+                let (target, params) = if method == "backend/commands/list" {
+                    ("zf/commands/list", json!({"sessionId":session}))
+                } else if self.turn_id.is_some() {
+                    return self.core.send(Envelope::error_response(
+                        id,
+                        -32000,
+                        "a turn is running",
+                    ));
+                } else {
+                    let line = message
+                        .params
+                        .as_ref()
+                        .and_then(|params| params["line"].as_str())
+                        .unwrap_or_default();
+                    ("zf/commands/run", json!({"sessionId":session,"line":line}))
+                };
+                self.pending.insert(id.clone(), Pending::Passthrough);
+                self.acp
+                    .send(with_jsonrpc(Envelope::request(id, target, Some(params))))?;
+            }
             // dsh's permission presets belong to a session; the bridge names ours.
             (Some(method @ ("permission/describe" | "permission/set")), Some(id)) => {
                 let Some(session) = self.session_id.clone() else {
@@ -791,7 +867,8 @@ impl AcpBridge {
                 self.acp.send(with_jsonrpc(Envelope::request(
                     id,
                     "zf/session/list",
-                    Some(json!({"cwd": self.cwd})),
+                    // 列出所有工作区的会话，每条标明是否属于这里；范围由界面切换。
+                    Some(json!({"cwd": self.cwd, "all": true})),
                 )))?;
             }
             (Some("thread/history"), Some(id)) => {
@@ -888,6 +965,23 @@ impl AcpBridge {
                 ))?;
             }
             (Some("initialized"), None) => {}
+            // Core 对插件提问的答复原样交还；结果的换算在插件里做。
+            (None, Some(id)) if self.asks.remove(&id) => {
+                self.acp.send(with_jsonrpc(Envelope {
+                    jsonrpc: None,
+                    id: Some(id.clone()),
+                    method: None,
+                    params: None,
+                    result: message.result,
+                    error: message.error,
+                }))?;
+                if let Some(session) = &self.session_id {
+                    self.core.send(Envelope::notification(
+                        "serverRequest/resolved",
+                        Some(json!({"threadId": session, "requestId": id})),
+                    ))?;
+                }
+            }
             (None, Some(id)) if self.permissions.contains_key(&id) => {
                 let permission = self.permissions.remove(&id).unwrap();
                 let response = if let Some(error) = message.error {
@@ -939,7 +1033,282 @@ impl AcpBridge {
             (Some(acp_protocol::SESSION_REQUEST_PERMISSION), Some(id)) => {
                 self.permission(id, message.params.unwrap_or(Value::Null))?;
             }
+            (Some("zf/session/event"), None) => {
+                self.plugin_event(message.params.unwrap_or(Value::Null))?;
+            }
+            (Some("zf/session/ask"), Some(id)) => {
+                self.ask(id, message.params.unwrap_or(Value::Null))?;
+            }
             (None, Some(id)) => self.response(id, message).await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 撤掉生成中的预览。权威内容是 dsh 提交的整条消息，预览只是它到达前的占位。
+    fn discard_live(&mut self, session: &str, turn: &str) -> Result<(), TransportError> {
+        self.live_settled = false;
+        for item in std::mem::take(&mut self.live_items) {
+            self.core.send(Envelope::notification(
+                "item/discarded",
+                Some(json!({"threadId":session,"turnId":turn,"itemId":item})),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// 给内容块一个稳定身份。dsh 的一条消息里，思考块和正文块共用 messageId 并
+    /// 按顺序到达；每次在两者之间切换就是新的一段，否则 Core 会把它们各并成一条，
+    /// 丢掉“思考、正文、再思考”的先后。
+    fn block_id(&mut self, message_id: String, thought: bool) -> String {
+        let index = match &self.block {
+            Some((current, kind, index)) if *current == message_id => {
+                index + u32::from(*kind != thought)
+            }
+            _ => 0,
+        };
+        self.block = Some((message_id.clone(), thought, index));
+        if index == 0 {
+            message_id
+        } else {
+            format!("{message_id}#{index}")
+        }
+    }
+
+    /// Agent 向用户提的问题（如 plan 评审）。dsh 的 ACP 没有应答者，由插件转来；
+    /// 这里把它变成 Core 已有的用户输入请求，绑定当前会话和轮次。
+    fn ask(&mut self, id: RpcId, params: Value) -> Result<(), TransportError> {
+        let questions = params["questions"]
+            .as_array()
+            .filter(|questions| !questions.is_empty() && questions.len() <= 16);
+        let (Some(session), Some(turn), Some(questions)) = (
+            self.session_id
+                .clone()
+                .filter(|id| params["sessionId"] == id.as_str()),
+            self.turn_id.clone(),
+            questions,
+        ) else {
+            return self.acp.send(with_jsonrpc(Envelope::error_response(
+                id,
+                -32000,
+                "no turn of this session is running",
+            )));
+        };
+        // Core 的请求上限是 32 KiB；被评审的正文按题目数均分预算后截断。
+        let budget = 20_000 / questions.len();
+        let clip = |value: &Value, limit: usize| -> String {
+            let text = value.as_str().unwrap_or_default();
+            let mut end = text.len().min(limit);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end < text.len() {
+                format!("{}\n[truncated]", &text[..end])
+            } else {
+                text.to_owned()
+            }
+        };
+        let questions: Vec<Value> = questions
+            .iter()
+            .map(|question| {
+                let options: Vec<Value> = question["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(12)
+                    .map(|option| {
+                        json!({"label":clip(&option["label"], 200),
+                            "description":clip(&option["description"], 400)})
+                    })
+                    .collect();
+                let mut item = json!({"id":clip(&question["id"], 128),
+                    "header":clip(&question["header"], 200),
+                    "question":clip(&question["question"], budget)});
+                if !options.is_empty() {
+                    item["options"] = Value::Array(options);
+                }
+                item
+            })
+            .collect();
+        self.asks.insert(id.clone());
+        self.core.send(Envelope::request(
+            id,
+            "item/tool/requestUserInput",
+            Some(json!({"threadId":session,"turnId":turn,"questions":questions})),
+        ))
+    }
+
+    /// dsh 的 ACP 只转发已提交的整条消息；模型所处阶段和 todo 列表由
+    /// zf-tui-bridge 插件补发。只接受当前会话的事件，载荷在这里再次限界。
+    fn plugin_event(&mut self, params: Value) -> Result<(), TransportError> {
+        let Some(session) = self
+            .session_id
+            .clone()
+            .filter(|id| params["sessionId"] == id.as_str())
+        else {
+            return Ok(());
+        };
+        let event = &params["event"];
+        match event["type"].as_str() {
+            Some("stage") => {
+                let (Some(turn), Some(stage)) = (
+                    self.turn_id.clone(),
+                    event["stage"]
+                        .as_str()
+                        .filter(|stage| matches!(*stage, "waiting" | "thinking" | "response")),
+                ) else {
+                    return Ok(());
+                };
+                if !self.turn_started {
+                    self.core.send(Envelope::notification(
+                        "turn/started",
+                        Some(json!({"threadId":session,"turn":{"id":turn}})),
+                    ))?;
+                    self.turn_started = true;
+                }
+                self.core.send(Envelope::notification(
+                    "turn/stage",
+                    Some(json!({"threadId":session,"turnId":turn,"stage":stage})),
+                ))?;
+            }
+            Some("delta") => {
+                let (Some(turn), Some(text)) = (
+                    self.turn_id.clone(),
+                    event["text"]
+                        .as_str()
+                        .filter(|text| !text.is_empty() && text.len() <= 64 * 1024),
+                ) else {
+                    return Ok(());
+                };
+                if self.live_settled {
+                    self.discard_live(&session, &turn)?;
+                }
+                let thinking = event["kind"] == "thinking";
+                let item = format!(
+                    "live:{}:{}",
+                    if thinking { "thinking" } else { "text" },
+                    event["block"].as_u64().unwrap_or(0).min(999)
+                );
+                if !self.live_items.contains(&item) && self.live_items.len() < 64 {
+                    self.live_items.push(item.clone());
+                }
+                if !self.turn_started {
+                    self.core.send(Envelope::notification(
+                        "turn/started",
+                        Some(json!({"threadId":session,"turn":{"id":turn}})),
+                    ))?;
+                    self.turn_started = true;
+                }
+                self.core.send(Envelope::notification(
+                    if thinking {
+                        "item/reasoning/textDelta"
+                    } else {
+                        "item/agentMessage/delta"
+                    },
+                    Some(json!({"threadId":session,"turnId":turn,"itemId":item,"delta":text})),
+                ))?;
+            }
+            Some("delta-end") => {
+                let Some(turn) = self.turn_id.clone() else {
+                    return Ok(());
+                };
+                if event["committed"] == true {
+                    // 权威消息紧随其后；等它到了再换，避免中间出现空白。
+                    self.live_settled = true;
+                } else {
+                    self.discard_live(&session, &turn)?;
+                }
+            }
+            Some("ask") => {
+                if let Some(id) = event["id"].as_str().filter(|id| id.len() <= 128) {
+                    let id = RpcId::String(id.to_owned());
+                    if event["state"] == "withdrawn" && self.asks.remove(&id) {
+                        self.core.send(Envelope::notification(
+                            "serverRequest/resolved",
+                            Some(json!({"threadId": session, "requestId": id})),
+                        ))?;
+                    }
+                }
+            }
+            Some("steer") => {
+                let (Some(turn), Some(id)) = (
+                    self.turn_id.clone(),
+                    event["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128),
+                ) else {
+                    return Ok(());
+                };
+                if event["state"] == "delivered" {
+                    self.core.send(Envelope::notification(
+                        "turn/steer/delivered",
+                        Some(json!({"threadId":session,"turnId":turn,"id":id})),
+                    ))?;
+                }
+            }
+            Some("retry") => {
+                let (Some(turn), Some(retry)) = (self.turn_id.clone(), event["retry"].as_u64())
+                else {
+                    return Ok(());
+                };
+                let code = event["code"].as_str().filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 64
+                        && code
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                });
+                self.core.send(Envelope::notification(
+                    "turn/notice",
+                    Some(json!({"threadId":session,"turnId":turn,"kind":"retry",
+                        "retry":retry,"maxRetries":event["maxRetries"].as_u64(),
+                        "delayMs":event["delayMs"].as_u64(),"code":code})),
+                ))?;
+            }
+            Some("compaction") => {
+                let (Some(id), Some(state)) = (
+                    event["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128),
+                    event["state"]
+                        .as_str()
+                        .filter(|state| matches!(*state, "start" | "end" | "failed")),
+                ) else {
+                    return Ok(());
+                };
+                // 手动压缩发生在轮次之外；此时没有 turn，提示仍属于这个会话。
+                self.core.send(Envelope::notification(
+                    "turn/notice",
+                    Some(
+                        json!({"threadId":session,"turnId":self.turn_id,"kind":"compaction",
+                        "id":id,"state":state}),
+                    ),
+                ))?;
+            }
+            Some("todos") => {
+                let Some(todos) = event["todos"].as_array() else {
+                    return Ok(());
+                };
+                let todos: Vec<Value> = todos
+                    .iter()
+                    .take(crate::state::MAX_TODOS)
+                    .filter_map(|todo| {
+                        let status = todo["status"].as_str().filter(|status| {
+                            matches!(*status, "pending" | "in_progress" | "completed")
+                        })?;
+                        let content: String = todo["content"]
+                            .as_str()?
+                            .chars()
+                            .take(crate::state::MAX_TODO_CHARS)
+                            .collect();
+                        Some(json!({"content":content,"status":status}))
+                    })
+                    .collect();
+                self.core.send(Envelope::notification(
+                    "thread/todos/updated",
+                    Some(json!({"threadId":session,"todos":todos})),
+                ))?;
+            }
             _ => {}
         }
         Ok(())
@@ -949,14 +1318,63 @@ impl AcpBridge {
         &self,
         item_id: &str,
         status: &str,
-        output: Option<String>,
-        structured_output: Option<Value>,
+        content: acp_protocol::ToolContent,
     ) -> Value {
+        let acp_protocol::ToolContent {
+            output,
+            structured_output,
+            diffs,
+            exit_code,
+            duration_ms,
+        } = content;
+        let diffs = diffs.as_slice();
         if let Some(call) = self.mcp_calls.get(item_id) {
-            let result = structured_output.or_else(|| output.map(Value::String));
-            json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"status":status,"result":result})
+            let result = structured_output
+                .or_else(|| output.as_ref().map(|output| Value::String(output.clone())));
+            json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"status":status,"result":result,
+                "aggregatedOutput":output,"exitCode":exit_code,"durationMs":duration_ms})
         } else {
-            json!({"id":item_id,"type":"commandExecution","status":status,"aggregatedOutput":output})
+            let input = self.tool_inputs.get(item_id);
+            let presentation = self.tool_presentations.get(item_id);
+            let kind = if !diffs.is_empty() {
+                acp_protocol::ToolKind::File
+            } else {
+                presentation.map_or(acp_protocol::ToolKind::Generic, |value| value.0)
+            };
+            let name = presentation.map_or("ACP tool call", |value| value.1.as_str());
+            let diffs = if diffs.is_empty() {
+                presentation.map_or(diffs, |value| value.2.as_slice())
+            } else {
+                diffs
+            };
+            let patch = (!diffs.is_empty()).then(|| {
+                diffs
+                    .iter()
+                    .map(|diff| format!("--- {}\n+++ {}\n{}", diff.path, diff.path, diff.patch))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            let mut item = json!({"id":item_id,"status":status,"tool":name,
+                "cwd":input.and_then(|input| input.cwd.as_deref()),
+                "target":input.and_then(|input| input.target.as_deref()).or_else(|| diffs.first().map(|diff| diff.path.as_str())),
+                "exitCode":exit_code,"durationMs":duration_ms,"aggregatedOutput":patch.or(output)});
+            match kind {
+                acp_protocol::ToolKind::Shell => {
+                    item["type"] = json!("commandExecution");
+                    item["command"] = json!(input
+                        .and_then(|input| input.command.as_deref())
+                        .unwrap_or(name));
+                }
+                acp_protocol::ToolKind::File => {
+                    item["type"] = json!("fileChange");
+                    if !diffs.is_empty() {
+                        item["changes"] = json!(diffs.iter().map(|diff|
+                        json!({"path":diff.path,"kind":{"type":"update"},"diff":diff.patch})).collect::<Vec<_>>());
+                    }
+                }
+                acp_protocol::ToolKind::Generic => item["type"] = json!("dynamicToolCall"),
+            }
+            item
         }
     }
 
@@ -1363,8 +1781,12 @@ impl AcpBridge {
             ))?;
             self.turn_started = true;
         }
+        if self.live_settled {
+            self.discard_live(&session, &turn)?;
+        }
         match update {
             Update::AgentMessage { item_id, text } => {
+                let item_id = self.block_id(item_id, false);
                 self.last_message_id = Some(item_id.clone());
                 if !self.message_text.contains_key(&item_id) && self.message_text.len() >= 64 {
                     self.message_text.clear();
@@ -1380,25 +1802,32 @@ impl AcpBridge {
                 }
                 self.core.send(Envelope::notification("item/agentMessage/delta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?
             }
-            Update::AgentThought { item_id, text } => self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?,
+            Update::AgentThought { item_id, text } => {
+                let item_id = self.block_id(item_id, true);
+                self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?
+            }
             Update::ToolCall {
                 item_id,
-                title,
+                name,
                 kind,
+                diffs,
                 input,
                 mcp,
             } => {
                 if self.tool_inputs.len() < 256 {
                     self.tool_inputs.insert(item_id.clone(), input);
                 }
+                if self.tool_presentations.len() < 256 {
+                    self.tool_presentations.insert(item_id.clone(), (kind, name, diffs));
+                }
                 let item = if let Some(call) = mcp {
                     let item = json!({"id":item_id,"type":"mcpToolCall","server":call.server,"tool":call.tool,"arguments":call.arguments,"status":"inProgress"});
                     if self.mcp_calls.len() < 256 { self.mcp_calls.insert(item_id.clone(), *call); }
                     item
-                } else { json!({"id":item_id,"type":"commandExecution","command":title,"kind":kind}) };
+                } else { self.acp_tool_item(&item_id, "inProgress", acp_protocol::ToolContent::default()) };
                 self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
             }
-            Update::ToolCallUpdate { item_id, status, output, structured_output } => {
+            Update::ToolCallUpdate { item_id, status, mut content } => {
                 match status {
                     ToolStatus::Completed | ToolStatus::Failed | ToolStatus::Cancelled => {
                         let status = match status {
@@ -1407,11 +1836,12 @@ impl AcpBridge {
                             ToolStatus::Cancelled => "cancelled",
                             _ => unreachable!(),
                         };
-                        let item = self.acp_tool_item(&item_id, status, output, structured_output);
+                        let item = self.acp_tool_item(&item_id, status, content);
                         self.core.send(Envelope::notification("item/completed", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                     ToolStatus::InProgress | ToolStatus::Unknown => {
-                        let item = self.acp_tool_item(&item_id, "inProgress", output, None);
+                        content.structured_output = None;
+                        let item = self.acp_tool_item(&item_id, "inProgress", content);
                         self.core.send(Envelope::notification("item/started", Some(json!({"threadId":session,"turnId":turn,"item":item}))))?;
                     }
                 }
@@ -2915,6 +3345,619 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generated_text_is_a_preview_replaced_by_the_committed_message() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        let event = |event: serde_json::Value| {
+            Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":"s","event":event})),
+            )
+        };
+        macro_rules! next {
+            () => {{
+                let frame = core_client.recv().await.unwrap();
+                let params = frame.params.unwrap();
+                (
+                    frame.method.unwrap(),
+                    params["itemId"].as_str().unwrap_or_default().to_owned(),
+                    params["delta"].as_str().unwrap_or_default().to_owned(),
+                )
+            }};
+        }
+        for delta in [
+            json!({"type":"delta","kind":"thinking","block":0,"text":"weigh"}),
+            json!({"type":"delta","kind":"text","block":1,"text":"Hel"}),
+            json!({"type":"delta","kind":"text","block":1,"text":"lo"}),
+            json!({"type":"delta-end","committed":true}),
+        ] {
+            acp_server.send(event(delta)).unwrap();
+        }
+        assert_eq!(
+            next!(),
+            (
+                "item/reasoning/textDelta".into(),
+                "live:thinking:0".into(),
+                "weigh".into()
+            )
+        );
+        assert_eq!(
+            next!(),
+            (
+                "item/agentMessage/delta".into(),
+                "live:text:1".into(),
+                "Hel".into()
+            )
+        );
+        assert_eq!(
+            next!(),
+            (
+                "item/agentMessage/delta".into(),
+                "live:text:1".into(),
+                "lo".into()
+            )
+        );
+        // 提交后预览留在原位，直到权威消息到达的那一刻才换掉。
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s","update":{
+            "sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Hello"}}})))).unwrap();
+        assert_eq!(
+            next!(),
+            (
+                "item/discarded".into(),
+                "live:thinking:0".into(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            next!(),
+            ("item/discarded".into(), "live:text:1".into(), String::new())
+        );
+        assert_eq!(
+            next!(),
+            (
+                "item/agentMessage/delta".into(),
+                "m1".into(),
+                "Hello".into()
+            )
+        );
+        // 被放弃的请求（例如随后重试）：预览立刻撤掉，没有消息来替换它。
+        acp_server
+            .send(event(
+                json!({"type":"delta","kind":"text","block":0,"text":"partial"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(json!({"type":"delta-end","committed":false})))
+            .unwrap();
+        assert_eq!(next!().1, "live:text:0");
+        assert_eq!(
+            next!(),
+            ("item/discarded".into(), "live:text:0".into(), String::new())
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn alternating_thought_and_text_blocks_of_one_message_keep_their_order() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        let chunk = |kind: &str, message: &str, text: &str| {
+            Envelope::notification(
+                "session/update",
+                Some(
+                    json!({"sessionId":"s","update":{"sessionUpdate":kind,"messageId":message,
+                    "content":{"type":"text","text":text}}}),
+                ),
+            )
+        };
+        // dsh 把一条消息的各个内容块按顺序发来，共用一个 messageId。
+        for (kind, message, text) in [
+            ("agent_thought_chunk", "m1", "think A"),
+            ("agent_thought_chunk", "m1", " more"),
+            ("agent_message_chunk", "m1", "text B"),
+            ("agent_thought_chunk", "m1", "think C"),
+            ("agent_message_chunk", "m1", "text D"),
+            ("agent_message_chunk", "m2", "next message"),
+        ] {
+            acp_server.send(chunk(kind, message, text)).unwrap();
+        }
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let event = core_client.recv().await.unwrap();
+            let params = event.params.unwrap();
+            seen.push((
+                event.method.unwrap(),
+                params["itemId"].as_str().unwrap().to_owned(),
+                params["delta"].as_str().unwrap().to_owned(),
+            ));
+        }
+        let expected = [
+            ("item/reasoning/textDelta", "m1", "think A"),
+            ("item/reasoning/textDelta", "m1", " more"),
+            ("item/agentMessage/delta", "m1#1", "text B"),
+            ("item/reasoning/textDelta", "m1#2", "think C"),
+            ("item/agentMessage/delta", "m1#3", "text D"),
+            ("item/agentMessage/delta", "m2", "next message"),
+        ];
+        assert_eq!(
+            seen.iter()
+                .map(|(method, item, delta)| (method.as_str(), item.as_str(), delta.as_str()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn questions_from_the_plugin_become_user_input_requests_and_answers_return() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        let ask = |id: &str, session: &str, question: String| {
+            Envelope::request(
+                RpcId::String(id.into()),
+                "zf/session/ask",
+                Some(
+                    json!({"sessionId":session,"questions":[{"id":"plan-review","header":"Plan review",
+                    "question":question,"options":[{"label":"Approve","description":"Leave plan mode"},
+                    {"label":"Keep planning","description":"Stay"}]}]}),
+                ),
+            )
+        };
+        // 没有进行中的轮次时没有人能回答：直接告诉 dsh，不留悬而未决的请求。
+        acp_server
+            .send(ask("zf-ask-0", "s", "early".into()))
+            .unwrap();
+        let refused = acp_server.recv().await.unwrap();
+        assert_eq!(refused.id, Some(RpcId::String("zf-ask-0".into())));
+        assert!(refused.error.is_some());
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        acp_server
+            .send(ask("zf-ask-x", "other", "foreign".into()))
+            .unwrap();
+        assert!(acp_server.recv().await.unwrap().error.is_some());
+        acp_server
+            .send(ask(
+                "zf-ask-1",
+                "s",
+                format!("Approve?\n\n{}", "计划".repeat(20_000)),
+            ))
+            .unwrap();
+        let request = core_client.recv().await.unwrap();
+        assert_eq!(
+            request.method.as_deref(),
+            Some("item/tool/requestUserInput")
+        );
+        assert_eq!(request.id, Some(RpcId::String("zf-ask-1".into())));
+        let params = request.params.unwrap();
+        assert_eq!(params["threadId"], "s");
+        assert!(params["turnId"]
+            .as_str()
+            .is_some_and(|turn| !turn.is_empty()));
+        assert!(params.to_string().len() <= 32 * 1024);
+        assert_eq!(params["questions"][0]["options"][0]["label"], "Approve");
+        assert!(crate::interactions::RequestView::decode(
+            RpcId::String("zf-ask-1".into()),
+            "item/tool/requestUserInput",
+            &params
+        )
+        .is_ok());
+        core_client
+            .send(Envelope::response(
+                RpcId::String("zf-ask-1".into()),
+                Some(json!({"answers":{"plan-review":{"answers":["Approve"]}}})),
+            ))
+            .unwrap();
+        let answer = acp_server.recv().await.unwrap();
+        assert_eq!(answer.id, Some(RpcId::String("zf-ask-1".into())));
+        assert_eq!(
+            answer.result.unwrap(),
+            json!({"answers":{"plan-review":{"answers":["Approve"]}}})
+        );
+        let resolved = core_client.recv().await.unwrap();
+        assert_eq!(resolved.method.as_deref(), Some("serverRequest/resolved"));
+        assert_eq!(resolved.params.unwrap()["requestId"], "zf-ask-1");
+        // dsh 撤回问题（例如轮次被中断）：Core 里的请求随之结束，迟到的答复不再转发。
+        acp_server
+            .send(ask("zf-ask-2", "s", "again".into()))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server
+            .send(Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":"s","event":{"type":"ask","id":"zf-ask-2","state":"withdrawn"}})),
+            ))
+            .unwrap();
+        let resolved = core_client.recv().await.unwrap();
+        assert_eq!(resolved.method.as_deref(), Some("serverRequest/resolved"));
+        assert_eq!(resolved.params.unwrap()["requestId"], "zf-ask-2");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn backend_commands_are_listed_any_time_but_run_only_between_turns() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::backend_commands_list(RpcId::Number(1)))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().error.unwrap()["message"],
+            "ACP session is not ready"
+        );
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::backend_command_run(
+                RpcId::Number(4),
+                "/plan off",
+            ))
+            .unwrap();
+        let forwarded = acp_server.recv().await.unwrap();
+        assert_eq!(forwarded.method.as_deref(), Some("zf/commands/run"));
+        assert_eq!(
+            forwarded.params.unwrap(),
+            json!({"sessionId":"s","line":"/plan off"})
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(4),
+                Some(json!({"kind":"success","text":"Plan mode off."})),
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().result.unwrap()["text"],
+            "Plan mode off."
+        );
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        // 轮次进行中：清单照常可取，执行由桥接直接拒绝。
+        core_client
+            .send(app_server::backend_command_run(
+                RpcId::Number(5),
+                "/compact",
+            ))
+            .unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().error.unwrap()["message"],
+            "a turn is running"
+        );
+        core_client
+            .send(app_server::backend_commands_list(RpcId::Number(6)))
+            .unwrap();
+        let forwarded = acp_server.recv().await.unwrap();
+        assert_eq!(forwarded.method.as_deref(), Some("zf/commands/list"));
+        assert_eq!(forwarded.params.unwrap(), json!({"sessionId":"s"}));
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn steering_is_forwarded_for_the_bound_turn_and_its_delivery_is_reported() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        // 没有进行中的轮次：桥接直接拒绝，不打扰 dsh。
+        core_client
+            .send(app_server::turn_steer(
+                RpcId::Number(9),
+                "s",
+                "none",
+                "early",
+            ))
+            .unwrap();
+        let refused = core_client.recv().await.unwrap();
+        assert_eq!(refused.id, Some(RpcId::Number(9)));
+        assert_eq!(refused.error.unwrap()["message"], "no turn is running");
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        let mut turn = None;
+        for _ in 0..2 {
+            let frame = core_client.recv().await.unwrap();
+            for value in [frame.result.as_ref(), frame.params.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = value.pointer("/turn/id").and_then(|id| id.as_str()) {
+                    turn = Some(id.to_owned());
+                }
+            }
+        }
+        let turn = turn.expect("the bridge names the turn");
+        acp_server.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_steer(
+                RpcId::Number(10),
+                "s",
+                "stale-turn",
+                "late",
+            ))
+            .unwrap();
+        assert!(core_client.recv().await.unwrap().error.is_some());
+        core_client
+            .send(app_server::turn_steer(
+                RpcId::Number(11),
+                "s",
+                &turn,
+                "use 中文",
+            ))
+            .unwrap();
+        let forwarded = acp_server.recv().await.unwrap();
+        assert_eq!(forwarded.method.as_deref(), Some("zf/session/steer"));
+        assert_eq!(
+            forwarded.params.unwrap(),
+            json!({"sessionId":"s","text":"use 中文"})
+        );
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(11),
+                Some(json!({"messageId":"m1"})),
+            ))
+            .unwrap();
+        let accepted = core_client.recv().await.unwrap();
+        assert_eq!(accepted.result.unwrap()["messageId"], "m1");
+        for (session, state) in [
+            ("other", "delivered"),
+            ("s", "invented"),
+            ("s", "delivered"),
+        ] {
+            acp_server
+                .send(Envelope::notification(
+                    "zf/session/event",
+                    Some(json!({"sessionId":session,"event":{"type":"steer","id":"m1","state":state}})),
+                ))
+                .unwrap();
+        }
+        let delivered = core_client.recv().await.unwrap();
+        assert_eq!(delivered.method.as_deref(), Some("turn/steer/delivered"));
+        assert_eq!(
+            delivered.params.unwrap(),
+            json!({"threadId":"s","turnId":turn,"id":"m1"})
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn plugin_events_reach_core_only_for_the_current_session_and_stay_bounded() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        let event = |session: &str, event: serde_json::Value| {
+            Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":session,"event":event})),
+            )
+        };
+        // 没有进行中的轮次时，阶段没有归属，不转发；todo 列表属于会话，照常转发。
+        acp_server
+            .send(event("s", json!({"type":"stage","stage":"waiting"})))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"todos","todos":[
+                {"content":"scan","status":"completed"},
+                {"content":"中".repeat(2000),"status":"in_progress"},
+                {"content":"bad","status":"done"},
+                {"content":7,"status":"pending"}]}),
+            ))
+            .unwrap();
+        let todos = core_client.recv().await.unwrap();
+        assert_eq!(todos.method.as_deref(), Some("thread/todos/updated"));
+        let todos = todos.params.unwrap();
+        assert_eq!(todos["threadId"], "s");
+        assert_eq!(todos["todos"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            todos["todos"][0],
+            json!({"content":"scan","status":"completed"})
+        );
+        assert_eq!(
+            todos["todos"][1]["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            crate::state::MAX_TODO_CHARS
+        );
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        for (session, stage) in [
+            ("other", "thinking"),
+            ("s", "invented"),
+            ("s", "thinking"),
+            ("s", "response"),
+        ] {
+            acp_server
+                .send(event(session, json!({"type":"stage","stage":stage})))
+                .unwrap();
+        }
+        acp_server
+            .send(event("other", json!({"type":"todos","todos":[]})))
+            .unwrap();
+        acp_server
+            .send(event("s", json!({"type":"unknown"})))
+            .unwrap();
+        for stage in ["thinking", "response"] {
+            let relayed = core_client.recv().await.unwrap();
+            assert_eq!(relayed.method.as_deref(), Some("turn/stage"));
+            let params = relayed.params.unwrap();
+            assert_eq!(params["threadId"], "s");
+            assert!(params["turnId"]
+                .as_str()
+                .is_some_and(|turn| !turn.is_empty()));
+            assert_eq!(params["stage"], stage);
+        }
+        // 重试只带计数和失败代码；压缩带身份和结果。供应商的报错文字不进入 Core。
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"retry","retry":1,"maxRetries":2,"delayMs":500,
+                "code":"rate_limit","message":"PRIVATE"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"retry","retry":2,"code":"has spaces PRIVATE"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"compaction","id":"c1","state":"failed"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event(
+                "s",
+                json!({"type":"compaction","id":"c1","state":"invented"}),
+            ))
+            .unwrap();
+        acp_server
+            .send(event("other", json!({"type":"retry","retry":9})))
+            .unwrap();
+        let mut notices = Vec::new();
+        for _ in 0..3 {
+            let notice = core_client.recv().await.unwrap();
+            assert_eq!(notice.method.as_deref(), Some("turn/notice"));
+            notices.push(notice.params.unwrap());
+        }
+        assert!(!serde_json::to_string(&notices).unwrap().contains("PRIVATE"));
+        assert_eq!(
+            (
+                &notices[0]["kind"],
+                &notices[0]["retry"],
+                &notices[0]["maxRetries"]
+            ),
+            (&json!("retry"), &json!(1), &json!(2))
+        );
+        assert_eq!(
+            (&notices[0]["delayMs"], &notices[0]["code"]),
+            (&json!(500), &json!("rate_limit"))
+        );
+        assert_eq!(
+            (&notices[1]["retry"], &notices[1]["code"]),
+            (&json!(2), &json!(null))
+        );
+        assert_eq!(
+            (&notices[2]["kind"], &notices[2]["id"], &notices[2]["state"]),
+            (&json!("compaction"), &json!("c1"), &json!("failed"))
+        );
+        // 其余事件都被丢弃：下一条到达 Core 的是之后的普通更新。
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
+            "sessionUpdate":"agent_message_chunk", "messageId":"m", "content":{"type":"text","text":"ok"}}})))).unwrap();
+        assert_eq!(
+            core_client.recv().await.unwrap().method.as_deref(),
+            Some("item/agentMessage/delta")
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
     async fn mcp_calls_retain_typed_identity_arguments_and_structured_results() {
         let (mut core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();
@@ -2953,7 +3996,7 @@ mod tests {
         acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s", "update":{
             "sessionUpdate":"tool_call_update", "toolCallId":"unregistered", "status":"completed", "rawOutput":result.to_string()}})))).unwrap();
         let event = core_client.recv().await.unwrap().params.unwrap();
-        assert_eq!(event["item"]["type"], "commandExecution");
+        assert_eq!(event["item"]["type"], "dynamicToolCall");
         assert!(event["item"].get("result").is_none());
         assert!(event["item"]["aggregatedOutput"]
             .as_str()
@@ -2961,5 +4004,75 @@ mod tests {
             .ends_with("[output truncated]"));
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn acp_tool_presentations_keep_command_directory_output_exit_and_diff_facts() {
+        let (mut core_client, core_bridge) = pair();
+        let (_, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge.turn_id = Some("turn".into());
+        bridge.turn_started = true;
+        bridge
+            .update(
+                json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"shell",
+            "title":"pwsh","kind":"other","rawInput":{"command":"echo probe","workdir":"C:/ws"}}}),
+            )
+            .await
+            .unwrap();
+        let item = core_client.recv().await.unwrap().params.unwrap()["item"].clone();
+        assert_eq!(item["type"], "commandExecution");
+        assert_eq!(item["command"], "echo probe");
+        assert_eq!(item["cwd"], "C:/ws");
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"shell",
+            "status":"completed","exitCode":7,"durationMs":12,"content":[{"type":"content","content":{"type":"text","text":"line1\nline2"}}]}})).await.unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        let item = &params["item"];
+        assert_eq!(item["command"], "echo probe");
+        assert_eq!(item["cwd"], "C:/ws");
+        assert_eq!(item["exitCode"], 7);
+        assert_eq!(item["durationMs"], 12);
+        assert_eq!(item["aggregatedOutput"], "line1\nline2");
+        let notice = crate::protocol::decode_observed_tool("item/completed", &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notice.outcome,
+            Some(crate::protocol::ObservedToolOutcome::Failed)
+        );
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"edit",
+            "title":"edit","kind":"other","rawInput":{"file_path":"src/a.rs","old_string":"same\nold\n","new_string":"same\nnew\n"}}})).await.unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(params["item"]["type"], "fileChange");
+        assert_eq!(params["item"]["target"], "src/a.rs");
+        let fields = crate::protocol::decode_observed_tool_details(
+            &params["item"],
+            crate::protocol::ToolCategory::File,
+        );
+        assert_eq!(
+            fields.diff,
+            Some(crate::protocol::DiffStats {
+                added: 1,
+                removed: 1
+            })
+        );
+        assert!(fields.output.unwrap().contains("-old\n+new"));
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"edit","status":"failed"}})).await.unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(params["item"]["status"], "failed");
+        assert_eq!(params["item"]["target"], "src/a.rs");
+        assert!(params["item"]["exitCode"].is_null());
+        bridge
+            .update(
+                json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"read",
+            "title":"read","kind":"read","rawInput":{"file_path":"a.txt"}}}),
+            )
+            .await
+            .unwrap();
+        let params = core_client.recv().await.unwrap().params.unwrap();
+        assert_eq!(params["item"]["type"], "dynamicToolCall");
+        assert_eq!(params["item"]["target"], "a.txt");
+        assert!(params["item"].get("command").is_none());
     }
 }

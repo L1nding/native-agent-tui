@@ -36,7 +36,18 @@ def provider():
         def update(value):
             send({"method": "session/update", "params": {"sessionId": session, "update": value}})
 
+        # What zf-tui-bridge adds to ACP: the model's stage and the agent's todo list.
+        def event(value):
+            send({"method": "zf/session/event", "params": {"sessionId": session, "event": value}})
+
+        def todos(*statuses):
+            event({"type": "todos", "todos": [{"content": content, "status": status} for content, status in zip(("Probe the stream", "Report the answer"), statuses)]})
+
+        event({"type": "stage", "stage": "waiting"})
+        time.sleep(.3)
+        event({"type": "stage", "stage": "thinking"})
         update({"sessionUpdate": "agent_thought_chunk", "messageId": "shared", "content": {"type": "text", "text": "Inspect the probe"}})
+        todos("in_progress", "pending")
         time.sleep(.7)
         update({"sessionUpdate": "tool_call", "toolCallId": "tool", "title": "pwsh", "kind": "other", "status": "in_progress", "rawInput": {"command": "echo STREAM_PROBE"}})
         time.sleep(.7)
@@ -45,7 +56,18 @@ def provider():
         update({"sessionUpdate": "tool_call", "toolCallId": "failed-tool", "title": "pwsh", "kind": "other", "status": "in_progress", "rawInput": {"command": "echo FAILED_PROBE"}})
         time.sleep(.7)
         update({"sessionUpdate": "tool_call_update", "toolCallId": "failed-tool", "status": "failed", "content": []})
+        # As in dsh, the answer arrives whole when it is committed; only the stage
+        # events show that the model was answering for a while before that.
+        event({"type": "stage", "stage": "waiting"})
+        event({"type": "compaction", "id": "compaction-1", "state": "start"})
+        event({"type": "retry", "retry": 1, "maxRetries": 2, "delayMs": 300, "code": "rate_limit"})
+        time.sleep(.4)
+        event({"type": "compaction", "id": "compaction-1", "state": "end"})
+        event({"type": "stage", "stage": "response"})
+        todos("completed", "in_progress")
+        time.sleep(.6)
         update({"sessionUpdate": "agent_message_chunk", "messageId": "shared", "content": {"type": "text", "text": "Stream answer"}})
+        todos("completed", "completed")
         send({"id": request["id"], "result": {"stopReason": "end_turn"}})
 
     for line in sys.stdin:
@@ -61,6 +83,17 @@ def provider():
             result = {"sessionId": "stream-session" if created == 1 else "new-session"}
         elif method == "session/prompt":
             threading.Thread(target=stream, args=(request,), daemon=True).start()
+            continue
+        elif method == "zf/session/steer":
+            # As the bridge plugin does: accept, then report delivery at the next step.
+            steer = request["params"]
+
+            def deliver():
+                time.sleep(.2)
+                send({"method": "zf/session/event", "params": {"sessionId": steer["sessionId"], "event": {"type": "steer", "id": "steer-1", "state": "delivered"}}})
+
+            send({"id": request["id"], "result": {"messageId": "steer-1"}})
+            threading.Thread(target=deliver, daemon=True).start()
             continue
         elif method == "zf/session/list":
             result = {"sessions": [{"id": "stream-session", "title": "Stream fixture", "updatedAt": 2}, {"id": "new-session", "title": "New fixture", "updatedAt": 1}]}
@@ -91,12 +124,28 @@ def main():
     try:
         console.wait(lambda screen: "Ready" in screen, "initial ready")
         console.write("probe\r")
-        console.wait(lambda screen: "Thinking" in screen and "Inspect the probe" in screen, "server reasoning is visible")
+        console.wait(lambda screen: "Working" in screen, "activity while waiting for first output")
+        (root / "waiting-screen.txt").write_text(console.read(), encoding="utf-8")
+        console.wait(lambda screen: "┆ Inspect the probe" in screen, "server reasoning is a marked section of the answer")
         console.wait(lambda screen: "running · echo STREAM_PROBE" in screen, "tool call is visible while running")
         (root / "running-screen.txt").write_text(console.read(), encoding="utf-8")
+        console.write("/steer prefer short answers\r")
+        console.wait(lambda screen: "prefer short answers" in screen and "Steering queued" not in screen, "delivered steering becomes a user message in the running turn")
+        assert "Todos 0/2" in console.read() and "[>] Probe the stream" in console.read() and "[ ] Report the answer" in console.read(), "todo panel is missing while work remains"
         console.wait(lambda screen: "Stream answer" in screen and "done · echo STREAM_PROBE" in screen and "failed · echo FAILED_PROBE" in screen, "tool terminal states and answer are visible")
         assert "Inspect the probe carefully" in console.read()
         console.wait(lambda screen: "Completed" in screen, "turn completion is confirmed")
+        import re
+        timing = re.compile(r"Model wait \d+\.\ds · Thinking \d+\.\ds · Response \d+\.\ds · Tools \d+\.\ds · Completed \d\d:\d\d:\d\d UTC")
+        console.wait(lambda screen: timing.search(" ".join(screen.split())), "frozen per-stage timing follows the step")
+        frozen = timing.search(" ".join(console.read().split())).group()
+        response = float(re.search(r"Response (\d+\.\d)s", frozen).group(1))
+        assert 0.4 <= response <= 1.5, f"the answering stage must come from stage events, not from the whole-block arrival: {frozen}"
+        assert "Todos" not in console.read(), "a finished todo list must leave the screen"
+        assert "Retrying model request (1/2) in 300ms: rate_limit" in console.read(), "the retry notice is missing"
+        assert "earlier context was compacted" in console.read() and "Compacting earlier context" not in console.read(), "compaction must end as one settled notice"
+        time.sleep(1.2)
+        assert timing.search(" ".join(console.read().split())).group() == frozen, "timing changed after the turn ended"
         (root / "completed-screen.txt").write_text(console.read(), encoding="utf-8")
         console.write("/new\r")
         console.wait(lambda screen: "New conversation started." in screen, "new session is confirmed")

@@ -65,12 +65,14 @@ fn tool_details(locator: ToolDetailLocator) -> ToolDetailsSnapshot {
         name: None,
         command: Some("echo result".into()),
         cwd: None,
+        target: None,
         parameters: None,
         result: None,
         output: "result".into(),
         output_source: ToolTextSource::CommandAggregate,
         exit_code: Some(0),
         duration_ms: Some(1),
+        diff: None,
         bytes_observed: 6,
         bytes_retained: 6,
         clipped: false,
@@ -161,6 +163,7 @@ fn filters_use_confirmed_scopes_and_apply_before_a_same_batch_open() {
         text: "PRIVATE_BODY中文".into(),
         complete: true,
         truncated: false,
+        tools: Vec::new(),
     });
     panel.select_latest(&current);
     key(&mut panel, KeyCode::F(6), &current); // Lifecycle excludes output.
@@ -632,6 +635,7 @@ fn evicted_messages_and_duplicate_item_ids_require_the_full_conversation_key() {
             text: "unrelated".into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         })
         .to_vec();
     let mut panel = TimelinePanel::default();
@@ -645,6 +649,7 @@ fn evicted_messages_and_duplicate_item_ids_require_the_full_conversation_key() {
         text: "retained中文👋".into(),
         complete: false,
         truncated: true,
+        tools: Vec::new(),
     });
     assert!(matches!(
         key(&mut panel, KeyCode::Enter, &current),
@@ -665,6 +670,7 @@ fn timeline_and_scrollable_help_render_from_narrow_to_wide_without_body_leaks() 
         text: "PRIVATE_BODY".into(),
         complete: true,
         truncated: false,
+        tools: Vec::new(),
     });
     let mut panel = TimelinePanel::default();
     panel.open("root".into(), &current);

@@ -13,6 +13,17 @@ use crate::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 
 pub(crate) mod receipt;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct DomainFactData(pub(crate) Vec<u8>);
+
+impl std::fmt::Debug for DomainFactData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DomainFactData")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
 const CONTRACT: &str = "modeling-domain/v2";
 const SERVER: &str = "modeling_domain";
 const LIMIT: usize = 64 * 1024;
@@ -235,6 +246,14 @@ impl std::fmt::Debug for DomainSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FactProjection {
+    Applied,
+    Superseded,
+    Unrelated,
+    Invalid,
+}
+
 pub struct DomainFacts {
     setup: Option<DomainSetup>,
     pub snapshot: DomainSnapshot,
@@ -264,8 +283,7 @@ impl DomainFacts {
         }
     }
 
-    #[cfg(test)]
-    fn observe(&mut self, notice: &ObservedTool, item: &Value) {
+    pub(crate) fn observe(&mut self, notice: &ObservedTool, item: &Value) {
         if notice.category != ToolCategory::Mcp
             || notice.outcome != Some(ObservedToolOutcome::Completed)
             || item["type"] != "mcpToolCall"
@@ -274,29 +292,34 @@ impl DomainFacts {
         {
             return;
         }
-        if let Some(value) = unwrap_envelope(item["result"].clone(), 0) {
-            self.apply_verified_fact(&value);
+        if let Some(envelope) = unwrap_envelope(item["result"].clone(), 0) {
+            if let Some(value) = serde_json::to_string(&envelope)
+                .ok()
+                .and_then(|raw| decode_envelope(&raw))
+            {
+                self.apply_verified_fact(&value);
+            }
         }
     }
 
-    /// Only the Core private-channel verifier calls this projection in production.
-    pub(crate) fn apply_verified_fact(&mut self, value: &Value) {
+    /// Core calls this only after validating a bounded inline envelope or a sealed fact.
+    pub(crate) fn apply_verified_fact(&mut self, value: &Value) -> FactProjection {
         let Some(setup) = self.setup.as_ref() else {
-            return;
+            return FactProjection::Invalid;
         };
         if value["contract"] != CONTRACT {
-            return;
+            return FactProjection::Invalid;
         }
         if value["run_id"] != setup.run_id || value["context_sha256"] != setup.context_sha256 {
-            return;
+            return FactProjection::Invalid;
         }
         let Some(kind) = value["kind"].as_str() else {
-            return;
+            return FactProjection::Invalid;
         };
         let artifact_kind = matches!(kind, "artifact" | "artifact_validation");
         let fact_key = if artifact_kind {
             let Some(id) = value["artifact"]["build_id"].as_str() else {
-                return;
+                return FactProjection::Invalid;
             };
             format!("artifact:{id}")
         } else {
@@ -308,12 +331,12 @@ impl DomainFacts {
             .get(&fact_key)
             .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
         {
-            return;
+            return FactProjection::Superseded;
         }
         let mut accepted = false;
         match Some(kind) {
             Some("proposal") => {
-                if let Some(proposal) = proposal_fact(&value) {
+                if let Some(proposal) = proposal_fact(value) {
                     let old = self.snapshot.proposal.as_ref();
                     let same = old.is_some_and(|p| p.binding == proposal.binding);
                     let parent = value["proposal"]["parent_id"].as_str();
@@ -337,7 +360,7 @@ impl DomainFacts {
                 }
             }
             Some("source_ledger") => {
-                if let Some(ledger) = source_ledger_fact(&value) {
+                if let Some(ledger) = source_ledger_fact(value) {
                     self.snapshot.ledger = Some(ledger);
                     accepted = true;
                 }
@@ -347,7 +370,7 @@ impl DomainFacts {
                     .snapshot
                     .proposal
                     .as_ref()
-                    .and_then(|p| operation_fact(&value, &p.binding))
+                    .and_then(|p| operation_fact(value, &p.binding))
                 {
                     self.snapshot.application = Some(format!(
                         "{} · current={}",
@@ -373,7 +396,7 @@ impl DomainFacts {
                     .snapshot
                     .proposal
                     .as_ref()
-                    .and_then(|p| operation_fact(&value, &p.binding))
+                    .and_then(|p| operation_fact(value, &p.binding))
                 {
                     self.snapshot.operation = Some(operation);
                 }
@@ -397,7 +420,7 @@ impl DomainFacts {
                     .snapshot
                     .proposal
                     .as_ref()
-                    .and_then(|p| artifact_fact(&value, &p.binding))
+                    .and_then(|p| artifact_fact(value, &p.binding))
                 {
                     if sequence.is_none_or(|seq| {
                         self.fact_sequences
@@ -450,6 +473,11 @@ impl DomainFacts {
             if let Some(sequence) = sequence {
                 self.fact_sequences.insert(fact_key, sequence);
             }
+            FactProjection::Applied
+        } else if matches!(kind, "proposal" | "source_ledger") {
+            FactProjection::Invalid
+        } else {
+            FactProjection::Unrelated
         }
     }
 
@@ -837,7 +865,6 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     })
 }
 
-#[cfg(test)]
 fn decode_envelope(raw: &str) -> Option<Value> {
     if raw.len() > LIMIT {
         return None;
@@ -845,7 +872,6 @@ fn decode_envelope(raw: &str) -> Option<Value> {
     unwrap_envelope(serde_json::from_str(raw).ok()?, 0)
 }
 
-#[cfg(test)]
 fn unwrap_envelope(value: Value, depth: usize) -> Option<Value> {
     if depth > 4 {
         return None;

@@ -23,6 +23,7 @@ struct RedrawSchedule {
     immediate: bool,
     stream_pending: bool,
     next_stream_frame: tokio::time::Instant,
+    next_activity_frame: tokio::time::Instant,
 }
 
 impl RedrawSchedule {
@@ -31,11 +32,25 @@ impl RedrawSchedule {
             immediate: true,
             stream_pending: false,
             next_stream_frame: now,
+            next_activity_frame: now,
         }
     }
 
     fn request(&mut self) {
         self.immediate = true;
+    }
+
+    fn activity_tick(&mut self, now: tokio::time::Instant, active: bool) -> bool {
+        if !active {
+            self.next_activity_frame = now;
+            return false;
+        }
+        if now < self.next_activity_frame {
+            return false;
+        }
+        self.next_activity_frame = now + Duration::from_millis(50);
+        self.request();
+        true
     }
 
     fn snapshot(&mut self, urgent: bool) {
@@ -66,7 +81,7 @@ fn urgent_snapshot_change(
     old.phase != new.phase
         || old.thread_id != new.thread_id
         || old.turn_id != new.turn_id
-        || old.domain != new.domain
+        || old.extensions != new.extensions
         || old.requests != new.requests
         || old.gate != new.gate
         || old.scheduler != new.scheduler
@@ -143,7 +158,7 @@ pub async fn run_tasks_with_history(
     }
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
-        let mut local = LocalState { domain_visible: client.snapshots.borrow().domain.enabled, ..Default::default() };
+        let mut local = LocalState { extension: super::extensions::ExtensionPanel::new(super::extensions::REGISTRY.first(&client.snapshots.borrow())), ..Default::default() };
         if !tasks.is_empty() {
             client.commands.send(Command::QueueRootTasks { tasks }).await
                 .map_err(|_| UiError::Shutdown("client is closed".into()))?;
@@ -161,18 +176,13 @@ pub async fn run_tasks_with_history(
                 sync_local_requests(&mut local, &snapshot);
                 local.search.dispatch(snapshot.clone(), &mut search);
                 local.timeline.sync(&snapshot);
+                local.extension.clear_displayed();
                 terminal.terminal.draw(|frame| {
                     if local.palette.visible { draw(frame, &snapshot, &local); }
                     else if sessions_panel.visible { sessions_panel.draw(frame, &snapshot); }
                     else if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
                     else { draw(frame, &snapshot, &local); }
                 })?;
-                local.displayed_domain_binding = if local.domain_visible && snapshot.domain.enabled
-                    && !local.palette.visible && !sessions_panel.visible && !history_panel.visible
-                    && !local.models.visible && !local.settings.visible && !local.provider_form.visible
-                    && snapshot.requests.is_empty() && local.viewport.width >= 24 && local.viewport.height >= 8 {
-                    snapshot.domain.proposal.as_ref().filter(|p| p.ready).map(|p| p.binding.clone())
-                } else { None };
                 last_drawn = Some(snapshot);
                 redraw.drawn(tokio::time::Instant::now());
             }
@@ -211,6 +221,9 @@ pub async fn run_tasks_with_history(
                     redraw.snapshot(urgent);
                 }
                 _ = tick.tick() => {
+                    if redraw.activity_tick(tokio::time::Instant::now(), super::busy::label(&client.snapshots.borrow()).is_some()) {
+                        local.activity.advance();
+                    }
                     // Bound each input batch so snapshots and redraw remain responsive.
                     for _ in 0..128 {
                         let Some(event) = terminal.input.read_ready()? else { break; };
@@ -374,6 +387,7 @@ mod tests {
             text: "partial".into(),
             complete: false,
             truncated: false,
+            tools: Vec::new(),
         });
         let mut after = before.clone();
         after.version += 1;
@@ -418,5 +432,23 @@ mod tests {
         redraw.drawn(now + Duration::from_millis(34));
         redraw.request();
         assert!(redraw.ready(now + Duration::from_millis(35)));
+    }
+
+    #[test]
+    fn activity_frames_are_bounded_and_idle_ticks_never_request_a_draw() {
+        let now = tokio::time::Instant::now();
+        let mut redraw = RedrawSchedule::new(now);
+        redraw.drawn(now);
+        for ms in 1..100 {
+            assert!(!redraw.activity_tick(now + Duration::from_millis(ms), false));
+            assert!(!redraw.ready(now + Duration::from_millis(ms)));
+        }
+        assert!(redraw.activity_tick(now + Duration::from_millis(100), true));
+        redraw.drawn(now + Duration::from_millis(100));
+        assert!(!redraw.activity_tick(now + Duration::from_millis(149), true));
+        assert!(redraw.activity_tick(now + Duration::from_millis(150), true));
+        redraw.drawn(now + Duration::from_millis(150));
+        assert!(!redraw.activity_tick(now + Duration::from_secs(30), false));
+        assert!(!redraw.ready(now + Duration::from_secs(30)));
     }
 }

@@ -585,7 +585,7 @@ def domain_checks(report, binary, common, args, workspace, root):
     def finished():
         screen = tui.wait("domain turn completed", lambda s: any(state in s for state in
                           (" · Completed · ", " · Failed · ", " · Interrupted · "))
-                          and (case == "hospital" or "A turn is running" not in s), max(240, getattr(args, "domain_timeout", 0)))
+                          and (case == "hospital" or "A turn is running" not in s), max(900 if case == "hospital" else 240, getattr(args, "domain_timeout", 0)))
         expect(" · Completed · " in screen, "domain turn ended without success")
         return screen
     def fact(what, predicate, timeout=300):

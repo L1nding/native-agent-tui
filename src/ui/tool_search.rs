@@ -9,6 +9,7 @@ use crate::tool_details::{ToolDetail, ToolDetailLocator, ToolDetailsSnapshot, To
 pub(super) enum Field {
     Command,
     Cwd,
+    Target,
     Parameters,
     Result,
     Output,
@@ -19,6 +20,7 @@ impl Field {
         match self {
             Self::Command => detail.command.as_deref(),
             Self::Cwd => detail.cwd.as_deref(),
+            Self::Target => detail.target.as_deref(),
             Self::Parameters => detail.parameters.as_deref(),
             Self::Result => detail.result.as_deref(),
             Self::Output => Some(&detail.output),
@@ -30,6 +32,7 @@ impl Field {
         match self {
             Self::Command => tr("Command", "命令"),
             Self::Cwd => tr("Cwd", "工作目录"),
+            Self::Target => tr("Target", "目标"),
             Self::Parameters => tr("Parameters", "参数"),
             Self::Result => tr("Result", "结果"),
             Self::Output => tr("Output", "输出"),
@@ -154,6 +157,7 @@ pub(super) fn scan(
         for field in [
             Field::Command,
             Field::Cwd,
+            Field::Target,
             Field::Parameters,
             Field::Result,
             Field::Output,
@@ -218,12 +222,14 @@ mod tests {
             name: None,
             command: Some("echo 中文👋".into()),
             cwd: None,
+            target: None,
             parameters: None,
             result: None,
             output: "中文👋".into(),
             output_source: ToolTextSource::OutputDelta,
             exit_code: None,
             duration_ms: None,
+            diff: None,
             bytes_observed: 0,
             bytes_retained: 0,
             clipped: false,
@@ -286,6 +292,7 @@ mod tests {
         for field in [
             Field::Command,
             Field::Cwd,
+            Field::Target,
             Field::Parameters,
             Field::Result,
             Field::Output,
@@ -311,6 +318,29 @@ mod tests {
             assert_eq!(CategoryFilter::Other.label(), "其他");
             assert_eq!(LifecycleFilter::Ended.label(), "已结束");
         });
+    }
+
+    #[test]
+    fn generic_tool_targets_are_searchable_without_a_shell_command() {
+        let mut snapshot = snapshot();
+        let entries = std::sync::Arc::make_mut(&mut snapshot.tool_details.entries);
+        let detail = std::sync::Arc::make_mut(entries.front_mut().unwrap());
+        detail.category = ToolCategory::Dynamic;
+        detail.command = None;
+        detail.output.clear();
+        detail.target = Some("src/目标👋.rs".into());
+        let (hits, total) = scan(
+            &snapshot.tool_details,
+            "目标👋",
+            None,
+            "",
+            CategoryFilter::Other,
+            LifecycleFilter::All,
+            8,
+        );
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].field, Field::Target);
+        assert_eq!(hits[0].range, 4..14);
     }
 
     #[test]

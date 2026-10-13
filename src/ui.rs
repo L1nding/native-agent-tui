@@ -12,11 +12,13 @@ use crate::state::CoreSnapshot;
 
 mod activity;
 mod attention;
+mod busy;
 mod commands;
 mod context;
 mod conversation;
 mod domain;
 mod editor;
+mod extensions;
 mod help;
 mod history;
 mod input;
@@ -40,6 +42,7 @@ mod skills;
 mod terminal;
 mod theme;
 mod timeline;
+mod todos;
 mod tool_detail;
 mod tool_search;
 mod tool_trace;
@@ -120,10 +123,8 @@ struct LocalState {
     reminders: reminders::Reminders,
     attention_editor: Option<AttentionEditor>,
     evidence: bool,
-    domain_visible: bool,
-    domain_scroll: u16,
-    domain_reply_scroll_from_bottom: u16,
-    displayed_domain_binding: Option<crate::domain::ProposalBinding>,
+    activity: busy::ActivityIndicator,
+    extension: extensions::ExtensionPanel,
     evidence_scroll: usize,
     skills: bool,
     skills_scroll: usize,
@@ -132,6 +133,8 @@ struct LocalState {
     scroll_from_bottom: usize,
     /// 展开对话中折叠的工具组；只影响显示，不改变任何执行事实。
     tools_expanded: bool,
+    /// 第三档：不显示工具行。与 `tools_expanded` 互斥。
+    tools_hidden: bool,
     notice: Option<String>,
     help: bool,
     workflow: workflow::WorkflowPanel,
@@ -142,6 +145,10 @@ struct LocalState {
     provider_form: provider_form::ProviderForm,
     /// 输入 `/名称` 时提示列表里的选中行。
     slash_selected: usize,
+    /// 已经为哪个会话问过 dsh 的命令清单。
+    commands_requested: Option<String>,
+    /// 已经向 Core 问过的 `@路径` 查询。
+    path_query: Option<String>,
     request_selection: Option<RequestRef>,
     request_panel: bool,
     request_scroll: usize,
@@ -298,7 +305,75 @@ fn open_model_picker(local: &mut LocalState, tx: &tokio::sync::mpsc::Sender<Comm
     send(Command::ListModels, tx, local);
 }
 
+impl LocalState {
+    fn tool_display(&self) -> conversation::ToolDisplay {
+        match (self.tools_expanded, self.tools_hidden) {
+            (_, true) => conversation::ToolDisplay::Hidden,
+            (true, false) => conversation::ToolDisplay::Expanded,
+            (false, false) => conversation::ToolDisplay::Preview,
+        }
+    }
+
+    /// 预览 → 展开 → 隐藏 → 预览。
+    fn cycle_tool_display(&mut self) {
+        (self.tools_expanded, self.tools_hidden) = match self.tool_display() {
+            conversation::ToolDisplay::Preview => (true, false),
+            conversation::ToolDisplay::Expanded => (false, true),
+            conversation::ToolDisplay::Hidden => (false, false),
+        };
+    }
+}
+
+fn request_backend_commands(
+    snapshot: &CoreSnapshot,
+    local: &mut LocalState,
+    tx: &tokio::sync::mpsc::Sender<Command>,
+) {
+    if !snapshot.commands_loaded
+        && snapshot.thread_id.is_some()
+        && local.commands_requested != snapshot.thread_id
+        && tx.try_send(Command::ListBackendCommands).is_ok()
+    {
+        local.commands_requested.clone_from(&snapshot.thread_id);
+    }
+}
+
 fn handle_key(
+    key: KeyEvent,
+    snapshot: &CoreSnapshot,
+    local: &mut LocalState,
+    tx: &tokio::sync::mpsc::Sender<Command>,
+) -> bool {
+    let quit = handle_key_inner(key, snapshot, local, tx);
+    // 输入 `@路径` 时，每进入一个新目录向 Core 问一次；同一目录内在本地收窄。
+    match commands::path_token(&local.editor.text, local.editor.cursor) {
+        Some((_, query)) => {
+            let directory = query
+                .rsplit_once(['/', '\\'])
+                .map_or("", |(directory, _)| directory);
+            let asked = local.path_query.as_deref().is_some_and(|asked| {
+                asked
+                    .rsplit_once(['/', '\\'])
+                    .map_or("", |(directory, _)| directory)
+                    == directory
+                    && query.starts_with(asked)
+            });
+            if !asked
+                && tx
+                    .try_send(Command::CompletePath {
+                        query: query.to_owned(),
+                    })
+                    .is_ok()
+            {
+                local.path_query = Some(query.to_owned());
+            }
+        }
+        None => local.path_query = None,
+    }
+    quit
+}
+
+fn handle_key_inner(
     key: KeyEvent,
     snapshot: &CoreSnapshot,
     local: &mut LocalState,
@@ -306,6 +381,10 @@ fn handle_key(
 ) -> bool {
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
+    // dsh 自己的命令只在用户开始输入 `/` 时问一次，启动时不多发请求。
+    if key.code != KeyCode::Enter && local.editor.text.starts_with('/') {
+        request_backend_commands(snapshot, local, tx);
+    }
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
     if control && key.code == KeyCode::Char('p') {
         local.palette.toggle();
@@ -554,7 +633,7 @@ fn handle_key(
                 focus,
                 width,
                 height,
-                local.tools_expanded,
+                local.tool_display(),
             ) {
                 local.scroll_from_bottom = scroll;
             }
@@ -635,54 +714,31 @@ fn handle_key(
     } else {
         key
     };
-    if key.code == KeyCode::F(6) && snapshot.domain.enabled {
-        local.domain_visible = !local.domain_visible;
-        local.domain_scroll = 0;
-        local.domain_reply_scroll_from_bottom = 0;
+    if key.code == KeyCode::F(6)
+        && (local.extension.visible.is_some() || extensions::REGISTRY.first(snapshot).is_some())
+    {
+        local.extension.toggle(snapshot);
         local.workflow.visible = false;
         return false;
     }
-    if local.domain_visible && snapshot.requests.is_empty() {
-        match key.code {
-            KeyCode::Esc => {
-                local.domain_visible = false;
-                return false;
+    if let Some(action) = extensions::REGISTRY.handle_key(
+        key,
+        snapshot,
+        &mut local.extension,
+        local.viewport,
+        &local.editor.text,
+        local.notice.as_deref(),
+    ) {
+        match action {
+            extensions::ExtensionAction::Confirm(confirmation) => {
+                send(Command::ConfirmExtension { confirmation }, tx, local);
             }
-            KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                local.domain_reply_scroll_from_bottom =
-                    local.domain_reply_scroll_from_bottom.saturating_add(8);
-                return false;
+            extensions::ExtensionAction::NoDisplayedConfirmation => {
+                local.notice = Some("当前尚无已展示的可批准方案".into())
             }
-            KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                local.domain_reply_scroll_from_bottom =
-                    local.domain_reply_scroll_from_bottom.saturating_sub(8);
-                return false;
-            }
-            KeyCode::PageUp => {
-                local.domain_scroll = local
-                    .domain_scroll
-                    .min(domain::max_scroll(snapshot, local, local.viewport))
-                    .saturating_sub(8);
-                return false;
-            }
-            KeyCode::PageDown => {
-                local.domain_scroll = local
-                    .domain_scroll
-                    .min(domain::max_scroll(snapshot, local, local.viewport))
-                    .saturating_add(8)
-                    .min(domain::max_scroll(snapshot, local, local.viewport));
-                return false;
-            }
-            KeyCode::Char('y') if control => {
-                if let Some(binding) = local.displayed_domain_binding.clone() {
-                    send(Command::ApproveDomainChange { binding }, tx, local);
-                } else {
-                    local.notice = Some("当前尚无已展示的可批准方案".into());
-                }
-                return false;
-            }
-            _ => {}
+            extensions::ExtensionAction::Handled => {}
         }
+        return false;
     }
     if control {
         match key.code {
@@ -760,7 +816,7 @@ fn handle_key(
             local.skills = !local.skills;
             local.skills_scroll = 0;
         }
-        KeyCode::Char('e') if control => local.tools_expanded = !local.tools_expanded,
+        KeyCode::Char('e') if control => local.cycle_tool_display(),
         KeyCode::PageUp if local.request_panel => {
             // 先收回到实际可滚动范围，越界后第一次 PageUp 就能生效。
             local.request_scroll = local
@@ -836,11 +892,23 @@ fn handle_key(
         }
         KeyCode::PageUp => {
             local.conversation_focus = None;
-            local.scroll_from_bottom = local.scroll_from_bottom.saturating_add(8);
+            let view = local.conversation_viewport.get();
+            let current = if view.area.height > 0 {
+                view.scroll
+            } else {
+                local.scroll_from_bottom
+            };
+            local.scroll_from_bottom = current.saturating_add(8);
         }
         KeyCode::PageDown => {
             local.conversation_focus = None;
-            local.scroll_from_bottom = local.scroll_from_bottom.saturating_sub(8);
+            let view = local.conversation_viewport.get();
+            let current = if view.area.height > 0 {
+                view.scroll
+            } else {
+                local.scroll_from_bottom
+            };
+            local.scroll_from_bottom = current.saturating_sub(8);
         }
         KeyCode::Home if control => {
             local.conversation_focus = None;
@@ -851,9 +919,49 @@ fn handle_key(
             local.scroll_from_bottom = 0;
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Tab
-            if !commands::slash_hints(&local.editor.text, &snapshot.skills.entries).is_empty() =>
+            if !commands::path_hints(
+                &local.editor.text,
+                local.editor.cursor,
+                &snapshot.path_hints,
+            )
+            .is_empty() =>
         {
-            let hints = commands::slash_hints(&local.editor.text, &snapshot.skills.entries);
+            let hints = commands::path_hints(
+                &local.editor.text,
+                local.editor.cursor,
+                &snapshot.path_hints,
+            );
+            let selected = local.slash_selected.min(hints.len() - 1);
+            match key.code {
+                KeyCode::Up => local.slash_selected = selected.saturating_sub(1),
+                KeyCode::Down => local.slash_selected = (selected + 1).min(hints.len() - 1),
+                _ => {
+                    // 目录补全后继续往下选；文件补全后留一个空格。
+                    let entry = hints[selected].name.as_str();
+                    let tail = if entry.ends_with('/') { "" } else { " " };
+                    let cursor = local.editor.cursor;
+                    if let Some((start, _)) = commands::path_token(&local.editor.text, cursor) {
+                        let completed = format!("@{entry}{tail}");
+                        local.editor.text.replace_range(start..cursor, &completed);
+                        local.editor.cursor = start + completed.len();
+                    }
+                    local.slash_selected = 0;
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Tab
+            if !commands::slash_hints_with(
+                &local.editor.text,
+                &snapshot.skills.entries,
+                &snapshot.commands,
+            )
+            .is_empty() =>
+        {
+            let hints = commands::slash_hints_with(
+                &local.editor.text,
+                &snapshot.skills.entries,
+                &snapshot.commands,
+            );
             let selected = local.slash_selected.min(hints.len() - 1);
             match key.code {
                 KeyCode::Up => local.slash_selected = selected.saturating_sub(1),
@@ -888,7 +996,8 @@ fn handle_key(
         KeyCode::Enter if !local.editor.text.trim().is_empty() => {
             let mut text = local.editor.text.clone();
             // 提示列表可见时，Enter 执行选中的命令，不要求把名字打全。
-            let hints = commands::slash_hints(&text, &snapshot.skills.entries);
+            let hints =
+                commands::slash_hints_with(&text, &snapshot.skills.entries, &snapshot.commands);
             if !hints.is_empty()
                 && !selected_request(snapshot, local)
                     .is_some_and(|r| matches!(r.kind, RequestKind::UserInput { .. }))
@@ -947,10 +1056,20 @@ fn handle_key(
             if let Some(task) = skill_task {
                 text = task;
             }
+            // dsh 自己的命令（如 `/compact`、`/plan off`）交给 dsh 执行。
+            else if let Some(line) =
+                commands::backend_command(&text, &snapshot.skills.entries, &snapshot.commands)
+            {
+                local.editor.clear();
+                send(Command::RunBackendCommand { line }, tx, local);
+                return false;
+            }
             // `/名称` 是界面命令，不作为任务发给模型。
             else if let Some(slash) = commands::parse_slash(&text, &snapshot.skills.entries) {
                 use commands::{PaletteAction, Slash};
                 if slash == Slash::Unknown {
+                    // 还没问过 dsh 时，这个名称可能是它的命令：先取清单。
+                    request_backend_commands(snapshot, local, tx);
                     // 保留输入，方便改正拼写。
                     local.notice = Some(format!(
                         "{} {}",
@@ -969,7 +1088,7 @@ fn handle_key(
                         open_model_picker(local, tx)
                     }
                     Slash::Action(action) => open_palette_action(action, snapshot, local),
-                    Slash::Tools => local.tools_expanded = !local.tools_expanded,
+                    Slash::Tools => local.cycle_tool_display(),
                     Slash::Settings => {
                         overlays::close_mutual_overlays(local);
                         local.settings.open();
@@ -978,6 +1097,19 @@ fn handle_key(
                     }
                     Slash::New => {
                         send(Command::NewConversation, tx, local);
+                    }
+                    Slash::Steer("") => {
+                        local.notice = Some(
+                            lang::tr(
+                                "Usage: /steer <guidance for the running turn>",
+                                "用法：/steer <给当前轮次的引导>",
+                            )
+                            .into(),
+                        );
+                    }
+                    Slash::Steer(text) => {
+                        let text = text.to_owned();
+                        send(Command::SteerRoot { text }, tx, local);
                     }
                     Slash::Quit => return true,
                     Slash::Skill { .. } | Slash::Unknown => {}
@@ -1042,7 +1174,7 @@ fn handle_key(
             ) {
                 local.editor.clear();
                 local.scroll_from_bottom = 0;
-                local.domain_reply_scroll_from_bottom = 0;
+                local.extension.reply_scroll_from_bottom = 0;
             }
         }
         KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -1199,6 +1331,7 @@ mod tests {
                         .join("\n"),
                     complete: false,
                     truncated: false,
+                    tools: Vec::new(),
                 });
             }
             let mut local = LocalState {
@@ -1266,6 +1399,7 @@ mod tests {
                 .join("\n"),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         let mut local = LocalState::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1321,6 +1455,7 @@ mod tests {
                     .repeat(12),
                 complete: true,
                 truncated: false,
+                tools: Vec::new(),
             });
         }
         let local = LocalState::default();
@@ -3099,6 +3234,7 @@ mod tests {
                 text: format!("line {index}"),
                 complete: true,
                 truncated: false,
+                tools: Vec::new(),
             })
             .collect();
         let snapshot = CoreSnapshot {
@@ -3288,6 +3424,13 @@ mod tests {
         local.editor.insert("/tools");
         handle_key(enter, &snapshot, &mut local, &tx);
         assert!(local.tools_expanded);
+        // 三档循环：预览 → 展开 → 隐藏 → 预览。
+        local.cycle_tool_display();
+        assert_eq!(local.tool_display(), conversation::ToolDisplay::Hidden);
+        local.cycle_tool_display();
+        assert_eq!(local.tool_display(), conversation::ToolDisplay::Preview);
+        local.cycle_tool_display();
+        assert!(local.tools_expanded);
         local.editor.insert("/nope");
         assert!(!handle_key(enter, &snapshot, &mut local, &tx));
         assert_eq!(local.editor.text, "/nope");
@@ -3295,6 +3438,8 @@ mod tests {
         local.editor.clear();
         local.editor.insert("/quit");
         assert!(handle_key(enter, &snapshot, &mut local, &tx));
+        // 未知名称可能是 dsh 自己的命令：只向它要一次清单，不执行任何东西。
+        assert_eq!(rx.try_recv().unwrap(), Command::ListBackendCommands);
         assert!(rx.try_recv().is_err());
     }
 
@@ -3397,6 +3542,56 @@ mod tests {
     }
 
     #[test]
+    fn at_path_asks_core_once_per_directory_and_tab_completes_the_word_at_the_cursor() {
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Ready,
+            thread_id: Some("root".into()),
+            ..CoreSnapshot::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        sync_local_requests(&mut local, &snapshot);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        local.editor.insert("read ");
+        for key in ['@', 's'] {
+            handle_key(press(KeyCode::Char(key)), &snapshot, &mut local, &tx);
+        }
+        // 进入一个目录只问一次；同一目录里继续输入不再发请求。
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::CompletePath {
+                query: String::new()
+            }
+        );
+        assert!(rx.try_recv().is_err());
+        snapshot.path_hints = crate::path_hints::PathHints {
+            query: String::new(),
+            entries: vec!["src/".into(), "scripts/".into(), "README.md".into()],
+        };
+        handle_key(press(KeyCode::Down), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Up), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Tab), &snapshot, &mut local, &tx);
+        assert_eq!(local.editor.text, "read @src/");
+        assert_eq!(local.editor.cursor, local.editor.text.len());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::CompletePath {
+                query: "src/".into()
+            }
+        );
+        // 文件补全后留一个空格，其后的输入不再是路径。
+        snapshot.path_hints = crate::path_hints::PathHints {
+            query: "src/".into(),
+            entries: vec!["src/ui/".into(), "src/lib.rs".into()],
+        };
+        handle_key(press(KeyCode::Char('l')), &snapshot, &mut local, &tx);
+        handle_key(press(KeyCode::Tab), &snapshot, &mut local, &tx);
+        assert_eq!(local.editor.text, "read @src/lib.rs ");
+        assert!(local.path_query.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn slash_new_sends_a_conversation_command_and_resets_navigation_after_confirmation() {
         let mut snapshot = CoreSnapshot {
             phase: SessionPhase::Ready,
@@ -3482,6 +3677,8 @@ mod tests {
         local.editor.clear();
         local.editor.insert("/etc/hosts");
         assert!(row_of(&rows(&local), "Commands").is_none());
+        // 开始输入 `/` 后只向 dsh 要一次它的命令清单。
+        assert_eq!(rx.try_recv().unwrap(), Command::ListBackendCommands);
         assert!(rx.try_recv().is_err());
     }
 
@@ -4827,6 +5024,7 @@ mod tests {
                 text: text.into(),
                 complete: true,
                 truncated: false,
+                tools: Vec::new(),
             });
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -5263,6 +5461,7 @@ mod tests {
             text: "READY 中文".into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         for (width, height) in [(80, 24), (160, 45), (40, 12)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

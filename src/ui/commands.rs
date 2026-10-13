@@ -227,6 +227,8 @@ pub(super) enum Slash<'a> {
     Tools,
     Settings,
     New,
+    /// `/steer TEXT`: guide the running turn at its next step.
+    Steer(&'a str),
     Quit,
     /// `/skill-name [request]`: ask the agent to use one of dsh's skills.
     Skill {
@@ -258,7 +260,7 @@ pub(super) struct SlashHint {
     pub skill: bool,
 }
 
-const BUILT_IN: [&str; 5] = ["model", "setting", "tools", "new", "quit"];
+const BUILT_IN: [&str; 6] = ["model", "setting", "tools", "new", "steer", "quit"];
 
 fn built_in(name: &str) -> bool {
     name == "settings"
@@ -271,6 +273,55 @@ fn usable_skills(skills: &[SkillEntry]) -> impl Iterator<Item = &SkillEntry> {
     skills
         .iter()
         .filter(|skill| skill.enabled && !skill.name.is_empty() && !built_in(&skill.name))
+}
+
+/// The whole line when it names one of dsh's own commands, e.g. `/plan off`.
+/// The TUI's commands and dsh skills of the same name take precedence.
+pub(super) fn backend_command(
+    text: &str,
+    skills: &[SkillEntry],
+    commands: &[crate::state::BackendCommand],
+) -> Option<String> {
+    let line = text.trim();
+    let name = line
+        .strip_prefix('/')?
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or_default();
+    (!built_in(name)
+        && !usable_skills(skills).any(|skill| skill.name == name)
+        && commands.iter().any(|command| command.name == name))
+    .then(|| line.to_owned())
+}
+
+/// Hints with dsh's own commands after the TUI's and the skills.
+pub(super) fn slash_hints_with(
+    text: &str,
+    skills: &[SkillEntry],
+    commands: &[crate::state::BackendCommand],
+) -> Vec<SlashHint> {
+    let mut hints = slash_hints(text, skills);
+    let typed = text
+        .strip_prefix('/')
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if text.starts_with('/') && typed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        for command in commands {
+            if command.name.starts_with(typed.as_str())
+                && !hints.iter().any(|hint| hint.name == command.name)
+            {
+                hints.push(SlashHint {
+                    name: command.name.clone(),
+                    detail: match &command.hint {
+                        Some(hint) => format!("dsh · {} · {hint}", command.description),
+                        None => format!("dsh · {}", command.description),
+                    },
+                    skill: false,
+                });
+            }
+        }
+    }
+    hints
 }
 
 /// Commands, then dsh skills, whose name starts with what follows the `/`;
@@ -311,6 +362,13 @@ pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
             ),
             command("new", tr("Start a new conversation", "新建会话")),
             command(
+                "steer",
+                tr(
+                    "Guide the running turn at its next step",
+                    "引导正在运行的轮次，下一步生效",
+                ),
+            ),
+            command(
                 "tools",
                 tr("Fold or unfold tool groups", "折叠或展开工具组"),
             ),
@@ -349,6 +407,99 @@ pub(super) fn draw_slash_hints(
     hints: &[SlashHint],
     selected: usize,
 ) {
+    draw_hints(
+        frame,
+        input,
+        hints,
+        selected,
+        "/",
+        tr(" Commands ", " 命令 "),
+        tr(
+            "↑/↓ select | Tab complete | Enter run",
+            "↑/↓ 选择 | Tab 补全 | Enter 执行",
+        ),
+    );
+}
+
+/// The `@word` being typed at the cursor: its start byte and what follows the `@`.
+pub(super) fn path_token(text: &str, cursor: usize) -> Option<(usize, &str)> {
+    let before = text.get(..cursor)?;
+    let start = before.rfind(char::is_whitespace).map_or(0, |at| {
+        at + before[at..].chars().next().map_or(1, char::len_utf8)
+    });
+    before[start..]
+        .strip_prefix('@')
+        .map(|query| (start, query))
+}
+
+/// Paths that complete the `@word` at the cursor. Core answered for the
+/// directory being typed in; a longer name is narrowed here without asking again.
+pub(super) fn path_hints(
+    text: &str,
+    cursor: usize,
+    hints: &crate::path_hints::PathHints,
+) -> Vec<SlashHint> {
+    let Some((_, query)) = path_token(text, cursor) else {
+        return Vec::new();
+    };
+    let split = |query: &str| -> (String, String) {
+        let query = query.replace('\\', "/");
+        match query.rsplit_once('/') {
+            Some((directory, name)) => (directory.to_owned(), name.to_lowercase()),
+            None => (String::new(), query.to_lowercase()),
+        }
+    };
+    let (directory, name) = split(query);
+    let (answered_directory, answered_name) = split(&hints.query);
+    if directory != answered_directory || !name.starts_with(&answered_name) {
+        return Vec::new();
+    }
+    hints
+        .entries
+        .iter()
+        .filter(|entry| {
+            let leaf = entry.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            leaf.to_lowercase().starts_with(&name)
+        })
+        .map(|entry| SlashHint {
+            name: entry.clone(),
+            detail: if entry.ends_with('/') {
+                tr("directory", "目录")
+            } else {
+                tr("file", "文件")
+            }
+            .to_owned(),
+            skill: false,
+        })
+        .collect()
+}
+
+pub(super) fn draw_path_hints(
+    frame: &mut ratatui::Frame<'_>,
+    input: Rect,
+    hints: &[SlashHint],
+    selected: usize,
+) {
+    draw_hints(
+        frame,
+        input,
+        hints,
+        selected,
+        "@",
+        tr(" Files ", " 文件 "),
+        tr("↑/↓ select | Tab complete", "↑/↓ 选择 | Tab 补全"),
+    );
+}
+
+fn draw_hints(
+    frame: &mut ratatui::Frame<'_>,
+    input: Rect,
+    hints: &[SlashHint],
+    selected: usize,
+    prefix: &str,
+    title: &str,
+    keys: &str,
+) {
     let rows = hints.len().min(input.y.saturating_sub(2) as usize);
     if rows == 0 || input.width < 12 {
         return;
@@ -363,14 +514,8 @@ pub(super) fn draw_slash_hints(
     let theme = theme::current();
     let block = theme::focus_panel()
         .borders(Borders::ALL)
-        .title(tr(" Commands ", " 命令 "))
-        .title_bottom(footer(
-            tr(
-                "↑/↓ select | Tab complete | Enter run",
-                "↑/↓ 选择 | Tab 补全 | Enter 执行",
-            ),
-            rect.width,
-        ));
+        .title(title.to_owned())
+        .title_bottom(footer(keys, rect.width));
     let width = block.inner(rect).width as usize;
     let selected = selected.min(hints.len() - 1);
     let start = (selected + 1).saturating_sub(rows);
@@ -387,7 +532,7 @@ pub(super) fn draw_slash_hints(
         .take(rows)
         .map(|(index, hint)| {
             let marker = if index == selected { "> " } else { "  " };
-            let name = format!("/{:<name_width$}", hint.name);
+            let name = format!("{prefix}{:<name_width$}", hint.name);
             let spans = vec![
                 Span::raw(marker),
                 Span::styled(name, theme.key()),
@@ -435,6 +580,9 @@ pub(super) fn parse_slash<'a>(text: &'a str, skills: &'a [SkillEntry]) -> Option
     let name = name.to_ascii_lowercase();
     if name == "model" {
         return Some(Slash::Model((!argument.is_empty()).then_some(argument)));
+    }
+    if name == "steer" {
+        return Some(Slash::Steer(argument));
     }
     if !argument.is_empty() {
         return None;
@@ -834,6 +982,85 @@ mod tests {
         );
         assert_eq!(parse_slash("/tools", &[]), Some(Slash::Tools));
         assert_eq!(parse_slash("/new", &[]), Some(Slash::New));
+        assert_eq!(
+            parse_slash("/steer use 中文 names ", &[]),
+            Some(Slash::Steer("use 中文 names"))
+        );
+        assert_eq!(parse_slash("/steer", &[]), Some(Slash::Steer("")));
+        let dsh = [
+            crate::state::BackendCommand {
+                name: "compact".into(),
+                description: "Summarise earlier history".into(),
+                hint: None,
+            },
+            crate::state::BackendCommand {
+                name: "plan".into(),
+                description: "Plan mode".into(),
+                hint: Some("on|off".into()),
+            },
+            crate::state::BackendCommand {
+                name: "help".into(),
+                description: "shadowed by the TUI".into(),
+                hint: None,
+            },
+        ];
+        assert_eq!(
+            backend_command(" /plan off ", &[], &dsh).as_deref(),
+            Some("/plan off")
+        );
+        assert_eq!(
+            backend_command("/compact", &[], &dsh).as_deref(),
+            Some("/compact")
+        );
+        for other in ["/help", "/nope", "plan", "/", "/etc/hosts"] {
+            assert_eq!(backend_command(other, &[], &dsh), None, "{other}");
+        }
+        let hints = slash_hints_with("/", &[], &dsh);
+        assert_eq!(hints.iter().filter(|hint| hint.name == "help").count(), 1);
+        assert_eq!(
+            hints
+                .iter()
+                .find(|hint| hint.name == "plan")
+                .unwrap()
+                .detail,
+            "dsh · Plan mode · on|off"
+        );
+        assert_eq!(
+            slash_hints_with("/co", &[], &dsh)
+                .iter()
+                .map(|hint| hint.name.as_str())
+                .collect::<Vec<_>>(),
+            ["context", "compact"]
+        );
+        assert!(slash_hints_with("/plan off", &[], &dsh).is_empty());
+
+        // `@路径`：光标处的词以 @ 开头才算；目录相同时在本地按已输入的名字收窄。
+        assert_eq!(path_token("read @src/l", 11), Some((5, "src/l")));
+        assert_eq!(path_token("中文 @", "中文 @".len()), Some((7, "")));
+        assert_eq!(path_token("mail a@b", 8), None);
+        assert_eq!(path_token("@a b", 4), None);
+        let listed = crate::path_hints::PathHints {
+            query: "src/".into(),
+            entries: vec![
+                "src/ui/".into(),
+                "src/Layout.rs".into(),
+                "src/lib.rs".into(),
+            ],
+        };
+        let names = |text: &str| -> Vec<String> {
+            path_hints(text, text.len(), &listed)
+                .into_iter()
+                .map(|hint| hint.name)
+                .collect()
+        };
+        assert_eq!(
+            names("see @src/"),
+            ["src/ui/", "src/Layout.rs", "src/lib.rs"]
+        );
+        assert_eq!(names("see @src/l"), ["src/Layout.rs", "src/lib.rs"]);
+        assert!(names("see @docs/").is_empty());
+        assert!(names("see @sr").is_empty());
+        assert!(names("see src/").is_empty());
         assert_eq!(parse_slash("/quit", &[]), Some(Slash::Quit));
         assert_eq!(parse_slash("/nope", &[]), Some(Slash::Unknown));
         for task in [
@@ -852,7 +1079,7 @@ mod tests {
             assert!(names.contains(&format!("/{name}")), "{names}");
         }
         assert!(
-            names.ends_with("/model /setting /tools /new /quit"),
+            names.ends_with("/model /setting /tools /new /steer /quit"),
             "{names}"
         );
         assert_eq!(parse_slash("/setting", &[]), Some(Slash::Settings));

@@ -6,6 +6,8 @@
 # Local editor and OS files
 .vscode/
 .idea/
+.claude/
+.qoder/
 *.swp
 .DS_Store
 

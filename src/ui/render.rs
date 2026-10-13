@@ -25,6 +25,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     local
         .conversation_viewport
         .set(super::ConversationViewport::default());
+    local.extension.clear_displayed();
     let area = frame.area();
     let theme = theme::current();
     frame.render_widget(Block::default().style(theme.base()), area);
@@ -44,13 +45,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.provider_form.draw(frame, area, &snapshot.models.test);
         return;
     }
-    if local.domain_visible
-        && snapshot.domain.enabled
-        && snapshot.requests.is_empty()
-        && area.width >= 24
-        && area.height >= 8
-    {
-        super::domain::draw(frame, area, snapshot, local);
+    let mut extension_context = super::extensions::ViewContext::new(
+        snapshot,
+        &local.extension,
+        &local.editor.text,
+        local.notice.as_deref(),
+    );
+    extension_context.activity_marker = local.activity.marker();
+    if super::extensions::REGISTRY.draw(frame, snapshot, &extension_context) {
         return;
     }
     if area.width < 24 || area.height < 8 {
@@ -144,6 +146,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             .unwrap_or(tr("model pending", "模型待定")),
         snapshot.cwd,
     );
+    if let Some(branch) = &snapshot.branch {
+        settings.push_str(" | ");
+        settings.push_str(branch);
+    }
     // 只显示 dsh 报告过的权限预设；没读到就不显示，不猜。
     if !snapshot.permission.current.is_empty() {
         settings.push_str(" | ");
@@ -220,35 +226,28 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     if compact_header {
         header.remove(0);
     }
-    frame.render_widget(
-        Paragraph::new(header).block(
-            theme::panel()
-                .borders(Borders::BOTTOM)
-                .padding(Padding::horizontal(1))
-                .title(if compact_header {
-                    Line::from(Span::styled(
-                        format!(
-                            " {} {}:{actions} {}:{attention}{} ",
-                            lang::phase(snapshot.phase),
-                            tr("action", "待处理"),
-                            tr("attention", "需关注"),
-                            if acknowledged > 0 {
-                                format!(" {}:{acknowledged}", tr("wait", "暂不提醒"))
-                            } else {
-                                String::new()
-                            }
-                        ),
-                        theme.phase(snapshot.phase),
-                    ))
+    let mut header_block = theme::panel()
+        .borders(Borders::BOTTOM)
+        .padding(Padding::horizontal(1));
+    // 产品名不是执行事实：平时没有标题行，这一行留给对话。只有矮窗口里
+    // 把阶段和计数压进标题时才用它。
+    if compact_header {
+        header_block = header_block.title(Line::from(Span::styled(
+            format!(
+                " {} {}:{actions} {}:{attention}{} ",
+                lang::phase(snapshot.phase),
+                tr("action", "待处理"),
+                tr("attention", "需关注"),
+                if acknowledged > 0 {
+                    format!(" {}:{acknowledged}", tr("wait", "暂不提醒"))
                 } else {
-                    Line::from(vec![
-                        Span::styled(" Native Agent TUI ", theme.heading()),
-                        Span::styled(concat!(env!("CARGO_PKG_VERSION"), " "), theme.faint()),
-                    ])
-                }),
-        ),
-        chunks[0],
-    );
+                    String::new()
+                }
+            ),
+            theme.phase(snapshot.phase),
+        )));
+    }
+    frame.render_widget(Paragraph::new(header).block(header_block), chunks[0]);
 
     if local.search.visible {
         local.search.draw(
@@ -292,6 +291,17 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         wants_inspector(snapshot, local),
     );
     let (agents_area, conversation_area) = (workspace.agents, workspace.conversation);
+    // todo 面板占用对话区底部几行；只显示 root 会话的列表。
+    let todo_lines = if selected_agent.is_none() {
+        super::todos::lines(
+            &snapshot.todos,
+            conversation_area.width,
+            conversation_area.height,
+        )
+    } else {
+        Vec::new()
+    };
+    let (conversation_area, todo_area) = super::todos::split(conversation_area, todo_lines.len());
     if let Some(inspector) = workspace.inspector {
         requests::draw_inspector(frame, inspector, snapshot, local);
     }
@@ -314,7 +324,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         width,
         height,
         local.scroll_from_bottom,
-        local.tools_expanded,
+        local.tool_display(),
     );
     let focused_row = projected.transcript.focused;
     let foldable_tools = projected.transcript.foldable > 0;
@@ -424,6 +434,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         }),
         conversation_area,
     );
+    if !todo_lines.is_empty() {
+        frame.render_widget(Paragraph::new(todo_lines), todo_area);
+    }
     if local.workflow.visible {
         workflow_view::draw_workflow(
             frame,
@@ -541,10 +554,18 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .saturating_sub(input_height.saturating_sub(1));
     let prompt_span = |row: usize| {
         Span::styled(
-            if row == 0 { "› " } else { "  " }
-                .chars()
-                .take(prompt)
-                .collect::<String>(),
+            if row == 0 {
+                if super::busy::label(snapshot).is_some() {
+                    local.activity.marker()
+                } else {
+                    "› "
+                }
+            } else {
+                "  "
+            }
+            .chars()
+            .take(prompt)
+            .collect::<String>(),
             theme.heading(),
         )
     };
@@ -555,6 +576,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 // 只有 UserInput 请求才把输入框当作回答；审批用快捷键决定。
                 if answering {
                     tr("Write an answer…", "输入回答…")
+                } else if let Some(label) = super::busy::label(snapshot) {
+                    label
                 } else {
                     tr(
                         "Write a task…  Ctrl+O for a new line",
@@ -587,8 +610,18 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         chunks[3],
     );
     if !answering {
-        let hints = super::commands::slash_hints(&local.editor.text, &snapshot.skills.entries);
+        let hints = super::commands::slash_hints_with(
+            &local.editor.text,
+            &snapshot.skills.entries,
+            &snapshot.commands,
+        );
         super::commands::draw_slash_hints(frame, chunks[3], &hints, local.slash_selected);
+        let paths = super::commands::path_hints(
+            &local.editor.text,
+            local.editor.cursor,
+            &snapshot.path_hints,
+        );
+        super::commands::draw_path_hints(frame, chunks[3], &paths, local.slash_selected);
     }
     if input_height > 0 && chunks[3].width > 2 {
         frame.set_cursor_position((
@@ -626,18 +659,45 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 (tr("F2 details", "F2 详情"), 2),
             ]);
         } else {
-            hints.push((tr("Enter send", "Enter 发送"), 0));
+            // 提示只列当前状态下真的可用的操作。
+            use crate::state::SessionPhase::*;
+            match snapshot.phase {
+                Running => hints.extend([
+                    (tr("/steer guide", "/steer 引导"), 0),
+                    (tr("Ctrl+S queue", "Ctrl+S 排队"), 7),
+                    (tr("Ctrl+C interrupt", "Ctrl+C 中断"), 6),
+                ]),
+                GatePending => hints.extend([
+                    (tr("Enter queue", "Enter 排队"), 0),
+                    (tr("Ctrl+C interrupt", "Ctrl+C 中断"), 6),
+                ]),
+                Ready | Completed | Interrupted | Failed => {
+                    hints.push((tr("Enter send", "Enter 发送"), 0))
+                }
+                Created | Launching | Initializing | CheckingShell | StartingTurn => {
+                    hints.push((tr("starting…", "正在启动…"), 0))
+                }
+                Stopping | ClosingTransport | Stopped | Disconnected | Unknown => {
+                    hints.push((tr("session ended", "会话已结束"), 0))
+                }
+            }
         }
         hints.extend([
             (tr("Ctrl+P commands", "Ctrl+P 命令"), 3),
             (tr("Ctrl+F search", "Ctrl+F 搜索"), 4),
         ]);
-        if foldable_tools {
+        if foldable_tools || local.tools_expanded || local.tools_hidden {
             hints.push((
-                if local.tools_expanded {
-                    tr("Ctrl+E fold tools", "Ctrl+E 折叠工具")
-                } else {
-                    tr("Ctrl+E unfold tools", "Ctrl+E 展开工具")
+                match local.tool_display() {
+                    super::conversation::ToolDisplay::Preview => {
+                        tr("Ctrl+E unfold tools", "Ctrl+E 展开工具")
+                    }
+                    super::conversation::ToolDisplay::Expanded => {
+                        tr("Ctrl+E hide tools", "Ctrl+E 隐藏工具")
+                    }
+                    super::conversation::ToolDisplay::Hidden => {
+                        tr("Ctrl+E show tools", "Ctrl+E 显示工具")
+                    }
                 },
                 5,
             ));
@@ -903,11 +963,11 @@ mod tests {
     }
 
     #[test]
-    fn approval_keeps_the_task_prompt_and_only_user_input_asks_for_an_answer() {
+    fn approval_explains_the_wait_and_only_user_input_asks_for_an_answer() {
         let (snapshot, local) = running(vec![approval()]);
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
         assert!(!screen.contains("Write an answer"), "{screen}");
-        assert!(screen.contains("Write a task"), "{screen}");
+        assert!(screen.contains("Waiting for action"), "{screen}");
         assert!(screen.contains(" Root task "), "{screen}");
 
         let question = RequestView::decode(
@@ -934,9 +994,20 @@ mod tests {
                 let hints = all.last().unwrap();
                 // 行尾是完整的标签，说明这一行没有被右边界裁掉。
                 assert!(
-                    ["send", "keys", "quit", "decline", "details", "no"]
-                        .iter()
-                        .any(|label| hints.trim_end().ends_with(label)),
+                    // 运行中的提示以 /steer guide 开头，不再是 Enter send。
+                    [
+                        "send",
+                        "keys",
+                        "quit",
+                        "decline",
+                        "details",
+                        "no",
+                        "guide",
+                        "queue",
+                        "interrupt"
+                    ]
+                    .iter()
+                    .any(|label| hints.trim_end().ends_with(label)),
                     "{width}: {hints:?}"
                 );
                 if approving {
@@ -945,7 +1016,8 @@ mod tests {
                         "{width}: {hints:?}"
                     );
                 } else {
-                    assert!(hints.contains("Enter send"), "{width}: {hints:?}");
+                    // 运行中最重要的操作是引导，它在任何宽度下都保留。
+                    assert!(hints.contains("/steer guide"), "{width}: {hints:?}");
                 }
                 assert!(!hints.contains("Ctrl+Q") || hints.contains("Ctrl+Q quit"));
             }
@@ -989,11 +1061,14 @@ mod tests {
                 text: text.into(),
                 complete: false,
                 truncated: false,
+                tools: Vec::new(),
             });
         }
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
         assert!(
-            screen.contains("Thinking") && screen.contains("Inspect the input"),
+            // 思考过程是回答里的一节：竖线标出，与回答共用一个标题。
+            screen.contains("┆ Inspect the input")
+                && screen.lines().filter(|row| row.trim() == "Agent").count() == 1,
             "{screen}"
         );
         assert!(screen.contains("running · echo probe"), "{screen}");
@@ -1007,8 +1082,67 @@ mod tests {
         assert!(!screen.contains("running · echo probe"), "{screen}");
         lang::with_zh(|| {
             let screen = rows(&snapshot, &local, 120, 30).join("\n");
-            assert!(screen.contains("思考过程"), "{screen}");
+            // 换界面语言后缓存的行重新排版；思考一节不依赖文字标签。
+            assert!(screen.contains("┆ Inspect the input carefully"), "{screen}");
+            assert!(screen.contains("运行中"), "{screen}");
         });
+    }
+
+    #[test]
+    fn key_hints_follow_what_the_session_can_do_now() {
+        let (mut snapshot, local) = running(vec![]);
+        let hints = |snapshot: &CoreSnapshot| rows(snapshot, &local, 140, 30).pop().unwrap();
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("/steer guide") && row.contains("Ctrl+C interrupt"),
+            "{row}"
+        );
+        assert!(!row.contains("Enter send"), "{row}");
+        snapshot.phase = SessionPhase::GatePending;
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("Enter queue") && !row.contains("/steer"),
+            "{row}"
+        );
+        snapshot.phase = SessionPhase::Completed;
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("Enter send") && !row.contains("interrupt"),
+            "{row}"
+        );
+        snapshot.phase = SessionPhase::Disconnected;
+        let row = hints(&snapshot);
+        assert!(
+            row.contains("session ended") && !row.contains("Enter send"),
+            "{row}"
+        );
+        snapshot.phase = SessionPhase::Initializing;
+        assert!(hints(&snapshot).contains("starting…"));
+    }
+
+    #[test]
+    fn header_has_no_title_row_and_names_the_branch_beside_the_directory() {
+        let (mut snapshot, local) = running(vec![]);
+        snapshot.cwd = "D:/project/demo".into();
+        snapshot.branch = Some("feat/中文-branch".into());
+        let screen = rows(&snapshot, &local, 120, 30);
+        // 第一行就是执行状态；产品名不占常驻区。
+        assert!(screen[0].contains('●'), "{screen:#?}");
+        assert!(
+            screen[1].contains("D:/project/demo | feat/中文-branch"),
+            "{screen:#?}"
+        );
+        assert!(
+            !screen.iter().any(|row| row.contains("Native Agent TUI")),
+            "{screen:#?}"
+        );
+        // 不是仓库时不显示分支，也不留占位。
+        snapshot.branch = None;
+        let screen = rows(&snapshot, &local, 120, 30);
+        assert!(
+            screen[1].trim_end().ends_with("D:/project/demo"),
+            "{screen:#?}"
+        );
     }
 
     #[test]
@@ -1025,6 +1159,21 @@ mod tests {
                 .join("\n"),
             complete: true,
             truncated: false,
+            tools: (1..=6)
+                .map(|index| crate::tool_details::ConversationTool {
+                    item_id: index.to_string(),
+                    category: crate::protocol::ToolCategory::Shell,
+                    lifecycle: crate::tool_details::ToolLifecycle::Completed,
+                    name: None,
+                    command: None,
+                    cwd: None,
+                    target: None,
+                    exit_code: Some(0),
+                    output_lines: None,
+                    added_lines: None,
+                    removed_lines: None,
+                })
+                .collect(),
         });
         local.editor.insert("draft");
         let screen = rows(&snapshot, &local, 120, 30).join("\n");
@@ -1043,7 +1192,7 @@ mod tests {
             (1..=6).all(|index| screen.contains(&format!("step-{index}"))),
             "{screen}"
         );
-        assert!(screen.contains("Ctrl+E fold tools"), "{screen}");
+        assert!(screen.contains("Ctrl+E hide tools"), "{screen}");
         assert_eq!(local.editor.text, "draft");
         assert!(rx.try_recv().is_err());
     }
@@ -1080,6 +1229,7 @@ mod tests {
             text: "Review the layout".into(),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         for width in [40, 64, 100, 140] {
             let screen = lang::with_zh(|| rows(&snapshot, &local, width, 30));
@@ -1087,7 +1237,7 @@ mod tests {
             for expected in [
                 "运行中",
                 "待处理请求",
-                "输入任务",
+                "正在等待确认",
                 "Ctrl+Y 接受",
                 "Ctrl+N 拒绝",
             ] {
@@ -1129,6 +1279,7 @@ mod tests {
             text: "word ".repeat(400),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         let wide = rows(&snapshot, &local, 160, 40);
         let title = wide
@@ -1175,6 +1326,7 @@ mod tests {
             text: vec!["LEAKWORD ".repeat(12); 40].join("\n"),
             complete: true,
             truncated: false,
+            tools: Vec::new(),
         });
         let plain = rows(&snapshot, &LocalState::default(), 120, 30).join("\n");
         assert!(plain.contains("LEAKWORD"), "fixture must fill the screen");

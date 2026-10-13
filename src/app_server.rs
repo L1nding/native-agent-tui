@@ -207,6 +207,26 @@ pub(crate) fn turn_start(id: RpcId, thread: &str, text: &str, model: Option<&str
     Envelope::request(id, "turn/start", Some(params))
 }
 
+/// Understood by the ACP bridge only: guide the running turn. dsh hands the
+/// text to the model at the next step; the turn is not restarted.
+pub(crate) fn turn_steer(id: RpcId, thread: &str, turn: &str, text: &str) -> Envelope {
+    Envelope::request(
+        id,
+        "turn/steer",
+        Some(json!({"threadId":thread,"turnId":turn,"text":text})),
+    )
+}
+
+/// dsh's own slash commands for the current session; understood by the ACP bridge.
+pub(crate) fn backend_commands_list(id: RpcId) -> Envelope {
+    Envelope::request(id, "backend/commands/list", Some(json!({})))
+}
+
+/// Runs one of dsh's slash commands, e.g. `/compact`, on the idle session.
+pub(crate) fn backend_command_run(id: RpcId, line: &str) -> Envelope {
+    Envelope::request(id, "backend/command/run", Some(json!({"line":line})))
+}
+
 pub(crate) fn model_list(id: RpcId) -> Envelope {
     Envelope::request(id, "model/list", Some(json!({"limit":100})))
 }

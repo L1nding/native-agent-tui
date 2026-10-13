@@ -1,7 +1,6 @@
 //! The model carries only references. Core verifies sealed facts on a private channel.
 
 use super::*;
-use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 
 pub const FACT_LIMIT: usize = 8 * 1024 * 1024;
@@ -45,6 +44,12 @@ fn unwrap_receipt(value: &Value, depth: usize) -> Option<Value> {
     if depth > 4 {
         return None;
     }
+    if value
+        .get("isError")
+        .is_some_and(|error| !error.is_null() && error.as_bool() != Some(false))
+    {
+        return None;
+    }
     if value["contract"] == RECEIPT_CONTRACT {
         return Some(value.clone());
     }
@@ -79,6 +84,9 @@ pub fn from_tool(
     if notice.outcome != Some(ObservedToolOutcome::Completed) || item["result"]["isError"] == true {
         return Err("领域工具未成功返回事实回执；请检查当前执行结果".into());
     }
+    if super::unwrap_envelope(item["result"].clone(), 0).is_some() {
+        return Ok(None);
+    }
     if serde_json::to_vec(&item["result"]).map_or(true, |v| v.len() > RECEIPT_LIMIT) {
         return Err("领域事实回执超过大小上限；完整事实尚未同步".into());
     }
@@ -90,6 +98,20 @@ pub fn from_tool(
         || receipt.context_sha256 != setup.context_sha256
         || receipt.kind.is_empty()
         || receipt.kind.len() > 64
+        || !matches!(
+            receipt.kind.as_str(),
+            "capabilities"
+                | "source_ledger"
+                | "source_interpretation"
+                | "source_disposition"
+                | "proposal"
+                | "operation"
+                | "application"
+                | "artifact"
+                | "artifact_validation"
+                | "authorization"
+                | "diagnostic"
+        )
         || receipt.fact_sequence == 0
         || receipt.fact_bytes == 0
         || receipt.fact_bytes > FACT_LIMIT
@@ -155,55 +177,80 @@ async fn read_with_deadline(
     if raw.len() > 16 * 1024 || format!("{:x}", Sha256::digest(raw)) != setup.context_sha256 {
         return Err("建模上下文已变化；完整事实尚未同步".into());
     }
-    let mut command = tokio::process::Command::new(&setup.python);
+    let mut command = crate::owned_process::Command::new(&setup.python);
     command
         .current_dir(&setup.repository)
-        .env("PYTHONUTF8", "1")
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .args([
+            "-X",
+            "utf8",
             "-m",
             "blender_agent.cli.main",
             "domain-read-fact",
             "--context",
         ])
-        .arg(&setup.context_path)
+        .args([setup.context_path.as_os_str()])
         .args(["--fact-sha256", &receipt.fact_sha256]);
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let mut child = command.spawn().map_err(|_| "无法启动领域事实读取进程")?;
+    let mut child = crate::owned_process::spawn(command, crate::owned_process::Input::Null)
+        .map_err(|_| "无法启动领域事实读取进程")?;
     let mut stdout = child.stdout.take().ok_or("缺少领域事实读取通道")?;
     let mut stderr = child.stderr.take().ok_or("缺少领域事实错误通道")?;
-    let work = async {
+    async fn bounded<R: tokio::io::AsyncRead + Unpin>(
+        stream: &mut R,
+        limit: usize,
+    ) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::new();
-        let mut errors = Vec::new();
-        let mut bounded_stdout = (&mut stdout).take(FACT_LIMIT as u64 + 1);
-        let mut bounded_stderr = (&mut stderr).take(4097);
-        let (out, err) = tokio::join!(
-            bounded_stdout.read_to_end(&mut bytes),
-            bounded_stderr.read_to_end(&mut errors)
-        );
-        out.map_err(|_| "领域事实读取失败")?;
-        err.map_err(|_| "领域事实错误通道读取失败")?;
-        if bytes.len() > FACT_LIMIT || errors.len() > 4096 {
-            return Err("领域事实读取超过资源上限".to_owned());
+        stream
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "领域事实读取通道失败")?;
+        if bytes.len() > limit {
+            return Err("领域事实读取超过资源上限".into());
         }
+        Ok(bytes)
+    }
+    let work = async {
+        let (bytes, _) =
+            tokio::try_join!(bounded(&mut stdout, FACT_LIMIT), bounded(&mut stderr, 4096))?;
         let status = child.wait().await.map_err(|_| "领域事实读取进程异常退出")?;
         if !status.success() {
             return Err("封存领域事实不存在或校验失败".to_owned());
         }
         Ok(bytes)
     };
-    tokio::time::timeout(deadline, work)
+    let result = tokio::time::timeout(deadline, work)
         .await
-        .map_err(|_| "领域事实读取超时；请重新检查提案以同步事实".to_owned())?
+        .map_err(|_| "领域事实读取超时；请重新检查提案以同步事实".to_owned())
+        .and_then(|result| result);
+    if result.is_err() {
+        child
+            .kill()
+            .await
+            .map_err(|_| "领域事实读取进程退出未确认".to_owned())?;
+    }
+    result
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn python() -> PathBuf {
+        if let Ok(path) = std::env::var("MODELING_TEST_PYTHON") {
+            return path.into();
+        }
+        if cfg!(windows) {
+            for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+                for name in ["python.exe", "python.cmd", "python.bat"] {
+                    let path = directory.join(name);
+                    if path.is_file() {
+                        return path;
+                    }
+                }
+            }
+        }
+        if cfg!(windows) { "python" } else { "python3" }.into()
+    }
 
     fn fixture(script: &str) -> (DomainSetup, FactReceipt, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -223,9 +270,7 @@ mod tests {
         let setup = DomainSetup {
             context_path: root.join("context.json"),
             repository: root.clone(),
-            python: std::env::var("MODELING_TEST_PYTHON")
-                .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into())
-                .into(),
+            python: python(),
             run_id: "run".into(),
             context_sha256: format!("{:x}", Sha256::digest(b"{}")),
             floor_id: "floor".into(),
@@ -244,6 +289,17 @@ mod tests {
         (setup, receipt, root)
     }
 
+    /// A just-terminated process can hold its working directory for a moment on Windows.
+    async fn remove(root: &Path) {
+        for _ in 0..150 {
+            if std::fs::remove_dir_all(root).is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     async fn exited(root: &Path) {
         let pid: u32 = std::fs::read_to_string(root.join("reader.pid"))
             .unwrap()
@@ -256,18 +312,35 @@ mod tests {
         })
         .await
         .unwrap();
+        #[cfg(windows)]
+        {
+            let child: u32 = std::fs::read_to_string(root.join("descendant.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while crate::owned_process::process_alive(child) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 
-    const SLEEP: &str = "import os,time\nfrom pathlib import Path\nPath('reader.pid').write_text(str(os.getpid()))\ntime.sleep(60)\n";
+    // Pid files appear atomically, so the test never reads a half-written one.
+    const SLEEP: &str = "import os,time,subprocess,sys\nfrom pathlib import Path\ndef record(name,pid):\n    Path(name+'.tmp').write_text(str(pid))\n    os.replace(name+'.tmp',name)\nchild=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\nrecord('descendant.pid',child.pid)\nrecord('reader.pid',os.getpid())\ntime.sleep(60)\n";
 
     #[tokio::test]
     async fn deadline_and_cancellation_terminate_private_readers() {
         let (setup, receipt, root) = fixture(SLEEP);
-        let result =
-            read_with_deadline(setup, receipt, std::time::Duration::from_millis(500)).await;
-        assert!(result.unwrap_err().contains("超时"));
+        let result = read_with_deadline(setup, receipt, std::time::Duration::from_secs(3)).await;
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains("超时")),
+            "{result:?}"
+        );
         exited(&root).await;
-        std::fs::remove_dir_all(root).unwrap();
+        remove(&root).await;
         let (setup, receipt, root) = fixture(SLEEP);
         let task = tokio::spawn(read(setup, receipt));
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -280,7 +353,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         exited(&root).await;
-        std::fs::remove_dir_all(root).unwrap();
+        remove(&root).await;
     }
 
     #[tokio::test]
@@ -290,8 +363,15 @@ mod tests {
             "import sys\nsys.stderr.buffer.write(b'x'*4097)\n",
         ] {
             let (setup, receipt, root) = fixture(script);
-            assert!(read(setup, receipt).await.unwrap_err().contains("资源上限"));
-            std::fs::remove_dir_all(root).unwrap();
+            let result = read(setup, receipt).await;
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("资源上限")),
+                "{}",
+                result.as_ref().err().unwrap()
+            );
+            remove(&root).await;
         }
     }
 }
