@@ -974,3 +974,94 @@ fn superseded_source_policy_receipt_cannot_become_the_displayed_fact() {
     assert!(facts.snapshot.groups.is_none());
     assert!(facts.snapshot.fact_sync_notice.is_none());
 }
+
+fn stamped_source_view(mut value: Value, stamp: char) -> Value {
+    value["source_view_contract_version"] = json!("source-view/1");
+    value["source_view_sha256"] = json!(stamp.to_string().repeat(64));
+    value
+}
+
+#[test]
+fn cached_group_view_can_follow_newer_page_of_the_exact_same_source_state() {
+    let mut facts = sequenced_facts();
+    let groups = stamped_source_view(grouped_source_view(3), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let page = stamped_source_view(instance_source_view(9), 'a');
+    assert_eq!(facts.apply_verified_fact(&page), FactProjection::Applied);
+    facts.synchronization_finished(&private_receipt(&page));
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    facts.synchronization_finished(&private_receipt(&groups));
+    assert!(facts.snapshot.groups.is_some());
+    assert!(facts.snapshot.ledger.is_none());
+    assert_eq!(
+        facts.snapshot.verified_fact.as_ref().unwrap().kind,
+        "source_groups"
+    );
+    assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().sequence, 3);
+    // The presentation choice must not lower the watermark for different source state.
+    let older_other_state = stamped_source_view(instance_source_view(8), 'b');
+    assert_eq!(
+        facts.apply_verified_fact(&older_other_state),
+        FactProjection::Superseded
+    );
+    assert!(facts.snapshot.groups.is_some());
+}
+
+#[test]
+fn source_view_stamp_declaration_clears_legacy_views_and_rejects_late_unstamped_data() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "old-groups", grouped_source_view(4));
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx", "kind":"capabilities",
+        "fact_sequence":5,"capabilities":{"source_view":{"contract_version":"source-view/1"}}});
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Applied);
+    assert!(facts.snapshot.groups.is_none());
+    assert_eq!(
+        facts.apply_verified_fact(&grouped_source_view(100)),
+        FactProjection::Superseded
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&stamped_source_view(grouped_source_view(6), 'a')),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.groups.is_some());
+}
+
+#[test]
+fn malformed_source_view_stamp_cannot_poison_state_or_lower_its_watermark() {
+    let mut facts = sequenced_facts();
+    let groups = stamped_source_view(grouped_source_view(4), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let mut bad = stamped_source_view(instance_source_view(100), 'a');
+    bad["source_view_sha256"] = json!("invalid");
+    assert_eq!(facts.apply_verified_fact(&bad), FactProjection::Invalid);
+    assert!(facts.snapshot.groups.is_some());
+    assert_eq!(
+        facts.apply_verified_fact(&stamped_source_view(instance_source_view(5), 'b')),
+        FactProjection::Applied
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&groups),
+        FactProjection::Superseded
+    );
+}
+
+#[test]
+fn source_view_capability_preserves_stamped_cache_and_stale_receipt_cannot_replace_header() {
+    let mut facts = sequenced_facts();
+    let groups = stamped_source_view(grouped_source_view(4), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx", "kind":"capabilities",
+        "fact_sequence":5,"capabilities":{"source_view":{"contract_version":"source-view/1"}}});
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Applied);
+    assert!(facts.snapshot.groups.is_some());
+    let page = stamped_source_view(instance_source_view(6), 'b');
+    assert_eq!(facts.apply_verified_fact(&page), FactProjection::Applied);
+    facts.synchronization_finished(&private_receipt(&page));
+    assert_eq!(
+        facts.apply_verified_fact(&groups),
+        FactProjection::Superseded
+    );
+    facts.synchronization_finished(&private_receipt(&groups));
+    assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().sequence, 6);
+    assert!(facts.snapshot.ledger.is_some());
+}

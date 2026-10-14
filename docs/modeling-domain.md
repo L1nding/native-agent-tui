@@ -203,3 +203,10 @@ Core 记录能力事实中的来源策略与当前来源视图策略。新策略
 真实验收 target/dsh-e2e-019a2245 使用 hi/gpt-6.1-sol 和 zf-tui-modeling-batch，2 PASS、0 FAIL。模型器独立核验从 CAD 和实际已建来源映射推导七对身份，核对 Core 私有完整事实及显示绑定，valid=true，日志 outputs/hospital-source-coincidence-independent-20261014.log。该验收是只读来源分类，不代表新增构建或人工审批。
 
 完整验证 outputs/source-coincidence-tui-full-check-20261014-03.log：629 项 Rust 通过、4 项可选 live 跳过，fmt/check/Clippy/doctest/release/夹具通过；模型器 outputs/source-coincidence-workspace-check-20261014-04.log：547 项通过。此前编译器崩溃、并行构建内存不足及受资源压力影响的模型器检查失败保留原日志；串行构建和最终完整检查通过。
+## 同状态来源视图切换（2026-10-14）
+
+source-view/1给来源分页和全层分组附上同一完整来源状态SHA。Core允许相同SHA的缓存视图重新显示，同时保留最大来源序号水位；不同SHA的旧事实仍Superseded。缺合同的历史数据在新能力声明下不能倒灌，损坏字段不能清空或污染视图。页眉绑定实际显示的已验证来源视图，提案与授权绑定保持独立。
+
+该修复来源于真实代理用例：scan_source_groups缓存的序号低于较新的单页scan_source_instances，同一场景与来源状态也被拒绝切回。专项先红后绿，domain与UI相关48项通过。完整验证outputs/proxy-source-view-tui-full-check-20261014-01.log：633 Rust通过、4项optional live跳过，fmt/check/Clippy/doctest（0）/release/全部夹具通过。
+
+真实target/dsh-e2e-061543fd使用hi/gpt-6.1-sol：一次请求对29个实际来源逐项回答，记录7项测试跳过和16组assumed分类，4 PASS。模型器独立复验valid=true，完整场景应用与构建仍在后续批次，不把代理意见阶段称为完整建模通过。新增hospital-floor-proxy验收夹具尚在实施中，独立于本次缓存切换修复。

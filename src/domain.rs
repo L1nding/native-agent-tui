@@ -273,6 +273,9 @@ pub struct DomainFacts {
     fact_sequences: BTreeMap<String, u64>,
     source_policy: Option<String>,
     source_view_policy: Option<String>,
+    source_view_required: bool,
+    source_view_sha256: Option<String>,
+    source_view_sequence: Option<u64>,
     pub(crate) synchronizing: bool,
     synchronization_errors: BTreeMap<String, u64>,
 }
@@ -294,6 +297,9 @@ impl DomainFacts {
             fact_sequences: BTreeMap::new(),
             source_policy: None,
             source_view_policy: None,
+            source_view_required: false,
+            source_view_sha256: None,
+            source_view_sequence: None,
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
         }
@@ -346,10 +352,24 @@ impl DomainFacts {
             kind.to_owned()
         };
         let sequence = value["fact_sequence"].as_u64();
-        if self
-            .fact_sequences
-            .get(&fact_key)
-            .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
+        let source_kind = matches!(kind, "source_ledger" | "source_groups");
+        let source_stamp = if source_kind {
+            match self.source_stamp(value) {
+                Ok(stamp) => stamp,
+                Err(projection) => return projection,
+            }
+        } else {
+            None
+        };
+        let same_source_state = source_kind
+            && source_stamp.is_some()
+            && source_stamp == self.source_view_sha256
+            && sequence.is_some();
+        if !same_source_state
+            && self
+                .fact_sequences
+                .get(&fact_key)
+                .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
         {
             return FactProjection::Superseded;
         }
@@ -504,31 +524,38 @@ impl DomainFacts {
                 }
             }
             Some("capabilities") => {
-                if let Some(declaration) = value["capabilities"].get("source_coincidence_review") {
+                let declaration = value["capabilities"].get("source_coincidence_review");
+                let policy = if let Some(declaration) = declaration {
                     let Some(policy) = declaration["contract_version"]
                         .as_str()
                         .filter(|v| !v.is_empty() && v.len() <= 80)
                     else {
                         return FactProjection::Invalid;
                     };
-                    if sequence.is_none() {
-                        return FactProjection::Invalid;
-                    }
+                    Some(policy)
+                } else {
+                    None
+                };
+                let view_declaration = value["capabilities"].get("source_view");
+                if view_declaration.is_some_and(|d| d["contract_version"] != "source-view/1") {
+                    return FactProjection::Invalid;
+                }
+                if (policy.is_some() || view_declaration.is_some()) && sequence.is_none() {
+                    return FactProjection::Invalid;
+                }
+                if let Some(policy) = policy {
                     if self.source_policy.as_deref() != Some(policy) {
                         self.source_policy = Some(policy.to_owned());
                         if self.source_view_policy.as_deref() != Some(policy) {
-                            self.snapshot.groups = None;
-                            self.snapshot.ledger = None;
-                            if self.snapshot.verified_fact.as_ref().is_some_and(|f| {
-                                matches!(f.kind.as_str(), "source_groups" | "source_ledger")
-                            }) {
-                                self.snapshot.verified_fact = None;
-                            }
-                            self.source_view_policy = None;
-                            self.fact_sequences.remove("sources");
-                            self.synchronization_errors.remove("source_groups");
-                            self.synchronization_errors.remove("source_ledger");
+                            self.clear_source_view();
                         }
+                    }
+                    accepted = true;
+                }
+                if view_declaration.is_some() {
+                    self.source_view_required = true;
+                    if self.source_view_sha256.is_none() {
+                        self.clear_source_view();
                     }
                     accepted = true;
                 }
@@ -543,7 +570,16 @@ impl DomainFacts {
         }
         if accepted {
             if let Some(sequence) = sequence {
-                self.fact_sequences.insert(fact_key, sequence);
+                if source_kind {
+                    self.source_view_sha256 = source_stamp;
+                    self.source_view_sequence = Some(sequence);
+                    self.fact_sequences
+                        .entry(fact_key)
+                        .and_modify(|last| *last = (*last).max(sequence))
+                        .or_insert(sequence);
+                } else {
+                    self.fact_sequences.insert(fact_key, sequence);
+                }
             }
             FactProjection::Applied
         } else if matches!(kind, "proposal" | "source_ledger" | "source_groups") {
@@ -551,6 +587,50 @@ impl DomainFacts {
         } else {
             FactProjection::Unrelated
         }
+    }
+
+    fn clear_source_view(&mut self) {
+        self.snapshot.groups = None;
+        self.snapshot.ledger = None;
+        if self
+            .snapshot
+            .verified_fact
+            .as_ref()
+            .is_some_and(|f| matches!(f.kind.as_str(), "source_groups" | "source_ledger"))
+        {
+            self.snapshot.verified_fact = None;
+        }
+        self.source_view_policy = None;
+        self.source_view_sha256 = None;
+        self.source_view_sequence = None;
+        self.fact_sequences.remove("sources");
+        self.synchronization_errors.remove("source_groups");
+        self.synchronization_errors.remove("source_ledger");
+    }
+
+    fn source_stamp(&self, value: &Value) -> Result<Option<String>, FactProjection> {
+        let contract = value.get("source_view_contract_version");
+        let raw = value.get("source_view_sha256");
+        if contract.is_none() && raw.is_none() {
+            return if self.source_view_required {
+                Err(FactProjection::Superseded)
+            } else {
+                Ok(None)
+            };
+        }
+        let Some(sha) = raw.and_then(Value::as_str).filter(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) else {
+            return Err(FactProjection::Invalid);
+        };
+        if contract.and_then(Value::as_str) != Some("source-view/1")
+            || value["fact_sequence"].as_u64().is_none()
+        {
+            return Err(FactProjection::Invalid);
+        }
+        Ok(Some(sha.to_owned()))
     }
 
     fn accept_source_policy(&mut self, value: &Value) -> Result<(), FactProjection> {
@@ -591,15 +671,20 @@ impl DomainFacts {
                 self.synchronization_errors.remove(key);
             }
         }
-        let current_source_receipt =
-            !matches!(receipt.kind.as_str(), "source_groups" | "source_ledger")
-                || self.fact_sequences.get("sources") == Some(&receipt.fact_sequence);
+        let source_receipt = matches!(receipt.kind.as_str(), "source_groups" | "source_ledger");
+        let current_source_receipt = !source_receipt
+            || (self.source_view_sequence == Some(receipt.fact_sequence)
+                && ((receipt.kind == "source_groups" && self.snapshot.groups.is_some())
+                    || (receipt.kind == "source_ledger" && self.snapshot.ledger.is_some())));
+        let stamped_current_source =
+            source_receipt && current_source_receipt && self.source_view_sha256.is_some();
         if current_source_receipt
-            && self
-                .snapshot
-                .verified_fact
-                .as_ref()
-                .is_none_or(|fact| fact.sequence <= receipt.fact_sequence)
+            && (stamped_current_source
+                || self
+                    .snapshot
+                    .verified_fact
+                    .as_ref()
+                    .is_none_or(|fact| fact.sequence <= receipt.fact_sequence))
         {
             self.snapshot.verified_fact = Some(VerifiedFact {
                 kind: receipt.kind.clone(),
