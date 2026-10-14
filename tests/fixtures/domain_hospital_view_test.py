@@ -5,6 +5,7 @@ import unittest
 
 from domain_hospital_mixed_check import (
     classified_state_visible, fact_sync_failure_is_terminal, artifact_validation_visible,
+    source_ledger_visible,
 )
 
 
@@ -31,6 +32,24 @@ class HospitalViewTest(unittest.TestCase):
 │capability_missing 1 · pending_addition 2 · pending_confirmation 484│
 │bed · pending_addition│
 ┌Agent 回复┐"""
+
+    def test_scan_wait_excludes_echoed_prompt_and_conversational_state_claims(self):
+        transcript = "来源实例对账 · 扫描 claimed-scan pending_addition 8 suspected_duplicate 1"
+        self.assertFalse(source_ledger_visible(transcript))
+        self.assertFalse(source_ledger_visible(
+            "┌方案与执行事实┐\n│等待平台 Agent 读取楼层并准备方案。│\n┌Agent 回复┐\n"
+            + transcript,
+        ))
+
+    def test_scan_wait_requires_current_business_ledger_and_expected_states(self):
+        actual = "┌方案与执行事实┐\n│来源实例对账 · 扫描 actual-scan│\n" \
+                 "│pending_addition 8 · pending_confirmation 4 · suspected_duplicate 1│\n" \
+                 "┌Agent 回复┐"
+        self.assertTrue(source_ledger_visible(actual))
+        self.assertTrue(source_ledger_visible(actual, hospital=True))
+        self.assertFalse(source_ledger_visible(actual.replace("suspected_duplicate", "absent")))
+        self.assertFalse(source_ledger_visible(actual.replace("pending_confirmation", "absent"),
+                                              hospital=True))
 
     def test_current_artifact_validation_survives_wrapping_at_build_identifier(self):
         build_id = "floor-built-8351deef91f143fda63ab0f72e98d3a1-430bb6bb"

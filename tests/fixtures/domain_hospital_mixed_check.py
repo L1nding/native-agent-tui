@@ -16,6 +16,15 @@ def business(screen):
     )
 
 
+def source_ledger_visible(screen, hospital=False):
+    """Wait for actual business facts, excluding echoed prompts and Agent claims."""
+    body = business(screen)
+    states = ("pending_confirmation",) if hospital else (
+        "pending_addition", "suspected_duplicate",
+    )
+    return "来源实例对账 · 扫描" in body and all(state in body for state in states)
+
+
 def artifact_validation_visible(screen, build_id):
     # Terminal wrapping may discard a separator space at the next line boundary.
     # Only compare the Core business pane; conversational claims are excluded.
