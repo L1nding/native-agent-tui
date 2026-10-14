@@ -6,6 +6,7 @@ never prepares/applies directly and never resolves collisions by moving CAD inpu
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -53,13 +54,21 @@ def run_hospital_remaining_check(report, tui, send, finished, fact, context_path
                "initial_authorizations": grants, "initial_operations": operations,
                "source_state_hashes": {k: hashlib.sha256(v).hexdigest() if v is not None else None
                                        for k, v in source_state.items()}}
+    resumed_id = os.environ.get("MODELING_COMPLEX_REMAINING_PROPOSAL")
+    if resumed_id:
+        previous = Path(os.environ["MODELING_COMPLEX_REMAINING_EVIDENCE"]).resolve()
+        lineage["resumed_from"] = str(previous)
+        lineage["resumed_proposal_id"] = resumed_id
+        lineage["resumed_proposal_sha256"] = hashlib.sha256((directory / (resumed_id + ".json")).read_bytes()).hexdigest()
+        lineage["history_sha256"] = {name:hashlib.sha256((previous / name).read_bytes()).hexdigest()
+                                      for name in ("report.json", "remaining-lineage.json", "failed-01.txt", "failed-01-conversation.txt")}
     (evidence / "remaining-lineage.json").write_text(json.dumps(lineage, indent=2), encoding="utf-8")
     (evidence / "remaining-baseline.scene.json").write_bytes(baseline)
 
     def assess():
         tui.wait("remaining floor assessment ready", lambda s: "建模" in s and "Initializing" not in s, 180)
         selectors = [c["component_id"] for c in candidates]
-        tui.type(
+        prompt = (
             "继续核查医院八层剩余来源。先describe_capabilities、scan_source_groups和inspect_change。"
             f"历史89实例提案{parent_id}在旧基线有32个碰撞实体；当前基线由已应用提案{applied_id}绑定。"
             f"本轮按当前Scene IR扣除所有已应用批次后，核查以下{count}个未建实例，不能把旧基线问题直接当作当前诊断："
@@ -78,15 +87,29 @@ def run_hospital_remaining_check(report, tui, send, finished, fact, context_path
             "仅用领域工具，不运行shell或额外模型。结束回复说明保持CAD位置时哪些对象无法新增，"
             "后续需要用户提供哪些安装资料或选择，不请求当前批准。"
         )
+        if resumed_id:
+            prompt = (
+                "只读续接医院八层当前基线29项诊断。此前已通过prepare_group_change确定性展开，"
+                "保持全部CAD姿态和参数依据，但provider在收尾时中断。"
+                "调用describe_capabilities、inspect_change提案 " + resumed_id +
+                " 读取全部诊断与来源绑定；最后调用scan_source_groups展示全层265已建、29待新增和193能力／安装缺口。"
+                "不prepare、不修订、不预览、不批准、不apply、不构建、不改解释或处置，不使用shell或其他模型。"
+                "报告本次投影阻塞及可回答的处理选择，人工语义／视觉与精确三维碰撞未验证保持未确认。"
+            )
+        tui.type(prompt)
         tui.keys(ENTER, 0.5)
         if "目标 / 自然语言反馈" not in tui.screen():
             tui.keys(F6, 0.5)
         finished()
-        proposals = [p for p in records("*.json") if p.get("proposal_id") not in old_proposals
+        proposals = [p for p in records("*.json") if (p.get("proposal_id") == resumed_id if resumed_id
+                     else p.get("proposal_id") not in old_proposals)
                      and p.get("base_sha256") == baseline_sha and p.get("state") == "blocked"]
         matches = [p for p in proposals if {c["component_id"] for c in p["component_plan"]["components"]} == set(selectors)]
         expect(len(matches) == 1, "no complete current diagnostic proposal for all remaining sources")
         proposal = matches[0]
+        if resumed_id:
+            expect(hashlib.sha256((directory / (resumed_id + ".json")).read_bytes()).hexdigest()
+                   == lineage["resumed_proposal_sha256"], "read-only continuation changed actual diagnostic proposal")
         actual = {c["component_id"]: c for c in proposal["component_plan"]["components"]}
         fields = ["template_id", "origin", "rotation_z_deg", "scale", "arguments", "basis",
                   "source_ids", "source_instance_id", "required_relations", "placement_basis"]
