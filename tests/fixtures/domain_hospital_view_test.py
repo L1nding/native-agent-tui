@@ -33,6 +33,28 @@ class HospitalViewTest(unittest.TestCase):
 │bed · pending_addition│
 ┌Agent 回复┐"""
 
+    def test_remaining_candidates_subtract_every_applied_batch_on_the_target_floor(self):
+        from domain_hospital_remaining_check import remaining_sources
+
+        parent = {"component_plan": {"components": [
+            {"component_id": name, "source_instance_id": name} for name in ("old", "latest", "remaining")
+        ]}}
+        scene = {"floors": [{"id": "floor", "solids": [
+            {"metadata": {"source_instance_id": "old"}},
+            {"metadata": {"source_instance_id": "latest"}},
+            {"metadata": {"source_instance_id": "latest"}},
+            {"metadata": {}},
+        ]}]}
+        self.assertEqual(remaining_sources(scene, "floor", parent),
+                         [{"component_id": "remaining", "source_instance_id": "remaining"}])
+        # Existing geometry on an adjacent floor is not an applied target-floor instance.
+        scene["floors"].append({"id": "other", "solids": [
+            {"metadata": {"source_instance_id": "remaining"}},
+        ]})
+        self.assertEqual(len(remaining_sources(scene, "floor", parent)), 1)
+        with self.assertRaises(StopIteration):
+            remaining_sources(scene, "missing", parent)
+
     def test_scan_wait_excludes_echoed_prompt_and_conversational_state_claims(self):
         transcript = "来源实例对账 · 扫描 claimed-scan pending_addition 8 suspected_duplicate 1"
         self.assertFalse(source_ledger_visible(transcript))

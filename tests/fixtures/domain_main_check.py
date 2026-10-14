@@ -137,7 +137,7 @@ def run_main_check(report, tui, send, finished, fact, context_path, evidence):
         proposal = state["v4"]
         build_id = "main-preview-" + evidence.name[-8:]
         send("只对当前具体提案 " + proposal["proposal_id"]
-             + " 渲染候选预览，使用build_scene candidate=true，build_id=" + build_id
+             + " 渲染候选预览，使用preview_candidate，build_id=" + build_id
              + "，expected_sha256使用提案base_sha256；用inspect_artifact等待终态，再validate_artifact。"
                "仅领域工具，不运行shell，不应用场景，不生成新提案。")
         screen = fact("main preview valid", lambda s: "产物验证 valid=true · current=true" in s, 600)
