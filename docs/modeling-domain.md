@@ -191,3 +191,5 @@ python tests/fixtures/question_batch_audit.py --evidence target/dsh-e2e-a698f67f
 ```
 
 真实验收条目是合成交互输入，Retain／Defer／adjustNN为测试回答，不是医院实际处理选择或授权。医院265／29／193状态保持；实际项目的分类、安装资料、移动选择及人工视觉核对仍等待用户答复。
+
+新版profile领域接入复验：`target/dsh-e2e-b1da3fe1`实际2项PASS，hi/gpt-6.1-sol读取当前医院上下文；Core source_groups seq253完整497462字节，显示487来源的265／29／193。场景、CAD、解释／处置、授权／操作保持，模型器独立复验valid=true，`outputs/batch-domain-readiness-independent-20261014-final.log`。读取器进一步核对私有分组字节／上下文／序号、业务页scan_id／scene_sha；同事实直接对应页眉，合法缓存允许更新的同运行／上下文／基线capabilities，实际更旧capabilities seq252被替换为页眉的反例拒绝。七项专项及模型器最终508项全量通过；该审计限制只作用本来源核查，不冒充医院新增构建或人工批准。
