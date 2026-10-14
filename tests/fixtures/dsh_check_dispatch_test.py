@@ -31,6 +31,32 @@ class DomainDispatchTest(unittest.TestCase):
             tui.assert_not_called()
             cli.assert_not_called()
 
+    def test_batch_question_only_runs_question_checks_and_cleanup(self):
+        path = Path(__file__).with_name("dsh_tui_check.py")
+        spec = importlib.util.spec_from_file_location("dsh_check_batch_dispatch", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            fake_script = Path(directory) / "tests" / "fixtures" / "dsh_tui_check.py"
+            with patch.object(module, "__file__", str(fake_script)), \
+                 patch("sys.argv", [str(path), "--binary", "fake.exe", "--model", "test/model",
+                                    "--only", "question", "--question-case", "batch"]), \
+                 patch.object(module, "question_checks") as questions, \
+                 patch.object(module, "domain_checks") as domain, \
+                 patch.object(module, "conversation_checks") as conversation, \
+                 patch.object(module, "conversation_edge_checks") as edges, \
+                 patch.object(module, "tui_checks") as tui, \
+                 patch.object(module, "cli_checks") as cli, \
+                 patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
+                 patch.object(module.time, "sleep"), \
+                 self.assertRaises(SystemExit) as exited:
+                module.main()
+            self.assertEqual(exited.exception.code, 0)
+            questions.assert_called_once()
+            self.assertEqual(questions.call_args.args[3].question_case, "batch")
+            for other in [domain, conversation, edges, tui, cli]:
+                other.assert_not_called()
+
     def test_full_domain_cases_refuse_a_nonisolated_fixture_scene(self):
         path = Path(__file__).with_name("dsh_tui_check.py")
         spec = importlib.util.spec_from_file_location("dsh_check_isolation", path)

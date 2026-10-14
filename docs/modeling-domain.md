@@ -166,6 +166,28 @@ release写到target/source-view-currency，不替换仍被真实医院验收持�
 
 只读续接`target/dsh-e2e-30d10d78`实际2项PASS，复用`af395b49`准备的`5e7229773aca41f4ab384d2066b511a0`。模型器独立核验valid=true：29项CAD姿态及来源依据保持，29项placement/2阻塞，当前265已建场景及来源处置未改变。`af395b49`仍按provider并发限制FAIL保存；续接不冒充其成功终态，也没有重新准备或应用。
 
-29项请求／逐项选择／自定义调整反馈／单次完整回答已由插件与Rust专项覆盖。该专项不等于用户已经批准29项，也不等于真实模型已完成批量请求验收。运行新版桥接时，dsh profile的`zf-tui-bridge`链接需指向本建模工作树构建的`dsh-plugin`；原平台链接不会因本工作树编译而更新。
+29项请求／逐项选择／自定义调整反馈／单次完整回答已由插件与Rust专项覆盖。该专项不等于用户已经批准29项；后续真实模型批量交互验收见下文，测试回答仍不充当医院人工批准。运行新版桥接时，dsh profile的`zf-tui-bridge`链接需指向本建模工作树构建的`dsh-plugin`；原平台链接不会因本工作树编译而更新。
 
 验证记录：完整`scripts/verify.py`通过，625项Rust测试通过、4项可选live跳过，格式／check／Clippy／doctest（0项）／release／原生及Python夹具通过，日志为模型器`outputs/batch-review-tui-full-check-20261014.log`。`dsh-plugin`的19项测试及类型检查通过，日志`outputs/batch-review-plugin-check-20261014.log`；只读医院续接独立复验见`outputs/hospital-current-remaining-independent-20261014.log`。
+
+
+## 真实29项提问与统一回答（2026-10-14）
+
+独立测试profile`zf-tui-modeling-batch`已链接本工作树新版`dsh-plugin`，原`zf-tui`仍保留原平台链接。真实`target/dsh-e2e-a698f67f`使用hi/gpt-6.1-sol，5项PASS、0失败：一个请求含q01–q29，详情逐页显示全部稳定ID，29项键盘选项／自由文本分别保存，最后一项后统一返回全部原ID及精确回答，退出／进程清理通过。首轮`e0e96c31`失败保留，原因是观察脚本只滚40行、只覆盖前12项；界面当时已正确显示1/29。修正PageDown覆盖范围后重跑，未改写失败。
+
+复跑命令：
+
+```powershell
+python tests/fixtures/dsh_tui_check.py --binary target/release/native-agent-tui.exe --model hi/gpt-6.1-sol --profile zf-tui-modeling-batch --only question --question-case batch
+python tests/fixtures/question_batch_audit.py --evidence target/dsh-e2e-a698f67f --negative-tests
+```
+
+独立审计实际请求、29组填写前／填写后终端截图和最终回复，valid=true；七个证据篡改反例全拒绝，模型器日志`outputs/batch-real-independent-20261014.log`。新增分派隔离用例通过，当前`scripts/verify.py --fixtures-only`通过，日志`outputs/batch-real-tui-fixtures-check-20261014.log`；此轮仅Python验收与文档变化，没有将fixtures-only冒充新的Rust全量检查。
+
+可用以下命令在新版profile打开当前医院隔离任务，输入自然语言由平台Agent查询事实并提出逐项问题。命令不自动批准任何对象：
+
+```powershell
+.\target\release\native-agent-tui.exe --profile zf-tui-modeling-batch --model hi/gpt-6.1-sol --cwd D:/project/blender-agent-modeler --domain-context D:/project/blender-agent-modeler/outputs/hospital-floor-live-20261013-03/context.json
+```
+
+真实验收条目是合成交互输入，Retain／Defer／adjustNN为测试回答，不是医院实际处理选择或授权。医院265／29／193状态保持；实际项目的分类、安装资料、移动选择及人工视觉核对仍等待用户答复。

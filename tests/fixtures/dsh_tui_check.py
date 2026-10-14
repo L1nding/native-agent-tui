@@ -210,11 +210,14 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "conversation", "edges", "question", "cli", "domain"], help="run only TUI, conversation, CLI, or modeling-domain checks")
+    parser.add_argument("--question-case", choices=["standard", "batch"], default="standard", help="real user-question scenario for --only question")
     parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "main", "main-partial", "main-partial-resume", "main-partial-reconcile", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel", "conflict", "vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"], help="modeling scenario for --only domain")
     parser.add_argument("--domain-timeout", type=int, default=0, help="Minimum per-phase observation timeout in seconds (0 keeps case defaults; maximum 1800)")
     args = parser.parse_args()
     if not 0 <= args.domain_timeout <= 1800:
         parser.error("--domain-timeout must be between 0 and 1800")
+    if args.question_case != "standard" and args.only != "question":
+        parser.error("--question-case requires --only question")
     if args.domain_case and args.only != "domain":
         parser.error("--domain-case requires --only domain")
     binary = args.binary.resolve()
@@ -1055,6 +1058,10 @@ def question_checks(report, binary, common, args, workspace):
         return screen
 
     try:
+        if args.question_case == "batch":
+            from question_batch_check import run_batch_questions
+            run_batch_questions(report, tui, args)
+            return
         report.step("startup reaches a ready session", lambda: (
             tui.see("Write a task", 60), tui.see("Ready", 60)) and None, tui)
 
