@@ -271,6 +271,8 @@ pub struct DomainFacts {
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
     fact_sequences: BTreeMap<String, u64>,
+    source_policy: Option<String>,
+    source_view_policy: Option<String>,
     pub(crate) synchronizing: bool,
     synchronization_errors: BTreeMap<String, u64>,
 }
@@ -290,6 +292,8 @@ impl DomainFacts {
             snapshot,
             control_messages: BTreeMap::new(),
             fact_sequences: BTreeMap::new(),
+            source_policy: None,
+            source_view_policy: None,
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
         }
@@ -382,6 +386,9 @@ impl DomainFacts {
             }
             Some("source_groups") => {
                 if let Some(groups) = source_groups_fact(value) {
+                    if let Err(projection) = self.accept_source_policy(value) {
+                        return projection;
+                    }
                     self.snapshot.groups = Some(groups);
                     self.snapshot.ledger = None;
                     accepted = true;
@@ -389,6 +396,9 @@ impl DomainFacts {
             }
             Some("source_ledger") => {
                 if let Some(ledger) = source_ledger_fact(value) {
+                    if let Err(projection) = self.accept_source_policy(value) {
+                        return projection;
+                    }
                     self.snapshot.ledger = Some(ledger);
                     self.snapshot.groups = None;
                     accepted = true;
@@ -493,6 +503,36 @@ impl DomainFacts {
                     }
                 }
             }
+            Some("capabilities") => {
+                if let Some(declaration) = value["capabilities"].get("source_coincidence_review") {
+                    let Some(policy) = declaration["contract_version"]
+                        .as_str()
+                        .filter(|v| !v.is_empty() && v.len() <= 80)
+                    else {
+                        return FactProjection::Invalid;
+                    };
+                    if sequence.is_none() {
+                        return FactProjection::Invalid;
+                    }
+                    if self.source_policy.as_deref() != Some(policy) {
+                        self.source_policy = Some(policy.to_owned());
+                        if self.source_view_policy.as_deref() != Some(policy) {
+                            self.snapshot.groups = None;
+                            self.snapshot.ledger = None;
+                            if self.snapshot.verified_fact.as_ref().is_some_and(|f| {
+                                matches!(f.kind.as_str(), "source_groups" | "source_ledger")
+                            }) {
+                                self.snapshot.verified_fact = None;
+                            }
+                            self.source_view_policy = None;
+                            self.fact_sequences.remove("sources");
+                            self.synchronization_errors.remove("source_groups");
+                            self.synchronization_errors.remove("source_ledger");
+                        }
+                    }
+                    accepted = true;
+                }
+            }
             Some("diagnostic") => {
                 self.snapshot.notice = value["diagnostics"][0]["message"]
                     .as_str()
@@ -511,6 +551,23 @@ impl DomainFacts {
         } else {
             FactProjection::Unrelated
         }
+    }
+
+    fn accept_source_policy(&mut self, value: &Value) -> Result<(), FactProjection> {
+        let raw = value.get("source_coincidence_contract_version");
+        if raw.is_some_and(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 80)) {
+            return Err(FactProjection::Invalid);
+        }
+        let policy = raw.and_then(Value::as_str);
+        if self
+            .source_policy
+            .as_deref()
+            .is_some_and(|expected| Some(expected) != policy)
+        {
+            return Err(FactProjection::Superseded);
+        }
+        self.source_view_policy = policy.map(str::to_owned);
+        Ok(())
     }
 
     pub(crate) fn synchronization_failed(&mut self, kind: &str, sequence: u64, reason: String) {
@@ -534,11 +591,15 @@ impl DomainFacts {
                 self.synchronization_errors.remove(key);
             }
         }
-        if self
-            .snapshot
-            .verified_fact
-            .as_ref()
-            .is_none_or(|fact| fact.sequence <= receipt.fact_sequence)
+        let current_source_receipt =
+            !matches!(receipt.kind.as_str(), "source_groups" | "source_ledger")
+                || self.fact_sequences.get("sources") == Some(&receipt.fact_sequence);
+        if current_source_receipt
+            && self
+                .snapshot
+                .verified_fact
+                .as_ref()
+                .is_none_or(|fact| fact.sequence <= receipt.fact_sequence)
         {
             self.snapshot.verified_fact = Some(VerifiedFact {
                 kind: receipt.kind.clone(),

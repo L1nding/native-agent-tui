@@ -5939,7 +5939,7 @@ mod tests {
             if i == 27 {
                 let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
                 terminal
-                    .draw(|frame| draw(frame, &snapshot, &mut local))
+                    .draw(|frame| draw(frame, &snapshot, &local))
                     .unwrap();
                 let screen: String = terminal
                     .backend()

@@ -193,3 +193,13 @@ python tests/fixtures/question_batch_audit.py --evidence target/dsh-e2e-a698f67f
 真实验收条目是合成交互输入，Retain／Defer／adjustNN为测试回答，不是医院实际处理选择或授权。医院265／29／193状态保持；实际项目的分类、安装资料、移动选择及人工视觉核对仍等待用户答复。
 
 新版profile领域接入复验：`target/dsh-e2e-b1da3fe1`实际2项PASS，hi/gpt-6.1-sol读取当前医院上下文；Core source_groups seq253完整497462字节，显示487来源的265／29／193。场景、CAD、解释／处置、授权／操作保持，模型器独立复验valid=true，`outputs/batch-domain-readiness-independent-20261014-final.log`。读取器进一步核对私有分组字节／上下文／序号、业务页scan_id／scene_sha；同事实直接对应页眉，合法缓存允许更新的同运行／上下文／基线capabilities，实际更旧capabilities seq252被替换为页眉的反例拒绝。七项专项及模型器最终508项全量通过；该审计限制只作用本来源核查，不冒充医院新增构建或人工批准。
+
+## 同位来源复核策略与当前事实（2026-10-14）
+
+模型器声明 source-coincidence/1：保留不同 INSERT 身份，依据同来源、同几何及变换后的 CAD 边界标记疑似同位来源。当前医院事实为 265 已建、22 待新增、7 疑似重复、193 缺能力。七对坐标近似一致仅作为复核依据，不自动合并、跳过或生成授权；原 29 项 blocked 提案保持。
+
+Core 记录能力事实中的来源策略与当前来源视图策略。新策略清除不兼容的旧来源快照和显示绑定；更高序号的旧策略来源事实仍视为 Superseded，不得覆盖当前视图或页眉。匹配策略的缓存可保留，错误策略元数据不能污染当前状态。提案、授权、操作及产物绑定保持独立。
+
+真实验收 target/dsh-e2e-019a2245 使用 hi/gpt-6.1-sol 和 zf-tui-modeling-batch，2 PASS、0 FAIL。模型器独立核验从 CAD 和实际已建来源映射推导七对身份，核对 Core 私有完整事实及显示绑定，valid=true，日志 outputs/hospital-source-coincidence-independent-20261014.log。该验收是只读来源分类，不代表新增构建或人工审批。
+
+完整验证 outputs/source-coincidence-tui-full-check-20261014-03.log：629 项 Rust 通过、4 项可选 live 跳过，fmt/check/Clippy/doctest/release/夹具通过；模型器 outputs/source-coincidence-workspace-check-20261014-04.log：547 项通过。此前编译器崩溃、并行构建内存不足及受资源压力影响的模型器检查失败保留原日志；串行构建和最终完整检查通过。
