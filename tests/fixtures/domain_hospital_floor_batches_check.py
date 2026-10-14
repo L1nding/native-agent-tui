@@ -25,6 +25,13 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
     marker = json.loads(
         (context_path.parent / "hospital-floor-acceptance.json").read_bytes()
     )
+    import os
+
+    requested_components = json.loads(os.environ.get("MODELING_FLOOR_BATCH_COMPONENT_IDS", "[]"))
+    if (not isinstance(requested_components, list) or len(requested_components) > 100
+            or any(not isinstance(value, str) for value in requested_components)
+            or len(set(requested_components)) != len(requested_components)):
+        raise ValueError("requested batch scope must contain up to 100 unique component IDs")
     stages = []
     known_facts = set()
     group_facts = []
@@ -166,8 +173,15 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
 
     def prepare():
         nonlocal proposal
+        restriction = (
+            "本批仅准备以下实例，保持其他来源的处置和待处理状态，不把未选择对象记为跳过："
+            + json.dumps(requested_components, ensure_ascii=False)
+            + "。本批属于已独立查明的凸包误阻塞；查询当前placement_contract_version，"
+            "按新规则重新准备，保持原CAD位置／尺寸／高度／定义，不因旧诊断永久排除。"
+            if requested_components else ""
+        )
         send(
-            "继续所有剩余可执行组，为下一批最多100实例准备具体方案。沿用此前允许的assumed示意高度／"
+            restriction + "继续所有剩余可执行组，为下一批最多100实例准备具体方案。沿用此前允许的assumed示意高度／"
             "细节，保持CAD平面、位置、旋转、镜像和全部已有实体。缺profile的落地家具／洁具提出明确"
             "数据定义；已有定义复用。宿主不全和碰撞实例保留实际问题，为其余实例继续准备。"
             "优先处理此前未完成的请求。只准备并展示，不预览、不批准、不应用。"
@@ -194,6 +208,12 @@ def run_hospital_floor_batch(report, tui, send, finished, fact, context_path, ev
             proposal and 1 <= len(proposal["component_plan"]["components"]) <= 100,
             "invalid concrete batch capacity",
         )
+        if requested_components:
+            expect(
+                {c["component_id"] for c in proposal["component_plan"]["components"]}
+                == set(requested_components), "prepared batch exceeds or omits requested scope"
+            )
+            lineage["requested_component_ids"] = requested_components
         built = {
             i["source_id"]
             for g in stages[0]["groups"]["groups"]
