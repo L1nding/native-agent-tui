@@ -1094,7 +1094,7 @@ pub async fn authorize(setup: DomainSetup, binding: ProposalBinding) -> Result<S
                   "expected_sha256": binding.base_sha256,
                   "authorization_id": authorization_id
               },
-              "instruction":"用户已批准此具体版本。使用 apply_change_arguments 并补充稳定 operation_id 调用领域 apply_change；expected_sha256 必须是 base_sha256。再独立构建和验证产物，保留假设标签。"});
+              "instruction":"用户已批准此具体版本。使用 apply_change_arguments 并补充稳定 operation_id 调用领域 apply_change；expected_sha256 必须是 base_sha256。再独立构建和验证产物，保留假设标签。有来源输入时，最后调用 scan_source_instances 并按 next_offset 读完全部页，展示已建、跳过和未决来源的完整对账；仅完成构建不能报告来源对账已完成。"});
     Ok(format!("{display}\n{payload}"))
 }
 

@@ -66,7 +66,11 @@ def run_hospital_remaining_check(report, tui, send, finished, fact, context_path
             + json.dumps(selectors, ensure_ascii=False)
             + f"。读取历史提案component_plan，对这{count}个保留来源、平面位置、旋转、镜像、尺寸、"
             "高度、参数依据及定义。复用实际已应用定义；尚未落盘定义保留原参数依据并完整带入。"
-            "用当前scan_id和当前scene_sha256重新prepare_change，形成独立当前基线提案。"
+            "用prepare_group_change按当前group_id及精确source_ids子集展开这批来源。"
+            "definitions只带所需profiles和尚未落盘定义，components/openings/connections留空；"
+            "placements引用历史template_id与arguments，让Python确定性展开CAD变换，不手抄坐标。"
+            "保持placement_basis=source；姿态冲突需核对指定来源，不能改成user_request来绕过。"
+            "传当前scan_id和当前scene_sha256，形成独立当前基线提案。"
             "不要移位、缩小、改高度、改类别、丢弃实例或修改来源处置来绕过碰撞。"
             "不预览、不批准、不应用、不构建；本轮只要完整的新阻塞诊断和可回答的处理选择。"
             "其余193个安装／关系／类别问题保留真实缺口，不能通过通用落地profile掩盖。"
