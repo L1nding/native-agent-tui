@@ -820,3 +820,86 @@ fn readonly_recovery_of_older_applied_artifact_uses_verified_operation_authority
         "later read of the same applied authority must not erase current build status"
     );
 }
+
+fn grouped_source_view(sequence: u64) -> Value {
+    json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+    "kind":"source_groups","fact_sequence":sequence,
+    "scan_id":"scan","scene_sha256":"scene","total_groups":1,"total_objects":2,
+    "state_counts":{"pending_addition":1,"skipped":1},"groups":[{
+        "group_id":"group.chairs","block":"chairs","instance_count":2,
+        "instances":[{"source_id":"a"},{"source_id":"b"}],
+        "category_counts":{"chair":2},"state_counts":{"pending_addition":1,"skipped":1}
+    }]})
+}
+
+fn instance_source_view(sequence: u64) -> Value {
+    json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+    "kind":"source_ledger","fact_sequence":sequence,"scan_id":"scan","scene_sha256":"scene",
+    "objects":[
+        {"source_id":"a","category":"chair","state":"skipped","origin_m":[4,5],"matched_component_ids":[]},
+        {"source_id":"b","category":"chair","state":"pending_addition","origin_m":[6,5],"matched_component_ids":[]}
+    ]})
+}
+
+#[test]
+fn source_views_new_ledger_replaces_group_snapshot_and_rejects_late_groups() {
+    let mut facts = sequenced_facts();
+    let proposal = envelope();
+    deliver_fact(&mut facts, "proposal", proposal);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    deliver_fact(&mut facts, "groups", grouped_source_view(4));
+    assert!(facts.snapshot.groups.is_some());
+    deliver_fact(&mut facts, "ledger", instance_source_view(5));
+    assert!(
+        facts.snapshot.groups.is_none(),
+        "older group rows are not current ledger facts"
+    );
+    assert_eq!(
+        facts
+            .snapshot
+            .ledger
+            .as_ref()
+            .unwrap()
+            .counts
+            .get("skipped"),
+        Some(&1)
+    );
+    // Equal totals and unchanged scan IDs do not prove that every member state is unchanged.
+    assert_eq!(
+        facts.apply_verified_fact(&grouped_source_view(4)),
+        FactProjection::Superseded
+    );
+    assert!(facts.snapshot.groups.is_none());
+    assert_eq!(facts.snapshot.proposal.as_ref().unwrap().binding, binding);
+    assert!(facts.can_authorize(&binding));
+}
+
+#[test]
+fn source_views_new_groups_replace_ledger_and_malformed_or_late_ledger_cannot_displace_them() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "ledger", instance_source_view(4));
+    deliver_fact(&mut facts, "groups", grouped_source_view(5));
+    assert!(
+        facts.snapshot.ledger.is_none(),
+        "older instance rows must not appear as current"
+    );
+    assert!(facts.snapshot.groups.is_some());
+    assert_eq!(
+        facts.apply_verified_fact(&instance_source_view(4)),
+        FactProjection::Superseded
+    );
+    let mut malformed = instance_source_view(100);
+    malformed["objects"][0]["state"] = json!("invented-state");
+    assert_eq!(
+        facts.apply_verified_fact(&malformed),
+        FactProjection::Invalid
+    );
+    assert!(facts.snapshot.groups.is_some());
+    assert!(facts.snapshot.ledger.is_none());
+    assert_eq!(
+        facts.apply_verified_fact(&instance_source_view(6)),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.groups.is_none());
+    assert!(facts.snapshot.ledger.is_some());
+}

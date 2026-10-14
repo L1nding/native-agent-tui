@@ -334,6 +334,10 @@ impl DomainFacts {
                 return FactProjection::Invalid;
             };
             format!("artifact:{id}")
+        } else if matches!(kind, "source_ledger" | "source_groups") {
+            // Both shapes describe the same mutable source state. Delayed pages
+            // from either shape must not replace a newer verified source view.
+            "sources".to_owned()
         } else {
             kind.to_owned()
         };
@@ -379,12 +383,14 @@ impl DomainFacts {
             Some("source_groups") => {
                 if let Some(groups) = source_groups_fact(value) {
                     self.snapshot.groups = Some(groups);
+                    self.snapshot.ledger = None;
                     accepted = true;
                 }
             }
             Some("source_ledger") => {
                 if let Some(ledger) = source_ledger_fact(value) {
                     self.snapshot.ledger = Some(ledger);
+                    self.snapshot.groups = None;
                     accepted = true;
                 }
             }

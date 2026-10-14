@@ -141,3 +141,20 @@ MCP包装规范化补充（2026-10-13）：第5轮target/dsh-e2e-447307c5再次�
 
 
 跨层第10轮进一步核对：小回执与Core独立读取已支持45,171字节同链修订、依赖完整子方案、真实预览与具体批准应用／有效构建。模型在领域成功后遇到upstream_http2_stream_error，该轮按失败保留；独立verify-partial证据核对仅一次授权／应用和真实几何，不能代替完整井道连续增补。其他provider实际调用及最新状态见领域事实独立通道文档。整体复杂计划保持实施中。
+
+
+## 来源分组与实例台账的当前性（2026-10-14）
+
+真实C04运行出现过：source_groups旧快照仍显示8个待新增，而较新source_ledger已把4个来源跳过。
+这些事实的历史归属都有效，但不能同时作为当前来源视图显示。Core现按一个sources序号处理两种
+核验事实；新分组取代旧实例视图，新实例台账取代旧分组视图，跨类型迟到结果保持历史归属。
+不从相同总数或scan_id推导逐实例状态相同，不在UI猜测或拼合类别状态。Malformed事实不清掉
+已有有效视图、不推进序号。提案及具体批准binding保持独立。
+
+两条确定性正反回归先在旧实现上失败；修复后40项领域／业务页专项通过。全量格式、check、Clippy、
+nextest 620项通过，4项可选live跳过；doctest为0项。日志在模型器outputs/source-view-currency-*-20261014.log。
+release写到target/source-view-currency，不替换仍被真实医院验收持有的target/release；该新二进制的原生／回放／对话／终端／进程／Python夹具现已全量通过，日志outputs/source-view-currency-release-fixtures-20261014.log（位于模型器根目录）。
+
+真实模型调用遵循用户当前指定的hi/gpt-6.1-sol，禁止Astra和自动回退。C04第三轮在真实候选预览验证后
+因provider并发上限失败，原记录5 PASS／1 FAIL及零批准／零应用保持；当前医院29项诊断串行重试中。
+历史Astra验收只保留原证据，不能冒充本次指定模型成功。
