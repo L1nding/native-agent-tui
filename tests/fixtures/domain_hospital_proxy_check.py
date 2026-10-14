@@ -13,6 +13,13 @@ from pathlib import Path
 from domain_hospital_mixed_check import artifact_validation_visible, business
 
 
+def applied_proxy_proposals(values, scene_sha256):
+    return [v for v in values if isinstance(v.get("draft"),dict)
+            and isinstance(v.get("component_plan"),dict)
+            and v.get("candidate_sha256")==scene_sha256
+            and v.get("state") in {"applied","built"}]
+
+
 def run_hospital_proxy_check(report,tui,send,finished,fact,context_path,evidence):
     from dsh_tui_check import CTRL_Y,ENTER,ESC,F6,expect
     context=json.loads(context_path.read_bytes())
@@ -203,7 +210,7 @@ def run_hospital_proxy_check(report,tui,send,finished,fact,context_path,evidence
 
     expect(phase=="finalize" and not source_ids,"finalize requires no supported pending source")
     expect(current["state_counts"]=={"built":480,"skipped":7},"final source outcomes differ")
-    proposals=[v for v in records("*.json") if v.get("candidate_sha256")==base_sha and v.get("state") in {"applied","built"}]
+    proposals=applied_proxy_proposals(records("*.json"),base_sha)
     expect(len(proposals)==1,"no unique current applied proposal")
     proposal=proposals[0]
     rebuild_id="proxy-rebuilt-"+evidence.name[-8:]

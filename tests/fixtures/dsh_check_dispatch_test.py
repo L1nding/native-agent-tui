@@ -10,6 +10,19 @@ from unittest.mock import patch
 
 
 class DomainDispatchTest(unittest.TestCase):
+    def test_proxy_finalization_does_not_treat_apply_receipt_as_proposal(self):
+        from domain_hospital_proxy_check import applied_proxy_proposals
+        current = {"proposal_id":"current", "state":"applied", "candidate_sha256":"current-scene",
+                   "draft":{"operations":[{"object_id":"fixture"}]}, "component_plan":{"components":[{"id":"fixture"}]}}
+        receipt = {"proposal_id":"current", "operation_id":"apply-current", "state":"applied", "candidate_sha256":"current-scene"}
+        historical = dict(current, proposal_id="old", candidate_sha256="old-scene", state="built")
+        blocked = dict(current, proposal_id="blocked", state="blocked")
+        self.assertEqual(applied_proxy_proposals([receipt,historical,current,blocked], "current-scene"), [current])
+        built = dict(current, state="built")
+        self.assertEqual(applied_proxy_proposals([receipt,built], "current-scene"), [built])
+        other = dict(current, proposal_id="another-real-proposal")
+        self.assertEqual(len(applied_proxy_proposals([current,other], "current-scene")), 2)
+
     def test_domain_only_runs_domain_checks_and_cleanup(self):
         path = Path(__file__).with_name("dsh_tui_check.py")
         spec = importlib.util.spec_from_file_location("dsh_check_dispatch", path)
