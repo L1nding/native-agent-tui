@@ -220,7 +220,8 @@ def run_hospital_proxy_check(report,tui,send,finished,fact,context_path,evidence
              "。inspect_artifact(wait_seconds=20)等待，validate_artifact核对Blender、rebuilt和glb_roundtrip。"
              "然后render_artifact_review生成top、perspective及front三幅图，每幅read_artifact_review_image读取实际PNG。"
              "当前只生成可交付的新图；编码Agent随后自行作代理视觉判断。scene与来源不能改变，真实人工not_run。"
-             "最后scan_source_groups。")
+             "先scan_source_groups，再validate_artifact参数"+json.dumps({"build_id":rebuild_id})+
+             "作为最后一次领域调用，保留可观察的当前产物验证；不要以图像回执替代构建验证。")
         fact("final full-floor rebuild GLB validated",lambda s:artifact_validation_visible(s,rebuild_id),1800);finished()
         lineage["proposal"]=proposal;lineage["rebuild_id"]=rebuild_id;save();checkpoint("rebuilt-and-rendered")
         images=[v for v in records("facts/*.json") if v.get("artifact",{}).get("build_id")==rebuild_id and v.get("artifact",{}).get("review_image",{}).get("delivery")=="attached_png"]
