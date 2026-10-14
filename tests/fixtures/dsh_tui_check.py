@@ -210,7 +210,7 @@ def main():
     parser.add_argument("--dsh", default="dsh.cmd" if os.name == "nt" else "dsh")
     parser.add_argument("--profile", default="zf-tui")
     parser.add_argument("--only", choices=["tui", "conversation", "edges", "question", "cli", "domain"], help="run only TUI, conversation, CLI, or modeling-domain checks")
-    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel", "conflict", "vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining"], help="modeling scenario for --only domain")
+    parser.add_argument("--domain-case", choices=["scan", "chair", "mixed", "blocked", "clarify", "hosted", "async", "recovery", "failure", "cancel", "conflict", "vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"], help="modeling scenario for --only domain")
     parser.add_argument("--domain-timeout", type=int, default=0, help="Minimum per-phase observation timeout in seconds (0 keeps case defaults; maximum 1800)")
     args = parser.parse_args()
     if not 0 <= args.domain_timeout <= 1800:
@@ -1137,7 +1137,7 @@ def domain_checks(report, binary, common, args, workspace, root):
     def finished():
         screen = tui.wait("domain turn completed", lambda s: any(state in s for state in
                           (" · Completed · ", " · Failed · ", " · Interrupted · "))
-                          and (case in {"hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining"} or "A turn is running" not in s), max(1800 if case.startswith("hospital-floor") else (900 if case == "hospital" else 240), getattr(args, "domain_timeout", 0)))
+                          and (case in {"hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"} or "A turn is running" not in s), max(1800 if case.startswith("hospital-floor") else (900 if case == "hospital" else 240), getattr(args, "domain_timeout", 0)))
         expect(" · Completed · " in screen, "domain turn ended without success")
         return screen
     def fact(what, predicate, timeout=300):
@@ -1150,7 +1150,7 @@ def domain_checks(report, binary, common, args, workspace, root):
             if case.startswith("hospital-floor") and "Needs your approval" in screen:
                 raise Failed(f"{what}: unexpected platform approval request; artifact waiting must use domain tools")
             if "领域事实同步失败" in screen:
-                if case in {"hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining"}:
+                if case in {"hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"}:
                     from domain_hospital_mixed_check import fact_sync_failure_is_terminal
                     recorded_error = root / "hospital-transient-fact-error.txt"
                     if not recorded_error.exists():
@@ -1163,7 +1163,7 @@ def domain_checks(report, binary, common, args, workspace, root):
                 return True
             if " · Failed · " in screen or " · Interrupted · " in screen:
                 raise Failed(f"{what}: domain turn ended without success")
-            if case in {"vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining"} and " · Completed · " in screen and not completed_seen:
+            if case in {"vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"} and " · Completed · " in screen and not completed_seen:
                 completed_seen = True
                 tui.keys(CTRL_HOME, 0.2)
                 if case == "hospital-floor-finalize":
@@ -1171,8 +1171,8 @@ def domain_checks(report, binary, common, args, workspace, root):
                 page, last_move = 0, time.monotonic()
                 return False
             if time.monotonic() - last_move >= 1:
-                if page >= (40 if case in {"failure", "cancel", "conflict", "vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining"} else 10):
-                    if case in {"vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining"} and completed_seen and " · Completed · " in screen:
+                if page >= (40 if case in {"failure", "cancel", "conflict", "vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"} else 10):
+                    if case in {"vertical", "hospital", "hospital-floor", "hospital-floor-resume", "hospital-floor-batch", "hospital-floor-finalize", "hospital-floor-visual-review", "hospital-floor-remaining", "hospital-floor-readiness"} and completed_seen and " · Completed · " in screen:
                         raise Failed(f"{what}: completed Agent turn has no required Core fact after full viewport scan")
                     tui.keys("\x1b[5~" * page, 0.1)
                     page = 0
@@ -1197,6 +1197,10 @@ def domain_checks(report, binary, common, args, workspace, root):
         tui.console = Console(command, repository)
         return code
     try:
+        if case == "hospital-floor-readiness":
+            from domain_hospital_readiness_check import run_hospital_readiness_check
+            run_hospital_readiness_check(report, tui, send, finished, fact, context, root)
+            return
         if case == "hospital-floor-remaining":
             from domain_hospital_remaining_check import run_hospital_remaining_check
             run_hospital_remaining_check(report, tui, send, finished, fact, context, root)
