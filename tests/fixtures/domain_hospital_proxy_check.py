@@ -215,7 +215,11 @@ def run_hospital_proxy_check(report,tui,send,finished,fact,context_path,evidence
     proposal=proposals[0]
     rebuild_id="proxy-rebuilt-"+evidence.name[-8:]
     def rebuild():
-        send("完整代理测试当前应为480built、7skipped。用build_scene对最后应用提案独立重建，参数"+
+        operation=next(o["operation_id"] for o in initial_operations if o["proposal_id"]==proposal["proposal_id"])
+        send("先只读恢复当前已应用提案及原操作：inspect_change参数"+
+             json.dumps({"proposal_id":proposal["proposal_id"]})+"，inspect_operation参数"+
+             json.dumps({"operation_id":operation})+"。让Core核验并绑定实际提案和当前应用事实，不准备、不授权、不重放应用。"
+             "完整代理测试当前应为480built、7skipped。再用build_scene对最后应用提案独立重建，参数"+
              json.dumps({"proposal_id":proposal["proposal_id"],"expected_sha256":base_sha,"build_id":rebuild_id})+
              "。inspect_artifact(wait_seconds=20)等待，validate_artifact核对Blender、rebuilt和glb_roundtrip。"
              "然后render_artifact_review生成top、perspective及front三幅图，每幅read_artifact_review_image读取实际PNG。"
