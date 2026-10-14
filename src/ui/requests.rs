@@ -223,6 +223,19 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
     let mut meta = Vec::new();
     match &request.kind {
         RequestKind::UserInput { questions } => {
+            rows.push(Row::new(
+                RowKind::Meta,
+                format!(
+                    "{} {}/{} · {}",
+                    tr("Answers saved", "已保存回答"),
+                    local.answers.len(),
+                    questions.len(),
+                    tr(
+                        "All answers return together after the last item.",
+                        "全部逐项回答后统一提交。"
+                    ),
+                ),
+            ));
             for (index, question) in questions.iter().enumerate() {
                 rows.push(Row::blank());
                 rows.push(
@@ -254,6 +267,23 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                         },
                     ),
                 );
+                if let Some(answer) = local.answers.get(&question.id) {
+                    rows.push(
+                        Row::new(
+                            RowKind::Meta,
+                            format!(
+                                "{} {}",
+                                tr("Saved answer:", "已保存："),
+                                if question.is_secret {
+                                    "***".into()
+                                } else {
+                                    answer.join(", ")
+                                },
+                            ),
+                        )
+                        .lead(INDENT, RowKind::Meta),
+                    );
+                }
                 rows.push(
                     Row::new(RowKind::Decision, question.question.clone())
                         .lead(INDENT, RowKind::Decision),
@@ -1138,5 +1168,44 @@ mod tests {
         assert_eq!(buffer[locked].fg, dark().muted);
         assert!(!buffer[locked].modifier.contains(Modifier::BOLD));
         assert!(!screen(&buffer).contains("Ctrl+Y"));
+    }
+    #[test]
+    fn batch_request_renders_saved_progress_and_masks_saved_secret_answers() {
+        let questions: Vec<serde_json::Value> = (0..29)
+            .map(|i| {
+                serde_json::json!({
+                    "id":format!("item-{i}"), "header":format!("Item {i}"),
+                    "question":"Review", "isSecret":i == 1
+                })
+            })
+            .collect();
+        let request = RequestView::decode(
+            RpcId::Number(1),
+            "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root","turnId":"one","questions":questions}),
+        )
+        .unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            request_panel: true,
+            ..Default::default()
+        };
+        sync_local_requests(&mut local, &snapshot);
+        local.answers.insert("item-0".into(), vec!["Accept".into()]);
+        local
+            .answers
+            .insert("item-1".into(), vec!["PRIVATE_BATCH_ANSWER".into()]);
+        for width in [60, 80, 120] {
+            let buffer = render(&snapshot, &local, dark(), width, 36);
+            let screen = screen(&buffer);
+            assert!(screen.contains("Answers saved 2/29"), "{screen}");
+            assert!(screen.contains("Saved answer: Accept"), "{screen}");
+            assert!(screen.contains("Saved answer: ***"), "{screen}");
+            assert!(!screen.contains("PRIVATE_BATCH_ANSWER"));
+        }
     }
 }

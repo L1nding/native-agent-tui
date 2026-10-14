@@ -5901,6 +5901,71 @@ mod tests {
     }
 
     #[test]
+    fn batch_of_29_submits_one_complete_request_with_individual_decisions() {
+        let questions: Vec<serde_json::Value> = (0..29).map(|i| serde_json::json!({
+            "id":format!("component-{i}"), "header":format!("Item {i}"), "question":"Review V1",
+            "options":[{"label":"Accept","description":"Validate first"},
+                {"label":"Defer","description":"Pending"}]
+        })).collect();
+        let request = RequestView::decode(
+            RpcId::String("batch".into()),
+            "item/tool/requestUserInput",
+            &serde_json::json!({"threadId":"root","turnId":"one","questions":questions}),
+        )
+        .unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        sync_local_requests(&mut local, &snapshot);
+        for i in 0..29 {
+            local.editor.insert(match i % 3 {
+                0 => "1",
+                1 => "move X +0.25 m",
+                _ => "2",
+            });
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+            if i < 28 {
+                assert!(rx.try_recv().is_err(), "early submission at {i}");
+            }
+            if i == 27 {
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &snapshot, &mut local))
+                    .unwrap();
+                let screen: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(screen.contains("29/29"), "{screen}");
+                assert!(screen.contains("Item 28"), "{screen}");
+            }
+        }
+        let Command::AnswerUserInput { request, answers } = rx.try_recv().unwrap() else {
+            panic!("expected one batch answer")
+        };
+        assert_eq!(request, snapshot.requests[0].reference());
+        assert_eq!(answers.len(), 29);
+        assert_eq!(answers["component-0"], ["Accept"]);
+        assert_eq!(answers["component-1"], ["move X +0.25 m"]);
+        assert_eq!(answers["component-2"], ["Defer"]);
+        assert_eq!(answers["component-28"], ["move X +0.25 m"]);
+        assert!(rx.try_recv().is_err());
+        assert!(local.submitted.contains(&request));
+    }
+
+    #[test]
     fn oversized_multi_question_answers_keep_the_draft_and_can_be_corrected() {
         let request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({"threadId":"root","turnId":"one","questions":[{"id":"a","header":"A","question":"First"},{"id":"b","header":"B","question":"Second"}]})).unwrap();
         let snapshot = CoreSnapshot {

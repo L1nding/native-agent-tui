@@ -61,3 +61,47 @@ test('typed feedback, dismissal and withdrawal each reach the host as what they 
   assert.equal(ask({ agent, questions: [] }), 'passed on')
   assert.equal(sent.length, 4)
 })
+
+
+test('29 item decisions travel in one request and retain individual feedback', async () => {
+  const { ask, sent, questions, agent } = host()
+  const items = Array.from({ length: 29 }, (_, index) => ({
+    ...review, id: `component-${index}`, header: `Item ${index + 1}`,
+    options: [{ label: 'Accept', description: 'Retain for validation' }, { label: 'Defer', description: 'Keep pending' }],
+  }))
+  const response = ask({ agent, questions: items })
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].params.questions.length, 29)
+  const answers = Object.fromEntries(items.map(({ id }, index) => [id, {
+    answers: [index % 3 === 0 ? 'Accept' : index % 3 === 1 ? 'move X +0.25 m' : 'Defer'],
+  }]))
+  questions.settle({ id: sent[0].id, result: { answers } })
+  const result = await response
+  assert.equal(result.answers.length, 29)
+  assert.deepEqual(result.answers[0], { id: 'component-0', selected: ['Accept'] })
+  assert.deepEqual(result.answers[1], { id: 'component-1', selected: [], custom: 'move X +0.25 m' })
+  assert.deepEqual(result.answers[28], { id: 'component-28', selected: [], custom: 'move X +0.25 m' })
+})
+
+
+test('64 question boundary is forwarded whole; a larger batch is passed on whole', async () => {
+  const { ask, sent, questions, agent } = host()
+  const items = Array.from({ length: 64 }, (_, index) => ({ ...review, id: `item-${index}` }))
+  const response = ask({ agent, questions: items })
+  assert.equal(sent[0].params.questions.length, 64)
+  const answers = Object.fromEntries(items.map(({ id }) => [id, { answers: ['Approve'] }]))
+  questions.settle({ id: sent[0].id, result: { answers } })
+  assert.equal((await response).answers.length, 64)
+  assert.equal(ask({ agent, questions: [...items, { ...review, id: 'item-64' }] }), 'passed on')
+  assert.equal(sent.length, 1)
+})
+
+
+test('question identity is never shortened before matching the reply', async () => {
+  const { ask, sent, questions, agent } = host()
+  const id = `component.${'x'.repeat(180)}`
+  const response = ask({ agent, questions: [{ ...review, id }] })
+  assert.equal(sent[0].params.questions[0].id, id)
+  questions.settle({ id: sent[0].id, result: { answers: { [id]: { answers: ['Approve'] } } } })
+  assert.deepEqual((await response).answers, [{ id, selected: ['Approve'] }])
+})

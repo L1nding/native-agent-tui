@@ -1078,9 +1078,9 @@ impl AcpBridge {
     /// Agent 向用户提的问题（如 plan 评审）。dsh 的 ACP 没有应答者，由插件转来；
     /// 这里把它变成 Core 已有的用户输入请求，绑定当前会话和轮次。
     fn ask(&mut self, id: RpcId, params: Value) -> Result<(), TransportError> {
-        let questions = params["questions"]
-            .as_array()
-            .filter(|questions| !questions.is_empty() && questions.len() <= 16);
+        let questions = params["questions"].as_array().filter(|questions| {
+            !questions.is_empty() && questions.len() <= crate::interactions::MAX_INPUT_QUESTIONS
+        });
         let (Some(session), Some(turn), Some(questions)) = (
             self.session_id
                 .clone()
@@ -1121,7 +1121,7 @@ impl AcpBridge {
                             "description":clip(&option["description"], 400)})
                     })
                     .collect();
-                let mut item = json!({"id":clip(&question["id"], 128),
+                let mut item = json!({"id":question["id"],
                     "header":clip(&question["header"], 200),
                     "question":clip(&question["question"], budget)});
                 if !options.is_empty() {
@@ -1131,11 +1131,26 @@ impl AcpBridge {
                 item
             })
             .collect();
+        let params = json!({"threadId":session,"turnId":turn,"questions":questions});
+        // Bound the whole request, including repeated options and identity fields.
+        // Reject here so dsh receives a terminal error rather than waiting for a
+        // Core request that cannot be decoded. Never drop questions from a batch.
+        if let Err(error) = crate::interactions::RequestView::decode(
+            id.clone(),
+            "item/tool/requestUserInput",
+            &params,
+        ) {
+            return self.acp.send(with_jsonrpc(Envelope::error_response(
+                id,
+                -32602,
+                format!("invalid user questions: {error}"),
+            )));
+        }
         self.asks.insert(id.clone());
         self.core.send(Envelope::request(
             id,
             "item/tool/requestUserInput",
-            Some(json!({"threadId":session,"turnId":turn,"questions":questions})),
+            Some(params),
         ))
     }
 
@@ -3527,6 +3542,74 @@ mod tests {
         );
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn batch_of_29_questions_reaches_core_without_losing_item_identity() {
+        let (mut core_client, core_bridge) = pair();
+        let (_acp_server, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge.turn_id = Some("t".into());
+        let questions: Vec<serde_json::Value> = (0..29).map(|i| json!({
+            "id":format!("component.hospital-floor-08.{i}"), "header":format!("构件 {i}"),
+            "question":"方案 V1，来源姿态保持；投影校验阻塞。请选择保留、调整或暂缓。", "multiSelect":false,
+            "options":[{"label":"保留","description":"校验通过后可申请批准"},
+                {"label":"调整","description":"填写具体位移或尺寸依据"},
+                {"label":"暂缓","description":"保持待确认"}]
+        })).collect();
+        let id = RpcId::String("batch".into());
+        bridge
+            .ask(
+                id.clone(),
+                json!({"sessionId":"s","questions":questions.clone()}),
+            )
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(1), core_client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let params = request.params.unwrap();
+        assert_eq!(params["questions"], json!(questions));
+        assert!(crate::interactions::RequestView::decode(
+            id,
+            "item/tool/requestUserInput",
+            &params
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_questions_return_an_error_without_leaving_a_pending_request() {
+        let (_core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge.turn_id = Some("t".into());
+        let options: Vec<serde_json::Value> = (0..12)
+            .map(|i| {
+                json!({
+                    "label":format!("{i}{}", "l".repeat(180)), "description":"d".repeat(380)
+                })
+            })
+            .collect();
+        let oversized: Vec<serde_json::Value> = (0..29).map(|i| json!({
+            "id":format!("item-{i}"), "header":"Review", "question":"Choose", "options":options
+        })).collect();
+        let duplicate = vec![json!({"id":"same","header":"A","question":"Q"}); 2];
+        for (i, questions) in [oversized, duplicate].into_iter().enumerate() {
+            let id = RpcId::String(format!("invalid-{i}"));
+            bridge
+                .ask(id.clone(), json!({"sessionId":"s","questions":questions}))
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(1), acp_server.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.id, Some(id));
+            assert!(response.error.is_some());
+            assert!(bridge.asks.is_empty());
+        }
     }
 
     #[tokio::test]

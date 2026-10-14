@@ -14,7 +14,7 @@ import type { Frame, FrameId, HostContext } from './host.js'
 
 export const ASK_METHOD = 'zf/session/ask'
 
-const MAX_QUESTIONS = 16
+const MAX_QUESTIONS = 64
 const MAX_TEXT_CHARS = 6000
 const MAX_OPTIONS = 12
 
@@ -68,7 +68,8 @@ export function answerQuestions(
         .slice(0, MAX_OPTIONS)
         .map((option) => ({ label: text(record(option)?.['label'], 200), description: text(record(option)?.['description'], 400) }))
         .filter((option) => option.label !== '')
-      const id = text(question['id'], 128)
+      // The reply key must remain the host's exact item identity.
+      const id = typeof question['id'] === 'string' ? question['id'] : ''
       labels.set(id, new Set(options.map((option) => option.label)))
       const detail = text(question['detail'])
       return {

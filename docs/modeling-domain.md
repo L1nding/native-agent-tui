@@ -158,3 +158,14 @@ release写到target/source-view-currency，不替换仍被真实医院验收持�
 真实模型调用遵循用户当前指定的hi/gpt-6.1-sol，禁止Astra和自动回退。C04第三轮在真实候选预览验证后
 因provider并发上限失败，原记录5 PASS／1 FAIL及零批准／零应用保持；当前医院29项诊断串行重试中。
 历史Astra验收只保留原证据，不能冒充本次指定模型成功。
+
+
+## 同一请求逐项处理多个候选（2026-10-14）
+
+29个医院未建落地实例属于同一blocked提案。复用平台`ask_user_question`／`zf/session/ask`／`item/tool/requestUserInput`，插件、ACP与Core同步接收最多64项。每项独立回答，UI保存回答并在全部填写后一次提交；反馈ID与稳定实例ID由Agent传给现有修订和部分选择工具。没有新增领域写入通道或自动授权。
+
+只读续接`target/dsh-e2e-30d10d78`实际2项PASS，复用`af395b49`准备的`5e7229773aca41f4ab384d2066b511a0`。模型器独立核验valid=true：29项CAD姿态及来源依据保持，29项placement/2阻塞，当前265已建场景及来源处置未改变。`af395b49`仍按provider并发限制FAIL保存；续接不冒充其成功终态，也没有重新准备或应用。
+
+29项请求／逐项选择／自定义调整反馈／单次完整回答已由插件与Rust专项覆盖。该专项不等于用户已经批准29项，也不等于真实模型已完成批量请求验收。运行新版桥接时，dsh profile的`zf-tui-bridge`链接需指向本建模工作树构建的`dsh-plugin`；原平台链接不会因本工作树编译而更新。
+
+验证记录：完整`scripts/verify.py`通过，625项Rust测试通过、4项可选live跳过，格式／check／Clippy／doctest（0项）／release／原生及Python夹具通过，日志为模型器`outputs/batch-review-tui-full-check-20261014.log`。`dsh-plugin`的19项测试及类型检查通过，日志`outputs/batch-review-plugin-check-20261014.log`；只读医院续接独立复验见`outputs/hospital-current-remaining-independent-20261014.log`。

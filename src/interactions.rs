@@ -6,6 +6,9 @@ use thiserror::Error;
 
 use crate::protocol::RpcId;
 
+/// Shared with the ACP edge; bytes remain independently limited to 32 KiB.
+pub(crate) const MAX_INPUT_QUESTIONS: usize = 64;
+
 /// Fixed, redacted reasons for actions taken by a noninteractive consumer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
@@ -211,8 +214,10 @@ impl RequestView {
                             || InteractionError::Invalid("missing questions".into()),
                         )?)
                         .map_err(|error| InteractionError::Invalid(error.to_string()))?;
-                    if questions.is_empty() || questions.len() > 16 {
-                        return Err(InteractionError::Invalid("expected 1-16 questions".into()));
+                    if questions.is_empty() || questions.len() > MAX_INPUT_QUESTIONS {
+                        return Err(InteractionError::Invalid(format!(
+                            "expected 1-{MAX_INPUT_QUESTIONS} questions"
+                        )));
                     }
                     let mut ids = BTreeSet::new();
                     if questions
@@ -600,6 +605,50 @@ mod tests {
             serde_json::from_value(json!({"id":"a","header":"H","question":"Count?"})).unwrap();
         assert!(!free.multi_select);
         assert_eq!(free.answer("1"), ["1"]);
+    }
+
+    #[test]
+    fn batch_of_29_requires_one_answer_per_stable_item_id() {
+        let questions: Vec<Value> = (0..29)
+            .map(|i| {
+                json!({
+                    "id":format!("component-{i}"), "header":format!("Item {i}"),
+                    "question":"Accept, revise with feedback, or defer?"
+                })
+            })
+            .collect();
+        let request = RequestView::decode(
+            RpcId::Number(1),
+            "item/tool/requestUserInput",
+            &json!({"threadId":"t","turnId":"u","questions":questions}),
+        )
+        .unwrap();
+        let mut answers: BTreeMap<String, Vec<String>> = (0..29)
+            .map(|i| {
+                (
+                    format!("component-{i}"),
+                    vec![if i % 2 == 0 { "Accept" } else { "Defer" }.into()],
+                )
+            })
+            .collect();
+        assert!(request.input_result(&answers).is_ok());
+        answers.remove("component-28");
+        assert!(request.input_result(&answers).is_err());
+        answers.insert("unknown-component".into(), vec!["Accept".into()]);
+        assert!(request.input_result(&answers).is_err());
+        let too_many: Vec<Value> = (0..65)
+            .map(|i| {
+                json!({
+                    "id":format!("item-{i}"), "header":"Item", "question":"Choose"
+                })
+            })
+            .collect();
+        assert!(RequestView::decode(
+            RpcId::Number(2),
+            "item/tool/requestUserInput",
+            &json!({"threadId":"t","turnId":"u","questions":too_many})
+        )
+        .is_err());
     }
 
     #[test]
