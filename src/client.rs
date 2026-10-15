@@ -2886,6 +2886,7 @@ impl Core {
                     self.state.view.phase = SessionPhase::Initializing;
                     self.state.view.creating_conversation = false;
                     self.state.view.messages.clear();
+                    self.state.view.message_replacements.clear();
                     self.state.view.todos.clear();
                     self.steer = None;
                     self.backend_command = None;
@@ -3099,6 +3100,7 @@ impl Core {
                 self.reset_domain_session();
                 self.state.view.permission = Default::default();
                 self.state.view.messages.clear();
+                self.state.view.message_replacements.clear();
                 self.state.view.todos.clear();
                 self.steer = None;
                 self.backend_command = None;
@@ -3954,6 +3956,26 @@ impl Core {
                     match output {
                         Ok(output) => match output.kind {
                             protocol::ObservedOutputKind::Reasoning => {
+                                let previous = params["replaces"]
+                                    .as_array()
+                                    .filter(|items| items.len() <= 64)
+                                    .and_then(|items| {
+                                        items
+                                            .iter()
+                                            .map(|id| id.as_str().map(str::to_owned))
+                                            .collect::<Option<Vec<_>>>()
+                                    })
+                                    .unwrap_or_default();
+                                if !output.text.is_empty()
+                                    && Some(thread) == self.state.view.thread_id.as_deref()
+                                {
+                                    self.state.replace_preview(
+                                        turn,
+                                        &output.item_id,
+                                        "Reasoning",
+                                        &previous,
+                                    );
+                                }
                                 if self.state.reasoning(
                                     thread,
                                     turn,
@@ -3982,6 +4004,16 @@ impl Core {
                                     self.tool_locator(thread, turn, &output.item_id)
                                 {
                                     self.tool_details.observe_output(&locator, &output.text);
+                                    if let Some(detail) = self.tool_details.get(&locator) {
+                                        self.state.tool_line(
+                                            thread,
+                                            turn,
+                                            crate::tool_details::ConversationTool::from_detail(
+                                                &detail,
+                                            ),
+                                            crate::tool_details::summary_line(&detail),
+                                        );
+                                    }
                                 }
                                 if let Err(error) = self.observer.tool_output(
                                     thread,
@@ -4169,6 +4201,31 @@ impl Core {
                     }
                 }
             }
+            "turn/step" => {
+                if let (Some(turn), Some(step)) = (
+                    turn.filter(|turn| {
+                        Some(*turn) == self.state.view.turn_id.as_deref()
+                            && matches!(
+                                self.state.view.phase,
+                                SessionPhase::Running | SessionPhase::GatePending
+                            )
+                    }),
+                    params["step"]
+                        .as_u64()
+                        .filter(|step| *step <= 9_007_199_254_740_991),
+                ) {
+                    match params["state"].as_str() {
+                        Some("start") => self.state.begin_step_timing(turn, step, Instant::now()),
+                        Some("end") => self.state.end_step_timing(
+                            turn,
+                            step,
+                            Instant::now(),
+                            crate::state::wall_clock_label(std::time::SystemTime::now()),
+                        ),
+                        _ => {}
+                    }
+                }
+            }
             "turn/stage" => {
                 let stage = match params["stage"].as_str() {
                     Some("waiting") => crate::state::TurnStage::ModelWait,
@@ -4183,6 +4240,13 @@ impl Core {
                             SessionPhase::Running | SessionPhase::GatePending
                         )
                 }) {
+                    if params.get("step").is_some_and(|step| {
+                        !step
+                            .as_u64()
+                            .is_some_and(|step| self.state.timing_step_matches(turn, step))
+                    }) {
+                        return;
+                    }
                     self.state.turn_stream_stage(turn, stage, Instant::now());
                 }
             }
@@ -4233,6 +4297,19 @@ impl Core {
                 if let (Some(turn), Some(id), Some(delta)) =
                     (turn, params["itemId"].as_str(), params["delta"].as_str())
                 {
+                    let previous = params["replaces"]
+                        .as_array()
+                        .filter(|items| items.len() <= 64)
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .map(|id| id.as_str().map(str::to_owned))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .unwrap_or_default();
+                    if !delta.is_empty() {
+                        self.state.replace_preview(turn, id, "Agent", &previous);
+                    }
                     if self.state.message(turn, id, delta, false) {
                         self.state.turn_stage(
                             turn,
@@ -8832,6 +8909,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_replacement_publishes_authority_in_place_with_its_identity_transfer() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        send(&mut server, json!({"method":"item/reasoning/textDelta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"live:0:thinking:0","delta":"draft thought"}})).await;
+        send(&mut server, json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"live:0:text:1","delta":"preview answer"}})).await;
+        client
+            .snapshots
+            .wait_for(|s| s.messages.iter().any(|m| m.id == "live:0:text:1"))
+            .await
+            .unwrap();
+        send(
+            &mut server,
+            json!({"method":"item/reasoning/textDelta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"thought","delta":"final thought",
+            "replaces":["live:0:thinking:0"]}}),
+        )
+        .await;
+        send(
+            &mut server,
+            json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"answer","delta":"",
+            "replaces":["live:0:text:1"]}}),
+        )
+        .await;
+        // A malformed transfer cannot partly consume valid IDs.
+        send(
+            &mut server,
+            json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"unrelated","delta":"kept",
+            "replaces":["live:0:text:1",42]}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|s| s.messages.iter().any(|m| m.id == "unrelated"))
+            .await
+            .unwrap();
+        assert!(client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.id == "live:0:text:1"));
+        send(
+            &mut server,
+            json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"root","turnId":"root-turn","itemId":"answer","delta":"final answer",
+            "replaces":["live:0:text:1"]}}),
+        )
+        .await;
+        let snapshot = client
+            .snapshots
+            .wait_for(|s| s.message_replacements.len() == 2)
+            .await
+            .unwrap();
+        let messages = snapshot
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role.as_str(), "Agent" | "Reasoning"))
+            .map(|m| (m.id.as_str(), m.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                ("thought", "final thought"),
+                ("answer", "final answer"),
+                ("unrelated", "kept")
+            ]
+        );
+        assert_eq!(snapshot.message_replacements[0].role, "Reasoning");
+        assert_eq!(snapshot.message_replacements[1].previous, "live:0:text:1");
+        drop(snapshot);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_live_preview_is_dropped_when_the_committed_message_replaces_it() {
         let (mut client, mut server) = harness().await;
         running_root(&mut client, &mut server).await;
@@ -9161,6 +9317,37 @@ mod tests {
         let snapshot = client.snapshots.borrow().clone();
         assert_eq!(snapshot.phase, SessionPhase::GatePending);
         assert!(!snapshot.messages.iter().any(|m| m.role == "Notice"));
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_steps_keep_separate_frozen_rows_and_reject_stale_step_stages() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        for (step, item) in [(1, "alpha"), (2, "beta")] {
+            observation_event(&mut client, &mut server, json!({"method":"turn/step","params":{"threadId":"root","turnId":"root-turn","step":step,"state":"start"}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"turn/stage","params":{"threadId":"root","turnId":"root-turn","step":step+10,"stage":"thinking"}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"turn/step","params":{"threadId":"root","turnId":"old","step":90,"state":"start"}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"root-turn","itemId":item,"delta":item}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"turn/step","params":{"threadId":"root","turnId":"root-turn","step":step,"state":"end"}})).await;
+            let snapshot = client.snapshots.borrow();
+            let timers: Vec<_> = snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role == "Timing")
+                .collect();
+            assert_eq!(timers.len(), step as usize);
+            assert!(timers.iter().all(|timer| timer.complete
+                && timer.text.contains("Completed")
+                && !timer.text.contains("Thinking")));
+            assert!(timers
+                .last()
+                .unwrap()
+                .text
+                .starts_with(&format!("Step {step} · ")));
+            assert_eq!(snapshot.messages[snapshot.messages.len() - 2].text, item);
+        }
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

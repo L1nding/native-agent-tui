@@ -36,6 +36,7 @@ pub struct Config {
     pub acp_profile: String,
     pub mcp_servers: Vec<McpServerConfig>,
     pub domain_context: Option<PathBuf>,
+    pub domain_project: Option<PathBuf>,
     pub domain_setup: Option<crate::domain::DomainSetup>,
     pub model: Option<String>,
     /// `model` came from saved preferences, not `--model`: a backend that no
@@ -66,6 +67,7 @@ impl Default for Config {
             acp_profile: DEFAULT_PROFILE.into(),
             mcp_servers: Vec::new(),
             domain_context: None,
+            domain_project: None,
             domain_setup: None,
             model: None,
             model_is_preference: false,
@@ -84,12 +86,6 @@ impl Default for Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
-    Modeling {
-        repository: PathBuf,
-        project: String,
-        target: Option<String>,
-        change_context: Option<PathBuf>,
-    },
     Help,
     Version,
     Sessions(Config),
@@ -180,9 +176,6 @@ where
     let mut search_category = None;
     let mut search_thread = None;
     let mut search_turn = None;
-    let mut modeling_project = None;
-    let mut modeling_target = None;
-    let mut change_context = None;
     while index < args.len() {
         let option = &args[index];
         index += 1;
@@ -190,12 +183,11 @@ where
             "--help" | "-h" if args.len() == 1 => return Ok(CliCommand::Help),
             "--version" | "-V" if args.len() == 1 => return Ok(CliCommand::Version),
             "--run" | "--tui" | "--workflow" | "--sessions" | "--replay" | "--history"
-            | "--export" | "--search" | "--recovery" | "--modeling" => {
+            | "--export" | "--search" | "--recovery" => {
                 if mode.replace(option.as_str()).is_some() {
                     return Err(CliError::ConflictingModes);
                 }
-                if option == "--modeling"
-                    || option == "--run"
+                if option == "--run"
                     || option == "--replay"
                     || option == "--workflow"
                     || option == "--export"
@@ -207,14 +199,12 @@ where
                     goal = Some(value(&args, &mut index, option)?);
                 }
             }
+            "--domain-project" => {
+                config.domain_project = Some(PathBuf::from(value(&args, &mut index, option)?))
+            }
             "--domain-context" => {
                 config.domain_context = Some(PathBuf::from(value(&args, &mut index, option)?))
             }
-            "--change-context" => {
-                change_context = Some(PathBuf::from(value(&args, &mut index, option)?))
-            }
-            "--modeling-project" => modeling_project = Some(value(&args, &mut index, option)?),
-            "--target" => modeling_target = Some(value(&args, &mut index, option)?),
             "--headless" if !headless => headless = true,
             "--cwd" => config.cwd = value(&args, &mut index, option)?.into(),
             "--dsh" => config.dsh_executable = value(&args, &mut index, option)?.into(),
@@ -302,12 +292,12 @@ where
             _ => return Err(CliError::UnknownOption(option.clone())),
         }
     }
-    if (modeling_project.is_some() || modeling_target.is_some() || change_context.is_some())
-        && mode != Some("--modeling")
-    {
+    if config.domain_context.is_some() && config.domain_project.is_some() {
         return Err(CliError::ConflictingModes);
     }
-    if config.domain_context.is_some() && !matches!(mode, None | Some("--tui" | "--run")) {
+    if (config.domain_context.is_some() || config.domain_project.is_some())
+        && !matches!(mode, None | Some("--tui" | "--run"))
+    {
         return Err(CliError::ConflictingModes);
     }
     if headless && mode != Some("--workflow") {
@@ -374,12 +364,6 @@ where
             json_events,
             config,
         },
-        Some("--modeling") => CliCommand::Modeling {
-            repository: goal.unwrap().into(),
-            project: modeling_project.unwrap_or_else(|| "projects/hospital-site".into()),
-            target: modeling_target,
-            change_context,
-        },
         Some("--workflow") => CliCommand::Workflow {
             path: goal.unwrap().into(),
             headless,
@@ -445,33 +429,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn modeling_mode_preserves_repository_project_and_chinese_target() {
-        let CliCommand::Modeling {
-            repository,
-            project,
-            target,
-            change_context,
-        } = parse_args([
-            "--modeling",
-            r"D:\project\blender-agent-modeler",
-            "--modeling-project",
+    fn project_domain_launch_uses_normal_dsh_modes_and_rejects_legacy_or_mixed_contexts() {
+        let CliCommand::Tui { config, .. } = parse_args([
+            "--domain-project",
             "projects/hospital-site",
-            "--target",
-            "建模八层",
+            "--tui",
+            "建模整栋",
         ])
-        .unwrap()
-        else {
-            panic!()
+        .unwrap() else {
+            panic!("expected ordinary TUI");
         };
         assert_eq!(
-            repository,
-            PathBuf::from(r"D:\project\blender-agent-modeler")
+            config.domain_project,
+            Some(PathBuf::from("projects/hospital-site"))
         );
-        assert_eq!(project, "projects/hospital-site");
-        assert_eq!(target.as_deref(), Some("建模八层"));
-        assert!(change_context.is_none());
-        assert!(parse_args(["--modeling", "repo", "--run", "other"]).is_err());
-        assert!(parse_args(["--target", "八层"]).is_err());
+        assert!(config.domain_context.is_none());
+        for args in [
+            vec!["--domain-project", "project", "--domain-context", "context"],
+            vec!["--domain-project", "project", "--modeling", "repo"],
+            vec!["--domain-project", "project", "--sessions"],
+            vec!["--domain-project", "project", "--workflow", "workflow"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
+    }
+
+    #[test]
+    fn retired_modeling_options_do_not_launch_a_separate_workflow() {
+        for option in [
+            "--modeling",
+            "--modeling-project",
+            "--target",
+            "--change-context",
+        ] {
+            assert_eq!(
+                parse_args([option, "value"]),
+                Err(CliError::UnknownOption(option.into()))
+            );
+        }
     }
 
     #[test]

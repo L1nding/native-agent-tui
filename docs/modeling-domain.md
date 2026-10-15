@@ -1,8 +1,14 @@
 # 建模业务视图
 
+2026-10-15 工作流展示：F4 与建模业务页共用只读业务步骤，展示选层、结构准备、图纸审查、来源发现与分组识别、具体批准／应用／Blender 构建、最终对账复核。步骤从已核验领域快照投影，不从 Agent 回合终态推断完成；已应用结构仍显示未决来源。该列表为进度展示，不创建新的调度任务，不自行批准或推进领域操作。27 项建模／工作流界面测试通过，包括宽窄屏步骤可见性和结构应用后 323 个待处理来源的回归；Clippy 通过。
+
+2026-10-15 主动构件发现修正：普通楼层目标由模型器技能定义完整流程，用户输入“建模八层”即可启动。Core 从来源台账提供独立构件进度，UI 以中文展示已发现／已建／待处理，并在存在未决来源时显示“整层尚未完成”；结构构建或模型回合结束不代表整层结束。项目楼层事实的 `component_discovery` 区分各图层发现、显式图层配置和需核查的旧范围，不能在普通提案中偷换。新类别沿模型器已有数据定义与具体批准机制创建和复用；修正原因、数据边界及回归命令见模型器 `docs/modeling-discovery-user-flow.md`。
+
 日期：2026-10-12。建模器根目录为 D:/project/blender-agent-modeler，业务 Skill 位于其 .agents/skills/building-modeling/SKILL.md；权威协议、基线重评估与真实验收分别位于 docs/domain-modeling-protocol.md、docs/domain-modeling-reassessment.md、docs/dsh-domain-acceptance.md。
 
 平台 dsh Agent 理解自然语言、准备/修订有类型的构件方案和调用 MCP。Python 管 CAD、IR、编译、验证与唯一写入/构建 seam。Rust Core 管执行生命周期、领域事实投影、具体版本批准和异步授权 ownership。UI 只消费 DomainSnapshot 并提交 typed Command，使用通用输入、请求、模型与会话页面。
+
+项目模式的楼层定位另提供`inspect_project_floor_location`只读事实：绑定catalog_id、selection_id、source SHA、floor_key及location_id，完整逐图层实体数支持分页。未配置楼层在默认墙线不足时，Agent提出`wall_layer_choice`（exact location_id／已见wall_layers／reason），随结构准备提交；选择不是授权，进入同一具体结构摘要后经原批准通道确认。配置/定位证书和CAD依赖在prepare、授权及唯一writer处检查；配置过的楼层保持原图层，定位阈值保持不变。Core仅在当前所选楼层与定位身份/图层匹配时接纳带选择的scope；恢复/切换该scope前先恢复定位事实。F6分别显示证据、绑定选择、原结构状态，不将已应用选择继续称为待执行。真实证据与未完成边界见[完成审计](dsh-tui-completion-audit.md)。
 
 --domain-context 在 config 中注入 stdio modeling_domain MCP。领域会话的通用工具必须 read-only，resume/reload/new 后重新确认；失败不启动 turn。普通 TUI 默认显示建模业务页，可 F6/Esc 返回会话、Enter 发反馈、Ctrl+Y 批准、PgUp/PgDn 查看依据及各阶段。小终端、平台问答和其他覆盖面板不会记录可批准的展示 binding。
 
@@ -16,7 +22,9 @@ Core 从已校验线程／回合身份、带 registry-derived MCP identity 的 c
 
 建模事实区按实际终端宽度预先换行，并根据可见高度限制 PgUp/PgDn 的偏移。连续翻到底保持最后一屏可见；终端调整大小或旧偏移超出范围时，渲染和下一次键盘操作均限制到内容边界。回复仍独立滚动，审批仍使用实际渲染的具体版本。宽／窄终端的 fake-terminal 回归覆盖连续翻页、超大偏移及一次 PgUp 返回事实；6 项建模 UI 专项和全量 546 项 Rust 测试通过，2 项可选 live 默认跳过。
 
-旧 --modeling/--change-context 功能、测试及医院证据保留为兼容入口。新旧控制者在 CLI 校验中互斥；仅床/盆单层示例不能等同整栋医院或全部构件支持。
+建模统一从普通 dsh 会话的 `--domain-project` / `--domain-context` 进入。旧 `--modeling` / `--change-context` CLI、专用 UI 和 Rust Python 工作流 owner 已移除；历史验收记录保留用于追溯。楼层、楼栋、来源、图纸修正、连接和已应用家具编辑的迁移证据见[入口迁移记录](dsh-modeling-entry-migration.md)。
+
+已应用家具编辑使用 `prepare_component_edit` 封存完整选中组件、原来源和用户意图。模板组件提交完整替换计划；旧无模板部件使用受限的类型化几何定义。稳定部件 ID、未选中对象及旧共享定义受保护；依赖完整性、来源及具体版本在批准和 writer 处重查。整组件删除从实际授权／应用链派生来源待确认状态，后续增补必须明确绑定原删除提案重新开启。Core 校验并展示原位置、编辑意图和删除来源；实际看图由同一 dsh Agent 回复记录，人工／合规仍为独立状态。
 
 
 复杂来源验收入口为 `tests/fixtures/dsh_tui_check.py --only domain`，只运行领域步骤和进程清理；`--domain-case chair`（或 `MODELING_COMPLEX_FULL=1`）增加单椅方案、局部反馈、具体批准和产物验证；`--domain-case mixed` 验证椅／柜／盆的候选、两轮局部反馈、部分采纳、批准和构建。需指定 `MODELING_COMPLEX_ROOT` 与 `MODELING_COMPLEX_CONTEXT`；完整运行必须使用 `repository/outputs` 下隔离的合成场景副本，脚本会拒绝直接修改跟踪夹具。验收等待每个回合终态后再发送意见，并滚动查看实际方案和阶段事实；结果保存为 `target/dsh-e2e-*/report.json`。领域程序测试、真实模型闭环、AI／人工视觉复核分别记录，不能相互替代。
@@ -191,3 +199,46 @@ python tests/fixtures/question_batch_audit.py --evidence target/dsh-e2e-a698f67f
 ```
 
 真实验收条目是合成交互输入，Retain／Defer／adjustNN为测试回答，不是医院实际处理选择或授权。医院265／29／193状态保持；实际项目的分类、安装资料、移动选择及人工视觉核对仍等待用户答复。
+
+
+## 项目楼栋派生产物与图纸审查
+
+`--domain-project` 复用普通 dsh 会话与 F6 领域扩展。逐层结构方案使用封存 CAD 重建证明，具体授权与应用仍走 Core；目录／目标选择不授予写入批准。
+
+项目楼栋以 `project_building` 单独发布事实：稳定 build_id 绑定完整选择、每层当前提案／授权／操作和权威哈希及定位依据，快照由独立 owned worker 构建。`assemble_project_building` 仅首次预留并启动，重用 ID 只读取；`inspect_project_building` 可等待0–20秒，`validate_project_building` 核对快照、assembly、Blender／重建／GLB 身份和哈希。取消只终止本 owner 的活跃进程树，未知任务不重启。`inspect_project.recovery_index.building_index` 报告已保存任务与省略计数。
+
+Core 把楼栋事实同具体楼层提案区分，逐 build_id 处理序号、输入身份和验证状态。切换目标或已知后续权威变更使旧楼栋非当前；一个任务的成功不能赋给另一个任务。F6 同时显示 `source_reconciliation`、`connection_check` 和人工复核，产物 built/valid 不代表来源处理、跨层连接或人工复核完成。
+
+`audit_drawing` 对当前权威场景及绑定提取事实运行确定性检测，返回 `drawing_audit` 分页事实，保留候选总数、场景／提取／来源哈希及下一页。它只发现候选；语义裁决由Agent读取实际候选图后记录，受控修正由独立具体提案批准后应用，详见下节。楼栋 render/read-image 工具另行提供输入及 BLEND 哈希绑定的真实图像，观察仍由实际看到图像的 Agent 回复记录。
+
+
+## 图纸候选、Agent 判断与受控结构修正
+
+`audit_drawing` 只发现候选；`render_drawing_candidate` 与 `read_drawing_candidate_image` 返回绑定当前审查的局部 CAD PNG。`record_drawing_judgement` 在已有图片读取后记录 Agent 的 error/doubt/not_error、解释及可选 typed 操作，人工状态保持 not_run。Core 显示候选总数、已判断数、当前页与判断依据，不将 recorded 当 passed。判断和图片实际准入分开验证，真实医院首项看图证据见实施记录。
+
+`prepare_drawing_correction` 将 error 中的具体操作、候选来源、局部范围、图片、读取尝试、配置与原 DXF 哈希和决策草稿封存成一份提案。专门检查仅允许绑定楼层的受支持平面结构变更；普通 component 路线仍保持保护。准备不修改权威或决策文件，批准仍绑定 proposal/revision/token/base/candidate；实际应用由同一 patch writer 写入场景和决策，再按原产物路线构建验证。审查后权威变化须读取新证据，源或图像被改动则原提案拒绝应用。原 DXF 不写入。完整医院候选判断、受控修正真实验收和楼栋未覆盖阶段继续按迁移核对记录推进。
+
+
+### 已登记楼层激活与楼栋报告
+
+项目楼层事实中的可选`project_scope.activation_revision`为正u64。登记根持久维护代次；切换已登记楼层时只增加一次，重复当前激活幂等，scope_id、context及proposal/grant绑定保持原身份。`activate_project_floor`不进入初始化；`inspect_project_floor`始终只读，旧登记不补写代次。Core把代次纳入作用域相等性，升级后拒绝倒退、缺失和畸形代次，阻止旧A激活的迟到事实进入新A。代次参与事实语义哈希，故重新激活可以产生新的序号并恢复该楼层观察。
+
+同一`source-view/1`的view／scan／scene哈希允许来源组和分页ledger共存。低序号等价事实仅填补缺失形态，不替换已经存在的形态或降低共享水位；不同状态及未封存旧协议仍严格处理过期页。
+
+`check_project_building_connections`与`read_project_building_report`只派生封存事实，不重建job或写authority。连接passed要求冻结来源proof、实际已验证声明覆盖及零问题；空声明／缺相邻连接／旧job缺proof保持attention。总报告绑定input及来源／图纸／连接统计，技术状态与整体状态分别核验，human_review保持not_run。同输入后续普通检查保留报告，来源、有效性或当前性变化后显示历史。报告能力不扩展单楼层scope到多楼层写入。
+
+
+### 项目连接写入（相邻两层来源体块）
+
+新`prepare_project_connection_change`以built/valid/current且input_binding精确相等的楼栋为基线，仅接受所选下层与相邻上层的来源楼梯／竖井plan。`ProjectConnections`拥有准备和输入封存，`ProjectScopes`仍拥有单一活动作用域及激活代次，`DomainChanges`仍是具体提案／授权／patch writer的唯一owner。原楼层不嵌入别层、不改变原context；新的连接authority复制已批准完整楼栋，仅下层elements来源编译增补，原墙／柱／上层／楼板／共享定义全部保护。
+
+`project_scope.assembly_binding`含project-connection-scope/v1、父build_id、input_binding及upper_floor_key。Core仅接受与已知当前有效父楼栋及当前selection相等的绑定；授权时再次检查父楼栋有效／当前。普通楼层与连接scope共享activation_revision，迟到事实不能跨作用域混入。连接应用不会把原楼层派生楼栋误标非当前；新楼栋`inputs.connection_authority`独立绑定连接scope、提案／授权／操作／候选SHA及父楼栋输入，后续连接权威变化只使相应连接产物历史化。
+
+`assembly-reference.json`以project-assembly-reference/v1封存父快照、输入／授权／操作、原CAD/config、原权威及原先缺失的解释／处置状态、图纸判断集合；新生成的引用同时封存父楼栋实际GLB／BLEND／验证文件。该证明及源依赖纳入具体prepare_token，在准备、批准、写入和派生构建前重新核对。几何可通过不等于已批准：非初始连接基线必须有匹配当前SHA的已确认原授权／应用操作，不能采用注入的合法连接几何。
+
+`assemble_project_building`可选connection_scope_id只使用该已批准连接authority的锁内副本，创建新的稳定build_id，不覆盖旧job；同ID的连接scope不等或遗漏均拒绝。新的冻结连接来源清单、统计、独立build/rebuild/GLB、连接报告和实际PNG仍单独验收。`activate_project_connection_scope`仅切换已登记scope；`inspect_project_connection_scope`只读恢复当前scope，修订恢复选择最新原提案。恢复索引报告connection_scopes与incomplete未知目录；部分准备绝不重构或自动采用。
+
+CAD初始化新增可选`slab_opening_source_ids`，仅从当前裁切内明确选择的观察线圈生成已有楼板孔洞，要求完整单一闭合环、与楼板边界合法且互不相交，保留来源ID。缺失、开口、超界、重叠和重复选择拒绝。该项不支持已批准楼板编辑，也不推断楼梯／竖井语义；空值从序列化排除，既有context／证明身份保持兼容。
+
+
+真实TUI验证：`target/project-live-708a4d47`为新的CAD结构／孔洞基线，`target/project-connection-live-01f0fb5b`对同一原连接提案独立批准并应用16级楼梯，新派生楼栋三阶段各34个精确mesh，连接passed／来源complete／技术complete，整体attention及human_review=not_run。新会话只读恢复`target/project-connection-recovery-4009bb8d`通过，原提案／授权／操作／job及产物哈希不变。之前4c77ef5a的界面夹具同屏条件失败保留，未生成批准，续验没有重做prepare。

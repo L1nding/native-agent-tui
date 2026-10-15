@@ -716,6 +716,7 @@ pub(super) fn compaction_fact_rows(fact: Option<&CompactionFact>) -> Vec<String>
 
 /// Stays English in both languages: the header strips `/unavailable` from it
 /// and compares it with `tokens:unavailable`.
+#[cfg(test)]
 pub(super) fn usage_status(snapshot: &CoreSnapshot) -> String {
     let usage =
         usage_fact_for(snapshot, None).map_or_else(UsageSummary::default, |fact| fact.summary);

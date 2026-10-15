@@ -2,11 +2,13 @@
 
 日期：2026-10-12。工作树：`D:/project/native-agent-tui-modeling`，分支：`feat/modeling-workflow`。
 
+> 历史整合记录。2026-10-15 已移除本文所述独立 CLI、UI 和 Rust 子进程 owner；当前使用普通 dsh 领域会话，见 [README](../README.md#建模) 和[入口迁移记录](dsh-modeling-entry-migration.md)。下文仅描述当时基线及验证。
+
 ## 来源与原因
 
 用户要求先更新 TUI 工作树并整合现有建模入口。执行 `git fetch origin` 后，远程 `origin/main` 为 `68c060d`；原仓库 `feat/dsh-first` 的最新已提交版本为 `a614d89c726eed8c3eb6d0e09fe92009a855192c`，包含该远程基线。建模工作树从 `2c7de49` 快进到这一版本，共纳入 12 个提交，然后恢复并整合原有建模修改。
 
-## 当前边界
+## 当时边界
 
 普通入口沿用 Rust Core → dsh → bridge/ACP。新版会话、技能、provider/model 和权限预设走 dsh 服务。
 
@@ -31,13 +33,3 @@
 - `git diff --check` 通过，无未解决的合并条目。
 
 未执行远程模型调用或新的 Blender 重建，未安装或切换用户 dsh profile。本轮没有验证真实 dsh/provider 会话或建模全流程运行。原 TUI 仓库的未提交改动仍由其当前工作持有；核对期间观察到并发修改，未复制、覆盖或回滚这些文件。建模旧修改的备份与 stash 保留。
-
-## 启动
-
-在此工作树中执行：
-
-```powershell
-.\target\modeling-integration\release\native-agent-tui.exe --modeling D:\project\blender-agent-modeler
-```
-
-进入后输入楼层或楼栋目标。直接指定目标会立即启动工作流并可能调用模型。

@@ -573,6 +573,13 @@ def tui_checks(report, binary, common, args, workspace, code_word):
 
 
 
+def steering_tool_window(screen):
+    """A running tool can still be blocked on an approval instead of accepting input."""
+    return ("● Running" in screen
+            and ("running · " in screen or "done · " in screen)
+            and "Ctrl+Y accept" not in screen)
+
+
 def conversation_checks(report, binary, common, args, workspace):
     """What the bridge plugin adds to a conversation: todos, timing, steering, plan
     review, dsh's own commands, the answer while it is written, and the sessions page.
@@ -616,6 +623,8 @@ def conversation_checks(report, binary, common, args, workspace):
     timing = re.compile(r"Model wait \d+\.\ds · .*Completed \d\d:\d\d:\d\d UTC")
     try:
         def step(name, action):
+            if report.failed():
+                return False
             def clean():
                 tui.home()
                 return action()
@@ -691,7 +700,7 @@ def conversation_checks(report, binary, common, args, workspace):
             state = {"sent": False, "queued": False}
 
             def watch(screen):
-                if not state["sent"] and "● Running" in screen and ("running · " in screen or "done · " in screen):
+                if not state["sent"] and steering_tool_window(screen):
                     expect("/steer guide" in screen, "the running hints do not offer /steer")
                     tui.type("/steer New instruction: end your final reply with the code made by joining "
                              + ", ".join(marker) + " without spaces.")

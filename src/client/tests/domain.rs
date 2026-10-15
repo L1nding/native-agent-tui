@@ -7,6 +7,7 @@ async fn domain_sessions_reconfirm_read_only_after_resume_reload_and_new_convers
             let config = Config {
                 permission: Some("read-only".into()),
                 domain_setup: Some(crate::domain::DomainSetup {
+                    mode: crate::domain::DomainMode::Floor,
                     context_path: "context.json".into(),
                     repository: ".".into(),
                     python: "python".into(),
@@ -93,6 +94,7 @@ async fn domain_proposals_survive_display_clipping_but_reject_foreign_or_incompl
     let config = Config {
         permission: Some("read-only".into()),
         domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
             context_path: "context.json".into(),
             repository: ".".into(),
             python: "python".into(),
@@ -238,6 +240,7 @@ async fn domain_proposals_use_private_facts_and_reject_foreign_or_incomplete_rec
     let config = Config {
         permission: Some("read-only".into()),
         domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
             context_path,
             repository: directory.clone(),
             python: crate::domain::receipt::tests::python(),
@@ -391,4 +394,105 @@ async fn domain_proposals_use_private_facts_and_reject_foreign_or_incomplete_rec
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn project_discovery_facts_flow_through_the_normal_client_and_cannot_be_approved() {
+    let config = Config {
+        permission: Some("read-only".into()),
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Project,
+            context_path: "project-context.json".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "项目目标".into(),
+        }),
+        ..Default::default()
+    };
+    let (mut client, mut server) = harness_with_config(config).await;
+    initialized(&mut server).await;
+    let set = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":set["id"],"result":{"current":"read-only","presets":[]}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Ready).await;
+    skip_skills(&mut server).await;
+    client
+        .commands
+        .send(Command::SubmitRootInput {
+            text: "建模整栋".into(),
+        })
+        .await
+        .unwrap();
+    let start = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Running).await;
+    let catalog = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"ctx",
+        "kind":"project_catalog","ok":true,"fact_sequence":1,"project":{
+            "catalog_id":"a".repeat(64),"source_sha256":"b".repeat(64),"project_path":"projects/test",
+            "floors":[{"key":"f08","title":"八层"}]}});
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"item/completed","params":{
+        "threadId":"root","turnId":"root-turn","item":{"id":"catalog","type":"mcpToolCall",
+        "server":"modeling_domain","tool":"inspect_project","status":"completed",
+        "result":{"structuredContent":catalog}}}}),
+    )
+    .await;
+    assert_eq!(
+        client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .project
+            .as_ref()
+            .unwrap()
+            .total_floors,
+        1
+    );
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/completed","params":{
+        "threadId":"root","turn":{"id":"root-turn","status":"completed"}}}),
+    )
+    .await;
+    client
+        .commands
+        .send(Command::ConfirmExtension {
+            confirmation: crate::extensions::ExtensionConfirmation::Modeling(
+                crate::domain::ProposalBinding {
+                    run_id: "run".into(),
+                    context_sha256: "ctx".into(),
+                    proposal_id: "target-is-not-a-proposal".into(),
+                    revision: 1,
+                    prepare_token: "none".into(),
+                    base_sha256: "none".into(),
+                    candidate_sha256: "none".into(),
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    client
+        .snapshots
+        .wait_for(|snapshot| snapshot.extensions[0].modeling().unwrap().notice.is_some())
+        .await
+        .unwrap();
+    assert!(
+        !client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .authorizing
+    );
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
 }

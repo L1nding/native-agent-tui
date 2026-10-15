@@ -9,7 +9,7 @@ const PRIVATE_MARKERS: [&str; 5] = [
 ];
 
 #[tokio::test]
-async fn conversation_file_tool_reports_diff_statistics_without_retaining_the_patch() {
+async fn conversation_file_tool_keeps_a_volatile_patch_and_serializes_only_statistics() {
     let (mut client, mut server) = harness().await;
     running_root(&mut client, &mut server).await;
     observation_event(&mut client, &mut server, json!({"method":"item/completed","params":{
@@ -29,6 +29,11 @@ async fn conversation_file_tool_reports_diff_statistics_without_retaining_the_pa
     assert_eq!(tool.added_lines, Some(2));
     assert_eq!(tool.removed_lines, Some(1));
     assert_eq!(tool.output_lines, Some(5));
+    assert_eq!(
+        tool.output.as_deref(),
+        Some("--- a\n+++ b\n-old\n+new\n+extra")
+    );
+    assert!(!serde_json::to_string(tool).unwrap().contains("-old"));
     assert!(!snapshot
         .messages
         .iter()
@@ -59,6 +64,19 @@ async fn root_tool_details_follow_exact_identity_stay_volatile_and_retire_with_t
         json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"root","turnId":"root-turn","itemId":"shell-1","delta":"PRIVATE_DELTA_TWO"}}),
     )
     .await;
+    assert_eq!(
+        client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .find(|message| message.role == "Tool")
+            .unwrap()
+            .tools[0]
+            .output
+            .as_deref(),
+        Some("PRIVATE_DELTA_ONEPRIVATE_DELTA_TWO")
+    );
     observation_event(
         &mut client,
         &mut server,
@@ -86,6 +104,10 @@ async fn root_tool_details_follow_exact_identity_stay_volatile_and_retire_with_t
     assert_eq!(tool.cwd.as_deref(), Some("PRIVATE_CWD"));
     assert_eq!(tool.exit_code, Some(0));
     assert_eq!(tool.output_lines, Some(1));
+    assert_eq!(tool.output.as_deref(), Some("PRIVATE_AGGREGATE"));
+    assert!(!serde_json::to_string(tool)
+        .unwrap()
+        .contains("PRIVATE_AGGREGATE"));
     let timeline_item = snapshot
         .timeline
         .entries
@@ -137,6 +159,19 @@ async fn root_tool_details_follow_exact_identity_stay_volatile_and_retire_with_t
     )
     .await;
     assert!(client.snapshots.borrow().tool_details.entries.is_empty());
+    assert_eq!(
+        client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .find(|message| message.role == "Tool")
+            .unwrap()
+            .tools[0]
+            .output
+            .as_deref(),
+        Some("PRIVATE_AGGREGATE")
+    );
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();
 }

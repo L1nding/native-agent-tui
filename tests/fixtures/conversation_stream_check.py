@@ -43,7 +43,8 @@ def provider():
         def todos(*statuses):
             event({"type": "todos", "todos": [{"content": content, "status": status} for content, status in zip(("Probe the stream", "Report the answer"), statuses)]})
 
-        event({"type": "stage", "stage": "waiting"})
+        event({"type": "step", "step": 1, "state": "start"})
+        event({"type": "stage", "stage": "waiting", "step": 1})
         time.sleep(.3)
         event({"type": "stage", "stage": "thinking"})
         update({"sessionUpdate": "agent_thought_chunk", "messageId": "shared", "content": {"type": "text", "text": "Inspect the probe"}})
@@ -68,6 +69,7 @@ def provider():
         time.sleep(.6)
         update({"sessionUpdate": "agent_message_chunk", "messageId": "shared", "content": {"type": "text", "text": "Stream answer"}})
         todos("completed", "completed")
+        event({"type": "step", "step": 1, "state": "end"})
         send({"id": request["id"], "result": {"stopReason": "end_turn"}})
 
     for line in sys.stdin:
@@ -133,12 +135,12 @@ def main():
         console.wait(lambda screen: "prefer short answers" in screen and "Steering queued" not in screen, "delivered steering becomes a user message in the running turn")
         assert "Todos 0/2" in console.read() and "[>] Probe the stream" in console.read() and "[ ] Report the answer" in console.read(), "todo panel is missing while work remains"
         console.wait(lambda screen: "Stream answer" in screen and "done · echo STREAM_PROBE" in screen and "failed · echo FAILED_PROBE" in screen, "tool terminal states and answer are visible")
-        assert "Inspect the probe carefully" in console.read()
         console.wait(lambda screen: "Completed" in screen, "turn completion is confirmed")
         import re
         timing = re.compile(r"Model wait \d+\.\ds · Thinking \d+\.\ds · Response \d+\.\ds · Tools \d+\.\ds · Completed \d\d:\d\d:\d\d UTC")
         console.wait(lambda screen: timing.search(" ".join(screen.split())), "frozen per-stage timing follows the step")
         frozen = timing.search(" ".join(console.read().split())).group()
+        assert "Step 1" in console.read(), "the timer has no host step identity"
         response = float(re.search(r"Response (\d+\.\d)s", frozen).group(1))
         assert 0.4 <= response <= 1.5, f"the answering stage must come from stage events, not from the whole-block arrival: {frozen}"
         assert "Todos" not in console.read(), "a finished todo list must leave the screen"
@@ -147,6 +149,13 @@ def main():
         time.sleep(1.2)
         assert timing.search(" ".join(console.read().split())).group() == frozen, "timing changed after the turn ended"
         (root / "completed-screen.txt").write_text(console.read(), encoding="utf-8")
+        console.write("\x1b[5~")
+        console.wait(lambda screen: "Inspect the probe carefully" in screen, "earlier reasoning remains readable above the tool cards")
+        assert "Tool / terminal / pwsh" in console.read() and "$ echo STREAM_PROBE" in console.read(), "terminal card is missing"
+        assert any(row.strip() == "STREAM_PROBE" for row in console.read().splitlines()), "tool output is missing from the card body"
+        (root / "scrolled-cards-screen.txt").write_text(console.read(), encoding="utf-8")
+        console.write("\x1b[1;5F")
+        console.wait(lambda screen: timing.search(" ".join(screen.split())), "return to the completed step after reading its cards")
         console.write("/new\r")
         console.wait(lambda screen: "New conversation started." in screen, "new session is confirmed")
         console.write("\x1b[D")

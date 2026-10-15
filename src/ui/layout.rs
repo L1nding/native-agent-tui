@@ -105,14 +105,16 @@ pub(super) fn main_layout(
     status: StatusRows,
     input_rows: u16,
 ) -> Rc<[Rect]> {
-    Layout::default()
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            // 状态行、设置行和下边框；有活动时多两行提醒与证据。没有标题行。
+            // 执行状态、活动与证据；元数据独立贴在输入框上方。
             Constraint::Length(if area.height > 16 && has_activity {
-                5
-            } else {
+                4
+            } else if has_activity {
                 3
+            } else {
+                2
             }),
             Constraint::Min(1),
             Constraint::Length(match status {
@@ -120,10 +122,13 @@ pub(super) fn main_layout(
                 StatusRows::Expanded if area.height > 16 => 6,
                 _ => 2,
             }),
+            Constraint::Length(1),
             Constraint::Length(input_rows.clamp(1, 5) + 2),
             Constraint::Length(1),
         ])
-        .split(area)
+        .split(area);
+    // Keep the established editor/hint indices for keyboard geometry consumers.
+    Rc::from([rows[0], rows[1], rows[2], rows[4], rows[5], rows[3]])
 }
 
 /// Columns of the main workspace: optional agent sidebar, conversation, optional inspector.
@@ -233,11 +238,13 @@ mod tests {
         assert_eq!(hidden[2].height, 0);
 
         let compact = main_layout(Rect::new(0, 0, 80, 20), false, StatusRows::Compact, 1);
-        assert_eq!(compact[0].height, 3);
+        assert_eq!(compact[0].height, 2);
         assert_eq!(compact[2].height, 2);
+        assert_eq!(compact[5].height, 1);
+        assert_eq!(compact[5].bottom(), compact[3].y);
 
         let expanded = main_layout(Rect::new(0, 0, 80, 20), true, StatusRows::Expanded, 1);
-        assert_eq!(expanded[0].height, 5);
+        assert_eq!(expanded[0].height, 4);
         assert_eq!(expanded[2].height, 6);
     }
 

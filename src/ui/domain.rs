@@ -8,6 +8,99 @@ use super::layout::wrap_text;
 use crate::extensions::{ExtensionConfirmation, ExtensionId, ExtensionSnapshot};
 use crate::state::display_text;
 
+/// Business milestones from verified facts, independent of Agent turn completion.
+pub(super) fn modeling_workflow_lines(domain: &crate::domain::DomainSnapshot) -> Vec<String> {
+    use crate::domain::{ArtifactState, SelectionState};
+    let selected = domain
+        .selection
+        .as_ref()
+        .is_some_and(|selection| selection.state == SelectionState::Selected)
+        || (domain.project.is_none() && !domain.floor_id.is_empty());
+    let mut lines = vec!["建模工作流 · 各步骤按实际回执更新".into()];
+    lines.push(format!(
+        "1 选择楼层 · {}",
+        if selected {
+            "已绑定目标"
+        } else {
+            "等待定位或选择图纸"
+        }
+    ));
+    lines.push(format!(
+        "2 结构与方案 · {}",
+        if domain.project_scope.is_some() {
+            "已有楼层作用域；具体方案状态见第 5 步"
+        } else {
+            "尚无楼层准备回执"
+        }
+    ));
+    lines.push(match &domain.drawing_audit {
+        Some(audit) => format!(
+            "3 图纸审查 · 已判断 {}/{} 项；未覆盖范围及人工复核仍须核对",
+            audit.judged_count, audit.candidate_count
+        ),
+        None => "3 图纸审查 · 尚无审查回执".into(),
+    });
+    lines.push(match domain.component_progress() {
+        Some(progress) => format!(
+            "4 发现与识别构件 · 已发现 {} · 已建 {} · 待处理 {}",
+            progress.total, progress.built, progress.pending
+        ),
+        None => "4 发现与识别构件 · 尚未扫描；结构之后继续家具、洁具和设备".into(),
+    });
+    if let Some(groups) = &domain.groups {
+        lines.push(format!(
+            "  类别识别 · 已评估 {}/{} 组；新类别由 Agent 提出定义",
+            groups.assessed_groups, groups.total_groups
+        ));
+    }
+    let proposal_status = match &domain.proposal {
+        _ if domain
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.state == "applied") =>
+        {
+            "当前方案已有应用回执"
+        }
+        _ if domain.operation.as_ref().is_some_and(|operation| {
+            matches!(operation.state.as_str(), "applying" | "unknown")
+        }) =>
+        {
+            "应用结果未确认，先对账原操作"
+        }
+        Some(proposal) if !proposal.diagnostics.is_empty() => "方案存在诊断，需处理后重新准备",
+        Some(proposal) if proposal.state == "applied" || proposal.state == "built" => {
+            "当前方案已应用"
+        }
+        Some(proposal) if proposal.ready => "当前具体方案待批准；Ctrl+Y 查看并批准",
+        Some(_) => "当前方案尚未就绪",
+        None => "等待 Agent 准备具体方案",
+    };
+    lines.push(format!("5 批准、应用与构建 · {proposal_status}"));
+    if let Some(artifact) = domain.artifacts.last() {
+        let state = match artifact.state {
+            ArtifactState::Queued => "排队中",
+            ArtifactState::Building => "构建中",
+            ArtifactState::Unknown => "结果未确认，需对账",
+            ArtifactState::Cancelled => "已取消",
+            ArtifactState::Failed => "失败，需处理诊断",
+            ArtifactState::Built => "已生成；有效性与当前版本仍按验证回执核对",
+        };
+        lines.push(format!(
+            "  Blender {} · {state}",
+            if artifact.binding.candidate {
+                "预览"
+            } else {
+                "正式产物"
+            }
+        ));
+    }
+    lines.push("6 最终对账与复核 · 仍须核对来源覆盖、未决项及实际看图；人工验收未执行".into());
+    if domain.fact_sync_notice.is_some() {
+        lines.push("事实同步存在提示；以上为已收到的回执，不能据此宣告整层完成".into());
+    }
+    lines
+}
+
 fn sections(area: Rect, has_reply: bool) -> [Rect; 5] {
     let reply_height = if has_reply && area.height >= 20 {
         (area.height / 3).clamp(6, 10)
@@ -31,6 +124,193 @@ fn business_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    lines.extend(modeling_workflow_lines(domain).into_iter().map(Line::from));
+    for notice in [
+        domain.notice.as_deref(),
+        domain.fact_sync_notice.as_deref(),
+        context.notice,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        lines.push(Line::from(display_text(notice)));
+    }
+    if let Some(progress) = domain.component_progress() {
+        lines.push(Line::from(format!(
+            "{} · 已发现 {} · 已建 {} · 待处理 {} · 已跳过 {} · 已排除 {}",
+            if progress.pending > 0 {
+                "整层尚未完成"
+            } else {
+                "当前扫描范围的构件处理情况"
+            },
+            progress.total,
+            progress.built,
+            progress.pending,
+            progress.skipped,
+            progress.rejected
+        )));
+    } else if domain
+        .project_scope
+        .as_ref()
+        .is_some_and(|scope| scope.assembly_binding.is_none())
+    {
+        lines.push(Line::from(
+            "构件发现尚未扫描；结构完成后继续识别家具、洁具等构件",
+        ));
+    }
+    if let Some(project) = &domain.project {
+        lines.push(Line::from(format!(
+            "项目 {} · {} 个楼层候选",
+            project.project_path, project.total_floors
+        )));
+        lines.push(Line::from(match &project.component_source_layers {
+            Some(layers) => format!("构件来源图层 {} · 只统计绑定图层", layers.join("、")),
+            None => "项目未指定构件图层；下方显示本层实际读取范围".into(),
+        }));
+        if let Some(selection) = &domain.selection {
+            lines.push(Line::from(format!(
+                "目标 {} · {}",
+                selection.target,
+                match selection.state {
+                    crate::domain::SelectionState::Selected => "目标已选择",
+                    crate::domain::SelectionState::NeedsSelection => "重复图纸待选择",
+                }
+            )));
+            lines.push(Line::from(
+                "选层操作：场景应用 not_run · 写入授权 not_granted；实际建模进度见下方",
+            ));
+            if !selection.selected_keys.is_empty() {
+                lines.push(Line::from(format!(
+                    "已选择 {}",
+                    selection
+                        .selected_keys
+                        .iter()
+                        .take(100)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )));
+                if selection.selected_keys.len() > 100 {
+                    lines.push(Line::from("其余已选楼层见完整事实"));
+                }
+            }
+            for row in &selection.rows {
+                lines.push(Line::from(row.clone()));
+            }
+        } else {
+            for row in &project.rows {
+                lines.push(Line::from(row.clone()));
+            }
+        }
+        lines.push(Line::from(format!("目录 {}", project.catalog_id)));
+        lines.push(Line::from(format!("来源 SHA256 {}", project.source_sha256)));
+    }
+    for building in &domain.buildings {
+        lines.push(Line::from(format!(
+            "楼栋 {} · {} · current={} · valid={}",
+            building.build_id,
+            building.state,
+            building.current,
+            building
+                .valid
+                .map_or_else(|| "not_run".into(), |valid| valid.to_string())
+        )));
+        lines.push(Line::from(format!(
+            "楼层 {} · 来源 {} · 连接检查 {}",
+            building.floor_keys.join("、"),
+            building.source_reconciliation,
+            building.connection_check
+        )));
+        if let Some(report) = &building.report {
+            let historical =
+                report.current != building.current || Some(report.artifact_valid) != building.valid;
+            lines.push(Line::from(format!(
+                "总报告 {} · 技术 {}{}",
+                report.state,
+                report.technical_status,
+                if historical { " · 历史报告" } else { "" }
+            )));
+            lines.push(Line::from(format!(
+                "来源未完成 {}/{} · 图纸未决 {} · 缺楼层审查 {} · 连接问题 {} · 人工 not_run",
+                report.unresolved_sources,
+                report.source_total,
+                report.unresolved_drawing,
+                report.missing_floor_reviews,
+                report.connection_issues
+            )));
+        }
+        lines.push(Line::from(format!(
+            "楼栋产物 {}",
+            display_text(&building.output)
+        )));
+        lines.push(Line::from("Agent 看图观察见回复 · 人工复核 not_run"));
+    }
+    if let Some(audit) = &domain.drawing_audit {
+        lines.push(Line::from(format!(
+            "图纸审查候选 {} 项 · 当前页起点 {} · 下一页 {}",
+            audit.candidate_count,
+            audit.offset,
+            audit
+                .next_offset
+                .map_or_else(|| "无".into(), |offset| offset.to_string())
+        )));
+        lines.push(Line::from(format!("审查场景 {}", audit.scene_sha256)));
+        lines.push(Line::from(format!(
+            "确定性候选 · Agent 判断 {} · 已记录 {}/{} · 修正需具体方案批准",
+            audit.ai_review, audit.judged_count, audit.candidate_count
+        )));
+        lines.extend(audit.rows.iter().cloned().map(Line::from));
+    }
+    if let Some(location) = &domain.project_location {
+        lines.push(Line::from(format!(
+            "楼层定位 {} · {} · 仅证据，未批准",
+            location.floor_key, location.status
+        )));
+        lines.push(Line::from(format!("定位证据 {}", location.location_id)));
+        lines.extend(location.rows.iter().cloned().map(Line::from));
+    }
+    if let Some(scope) = &domain.project_scope {
+        lines.push(Line::from(format!(
+            "当前楼层 {} · {}",
+            scope.floor_key, scope.floor_id
+        )));
+        lines.push(Line::from(format!("作用域 {}", scope.scope_id)));
+        lines.push(Line::from(match scope.component_discovery {
+            Some(crate::domain::ComponentDiscovery::AllLayers) => {
+                "构件发现：检查本层各图层的图纸符号，由 Agent 逐组识别用途"
+            }
+            Some(crate::domain::ComponentDiscovery::ConfiguredLayers) => {
+                "构件发现：扫描项目指定图层，范围外对象尚未覆盖"
+            }
+            None => "构件发现：沿用较早的读取范围，其他图层是否遗漏仍待检查",
+        }));
+        if let Some(choice) = &scope.wall_layer_choice {
+            lines.push(Line::from(format!(
+                "结构提案绑定的墙体图层 {}",
+                choice
+                    .wall_layers
+                    .iter()
+                    .map(|layer| crate::state::display_text(layer))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+            lines.push(Line::from(format!("图层选择理由 {}", choice.reason)));
+            lines.push(Line::from(format!(
+                "所用定位证据 {}",
+                choice.expected_location_id
+            )));
+        }
+        if let Some(binding) = &scope.assembly_binding {
+            lines.push(Line::from(format!(
+                "楼栋连接作用域 · 基线 {} · 只读上层 {}",
+                binding.build_id, binding.upper_floor_key
+            )));
+            lines.push(Line::from(format!("楼栋输入 {}", binding.input_binding)));
+            lines.push(Line::from(
+                "只增来源绑定连接 · 原楼层与楼板只读 · 不代表合规验收",
+            ));
+        }
+    }
     if let Some(groups) = &domain.groups {
         lines.push(Line::from(format!(
             "全层来源分组 · {} 组 · {} 实例 · 已评估 {} 组",
@@ -44,7 +324,9 @@ fn business_lines(
             groups
                 .counts
                 .iter()
-                .map(|(state, count)| format!("{state} {count}"))
+                .map(|(state, count)| {
+                    format!("{} {count}", crate::domain::source_state_label(state))
+                })
                 .collect::<Vec<_>>()
                 .join(" · "),
         ));
@@ -59,7 +341,9 @@ fn business_lines(
             ledger
                 .counts
                 .iter()
-                .map(|(state, count)| format!("{state} {count}"))
+                .map(|(state, count)| {
+                    format!("{} {count}", crate::domain::source_state_label(state))
+                })
                 .collect::<Vec<_>>()
                 .join(" · "),
         ));
@@ -136,7 +420,7 @@ fn business_lines(
             "产物位置 {}",
             display_text(&artifact.binding.output)
         )));
-        lines.push(Line::from("AI/人工复核未执行"));
+        lines.push(Line::from("Agent 看图观察见回复 · 人工复核 not_run"));
     }
     if domain.authorizing {
         lines.push(Line::from("正在记录具体版本批准…"));
@@ -167,16 +451,6 @@ fn business_lines(
             "已核验完整事实 · {} · 序号 {} · {} bytes",
             fact.kind, fact.sequence, fact.bytes
         )));
-    }
-    for notice in [
-        domain.notice.as_deref(),
-        domain.fact_sync_notice.as_deref(),
-        context.notice,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        lines.push(Line::from(display_text(notice)));
     }
     lines
         .into_iter()
@@ -391,6 +665,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn modeling_workflow_keeps_pending_sources_after_structure_application() {
+        let domain = DomainSnapshot {
+            enabled: true,
+            proposal: Some(proposal(1)),
+            operation: Some(crate::domain::OperationFact {
+                operation_id: "structure".into(),
+                state: "applied".into(),
+                recovery: "candidate_present".into(),
+                current_sha256: "candidate".into(),
+            }),
+            ledger: Some(crate::domain::SourceLedgerFact {
+                scan_id: "scan".into(),
+                scene_sha256: "candidate".into(),
+                rows: vec![],
+                counts: [("pending_confirmation".into(), 323)].into(),
+            }),
+            ..Default::default()
+        };
+        let lines = modeling_workflow_lines(&domain).join("\n");
+        assert!(lines.contains("待处理 323"), "{lines}");
+        assert!(lines.contains("已有应用回执"), "{lines}");
+        assert!(!lines.contains("待批准"), "{lines}");
+        assert!(lines.contains("人工验收未执行"), "{lines}");
+        assert!(!lines.contains("整层完成"), "{lines}");
+    }
+
     fn message(thread: &str, turn: &str, text: &str) -> crate::state::ConversationItem {
         crate::state::ConversationItem {
             id: format!("{thread}-{turn}"),
@@ -401,6 +702,174 @@ mod tests {
             complete: true,
             truncated: false,
             tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn applied_structure_with_unresolved_components_still_shows_floor_work_remaining() {
+        let domain = DomainSnapshot {
+            enabled: true,
+            floor_id: "floor.f08".into(),
+            application: Some("applied".into()),
+            ledger: Some(crate::domain::SourceLedgerFact {
+                scan_id: "scan".into(),
+                scene_sha256: "candidate".into(),
+                rows: vec![],
+                counts: [("pending_confirmation".into(), 323)].into(),
+            }),
+            ..Default::default()
+        };
+        let snapshot = CoreSnapshot::default();
+        let local = LocalState::default();
+        let context = ViewContext::new(&snapshot, &local.extension, "", None);
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("整层尚未完成"), "{text}");
+        assert!(text.contains("待确认 323"), "{text}");
+        assert!(!text.contains("pending_confirmation"), "{text}");
+    }
+
+    #[test]
+    fn project_candidates_and_target_selection_are_visible_without_scene_approval() {
+        use crate::domain::{ProjectCatalogFact, ProjectSelectionFact, SelectionState};
+        for width in [40, 120] {
+            let mut snapshot = CoreSnapshot {
+                phase: SessionPhase::Ready,
+                ..Default::default()
+            };
+            snapshot
+                .extensions
+                .push(ExtensionSnapshot::Modeling(DomainSnapshot {
+                    enabled: true,
+                    floor_id: "项目目标".into(),
+                    project: Some(ProjectCatalogFact {
+                        catalog_id: "a".repeat(64),
+                        project_path: "projects/hospital".into(),
+                        source_sha256: "b".repeat(64),
+                        total_floors: 2,
+                        component_source_layers: Some(vec![
+                            "PL-家具".into(),
+                            "USER-FIXTURES".into(),
+                        ]),
+                        floor_keys: vec!["f09.a".into(), "f09.b".into()],
+                        rows: vec!["f09.a · 九层图纸A".into(), "f09.b · 九层图纸B".into()],
+                    }),
+                    selection: Some(ProjectSelectionFact {
+                        selection_id: "c".repeat(64),
+                        catalog_id: "a".repeat(64),
+                        target: "整栋".into(),
+                        state: SelectionState::NeedsSelection,
+                        selected_keys: vec![],
+                        candidate_keys: vec!["f09.a".into(), "f09.b".into()],
+                        source_sha256: "b".repeat(64),
+                        rows: vec![
+                            "重复图纸：需用户选择".into(),
+                            "f09.a · 九层图纸A".into(),
+                            "f09.b · 九层图纸B".into(),
+                        ],
+                    }),
+                    ..Default::default()
+                }));
+            let local = LocalState::default();
+            let backend = ratatui::backend::TestBackend::new(width, 40);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, frame.area(), &snapshot, &local))
+                .unwrap();
+            use unicode_width::UnicodeWidthStr;
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..40 {
+                let mut x = 0;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    screen.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+                screen.push('\n');
+            }
+            for text in [
+                "项目",
+                "整栋",
+                "重复图纸",
+                "九层图纸A",
+                "九层图纸B",
+                "PL-家具",
+                "not_run",
+                "not_granted",
+            ] {
+                assert!(screen.contains(text), "{width}: {text}");
+            }
+            assert!(ModelingView.confirmation(&snapshot.extensions[0]).is_none());
+        }
+    }
+
+    #[test]
+    fn source_bound_location_and_layer_choice_are_visible_without_an_extra_approval_path() {
+        use crate::domain::{ProjectLocationFact, ProjectScopeFact, ProjectWallLayerChoice};
+        let domain = DomainSnapshot {
+            enabled: true,
+            project_location: Some(ProjectLocationFact {
+                location_id: "e".repeat(64),
+                catalog_id: "a".repeat(64),
+                selection_id: "c".repeat(64),
+                source_sha256: "b".repeat(64),
+                floor_key: "f10".into(),
+                status: "needs_wall_layers".into(),
+                layers: vec!["AUTHORED-ENCLOSURE".into()],
+                rows: vec!["AUTHORED-ENCLOSURE · 24 线实体".into()],
+            }),
+            project_scope: Some(ProjectScopeFact {
+                component_discovery: None,
+                activation_revision: Some(1),
+                assembly_binding: None,
+                scope_id: "d".repeat(64),
+                floor_key: "f10".into(),
+                floor_id: "floor.f10".into(),
+                selection_id: "c".repeat(64),
+                source_sha256: "b".repeat(64),
+                wall_layer_choice: Some(ProjectWallLayerChoice {
+                    expected_location_id: "e".repeat(64),
+                    wall_layers: vec!["AUTHORED-ENCLOSURE".into()],
+                    reason: "配对墙面证据".into(),
+                }),
+            }),
+            ..Default::default()
+        };
+        for width in [40, 120] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+            let snapshot = CoreSnapshot {
+                extensions: vec![ExtensionSnapshot::Modeling(domain.clone())],
+                ..Default::default()
+            };
+            terminal
+                .draw(|frame| draw(frame, frame.area(), &snapshot, &LocalState::default()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for y in 0..40 {
+                let mut x = 0;
+                while x < width {
+                    let text = buffer[(x, y)].symbol();
+                    screen.push_str(text);
+                    x += (unicode_width::UnicodeWidthStr::width(text) as u16).max(1);
+                }
+                screen.push('\n');
+            }
+            for expected in [
+                "楼层定位",
+                "未批准",
+                "24 线实体",
+                "配对墙面证据",
+                "结构提案绑定",
+            ] {
+                assert!(screen.contains(expected), "{width}: {expected}\n{screen}");
+            }
+            assert!(ModelingView.confirmation(&snapshot.extensions[0]).is_none());
         }
     }
 
@@ -549,11 +1018,11 @@ mod tests {
                 )
             })
             .collect();
+        prepared.diagnostics.push("BOTTOM_FACT".into());
         let snapshot = CoreSnapshot {
             extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
                 proposal: Some(prepared),
-                notice: Some("BOTTOM_FACT".into()),
                 ..Default::default()
             })],
             ..Default::default()
@@ -952,5 +1421,105 @@ mod tests {
         assert!(rows.iter().any(|line| line.contains("GROUP_ROW_199")));
         assert!(rows.iter().any(|line| line.contains("LEDGER_ROW_999")));
         assert!(rows.iter().any(|line| line.contains("bed.1.body")));
+    }
+
+    #[test]
+    fn control_failure_is_visible_before_large_proposal_details() {
+        let mut p = proposal(1);
+        p.objects = (0..2220).map(|i| format!("STRUCTURE_ENTITY_{i}")).collect();
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
+                enabled: true,
+                proposal: Some(p),
+                notice: Some("批准结果超过大小上限".into()),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let panel = ExtensionPanel::default();
+        let lines = business_lines(
+            snapshot.extensions[0].modeling().unwrap(),
+            &ViewContext::new(&snapshot, &panel, "", None),
+            120,
+        );
+        assert!(lines
+            .iter()
+            .take(10)
+            .any(|line| line.to_string().contains("批准结果超过大小上限")));
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("STRUCTURE_ENTITY_2219")));
+    }
+
+    #[test]
+    fn building_success_keeps_source_attention_and_unchecked_connections_visible_without_approval()
+    {
+        let domain = DomainSnapshot {
+            enabled: true,
+            buildings: vec![crate::domain::ProjectBuildingFact {
+                connection_authority: None,
+                build_id: "building-job".into(),
+                selection_id: "selection".into(),
+                input_binding: "binding".into(),
+                input_sha256: "sha".into(),
+                state: "built".into(),
+                current: true,
+                valid: Some(true),
+                floor_keys: vec!["f08".into(), "f09".into()],
+                floor_authorities: Default::default(),
+                source_reconciliation: "attention".into(),
+                connection_check: "not_run".into(),
+                report: Some(crate::domain::BuildingReportFact {
+                    state: "attention".into(),
+                    technical_status: "attention".into(),
+                    current: true,
+                    artifact_valid: true,
+                    source_total: 487,
+                    unresolved_sources: 222,
+                    unresolved_drawing: 15,
+                    missing_floor_reviews: 0,
+                    connection_issues: 1,
+                }),
+                output: "building/model.glb".into(),
+            }],
+            drawing_audit: Some(crate::domain::DrawingAuditFact {
+                audit_id: "audit".into(),
+                scene_sha256: "scene-sha".into(),
+                candidate_count: 41,
+                judged_count: 0,
+                ai_review: "not_run".into(),
+                offset: 0,
+                next_offset: Some(40),
+                rows: vec!["gap · wall_gap · review required".into()],
+            }),
+            ..Default::default()
+        };
+        let extension = ExtensionSnapshot::Modeling(domain.clone());
+        assert!(ModelingView.confirmation(&extension).is_none());
+        let snapshot = CoreSnapshot {
+            extensions: vec![extension],
+            ..Default::default()
+        };
+        let panel = ExtensionPanel::default();
+        for width in [60, 120] {
+            let lines = business_lines(
+                &domain,
+                &ViewContext::new(&snapshot, &panel, "", None),
+                width,
+            );
+            let text = lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("楼栋 building-job · built · current=true · valid=true"));
+            assert!(text.contains("来源 attention · 连接检查 not_run"));
+            assert!(text.contains("总报告 attention · 技术 attention"));
+            assert!(text.contains("来源未完成 222/487"));
+            assert!(text.contains("图纸未决 15"));
+            assert!(text.contains("图纸审查候选 41 项"));
+            assert!(text.contains("下一页 40"));
+            assert!(text.contains("人工复核 not_run"));
+        }
     }
 }

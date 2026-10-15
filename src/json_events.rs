@@ -37,6 +37,16 @@ pub struct OutputStatus {
     pub done: bool,
 }
 
+impl OutputStatus {
+    fn failure(&self, write_timeout: Duration) -> Option<OutputError> {
+        self.error.clone().or_else(|| {
+            self.writing_since
+                .filter(|since| since.elapsed() >= write_timeout)
+                .map(|_| OutputError::Stalled)
+        })
+    }
+}
+
 pub struct LiveOutput {
     pub status: watch::Receiver<OutputStatus>,
     producer_closed: Arc<AtomicBool>,
@@ -157,22 +167,17 @@ impl LiveOutput {
     }
 
     pub fn failure(&self) -> Option<OutputError> {
-        let status = self.status.borrow();
-        status.error.clone().or_else(|| {
-            status
-                .writing_since
-                .filter(|since| since.elapsed() >= self.write_timeout)
-                .map(|_| OutputError::Stalled)
-        })
+        self.status.borrow().failure(self.write_timeout)
     }
 
     pub async fn ready(&mut self) -> Result<(), OutputError> {
         tokio::time::timeout(self.write_timeout, async {
             loop {
-                if let Some(error) = self.failure() {
+                let status = self.status.borrow().clone();
+                if let Some(error) = status.failure(self.write_timeout) {
                     return Err(error);
                 }
-                if self.status.borrow().delivered_seq.is_some() {
+                if status.delivered_seq.is_some() {
                     return Ok(());
                 }
                 self.status
@@ -189,10 +194,11 @@ impl LiveOutput {
         self.producer_closed.store(true, Ordering::Release);
         let result = tokio::time::timeout(FINISH_TIMEOUT, async {
             loop {
-                if let Some(error) = self.failure() {
+                let status = self.status.borrow().clone();
+                if let Some(error) = status.failure(self.write_timeout) {
                     return Err(error);
                 }
-                if self.status.borrow().done {
+                if status.done {
                     return Ok(());
                 }
                 tokio::select! {

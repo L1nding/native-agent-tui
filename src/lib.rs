@@ -16,7 +16,6 @@ pub mod history;
 pub mod interactions;
 pub mod journal;
 pub mod json_events;
-pub mod modeling;
 pub mod models;
 pub mod observation;
 pub mod outbox;

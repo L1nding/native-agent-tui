@@ -190,6 +190,8 @@ pub struct CoreSnapshot {
     /// dsh's permission preset of this session and the ones that can be chosen.
     pub permission: crate::permission::PermissionSnapshot,
     pub messages: Vec<ConversationItem>,
+    /// Explicit preview → committed block identities, bounded and free of message text.
+    pub message_replacements: Vec<MessageReplacement>,
     pub requests: Vec<RequestView>,
     pub last_headless_action: Option<crate::interactions::HeadlessAction>,
     pub notice: Option<String>,
@@ -219,6 +221,17 @@ pub struct CoreSnapshot {
     pub todos: Vec<TodoItem>,
     /// 启动预检未通过且已不在启动阶段：本会话不能再提交任务。
     pub startup_blocked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageReplacement {
+    pub thread: String,
+    pub turn: String,
+    pub role: String,
+    pub previous: String,
+    pub current: String,
+    /// Earlier preview blocks folded into the same committed block.
+    pub prefix_bytes: usize,
 }
 
 /// dsh 的一条斜杠命令，例如 `compact`；名称不带斜杠。
@@ -329,7 +342,7 @@ pub(crate) struct SessionState {
     pub(crate) usage_facts: BTreeMap<String, UsageFact>,
     /// 工具摘要行，按 item 原位更新；一个轮次里被思考或正文隔开的调用各成一组。只存在内存中。
     pub(crate) tool_lines: VecDeque<ToolLines>,
-    /// 当前 root 轮次的分阶段耗时；轮次结束后固定进对话并清空。
+    /// 当前 root 步骤的分阶段耗时；step/end 固定，下一步换新计时器。
     pub(crate) turn_timing: Option<TurnTiming>,
 }
 
@@ -352,6 +365,9 @@ const TURN_STAGES: [(TurnStage, &str); 4] = [
 #[derive(Debug)]
 pub(crate) struct TurnTiming {
     turn_id: String,
+    step: Option<u64>,
+    segment: u64,
+    ended: Option<(Instant, Option<String>)>,
     stage: TurnStage,
     since: Instant,
     totals: [Duration; 4],
@@ -508,7 +524,41 @@ impl SessionState {
                 }
             }
         }
+        self.bound_tool_outputs();
         self.render_tool_lines(index);
+    }
+
+    /// Keep the retained card bodies bounded independently of message eviction.
+    /// Old summaries survive when their output body no longer fits.
+    fn bound_tool_outputs(&mut self) {
+        // Leave room in the history budget for summaries and other conversation rows.
+        let mut remaining = HISTORY_BYTES / 2;
+        for group in self.tool_lines.iter_mut().rev() {
+            let message_id = group.message_id();
+            for (tool, _) in group.lines.iter_mut().rev() {
+                let bytes = tool.output.as_ref().map_or(0, |output| output.len());
+                if bytes <= remaining {
+                    remaining -= bytes;
+                } else {
+                    tool.output = None;
+                    tool.output_clipped = true;
+                    if let Some(message) = self.view.messages.iter_mut().find(|message| {
+                        message.thread_id == group.thread_id
+                            && message.turn_id == group.turn_id
+                            && message.id == message_id
+                    }) {
+                        if let Some(retained) = message
+                            .tools
+                            .iter_mut()
+                            .find(|retained| retained.item_id == tool.item_id)
+                        {
+                            retained.output = None;
+                            retained.output_clipped = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 轮次结束时仍未报告终态的工具，结果不确定；不能继续显示为 running。
@@ -630,6 +680,9 @@ impl SessionState {
         }
         self.turn_timing = Some(TurnTiming {
             turn_id: turn,
+            step: None,
+            segment: 0,
+            ended: None,
             stage: TurnStage::ModelWait,
             since: now,
             totals: [Duration::ZERO; 4],
@@ -637,6 +690,60 @@ impl SessionState {
             stream_staged: false,
         });
         self.render_turn_timing(now, None);
+    }
+
+    /// A host step owns one model call (including retries) and its tools.
+    /// Repeated or old starts cannot reset elapsed time or reopen a frozen step.
+    pub fn begin_step_timing(&mut self, turn: &str, step: u64, now: Instant) {
+        let Some(current) = self
+            .turn_timing
+            .as_ref()
+            .filter(|timing| timing.turn_id == turn)
+        else {
+            return;
+        };
+        if current.step.is_some_and(|current| step <= current) {
+            return;
+        }
+        let segment = current.segment + u64::from(current.step.is_some());
+        if let Some(step) = current.step {
+            self.end_step_timing(turn, step, now, None);
+        }
+        self.turn_timing = Some(TurnTiming {
+            turn_id: turn.into(),
+            step: Some(step),
+            segment,
+            ended: None,
+            stage: TurnStage::ModelWait,
+            since: now,
+            totals: [Duration::ZERO; 4],
+            running_tools: BTreeSet::new(),
+            stream_staged: false,
+        });
+        self.render_turn_timing(now, None);
+    }
+
+    pub fn end_step_timing(
+        &mut self,
+        turn: &str,
+        step: u64,
+        now: Instant,
+        completed_at: Option<String>,
+    ) {
+        let Some(current) = self.turn_timing.as_mut().filter(|timing| {
+            timing.turn_id == turn && timing.step == Some(step) && timing.ended.is_none()
+        }) else {
+            return;
+        };
+        current.switch(current.stage, now);
+        current.ended = Some((now, completed_at));
+        self.render_turn_timing(now, None);
+    }
+
+    pub fn timing_step_matches(&self, turn: &str, step: u64) -> bool {
+        self.turn_timing.as_ref().is_some_and(|timing| {
+            timing.turn_id == turn && timing.step == Some(step) && timing.ended.is_none()
+        })
     }
 
     /// 已被接受的 root 输出把计时切到对应阶段。
@@ -648,7 +755,11 @@ impl SessionState {
         else {
             return;
         };
-        if !timing.stream_staged && timing.running_tools.is_empty() && timing.stage != stage {
+        if timing.ended.is_none()
+            && !timing.stream_staged
+            && timing.running_tools.is_empty()
+            && timing.stage != stage
+        {
             timing.switch(stage, now);
         }
         self.render_turn_timing(now, None);
@@ -665,7 +776,7 @@ impl SessionState {
             return;
         };
         timing.stream_staged = true;
-        if timing.running_tools.is_empty() && timing.stage != stage {
+        if timing.ended.is_none() && timing.running_tools.is_empty() && timing.stage != stage {
             timing.switch(stage, now);
         }
         self.render_turn_timing(now, None);
@@ -680,6 +791,9 @@ impl SessionState {
         else {
             return;
         };
+        if timing.ended.is_some() {
+            return;
+        }
         if running {
             if timing.running_tools.len() < 64 {
                 timing.running_tools.insert(item.to_owned());
@@ -706,9 +820,12 @@ impl SessionState {
     /// 轮次终结：固定各阶段数值。`completed_at` 只在服务端确认完成时给出。
     pub fn finish_turn_timing(&mut self, now: Instant, completed_at: Option<String>) {
         if let Some(timing) = self.turn_timing.as_mut() {
-            let stage = timing.stage;
-            timing.switch(stage, now);
-            self.render_turn_timing(now, Some(completed_at));
+            if timing.ended.is_none() {
+                let stage = timing.stage;
+                timing.switch(stage, now);
+                timing.ended = Some((now, completed_at));
+            }
+            self.render_turn_timing(now, None);
             self.turn_timing = None;
         }
     }
@@ -719,7 +836,12 @@ impl SessionState {
         };
         let thread = self.view.thread_id.clone().unwrap_or_default();
         let turn = timing.turn_id.clone();
+        let finished = timing.ended.as_ref().map(|(_, at)| at.clone()).or(finished);
+        let now = timing.ended.as_ref().map_or(now, |(at, _)| *at);
         let mut text = timing.text(now, finished.is_none());
+        if let Some(step) = timing.step {
+            text = format!("Step {step} · {text}");
+        }
         if let Some(Some(completed_at)) = &finished {
             if !text.is_empty() {
                 text.push_str(" · ");
@@ -727,7 +849,11 @@ impl SessionState {
             text.push_str("Completed ");
             text.push_str(completed_at);
         }
-        let id = format!("timing:{turn}");
+        let id = if timing.segment == 0 {
+            format!("timing:{turn}")
+        } else {
+            format!("timing:{turn}:{}", timing.segment)
+        };
         let same_turn = |m: &ConversationItem| m.thread_id == thread && m.turn_id == turn;
         let existing = self
             .view
@@ -960,6 +1086,79 @@ impl SessionState {
             .retain(|m| !(m.thread_id == thread && m.turn_id == turn && m.id == id));
     }
 
+    /// Replace a preview in place; the caller appends the authoritative first chunk
+    /// before publishing, so readers never observe an empty intermediate block.
+    pub fn replace_preview(&mut self, turn: &str, id: &str, role: &str, previous: &[String]) {
+        if self.view.turn_id.as_deref() != Some(turn)
+            || !matches!(
+                self.view.phase,
+                SessionPhase::Running | SessionPhase::GatePending
+            )
+            || !matches!(role, "Agent" | "Reasoning")
+            || previous.is_empty()
+            || previous.len() > 64
+            || !previous
+                .iter()
+                .all(|id| id.starts_with("live:") && id.len() <= 512)
+            || id.is_empty()
+            || id.starts_with("live:")
+            || id.len() > 512
+        {
+            return;
+        }
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        let matches = |message: &ConversationItem| {
+            message.thread_id == thread
+                && message.turn_id == turn
+                && message.role == role
+                && previous.contains(&message.id)
+        };
+        let Some(at) = self.view.messages.iter().position(matches) else {
+            return;
+        };
+        // A committed block can merge adjacent previews of its own role; it
+        // cannot move text across an intervening tool or reasoning block.
+        let count = self
+            .view
+            .messages
+            .iter()
+            .filter(|message| matches(message))
+            .count();
+        if !self.view.messages.iter().skip(at).take(count).all(matches) {
+            return;
+        }
+        // An already-existing authority must never be replaced by a replayed preview.
+        if self.view.messages.iter().any(|message| {
+            message.thread_id == thread
+                && message.turn_id == turn
+                && message.role == role
+                && message.id == id
+        }) {
+            return;
+        }
+        let mut prefix_bytes = 0;
+        for message in self.view.messages.iter().filter(|message| matches(message)) {
+            self.view.message_replacements.push(MessageReplacement {
+                thread: thread.clone(),
+                turn: turn.into(),
+                role: role.into(),
+                previous: message.id.clone(),
+                current: id.into(),
+                prefix_bytes,
+            });
+            prefix_bytes += display_text(&message.text).len();
+        }
+        let excess = self.view.message_replacements.len().saturating_sub(128);
+        self.view.message_replacements.drain(..excess);
+        let mut replacement = self.view.messages[at].clone();
+        replacement.id = id.into();
+        replacement.text.clear();
+        replacement.complete = false;
+        replacement.truncated = false;
+        self.view.messages.retain(|message| !matches(message));
+        self.view.messages.insert(at, replacement);
+    }
+
     pub fn finish_all_reasoning(&mut self) {
         for message in &mut self.view.messages {
             if message.role == "Reasoning" {
@@ -1094,6 +1293,107 @@ mod tests {
             output_lines: None,
             added_lines: None,
             removed_lines: None,
+            output: None,
+            output_clipped: false,
+        }
+    }
+
+    #[test]
+    fn preview_authority_replaces_in_place_and_preserves_interleaved_roles() {
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        state.message("turn", "live:0:text:0", "prefix ", false);
+        state.message("turn", "live:0:text:1", "body", false);
+        state.reasoning("root", "turn", "live:0:thinking:2", "thought", false);
+        state.message("turn", "live:0:text:3", "answer", false);
+        let original = state.view.messages.clone();
+        state.replace_preview(
+            "turn",
+            "bad-merge",
+            "Agent",
+            &["live:0:text:1".into(), "live:0:text:3".into()],
+        );
+        assert_eq!(
+            state.view.messages, original,
+            "cannot merge across intervening reasoning"
+        );
+        state.replace_preview(
+            "turn",
+            "committed",
+            "Agent",
+            &["live:0:text:0".into(), "live:0:text:1".into()],
+        );
+        state.message("turn", "committed", "prefix body", false);
+        assert_eq!(
+            state
+                .view
+                .messages
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["committed", "live:0:thinking:2", "live:0:text:3"]
+        );
+        assert_eq!(state.view.messages[0].text, "prefix body");
+        assert_eq!(state.view.message_replacements.len(), 2);
+        assert_eq!(
+            state.view.message_replacements[1].prefix_bytes,
+            "prefix ".len()
+        );
+        let saved = state.view.messages.clone();
+        for (turn, role, previous) in [
+            ("old-turn", "Agent", "live:0:text:3"),
+            ("turn", "Reasoning", "live:0:text:3"),
+            ("turn", "Agent", "live:1:text:3"),
+            ("turn", "Agent", "committed"),
+        ] {
+            state.replace_preview(turn, "wrong", role, &[previous.into()]);
+            assert_eq!(state.view.messages, saved);
+        }
+        state.replace_preview("turn", "committed", "Agent", &["live:0:text:3".into()]);
+        assert_eq!(
+            state.view.messages, saved,
+            "replayed preview cannot overwrite authority"
+        );
+        state.view.phase = SessionPhase::Ready;
+        state.replace_preview("turn", "late", "Agent", &["live:0:text:3".into()]);
+        assert_eq!(state.view.messages, saved);
+    }
+
+    #[test]
+    fn retained_card_outputs_are_bounded_even_after_history_messages_are_evicted() {
+        let mut state = SessionState::default();
+        for index in 0..20 {
+            let mut call = tool(
+                &format!("tool-{index}"),
+                crate::tool_details::ToolLifecycle::Completed,
+            );
+            call.output = Some("中".repeat(20_000).into());
+            state.tool_line("root", "turn", call, format!("▸ done · tool-{index}"));
+        }
+        let retained = state
+            .tool_lines
+            .iter()
+            .flat_map(|group| &group.lines)
+            .map(|(tool, _)| tool.output.as_ref().map_or(0, |body| body.len()))
+            .sum::<usize>();
+        assert!(retained <= HISTORY_BYTES / 2);
+        let oldest = &state.tool_lines.front().unwrap().lines.front().unwrap().0;
+        assert!(oldest.output.is_none());
+        assert!(oldest.output_clipped);
+        let group = state.tool_lines.back().unwrap();
+        assert!(group.lines.back().unwrap().0.output.is_some());
+        for message in &state.view.messages {
+            for tool in &message.tools {
+                let original = &state
+                    .tool_lines
+                    .iter()
+                    .flat_map(|group| &group.lines)
+                    .find(|(original, _)| original.item_id == tool.item_id)
+                    .unwrap()
+                    .0;
+                assert_eq!(tool.output, original.output);
+            }
         }
     }
 
@@ -1199,6 +1499,65 @@ mod tests {
             message.text.matches("ended, outcome unknown").count()
         };
         assert_eq!((unknown("tools:turn"), unknown("tools:turn:1")), (1, 2));
+    }
+
+    #[test]
+    fn each_host_step_freezes_after_its_tools_without_merging_the_next_model_call() {
+        let mut state = SessionState::default();
+        state.view.thread_id = Some("root".into());
+        state.turn_started("turn".into());
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        state.begin_turn_timing(at(0));
+        state.begin_step_timing("turn", 1, at(0));
+        state.turn_stream_stage("turn", TurnStage::Thinking, at(1));
+        state.begin_step_timing("turn", 1, at(1));
+        state.turn_stream_stage("turn", TurnStage::Response, at(2));
+        state.message("turn", "first", "first answer", true);
+        state.tool_line(
+            "root",
+            "turn",
+            tool("shell", crate::tool_details::ToolLifecycle::Running),
+            "▸ running · shell".into(),
+        );
+        state.turn_tool("turn", "shell", true, at(3));
+        state.turn_tool("turn", "shell", false, at(4));
+        state.end_step_timing("turn", 1, at(4), Some("12:00:04 UTC".into()));
+        let first = state.view.messages.last().unwrap().clone();
+        assert_eq!(first.text, "Step 1 · Model wait 1.0s · Thinking 1.0s · Response 1.0s · Tools 1.0s · Completed 12:00:04 UTC");
+        assert!(first.complete);
+        assert_eq!(
+            state.view.messages[state.view.messages.len() - 2].role,
+            "Tool"
+        );
+        state.refresh_turn_timing(at(5));
+        assert_eq!(state.view.messages.last().unwrap(), &first);
+        state.begin_step_timing("turn", 2, at(5));
+        state.begin_step_timing("old", 9, at(5));
+        state.begin_step_timing("turn", 1, at(5));
+        state.end_step_timing("turn", 1, at(6), Some("wrong".into()));
+        assert!(state.timing_step_matches("turn", 2));
+        assert!(!state.timing_step_matches("turn", 1));
+        state.turn_stream_stage("turn", TurnStage::Response, at(6));
+        state.message("turn", "second", "second answer", true);
+        state.end_step_timing("turn", 2, at(7), Some("12:00:07 UTC".into()));
+        state.finish_turn_timing(at(9), Some("12:00:09 UTC".into()));
+        let timers: Vec<_> = state
+            .view
+            .messages
+            .iter()
+            .filter(|message| message.role == "Timing")
+            .collect();
+        assert_eq!(timers.len(), 2);
+        assert_eq!(timers[0], &first);
+        assert_eq!(
+            timers[1].text,
+            "Step 2 · Model wait 1.0s · Response 1.0s · Completed 12:00:07 UTC"
+        );
+        assert_eq!(
+            state.view.messages[state.view.messages.len() - 2].text,
+            "second answer"
+        );
     }
 
     #[test]

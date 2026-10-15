@@ -592,9 +592,18 @@ fn bounded_content_result(value: &Value) -> Option<Value> {
             return content(inner, depth + 1);
         }
         let items = value.as_array()?;
-        (items.len() == 1)
-            .then(|| content(&items[0], depth + 1))
-            .flatten()
+        if items.len() == 1 {
+            return content(&items[0], depth + 1);
+        }
+        if items.len() > 8 {
+            return None;
+        }
+        // MCP image delivery may include display-only diagnostics beside the sealed
+        // receipt. Preserve exactly one complete receipt; never pick between JSONs.
+        let mut candidates = items.iter().filter_map(|item| content(item, depth + 1));
+        let receipt = candidates.next()?;
+        (receipt["contract"] == "modeling-fact-receipt/v1" && candidates.next().is_none())
+            .then_some(receipt)
     }
     content(value, 0)
 }
@@ -847,17 +856,48 @@ mod structured_result_tests {
         let (
             _,
             Update::ToolCallUpdate {
-                content: ToolContent { output, .. },
+                content:
+                    ToolContent {
+                        output,
+                        structured_output,
+                        ..
+                    },
                 ..
             },
         ) = update(&payload).unwrap()
         else {
             panic!()
         };
+        assert_eq!(
+            structured_output,
+            Some(receipt.clone()),
+            "Core must receive the sealed receipt independently of image/display blocks"
+        );
         let text = output.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), receipt);
         assert!(text.len() < 6000);
         assert!(!text.contains("BINARY_IMAGE_DATA"));
+    }
+
+    #[test]
+    fn image_receipt_survives_canonical_and_diagnostic_blocks_but_ambiguous_json_is_rejected() {
+        let receipt = json!({"contract":"modeling-fact-receipt/v1","kind":"artifact_validation"});
+        let block = json!({"type":"text","text":receipt.to_string()});
+        let image = json!({"type":"image","mimeType":"image/png","data":"not retained"});
+        let diagnostic =
+            json!({"type":"text","text":"[image unavailable: model does not declare image input]"});
+        for sibling in [image, diagnostic] {
+            let mixed = json!({"content":[block.clone(),sibling]});
+            assert_eq!(bounded_json_result(&mixed), Some(receipt.clone()));
+        }
+        for sibling in [block.clone(), json!({"type":"text","text":"{\"ok\":true}"})] {
+            assert!(bounded_content_result(&json!([block.clone(), sibling])).is_none());
+        }
+        assert!(
+            bounded_json_result(&json!({"isError":true,"content":[block.clone()]})).unwrap()
+                ["isError"]
+                == true
+        );
     }
 
     #[test]

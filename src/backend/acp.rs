@@ -378,7 +378,8 @@ struct AcpBridge {
     /// 交替出现时各成一段，保留先后关系。
     block: Option<(String, bool, u32)>,
     /// 正在生成的预览段的 item id；提交后的权威内容到达前由它们占位。
-    live_items: Vec<String>,
+    live_items: Vec<LiveItem>,
+    live_attempt: u64,
     /// 这次请求已经提交：下一条权威更新到达时撤掉预览。
     live_settled: bool,
     model: Option<String>,
@@ -403,6 +404,11 @@ struct AcpBridge {
         HashMap<String, (acp_protocol::ToolKind, String, Vec<acp_protocol::FileDiff>)>,
 }
 
+struct LiveItem {
+    id: String,
+    thinking: bool,
+}
+
 impl AcpBridge {
     fn new(core: PipeTransport, acp: PipeTransport, config: &Config) -> Self {
         Self {
@@ -421,6 +427,7 @@ impl AcpBridge {
             last_message_id: None,
             block: None,
             live_items: Vec::new(),
+            live_attempt: 0,
             live_settled: false,
             model: config.model.clone(),
             model_is_preference: config.model_is_preference,
@@ -1048,13 +1055,51 @@ impl AcpBridge {
     /// 撤掉生成中的预览。权威内容是 dsh 提交的整条消息，预览只是它到达前的占位。
     fn discard_live(&mut self, session: &str, turn: &str) -> Result<(), TransportError> {
         self.live_settled = false;
+        if !self.live_items.is_empty() {
+            self.live_attempt = self.live_attempt.saturating_add(1);
+        }
         for item in std::mem::take(&mut self.live_items) {
             self.core.send(Envelope::notification(
                 "item/discarded",
-                Some(json!({"threadId":session,"turnId":turn,"itemId":item})),
+                Some(json!({"threadId":session,"turnId":turn,"itemId":item.id})),
             ))?;
         }
         Ok(())
+    }
+
+    fn replace_live(
+        &mut self,
+        session: &str,
+        turn: &str,
+        thinking: bool,
+    ) -> Result<Vec<String>, TransportError> {
+        if !self.live_settled {
+            return Ok(Vec::new());
+        }
+        // Authority can omit a previewed section. Discard that section explicitly;
+        // only a matching role can transfer its scroll identity.
+        while self
+            .live_items
+            .first()
+            .is_some_and(|item| item.thinking != thinking)
+        {
+            let item = self.live_items.remove(0);
+            self.core.send(Envelope::notification(
+                "item/discarded",
+                Some(json!({"threadId":session,"turnId":turn,"itemId":item.id})),
+            ))?;
+        }
+        let count = self
+            .live_items
+            .iter()
+            .take_while(|item| item.thinking == thinking)
+            .count();
+        let replaced = self.live_items.drain(..count).map(|item| item.id).collect();
+        if self.live_items.is_empty() {
+            self.live_settled = false;
+            self.live_attempt = self.live_attempt.saturating_add(1);
+        }
+        Ok(replaced)
     }
 
     /// 给内容块一个稳定身份。dsh 的一条消息里，思考块和正文块共用 messageId 并
@@ -1166,6 +1211,36 @@ impl AcpBridge {
         };
         let event = &params["event"];
         match event["type"].as_str() {
+            Some("step") => {
+                let (Some(turn), Some(step), Some(state)) = (
+                    self.turn_id.clone(),
+                    event["step"]
+                        .as_u64()
+                        .filter(|step| *step <= 9_007_199_254_740_991),
+                    event["state"]
+                        .as_str()
+                        .filter(|state| matches!(*state, "start" | "end")),
+                ) else {
+                    return Ok(());
+                };
+                if !self.turn_started {
+                    if state != "start" {
+                        return Ok(());
+                    }
+                    self.core.send(Envelope::notification(
+                        "turn/started",
+                        Some(json!({"threadId":session,"turn":{"id":turn}})),
+                    ))?;
+                    self.turn_started = true;
+                }
+                self.core.send(Envelope::notification(
+                    "turn/step",
+                    Some(json!({"threadId":session,"turnId":turn,"step":step,"state":state})),
+                ))?;
+                if state == "end" && self.live_settled {
+                    self.discard_live(&session, &turn)?;
+                }
+            }
             Some("stage") => {
                 let (Some(turn), Some(stage)) = (
                     self.turn_id.clone(),
@@ -1182,10 +1257,15 @@ impl AcpBridge {
                     ))?;
                     self.turn_started = true;
                 }
-                self.core.send(Envelope::notification(
-                    "turn/stage",
-                    Some(json!({"threadId":session,"turnId":turn,"stage":stage})),
-                ))?;
+                let mut params = json!({"threadId":session,"turnId":turn,"stage":stage});
+                if let Some(step) = event["step"]
+                    .as_u64()
+                    .filter(|step| *step <= 9_007_199_254_740_991)
+                {
+                    params["step"] = json!(step);
+                }
+                self.core
+                    .send(Envelope::notification("turn/stage", Some(params)))?;
             }
             Some("delta") => {
                 let (Some(turn), Some(text)) = (
@@ -1201,12 +1281,17 @@ impl AcpBridge {
                 }
                 let thinking = event["kind"] == "thinking";
                 let item = format!(
-                    "live:{}:{}",
+                    "live:{}:{}:{}",
+                    self.live_attempt,
                     if thinking { "thinking" } else { "text" },
                     event["block"].as_u64().unwrap_or(0).min(999)
                 );
-                if !self.live_items.contains(&item) && self.live_items.len() < 64 {
-                    self.live_items.push(item.clone());
+                if !self.live_items.iter().any(|live| live.id == item) && self.live_items.len() < 64
+                {
+                    self.live_items.push(LiveItem {
+                        id: item.clone(),
+                        thinking,
+                    });
                 }
                 if !self.turn_started {
                     self.core.send(Envelope::notification(
@@ -1729,6 +1814,9 @@ impl AcpBridge {
             ))?;
             self.turn_started = true;
         }
+        if let Some(session) = self.session_id.clone() {
+            self.discard_live(&session, &turn)?;
+        }
         if let Some(item_id) = self.last_message_id.take() {
             if let Some(text) = self.message_text.remove(&item_id) {
                 self.core.send(Envelope::notification(
@@ -1797,12 +1885,10 @@ impl AcpBridge {
             ))?;
             self.turn_started = true;
         }
-        if self.live_settled {
-            self.discard_live(&session, &turn)?;
-        }
         match update {
             Update::AgentMessage { item_id, text } => {
                 let item_id = self.block_id(item_id, false);
+                let replaced = if self.last_message_id.as_deref() != Some(&item_id) { self.replace_live(&session, &turn, false)? } else { Vec::new() };
                 self.last_message_id = Some(item_id.clone());
                 if !self.message_text.contains_key(&item_id) && self.message_text.len() >= 64 {
                     self.message_text.clear();
@@ -1816,11 +1902,13 @@ impl AcpBridge {
                     }
                     entry.truncate(end);
                 }
-                self.core.send(Envelope::notification("item/agentMessage/delta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?
+                self.core.send(Envelope::notification("item/agentMessage/delta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text,"replaces":replaced}))))?
             }
             Update::AgentThought { item_id, text } => {
+                let previous = self.block.clone();
                 let item_id = self.block_id(item_id, true);
-                self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text}))))?
+                let replaced = if previous != self.block { self.replace_live(&session, &turn, true)? } else { Vec::new() };
+                self.core.send(Envelope::notification("item/reasoning/textDelta", Some(json!({"threadId":session,"turnId":turn,"itemId":item_id,"delta":text,"replaces":replaced}))))?
             }
             Update::ToolCall {
                 item_id,
@@ -3412,7 +3500,7 @@ mod tests {
             next!(),
             (
                 "item/reasoning/textDelta".into(),
-                "live:thinking:0".into(),
+                "live:0:thinking:0".into(),
                 "weigh".into()
             )
         );
@@ -3420,7 +3508,7 @@ mod tests {
             next!(),
             (
                 "item/agentMessage/delta".into(),
-                "live:text:1".into(),
+                "live:0:text:1".into(),
                 "Hel".into()
             )
         );
@@ -3428,7 +3516,7 @@ mod tests {
             next!(),
             (
                 "item/agentMessage/delta".into(),
-                "live:text:1".into(),
+                "live:0:text:1".into(),
                 "lo".into()
             )
         );
@@ -3439,22 +3527,16 @@ mod tests {
             next!(),
             (
                 "item/discarded".into(),
-                "live:thinking:0".into(),
+                "live:0:thinking:0".into(),
                 String::new()
             )
         );
-        assert_eq!(
-            next!(),
-            ("item/discarded".into(), "live:text:1".into(), String::new())
-        );
-        assert_eq!(
-            next!(),
-            (
-                "item/agentMessage/delta".into(),
-                "m1".into(),
-                "Hello".into()
-            )
-        );
+        let replaced = core_client.recv().await.unwrap();
+        assert_eq!(replaced.method.as_deref(), Some("item/agentMessage/delta"));
+        let params = replaced.params.unwrap();
+        assert_eq!(params["itemId"], "m1");
+        assert_eq!(params["delta"], "Hello");
+        assert_eq!(params["replaces"], json!(["live:0:text:1"]));
         // 被放弃的请求（例如随后重试）：预览立刻撤掉，没有消息来替换它。
         acp_server
             .send(event(
@@ -3464,10 +3546,14 @@ mod tests {
         acp_server
             .send(event(json!({"type":"delta-end","committed":false})))
             .unwrap();
-        assert_eq!(next!().1, "live:text:0");
+        assert_eq!(next!().1, "live:1:text:0");
         assert_eq!(
             next!(),
-            ("item/discarded".into(), "live:text:0".into(), String::new())
+            (
+                "item/discarded".into(),
+                "live:1:text:0".into(),
+                String::new()
+            )
         );
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
@@ -3505,6 +3591,26 @@ mod tests {
                 ),
             )
         };
+        for (block, kind) in [(0, "thinking"), (1, "text"), (2, "thinking"), (3, "text")] {
+            acp_server.send(Envelope::notification("zf/session/event", Some(json!({
+                "sessionId":"s", "event":{"type":"delta","block":block,"kind":kind,"text":"preview"}
+            })))).unwrap();
+        }
+        for _ in 0..4 {
+            let preview = core_client.recv().await.unwrap();
+            assert!(preview.params.unwrap()["itemId"]
+                .as_str()
+                .unwrap()
+                .starts_with("live:0:"));
+        }
+        acp_server
+            .send(Envelope::notification(
+                "zf/session/event",
+                Some(json!({
+                    "sessionId":"s", "event":{"type":"delta-end","committed":true}
+                })),
+            ))
+            .unwrap();
         // dsh 把一条消息的各个内容块按顺序发来，共用一个 messageId。
         for (kind, message, text) in [
             ("agent_thought_chunk", "m1", "think A"),
@@ -3517,15 +3623,28 @@ mod tests {
             acp_server.send(chunk(kind, message, text)).unwrap();
         }
         let mut seen = Vec::new();
+        let mut replacements = Vec::new();
         for _ in 0..6 {
             let event = core_client.recv().await.unwrap();
             let params = event.params.unwrap();
+            replacements.push(params["replaces"].clone());
             seen.push((
                 event.method.unwrap(),
                 params["itemId"].as_str().unwrap().to_owned(),
                 params["delta"].as_str().unwrap().to_owned(),
             ));
         }
+        assert_eq!(
+            replacements,
+            [
+                json!(["live:0:thinking:0"]),
+                json!([]),
+                json!(["live:0:text:1"]),
+                json!(["live:0:thinking:2"]),
+                json!(["live:0:text:3"]),
+                json!([]),
+            ]
+        );
         let expected = [
             ("item/reasoning/textDelta", "m1", "think A"),
             ("item/reasoning/textDelta", "m1", " more"),
@@ -3977,6 +4096,31 @@ mod tests {
                 .as_str()
                 .is_some_and(|turn| !turn.is_empty()));
             assert_eq!(params["stage"], stage);
+        }
+        for (session, step, state) in [
+            ("other", json!(1), "start"),
+            ("s", json!(-1), "start"),
+            ("s", json!(1), "wrong"),
+            ("s", json!(1), "start"),
+            ("s", json!(1), "end"),
+        ] {
+            acp_server
+                .send(event(
+                    session,
+                    json!({"type":"step","step":step,"state":state}),
+                ))
+                .unwrap();
+        }
+        for state in ["start", "end"] {
+            let relayed = core_client.recv().await.unwrap();
+            assert_eq!(relayed.method.as_deref(), Some("turn/step"));
+            let params = relayed.params.unwrap();
+            assert_eq!(params["threadId"], "s");
+            assert!(params["turnId"]
+                .as_str()
+                .is_some_and(|turn| !turn.is_empty()));
+            assert_eq!(params["step"], 1);
+            assert_eq!(params["state"], state);
         }
         // 重试只带计数和失败代码；压缩带身份和结果。供应商的报错文字不进入 Core。
         acp_server

@@ -31,17 +31,15 @@ The TUI requires an interactive terminal. `--run` prints streamed agent text and
 
 A session is ready once dsh confirms it; nothing is executed at startup. Command execution and its isolation belong to dsh: a session runs under one of dsh's **permission presets** (a sandbox mode bundled with an approval policy, for example `read-only`, `workspace-write`, `danger-full-access`). `--permission PRESET` selects one for a run. The session is not ready, and no task starts, until dsh confirms exactly that preset; an unknown preset or a refusal ends the run with an error.
 
-## 建模模式
+## 建模
 
-建模模式是过渡入口，与默认的 dsh/ACP 通用模式分别启动。Python 建模器负责阶段推进、模型调用、Scene IR 写入和产物验证；Rust 建模 owner 管理子进程与有序事件，界面展示状态并提交操作。
+建模使用普通 dsh 会话、模型和权限配置。Agent 通过领域工具选择楼层或楼栋、准备方案、应用及构建；F6 展示 Core 校验后的业务事实，`Ctrl+Y` / `Ctrl+N` 批准或拒绝当前具体版本。
 
 ```text
-cargo run --locked -- --modeling D:\project\blender-agent-modeler --target "建模八层"
+cargo run --locked -- --cwd D:/project/blender-agent-modeler --domain-project projects/hospital-site --permission read-only --tui "建模八层，先给我看方案"
 ```
 
-省略 `--target` 可在界面输入楼层或楼栋目标；`--modeling-project RELATIVE_PATH` 选择建模项目，默认是 `projects/hospital-site`。界面显示阶段进度、AI 摘要、待确认问题、预览以及 GLB、BLEND 和报告产物。`Ctrl+Y` / `Ctrl+N` 回答当前确认，`Ctrl+O` 打开选中产物，`Ctrl+C` 取消建模进程及其子进程。最终复核失败后可按 `F5` 重试，也可输入“复核上次”恢复最近一次复核。
-
-此入口通过 `blender-agent workflow-stdio` 的有界、有序 JSONL 事件获取状态。建模模型仍由建模器的 `config/models.yaml` 配置；普通模式的 `/model` 和 dsh provider 设置尚未接管独立建模模式。当前整合保留这一边界，后续工作流迁移另行实施。整合基线与验证结果见 [建模整合记录](docs/modeling-integration.md)。
+恢复既有运行时使用其 `--domain-context FILE`，先查询原操作和产物，再继续复核。图像模型需要声明并实际接收图像输入。项目入口、来源未决项及验收边界见下方领域会话说明和[入口迁移记录](docs/dsh-modeling-entry-migration.md)。旧 `--modeling`、`--modeling-project`、`--target` 和 `--change-context` 参数已移除。
 
 ## Controls
 
@@ -54,6 +52,7 @@ cargo run --locked -- --modeling D:\project\blender-agent-modeler --target "建�
 | Ctrl+Q / Ctrl+D | Quit and clean up owned processes |
 | Ctrl+F | Search retained conversation text; Enter searches/opens, Esc closes |
 | Ctrl+T | Browse live evidence; F1 lists filters, navigation and local bookmarks |
+| Ctrl+E / `/tools` | Cycle terminal, diff and generic tool cards through preview (three output rows), expanded output and hidden tools |
 | PageUp / PageDown, Ctrl+Home / Ctrl+End | Scroll conversation |
 | Ctrl+Y / Ctrl+N / Ctrl+B | Accept / decline / cancel the selected approval when allowed |
 | F1 / F2 | Show the grouped key overlay / select next pending request |
@@ -157,14 +156,26 @@ Results use a fixed snapshot. Press r to refresh; changed or evicted content can
 
 ## 建模业务视图与领域工具
 
+普通 dsh 会话现在可以从项目目标开始，用 `--domain-project` 指定模型器工作目录内、包含 `project.yaml` 的相对项目路径：
+
+~~~powershell
+cargo run --locked -- --cwd D:/project/blender-agent-modeler --domain-project projects/hospital-site --model hi/gpt-6.1-sol --permission read-only --tui "建模八层，先读取项目和具体结构方案"
+~~~
+
+Agent 通过领域工具读取真实楼层目录、解析单层／范围／整栋目标并处理重复图纸，随后为每个选定楼层准备隔离 CAD 结构候选。项目可在 `project.yaml` 的 `component_sources.layers` 和可选 `rules` 声明构件来源图层及已有分类依据；F6 显示该范围。未配置时使用默认观察图层，扫描数量不能当作整个 CAD 的家具／洁具总数。每层具体方案都经 F6 的 `Ctrl+Y` 批准后，由同一 Agent 应用、构建及验证；目标选择不会授予场景写入批准。恢复使用原运行生成的上下文文件，`inspect_project.recovery_index` 可发现原目标与作用域，先读取持久操作／构建回执再决定后续动作。
+
+已准备的楼层使用 `activate_project_floor` 切换并恢复原结构；每次切换保存新的激活代次，同一当前楼层重复调用保持幂等。`inspect_project_floor` 只读恢复当前楼层的丢失回执，不切换或初始化。源范围可以在项目 `component_sources` 中明确图层及已有规则；未配置时的默认观察范围不代表全图构件。
+
+看图复核要求 dsh 的模型配置声明 `input: [text, image]`，并且实际图片进入模型上下文。`attached_png` 只说明领域工具返回了图片；遇到 `image unavailable` 时保持复核未执行。实际看图观察由 Agent 回复记录，人工复核仍需独立完成。所选楼层都已具体批准应用，且 CAD 轴网和绝对标高完整时，Agent 可用 `assemble_project_building` 生成独立楼栋快照，通过 `inspect_project_building`、`validate_project_building` 等待并验证，取消使用 `cancel_project_building`。同一 `build_id` 重复调用只查询原任务，失去 owner 的非终态保持 `unknown`。`check_project_building_connections` 和 `read_project_building_report` 提供封存连接检查及总报告；缺冻结来源证明、未验证相邻连接和人工复核保持 attention／not_run。F6 分别显示产物有效性、来源对账、连接检查和总报告；`audit_drawing` 展示当前楼层的分页检测候选；Agent 可读取候选 PNG 并记录判断，必要修正经 `prepare_drawing_correction` 形成新的具体批准版本，保留原 DXF。候选和记录判断都不等于审查通过。医院整层收尾、楼栋连接和旧入口删除条件见 [入口迁移记录](docs/dsh-modeling-entry-migration.md)。
+
+已验证且当前的楼栋可以使用 `prepare_project_connection_change` 准备相邻两层的来源楼梯／竖井增补：明确下层、原楼栋输入绑定和已有楼板孔洞，返回独立连接作用域及具体提案。原楼层、上层与楼板保持只读，新连接必须单独 `Ctrl+Y` 批准，再复用应用／构建接口。通过 `assemble_project_building(..., connection_scope_id=...)` 创建含该授权的新楼栋任务；不覆盖旧任务。恢复用 `activate_project_connection_scope`／只读 `inspect_project_connection_scope`。缺孔洞或参数时保持未完成，不推断切孔、净高或建筑合规。详见 [领域契约](docs/modeling-domain.md)。
+
 通过 --domain-context FILE 可将 modeling_domain MCP 与 F6 建模业务页挂到普通 dsh 会话。用户输入仍使用平台编辑器和 SubmitRootInput；dsh Agent 通过建模器 .agents/skills/building-modeling/SKILL.md 理解流程，使用平台现有模型、会话和权限。Ctrl+Y 只批准已展示的具体方案版本，由 Core 调受控人类授权 seam 后交给同一 Agent 应用。启动/会话切换后必须先确认 read-only。
 
 ~~~powershell
 cargo run -- --cwd D:/project/blender-agent-modeler --domain-context PATH/TO/context.json --model hi/gpt-6.1-sol --permission read-only --tui "在首层新增两张床，先给我看方案"
 ~~~
 
-运行上下文由操作员预先配置 scene、floor、scope/protected_ids。当前领域工具支持来源扫描与实例对账、单层落地床/桌/椅/柜/盆/坐便器、未应用方案修订和依赖完整的部分采纳。门窗宿主、楼梯标高和井道跨层关系仍标为缺能力。Python 独立异步 worker 构建封存快照，Core 不接管领域几何。详见 [建模业务协议](docs/modeling-domain.md)。
-
---modeling MODELER_REPO 与 --change-context 保留为 Python 整段调度的兼容模式；不能和 --domain-context 用于同一运行。已有 CAD/医院功能与历史验收保留。新模式没有独立模型配置或额外会话主控。
+运行上下文绑定 scene、floor、scope/protected_ids。领域工具支持来源扫描与实例对账、单层落地床/桌/椅/柜/盆/坐便器、未应用方案修订、依赖完整的部分采纳，以及已应用家具的移动、形状/参数替换和整组件删除。编辑保留稳定部件身份和共享定义，删除来源保持待确认，重新增补需明确重新开启。Python 独立异步 worker 构建封存快照，Core 不接管领域几何。详见 [建模业务协议](docs/modeling-domain.md)。
 
 验证时可设置 CARGO_TARGET_DIR 使用独立目标目录，scripts/verify.py 会从该目录读取 release fixtures。避免占用用户正在运行的默认二进制文件。

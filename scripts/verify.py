@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--toolchain", help="Installed rustup toolchain, for example 1.96.0")
     parser.add_argument("--cargo-test", action="store_true", help="Use cargo test even when nextest is installed")
     parser.add_argument("--fixtures-only", action="store_true", help="Use existing release binaries; skip Rust checks/build")
+    parser.add_argument("--modeler-repo", type=Path, help="Also verify project target entry using local pure modeler tools (no model/network)")
     parser.add_argument("--live", action="store_true", help="Also run ignored tests requiring a local dsh installation")
     args = parser.parse_args()
     cargo = ["cargo"] + ([f"+{args.toolchain}"] if args.toolchain else [])
@@ -64,7 +65,16 @@ def main():
         run([sys.executable, str(fixtures / "domain_partial_resume_test.py")])
         run([sys.executable, str(fixtures / "windows_terminal_input_check.py"), "--fixture", str(binary.parent / "examples/input_fixture.exe")])
         run([sys.executable, str(fixtures / "conversation_stream_check.py"), "--binary", str(binary)])
+        run([sys.executable, str(fixtures / "conversation_anchor_check_test.py")])
+        run([sys.executable, str(fixtures / "conversation_steering_window_test.py")])
+        run([sys.executable, str(fixtures / "domain_project_component_geometry_test.py")])
+        run([sys.executable, str(fixtures / "domain_project_location_recovery_test.py")])
+        run([sys.executable, str(fixtures / "domain_component_edit_observer_test.py")])
         run([sys.executable, str(fixtures / "conversation_anchor_check.py"), "--binary", str(binary)])
+        if args.modeler_repo is not None:
+            run([sys.executable, str(fixtures / "domain_project_images_test.py")])
+            run([sys.executable, str(fixtures / "domain_project_check.py"), "--binary", str(binary),
+                 "--modeler-repo", str(args.modeler_repo)])
         run([sys.executable, str(fixtures / "process_identity_check.py")])
         run([sys.executable, str(fixtures / "process_ownership_check.py"), "--fixture", str(binary.parent / "examples/process_fixture.exe")])
     if args.live:

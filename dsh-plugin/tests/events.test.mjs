@@ -19,6 +19,30 @@ function host() {
 }
 const chunk = type => ({ type: 'chunk', chunk: { type, text: 'PRIVATE model output' } })
 
+test('durable steps distinguish model calls and retries keep the same step identity', () => {
+  const { sent, stream, event } = host()
+  event('s', 'turn/start', { turn: 3 })
+  event('s', 'step/start', { turn: 3, step: 1 })
+  stream('s', { type: 'start' })
+  stream('s', chunk('text-delta'))
+  event('s', 'step/start', { turn: 3, step: 1 })
+  event('s', 'step/end', { turn: 2, step: 1 })
+  event('s', 'step/end', { turn: 3, step: 99 })
+  event('s', 'step/end', { turn: 3, step: 1 })
+  event('s', 'step/start', { turn: 3, step: 2 })
+  stream('s', { type: 'start' })
+  event('s', 'step/start', { turn: 3, step: 1 })
+  event('s', 'step/end', { turn: 3, step: 2 })
+  event('s', 'turn/end', { turn: 3 })
+  event('s', 'step/start', { turn: 3, step: 3 })
+  const steps = sent.filter(frame => frame.params.event.type === 'step').map(frame => frame.params.event)
+  assert.deepEqual(steps, [
+    { type: 'step', step: 1, state: 'start' }, { type: 'step', step: 1, state: 'end' },
+    { type: 'step', step: 2, state: 'start' }, { type: 'step', step: 2, state: 'end' },
+  ])
+  assert.deepEqual(sent.filter(frame => frame.params.event.type === 'stage').map(frame => frame.params.event.step), [1, 1, 2])
+})
+
 test('a stage is announced once per change and never carries model output', () => {
   const { listeners, sent, stream, event } = host()
   assert.equal(listeners.get('agent/assistant-stream').options.global, true)

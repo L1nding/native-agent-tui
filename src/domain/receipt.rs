@@ -101,6 +101,12 @@ pub fn from_tool(
         || !matches!(
             receipt.kind.as_str(),
             "capabilities"
+                | "project_catalog"
+                | "project_selection"
+                | "project_location"
+                | "project_scope"
+                | "project_building"
+                | "drawing_audit"
                 | "source_ledger"
                 | "source_groups"
                 | "source_interpretation"
@@ -181,16 +187,32 @@ async fn read_with_deadline(
     let mut command = crate::owned_process::Command::new(&setup.python);
     command
         .current_dir(&setup.repository)
-        .args([
-            "-X",
-            "utf8",
-            "-m",
-            "blender_agent.cli.main",
-            "domain-read-fact",
-            "--context",
-        ])
+        .args(match setup.mode {
+            DomainMode::Floor => vec![
+                "-X",
+                "utf8",
+                "-m",
+                "blender_agent.cli.main",
+                "domain-read-fact",
+                "--context",
+            ],
+            DomainMode::Project => vec![
+                "-X",
+                "utf8",
+                "-m",
+                "blender_agent.integrations.project_mcp",
+                "--context",
+            ],
+        })
         .args([setup.context_path.as_os_str()])
-        .args(["--fact-sha256", &receipt.fact_sha256]);
+        .args([
+            if setup.mode == DomainMode::Floor {
+                "--fact-sha256"
+            } else {
+                "--read-fact"
+            },
+            &receipt.fact_sha256,
+        ]);
     let mut child = crate::owned_process::spawn(command, crate::owned_process::Input::Null)
         .map_err(|_| "无法启动领域事实读取进程")?;
     let mut stdout = child.stdout.take().ok_or("缺少领域事实读取通道")?;
@@ -269,6 +291,7 @@ pub(crate) mod tests {
         std::fs::write(root.join("blender_agent/cli/main.py"), script).unwrap();
         std::fs::write(root.join("context.json"), b"{}").unwrap();
         let setup = DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
             context_path: root.join("context.json"),
             repository: root.clone(),
             python: python(),

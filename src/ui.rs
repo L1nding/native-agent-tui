@@ -24,9 +24,7 @@ mod history;
 mod input;
 mod lang;
 mod layout;
-mod modeling;
 mod models;
-pub use modeling::run_modeling;
 mod overlays;
 mod provider_form;
 mod reminders;
@@ -3812,9 +3810,10 @@ mod tests {
             rendered.contains("Ready | action:0 attention:0"),
             "{rendered}"
         );
-        for noise in ["children: 0", "queued: 0", "turns: 0", "tokens:unavailable"] {
+        for noise in ["children: 0", "queued: 0", "turns: 0"] {
             assert!(!rendered.contains(noise), "{noise}: {rendered}");
         }
+        assert!(rendered.contains("tokens:unavailable | ctx:unavailable"));
     }
 
     #[test]
@@ -5939,7 +5938,7 @@ mod tests {
             if i == 27 {
                 let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
                 terminal
-                    .draw(|frame| draw(frame, &snapshot, &mut local))
+                    .draw(|frame| draw(frame, &snapshot, &local))
                     .unwrap();
                 let screen: String = terminal
                     .backend()

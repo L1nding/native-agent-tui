@@ -1,4 +1,4 @@
-"""Keep a scrolled conversation fixed while a local ACP provider appends text.
+"""Keep a scrolled preview fixed when authority replaces it and appends text.
 
 The provider waits for filesystem barriers, so terminal speed cannot race the test.
 No account, model, or network is used. Screens are retained under target/.
@@ -32,10 +32,14 @@ def provider():
                     "content": {"type": "text", "text": "".join(f"ANCHOR_{i:03d}\n" for i in range(start, end))},
                 }}})
 
-        append(0, 50)
+        send({"method": "zf/session/event", "params": {
+            "sessionId": "anchor-session", "event": {"type": "delta", "kind": "text",
+                "block": 0, "text": "".join(f"ANCHOR_{i:03d}\n" for i in range(50))}}})
         while not Path("grow").exists():
             time.sleep(.01)
-        append(50, 70)
+        send({"method": "zf/session/event", "params": {
+            "sessionId": "anchor-session", "event": {"type": "delta-end", "committed": True}}})
+        append(0, 70)
         send({"id": request["id"], "result": {"stopReason": "end_turn"}})
 
     for line in sys.stdin:
@@ -50,6 +54,23 @@ def provider():
         if method == "session/new":
             result = {"sessionId": "anchor-session"}
         send({"id": request["id"], "result": result})
+
+
+def anchor_screen(console):
+    """Capture stable visible anchor rows while the running header can animate."""
+    until = time.monotonic() + 2
+    previous, since = None, time.monotonic()
+    while time.monotonic() < until:
+        screen = console.read()
+        markers = re.findall(r"ANCHOR_\d{3}(?!\d)", screen)
+        now = time.monotonic()
+        if markers and markers == previous:
+            if now - since >= .075:
+                return screen
+        else:
+            previous, since = markers, now
+        time.sleep(.025)
+    raise AssertionError("visible conversation anchor rows did not settle")
 
 
 def main():
@@ -75,20 +96,25 @@ def main():
         console.wait(lambda screen: "ANCHOR_049" in screen, "initial output")
         console.write("\x1b[5~")
         console.wait(lambda screen: "ANCHOR_041" in screen and "ANCHOR_049" not in screen, "scroll up")
-        before = re.findall(r"ANCHOR_\d+", console.read())
+        before_screen = anchor_screen(console)
+        before = re.findall(r"ANCHOR_\d+", before_screen)
         assert before
-        (root / "before-screen.txt").write_text(console.read(), encoding="utf-8")
+        (root / "before-screen.txt").write_text(before_screen, encoding="utf-8")
         (root / "grow").touch()
         # The ordered prompt result proves Core consumed the preceding text update.
         console.wait(lambda screen: "Completed" in screen, "growth and completion consumed by UI")
-        after = re.findall(r"ANCHOR_\d+", console.read())
-        (root / "after-screen.txt").write_text(console.read(), encoding="utf-8")
+        # A header arrives before the remainder of the terminal diff. Read one
+        # settled set of anchor rows. The running header can keep animating
+        # while the conversation content is already stable.
+        after_screen = anchor_screen(console)
+        after = re.findall(r"ANCHOR_\d+", after_screen)
+        (root / "after-screen.txt").write_text(after_screen, encoding="utf-8")
         # Completion can reclaim a status row; the same top content must stay fixed.
         count = min(len(before), len(after))
         assert count and after[:count] == before[:count], f"viewport drifted: {before} -> {after}; screens: {root}"
         console.write("\x1b[1;5F")
         console.wait(lambda screen: "ANCHOR_069" in screen, "return to tail")
-        print(f"PASS: anchored streaming viewport and return to tail; screens: {root}")
+        print(f"PASS: anchored preview-to-authority viewport and return to tail; screens: {root}")
         console.write("\x11")
     except BaseException:
         (root / "failure-screen.txt").write_text(console.read(), encoding="utf-8")

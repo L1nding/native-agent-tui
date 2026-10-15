@@ -6,7 +6,8 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::activity::{
-    draw_evidence, evidence_brief, focus_activity, reminder_brief, usage_status,
+    draw_evidence, evidence_brief, focus_activity, reminder_brief, token_budget_brief,
+    truncate_display_label, usage_fact_for,
 };
 use super::attention::draw_attention_editor;
 use super::help::draw_help;
@@ -127,28 +128,37 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             status.push(format!("{label}: {count}"));
         }
     }
-    // 没有设置预算时省略 "/unavailable" 上限；F11 仍显示完整字段。
-    let usage = usage_status(snapshot).replacen("/unavailable", "", 1);
-    if usage != "tokens:unavailable" {
-        status.push(usage);
-    }
     if snapshot.scheduler.stopping {
         status.push(tr("stopping", "正在停止").into());
     } else if snapshot.scheduler.paused {
         status.push(tr("dispatch paused", "已暂停派发").into());
     }
     let status = status.join(" | ");
-    let mut settings = format!(
-        "{} | {}",
+    let mut settings = snapshot.cwd.clone();
+    if let Some(branch) = &snapshot.branch {
+        settings.push_str(" | ");
+        settings.push_str(branch);
+    }
+    settings.push_str(" | ");
+    settings.push_str(
         snapshot
             .model
             .as_deref()
             .unwrap_or(tr("model pending", "模型待定")),
-        snapshot.cwd,
     );
-    if let Some(branch) = &snapshot.branch {
-        settings.push_str(" | ");
-        settings.push_str(branch);
+    settings.push_str(" | ");
+    settings.push_str(&token_budget_brief(snapshot).replacen("/unavailable", "", 1));
+    let usage = usage_fact_for(snapshot, None).map(|fact| fact.summary);
+    settings.push_str(" | ctx:");
+    match usage
+        .and_then(|usage| usage.input_tokens.zip(usage.context_window))
+        .filter(|(_, window)| *window > 0)
+    {
+        Some((input, window)) => settings.push_str(&format!(
+            "{input}/{window} ({:.0}%)",
+            input as f64 / window as f64 * 100.0
+        )),
+        None => settings.push_str("unavailable"),
     }
     // 只显示 dsh 报告过的权限预设；没读到就不显示，不猜。
     if !snapshot.permission.current.is_empty() {
@@ -207,13 +217,32 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                 .style(theme.secondary()),
         );
     }
+    let settings = display_text(&settings);
+    let parts: Vec<_> = settings.split(" | ").collect();
+    let widths: Vec<_> = parts.iter().map(|part| part.width()).collect();
+    let room = (chunks[5].width as usize).saturating_sub(3 * parts.len().saturating_sub(1));
+    // Share a narrow strip across the fields so a long directory cannot hide model/usage.
+    let (mut low, mut high) = (0, widths.iter().copied().max().unwrap_or(0));
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if widths
+            .iter()
+            .map(|width| (*width).min(middle))
+            .sum::<usize>()
+            <= room
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
     let mut settings_spans = Vec::new();
-    for (index, part) in display_text(&settings).split(" | ").enumerate() {
+    for (index, part) in parts.into_iter().enumerate() {
         if index > 0 {
             settings_spans.push(Span::styled(" | ", theme.faint()));
         }
         settings_spans.push(Span::styled(
-            part.to_owned(),
+            truncate_display_label(part, low),
             if index == 0 {
                 Style::default().fg(theme.foreground)
             } else {
@@ -221,7 +250,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             },
         ));
     }
-    header.push(Line::from(settings_spans));
+    frame.render_widget(Paragraph::new(Line::from(settings_spans)), chunks[5]);
     let compact_header = area.height <= 16 && selected_activity.is_some();
     if compact_header {
         header.remove(0);
@@ -315,6 +344,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         );
     }
     let (width, height) = conversation_content_size(conversation_area);
+    local
+        .conversation_cache
+        .borrow_mut()
+        .replace_anchors(&snapshot.message_replacements);
     let projected = local.conversation_cache.borrow_mut().viewport(
         snapshot
             .messages
@@ -1211,17 +1244,31 @@ mod tests {
     }
 
     #[test]
-    fn header_has_no_title_row_and_names_the_branch_beside_the_directory() {
+    fn metadata_sits_above_input_and_header_keeps_execution_facts() {
         let (mut snapshot, local) = running(vec![]);
         snapshot.cwd = "D:/project/demo".into();
         snapshot.branch = Some("feat/中文-branch".into());
         let screen = rows(&snapshot, &local, 120, 30);
         // 第一行就是执行状态；产品名不占常驻区。
         assert!(screen[0].contains('●'), "{screen:#?}");
+        let at = screen
+            .iter()
+            .position(|row| row.contains("D:/project/demo | feat/中文-branch"))
+            .unwrap();
+        let input = super::main_layout(
+            ratatui::layout::Rect::new(0, 0, 120, 30),
+            false,
+            super::StatusRows::Hidden,
+            1,
+        )[3];
+        assert_eq!(at + 1, input.y as usize, "{screen:#?}");
         assert!(
-            screen[1].contains("D:/project/demo | feat/中文-branch"),
+            screen[at].contains("model pending | tokens:unavailable | ctx:unavailable"),
             "{screen:#?}"
         );
+        assert!(!screen[..at]
+            .iter()
+            .any(|row| row.contains("D:/project/demo")));
         assert!(
             !screen.iter().any(|row| row.contains("Native Agent TUI")),
             "{screen:#?}"
@@ -1230,9 +1277,94 @@ mod tests {
         snapshot.branch = None;
         let screen = rows(&snapshot, &local, 120, 30);
         assert!(
-            screen[1].trim_end().ends_with("D:/project/demo"),
+            screen[at].contains("D:/project/demo | model pending"),
             "{screen:#?}"
         );
+    }
+
+    #[test]
+    fn terminal_diff_and_generic_cards_render_all_three_modes_and_unicode() {
+        use super::super::conversation::ToolDisplay;
+        use crate::protocol::ToolCategory;
+        use crate::tool_details::{ConversationTool, ToolLifecycle};
+        for (category, kind) in [
+            (ToolCategory::Shell, "terminal"),
+            (ToolCategory::File, "diff"),
+            (ToolCategory::Mcp, "tool"),
+        ] {
+            let (mut snapshot, mut local) = running(vec![]);
+            snapshot.messages.push(ConversationItem {
+                id: "tool-group".into(),
+                thread_id: "root".into(),
+                turn_id: "turn".into(),
+                role: "Tool".into(),
+                text: "▸ done · card".into(),
+                complete: true,
+                truncated: false,
+                tools: vec![ConversationTool {
+                    item_id: "card".into(),
+                    category,
+                    lifecycle: ToolLifecycle::Completed,
+                    name: Some("测试👩‍💻".into()),
+                    command: (category == ToolCategory::Shell).then(|| "echo 中文".into()),
+                    cwd: Some("/workspace".into()),
+                    target: (category == ToolCategory::File).then(|| "src/中文.rs".into()),
+                    exit_code: (category == ToolCategory::Shell).then_some(0),
+                    output_lines: Some(5),
+                    added_lines: (category == ToolCategory::File).then_some(1),
+                    removed_lines: (category == ToolCategory::File).then_some(1),
+                    output: Some("first 中文👩‍💻e\u{301}\n-old\n+new\nfourth\nlast".into()),
+                    output_clipped: false,
+                }],
+            });
+            for mode in [
+                ToolDisplay::Preview,
+                ToolDisplay::Expanded,
+                ToolDisplay::Hidden,
+            ] {
+                local.tools_expanded = mode == ToolDisplay::Expanded;
+                local.tools_hidden = mode == ToolDisplay::Hidden;
+                let screen = rows(&snapshot, &local, 100, 50).join("\n");
+                if mode == ToolDisplay::Hidden {
+                    assert!(!screen.contains("Tool /"), "{screen}");
+                    assert!(!screen.contains("first 中文"), "{screen}");
+                    continue;
+                }
+                assert!(
+                    screen.contains(&format!("Tool / {kind} / 测试👩‍💻")),
+                    "{screen}"
+                );
+                assert!(screen.contains("first 中文👩‍💻e\u{301}"), "{screen}");
+                if mode == ToolDisplay::Preview {
+                    assert!(screen.contains("… +2 lines (Ctrl+E to expand)"), "{screen}");
+                    assert!(!screen.contains("fourth"), "{screen}");
+                } else {
+                    assert!(
+                        screen.contains("fourth") && screen.contains("last"),
+                        "{screen}"
+                    );
+                }
+                match category {
+                    ToolCategory::Shell => assert!(
+                        screen.contains("$ echo 中文") && screen.contains("[exit 0]"),
+                        "{screen}"
+                    ),
+                    ToolCategory::File => assert!(
+                        screen.contains("src/中文.rs") && screen.contains("└ +1 -1"),
+                        "{screen}"
+                    ),
+                    _ => assert!(
+                        screen.contains("-old") && screen.contains("+new"),
+                        "{screen}"
+                    ),
+                }
+                let narrow = rows(&snapshot, &local, 40, 200);
+                assert!(narrow.iter().all(|row| row.width() <= 40), "{narrow:#?}");
+                assert!(narrow.join("").contains("👩‍💻e\u{301}"), "{narrow:#?}");
+                let tiny = rows(&snapshot, &local, 18, 30);
+                assert!(tiny.iter().any(|row| row.contains("Resize terminal")));
+            }
+        }
     }
 
     #[test]
@@ -1262,6 +1394,8 @@ mod tests {
                     output_lines: None,
                     added_lines: None,
                     removed_lines: None,
+                    output: None,
+                    output_clipped: false,
                 })
                 .collect(),
         });

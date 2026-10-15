@@ -109,6 +109,8 @@ pub(super) struct Transcript {
     /// finished line outside a code fence: each line is laid out on its own, so
     /// text appended later cannot change the rows above it.
     checkpoint: Option<(usize, usize)>,
+    /// Displayed source offsets for body rows, used when preview identities merge.
+    source_rows: Vec<(usize, usize)>,
 }
 
 /// A bounded cache of message layouts, owned by this UI only. Width changes are
@@ -127,6 +129,8 @@ struct ScrollAnchor {
     item: String,
     role: String,
     row: usize,
+    offset: Option<usize>,
+    replaced: bool,
 }
 
 impl ScrollAnchor {
@@ -156,6 +160,29 @@ pub(super) struct Viewport {
 }
 
 impl ProjectionCache {
+    pub fn replace_anchors(&mut self, replacements: &[crate::state::MessageReplacement]) {
+        let Some(anchor) = self.anchor.as_mut() else {
+            return;
+        };
+        for replacement in replacements {
+            if anchor.thread == replacement.thread
+                && anchor.turn == replacement.turn
+                && anchor.role == replacement.role
+                && anchor.item == replacement.previous
+            {
+                anchor.item = replacement.current.clone();
+                if anchor.offset.is_some() || replacement.prefix_bytes > 0 {
+                    anchor.offset = Some(
+                        anchor
+                            .offset
+                            .unwrap_or(0)
+                            .saturating_add(replacement.prefix_bytes),
+                    );
+                }
+                anchor.replaced = true;
+            }
+        }
+    }
     fn message(
         &mut self,
         message: &ConversationItem,
@@ -216,11 +243,19 @@ impl ProjectionCache {
                 continued,
                 Some(offset),
             );
+            let mut source_rows = entry.transcript.source_rows;
+            source_rows.retain(|(row, _)| *row < kept);
+            source_rows.extend(
+                tail.source_rows
+                    .iter()
+                    .map(|(row, offset)| (kept + row, *offset)),
+            );
             let mut lines = entry.transcript.lines;
             lines.truncate(kept);
             lines.extend(tail.lines);
             Some(Transcript {
                 lines,
+                source_rows,
                 focused: None,
                 foldable: 0,
                 checkpoint: tail
@@ -250,6 +285,7 @@ impl ProjectionCache {
                 .iter()
                 .map(crate::tool_details::ConversationTool::bytes)
                 .sum::<usize>()
+            + transcript.source_rows.capacity() * std::mem::size_of::<(usize, usize)>()
             + transcript.lines.capacity() * std::mem::size_of::<Line<'static>>()
             + transcript
                 .lines
@@ -329,6 +365,7 @@ impl ProjectionCache {
         let continued = continued(messages.clone(), display);
         let continued = &continued;
         let requested = scroll;
+        let mut pending_anchor = None;
         let anchored = if focus.is_none() && scroll > 0 && scroll == self.requested_scroll {
             self.anchor.take().map(|anchor| {
                 let mut below = 0;
@@ -344,8 +381,33 @@ impl ProjectionCache {
                         continued.contains(&std::ptr::from_ref(message)),
                     );
                     if anchor.matches(message) {
-                        let row = anchor.row.min(layout.lines.len());
-                        return (below + layout.lines.len()).saturating_sub(row + height);
+                        let length = layout.lines.len();
+                        let mut row = anchor.row;
+                        if anchor.replaced {
+                            if let Some(offset) = anchor.offset {
+                                // Locate the same source position in the authoritative layout.
+                                // Its prefix may end mid-line or change Markdown/header shape.
+                                row = layout
+                                    .source_rows
+                                    .iter()
+                                    .take_while(|(_, start)| *start <= offset)
+                                    .last()
+                                    .map_or(row, |(row, _)| *row);
+                            }
+                        }
+                        let scroll = (below + length).saturating_sub(row.min(length) + height);
+                        // A split authoritative block can arrive over several
+                        // frames. Do not forget its source position while the
+                        // replacement is still shorter than the reading point.
+                        if anchor.replaced
+                            && !message.complete
+                            && anchor
+                                .offset
+                                .is_some_and(|offset| offset >= display_text(&message.text).len())
+                        {
+                            pending_anchor = Some(anchor);
+                        }
+                        return scroll;
                     }
                     below += layout.lines.len();
                 }
@@ -370,7 +432,9 @@ impl ProjectionCache {
             continued,
         );
         self.requested_scroll = requested;
-        self.anchor = if view.below > 0 {
+        self.anchor = if pending_anchor.is_some() {
+            pending_anchor
+        } else if view.below > 0 {
             let top = view.below + view.transcript.lines.len();
             let mut below = 0;
             let mut anchor = None;
@@ -391,6 +455,12 @@ impl ProjectionCache {
                         item: message.id.clone(),
                         role: message.role.clone(),
                         row: end.saturating_sub(top).min(layout.lines.len()),
+                        offset: layout
+                            .source_rows
+                            .iter()
+                            .find(|(row, _)| *row == end.saturating_sub(top))
+                            .map(|(_, offset)| *offset),
+                        replaced: false,
                     });
                     break;
                 }
@@ -470,6 +540,7 @@ impl ProjectionCache {
                 focused,
                 foldable,
                 checkpoint: None,
+                source_rows: Vec::new(),
             },
             below: scroll,
         }
@@ -489,34 +560,113 @@ pub(super) fn transcript<'a>(
     layout(messages, focus, width, display.into(), false, None)
 }
 
-/// Rows under one expanded tool call: only facts Core reported, nothing inferred.
-/// The outcome and exit code are already in the call's own row.
-fn tool_detail_rows(tool: &crate::tool_details::ConversationTool) -> Vec<String> {
+/// Three typed card bodies, with a bounded preview of retained output.
+/// Lifecycle coloring always comes from Core, including output containing status words.
+fn tool_detail_rows(
+    tool: &crate::tool_details::ConversationTool,
+    display: ToolDisplay,
+    theme: Theme,
+    width: usize,
+) -> Vec<(String, Style)> {
+    use crate::protocol::ToolCategory;
     let mut rows = Vec::new();
-    if let Some(cwd) = &tool.cwd {
-        rows.push(display_text(cwd));
+    let muted = Style::default().fg(theme.muted);
+    let kind = match tool.category {
+        ToolCategory::Shell => "terminal",
+        ToolCategory::File => "diff",
+        _ => "tool",
+    };
+    if tool.name.is_some()
+        || tool.command.is_some()
+        || tool.target.is_some()
+        || tool.output.is_some()
+    {
+        rows.push((
+            format!(
+                "Tool / {kind}{}",
+                tool.name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!(" / {name}"))
+            ),
+            Style::default().fg(theme.accent),
+        ));
     }
-    if tool.command.is_some() {
-        if let Some(target) = &tool.target {
-            rows.push(display_text(target));
+    if let Some(command) = &tool.command {
+        for line in command.lines() {
+            rows.push((format!("$ {line}"), Style::default().fg(theme.foreground)));
         }
     }
+    if let Some(cwd) = &tool.cwd {
+        rows.push((display_text(cwd), muted));
+    }
+    if let Some(target) = &tool.target {
+        rows.push((display_text(target), muted));
+    }
+    if let Some(output) = &tool.output {
+        let limit = if display == ToolDisplay::Expanded {
+            usize::MAX
+        } else {
+            3
+        };
+        let mut count = 0;
+        for line in output.lines() {
+            let style = if tool.category == ToolCategory::File && line.starts_with('+') {
+                Style::default().fg(theme.success)
+            } else if tool.category == ToolCategory::File && line.starts_with('-') {
+                Style::default().fg(theme.error)
+            } else {
+                muted
+            };
+            for range in wrap_words(line, width, 0) {
+                if count < limit {
+                    rows.push((line[range].to_owned(), style));
+                }
+                count += 1;
+            }
+        }
+        if count > limit {
+            rows.push((
+                format!(
+                    "… +{} {}",
+                    count - limit,
+                    tr("lines (Ctrl+E to expand)", "行（Ctrl+E 展开）")
+                ),
+                muted,
+            ));
+        }
+    } else if let Some(lines) = tool.output_lines {
+        rows.push((
+            format!(
+                "… {lines} {}",
+                tr("output lines (body unavailable)", "行输出（正文不可用）")
+            ),
+            muted,
+        ));
+    }
+    if tool.output_clipped {
+        rows.push((
+            tr(
+                "… output truncated by retention limit",
+                "… 输出已按保留上限截断",
+            )
+            .into(),
+            muted,
+        ));
+    }
     if tool.added_lines.is_some() || tool.removed_lines.is_some() {
-        rows.push(format!(
-            "└ +{} -{}",
-            tool.added_lines.unwrap_or(0),
-            tool.removed_lines.unwrap_or(0)
+        rows.push((
+            format!(
+                "└ +{} -{}",
+                tool.added_lines.unwrap_or(0),
+                tool.removed_lines.unwrap_or(0)
+            ),
+            muted,
         ));
     }
-    let mut tail = Vec::new();
-    if let Some(lines) = tool.output_lines {
-        tail.push(format!(
-            "… {lines} {}",
-            tr("output lines (Ctrl+T for details)", "行输出（Ctrl+T 查看）")
-        ));
-    }
-    if !tail.is_empty() {
-        rows.push(tail.join(" · "));
+    if tool.category == ToolCategory::Shell {
+        if let Some(exit) = tool.exit_code {
+            rows.push((format!("[exit {exit}]"), muted));
+        }
     }
     rows
 }
@@ -541,6 +691,7 @@ fn layout<'a>(
         focused: None,
         foldable: 0,
         checkpoint: None,
+        source_rows: Vec::new(),
     };
     let mut laid_out = 0;
     let mut flow = Flow::default();
@@ -624,19 +775,20 @@ fn layout<'a>(
                     spans.push(Span::raw(" ".repeat(hang)));
                 }
                 let used = if row > 0 { hang } else { 0 } + source[range.clone()].width();
+                out.source_rows.push((out.lines.len(), start + range.start));
                 slice_runs(source, &runs, range, &mut spans);
                 if code && used < body {
                     spans.push(Span::styled(" ".repeat(body - used), code_style(theme)));
                 }
                 out.lines.push(Line::from(spans));
             }
-            if let Some(tool) = tool.filter(|_| display == ToolDisplay::Expanded) {
+            if let Some(tool) = tool {
                 let detail = body.saturating_sub(4).max(1);
-                for row in tool_detail_rows(tool) {
+                for (row, style) in tool_detail_rows(tool, display, theme, detail) {
                     for range in wrap_words(&row, detail, 0) {
                         out.lines.push(Line::from(vec![
                             Span::raw(" ".repeat(indent + 4)),
-                            Span::styled(row[range].to_owned(), Style::default().fg(theme.muted)),
+                            Span::styled(row[range].to_owned(), style),
                         ]));
                     }
                 }
@@ -952,6 +1104,8 @@ mod tests {
                             output_lines: None,
                             added_lines: None,
                             removed_lines: None,
+                            output: None,
+                            output_clipped: false,
                         })
                     })
                     .collect()
@@ -979,6 +1133,47 @@ mod tests {
     }
 
     #[test]
+    fn card_preview_counts_wrapped_rows_and_cache_tracks_output_replacement() {
+        let mut message = item("Tool", "▸ done · echo");
+        message.tools[0].command = Some("echo".into());
+        message.tools[0].output = Some("中文👩‍💻e\u{301} ".repeat(40).into());
+        let mut cache = ProjectionCache::default();
+        for body in [
+            message.tools[0].output.clone(),
+            Some("authoritative final\n+new\n-old".into()),
+        ] {
+            message.tools[0].output = body;
+            for width in [12, 24, 80] {
+                for display in [
+                    ToolDisplay::Preview,
+                    ToolDisplay::Expanded,
+                    ToolDisplay::Hidden,
+                ] {
+                    let full = transcript(std::iter::once(&message), None, width, display);
+                    let view =
+                        cache.viewport(std::iter::once(&message), None, width, 10000, 0, display);
+                    assert_eq!(rows(&view.transcript), rows(&full), "{width} {display:?}");
+                    if display == ToolDisplay::Preview
+                        && message.tools[0].output.as_ref().unwrap().contains('中')
+                    {
+                        let rows = rows(&full);
+                        assert!(
+                            rows.iter()
+                                .any(|row| row.contains("Ctrl+E") || row.contains("expand")),
+                            "{rows:#?}"
+                        );
+                        assert_eq!(
+                            rows.iter().filter(|row| row.contains('中')).count(),
+                            3,
+                            "{rows:#?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tool_display_levels_show_facts_or_hide_tools_and_join_the_steps_of_one_answer() {
         let mut tools = item("Tool", "▸ done · cargo test\n▸ failed · edit src/view.rs");
         tools.tools[0].command = Some("cargo test".into());
@@ -1002,10 +1197,10 @@ mod tests {
             item("Timing", "Model wait 1.0s"),
         ];
 
-        // 预览：每次调用一行，没有额外事实。
+        // 预览也保留命令、目录与终态事实。
         let preview = rows(&transcript(messages.iter(), None, 80, ToolDisplay::Preview));
         assert!(preview.contains(&"  ▸ done · cargo test".to_owned()));
-        assert!(!preview.iter().any(|row| row.contains("/workspace/project")));
+        assert!(preview.iter().any(|row| row.contains("/workspace/project")));
 
         // 展开：每次调用下面列出 Core 给出的事实；没有的事实不出现。
         let expanded = rows(&transcript(
@@ -1019,12 +1214,14 @@ mod tests {
             .position(|row| row == "  ▸ done · cargo test")
             .unwrap();
         assert_eq!(
-            &expanded[at + 1..at + 5],
+            &expanded[at + 1..at + 7],
             [
+                "      Tool / terminal",
+                "      $ cargo test",
                 "      /workspace/project",
-                "      … 42 output lines (Ctrl+T for details)",
+                "      … 42 output lines (body unavailable)",
+                "      [exit 0]",
                 "  ▸ failed · edit src/view.rs",
-                "      └ +3 -1",
             ]
         );
 
@@ -1141,10 +1338,10 @@ mod tests {
             for piece in pieces {
                 message.text.push_str(piece);
                 PROJECTED_BYTES.with(|count| count.set(0));
-                let cached = cache
-                    .message(&message, None, width, ToolDisplay::Preview, false)
-                    .lines
-                    .clone();
+                let cached_layout =
+                    cache.message(&message, None, width, ToolDisplay::Preview, false);
+                let cached = cached_layout.lines.clone();
+                let source_rows = cached_layout.source_rows.clone();
                 costs.push(PROJECTED_BYTES.with(std::cell::Cell::get));
                 let full = transcript(std::iter::once(&message), None, width, false);
                 assert_eq!(
@@ -1153,6 +1350,10 @@ mod tests {
                     "{role} {width} after {piece:?}"
                 );
                 assert_eq!(cached, full.lines, "{role} {width} styles after {piece:?}");
+                assert_eq!(
+                    source_rows, full.source_rows,
+                    "{role} {width} source positions after {piece:?}"
+                );
             }
             // 最后两次追加只重排最后一个完整行之后的尾部，不是整条消息。
             let whole = display_text(&message.text).len();
@@ -1336,6 +1537,119 @@ mod tests {
         assert!(rows(&tail.transcript)
             .iter()
             .any(|row| row.contains("next message")));
+    }
+
+    #[test]
+    fn preview_replacement_preserves_the_reading_position_in_merged_blocks() {
+        for role in ["Agent", "Reasoning"] {
+            for width in [24, 80] {
+                // The first block ends mid-line; counting its layout rows would
+                // include a header and misplace the anchor in the merged body.
+                let prefix = "prefix 中文 e\u{301} words without newline ";
+                let body = (0..40)
+                    .map(|n| format!("paragraph {n:02} 中文 👋 e\u{301} content\n"))
+                    .collect::<String>();
+                let mut first = item(role, prefix);
+                first.id = "live:0:text:0".into();
+                let mut preview = item(role, &body);
+                preview.id = "live:0:text:1".into();
+                let mut history = item("You", &"older history\n".repeat(120));
+                history.turn_id = "old".into();
+                let tail = item("Tool", "▸ done · verify");
+                let mut messages = vec![history, first, preview.clone(), tail];
+                let mut cache = ProjectionCache::default();
+                let focus = focus_at(&preview, "paragraph 12");
+                let initial = cache.viewport(messages.iter(), Some(&focus), width, 6, 0, false);
+                let scroll = initial.below.saturating_sub(2);
+                let before = cache.viewport(messages.iter(), None, width, 6, scroll, false);
+                let old_offset = cache.anchor.as_ref().unwrap().offset.unwrap();
+                assert!(rows(&before.transcript)[0].contains("paragraph 12"));
+                let mut authority = preview;
+                authority.id = "committed".into();
+                authority.text = format!("{prefix}{body}");
+                cache.replace_anchors(&[crate::state::MessageReplacement {
+                    thread: authority.thread_id.clone(),
+                    turn: authority.turn_id.clone(),
+                    role: role.into(),
+                    previous: "live:0:text:1".into(),
+                    current: authority.id.clone(),
+                    prefix_bytes: prefix.len(),
+                }]);
+                messages.splice(1..3, [authority.clone()]);
+                // The same source offset, laid out in the full authority, is
+                // the expected top row even if Markdown or wrapping changed.
+                let mut focus = Focus::message(&authority);
+                focus.offset = prefix.len() + old_offset;
+                let expected = transcript(messages.iter(), Some(&focus), width, false);
+                let top = expected.focused.unwrap();
+                let after = cache.viewport(messages.iter(), None, width, 6, scroll, false);
+                assert_eq!(
+                    after.transcript.lines,
+                    expected.lines[top..top + 6],
+                    "{role} {width}"
+                );
+                let settled = cache.viewport(messages.iter(), None, width, 6, scroll, false);
+                assert_eq!(settled.transcript.lines, after.transcript.lines);
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_authority_keeps_the_preview_position_until_the_rest_arrives() {
+        let mut preview = item(
+            "Agent",
+            &(0..50)
+                .map(|n| format!("reading {n:02}\n"))
+                .collect::<String>(),
+        );
+        preview.id = "live:0:text:0".into();
+        let mut messages = [preview.clone(), item("You", "tail")];
+        let mut cache = ProjectionCache::default();
+        let before = cache.viewport(messages.iter(), None, 40, 6, 20, false);
+        cache.replace_anchors(&[crate::state::MessageReplacement {
+            thread: preview.thread_id.clone(),
+            turn: preview.turn_id.clone(),
+            role: preview.role.clone(),
+            previous: preview.id.clone(),
+            current: "authority".into(),
+            prefix_bytes: 0,
+        }]);
+        messages[0].id = "authority".into();
+        messages[0].text = "reading 00\n".into();
+        messages[0].complete = false;
+        cache.viewport(messages.iter(), None, 40, 6, 20, false);
+        assert!(cache.anchor.as_ref().unwrap().replaced);
+        messages[0].text = preview.text;
+        messages[0].complete = true;
+        let after = cache.viewport(messages.iter(), None, 40, 6, 20, false);
+        assert_eq!(before.transcript.lines, after.transcript.lines);
+        let tail = cache.viewport(messages.iter(), None, 40, 6, 0, false);
+        assert_eq!(tail.below, 0);
+        assert!(cache.anchor.is_none());
+    }
+
+    #[test]
+    fn replacement_identity_does_not_bind_another_turn_or_a_new_attempt() {
+        let mut old = item("Agent", &"reading old preview\n".repeat(40));
+        old.id = "live:0:text:0".into();
+        let mut messages = [old.clone(), item("You", "tail")];
+        let mut cache = ProjectionCache::default();
+        cache.viewport(messages.iter(), None, 40, 5, 15, false);
+        for (turn, previous) in [("another-turn", old.id.as_str()), ("turn", "live:1:text:0")] {
+            cache.replace_anchors(&[crate::state::MessageReplacement {
+                thread: old.thread_id.clone(),
+                turn: turn.into(),
+                role: old.role.clone(),
+                previous: previous.into(),
+                current: "committed".into(),
+                prefix_bytes: 0,
+            }]);
+            assert_eq!(cache.anchor.as_ref().unwrap().item, old.id);
+        }
+        messages[0].id = "live:1:text:0".into();
+        messages[0].text = "new attempt\n".repeat(40);
+        let view = cache.viewport(messages.iter(), None, 40, 5, 15, false);
+        assert_eq!(rows(&view.transcript)[0], "Agent");
     }
 
     #[test]

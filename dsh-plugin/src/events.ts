@@ -173,7 +173,8 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
         stages.set(session, stage)
         // A change of stage closes the batch before it, so text never trails its stage.
         flush(session)
-        notify(session, { type: 'stage', stage })
+        const step = steps.get(session)
+        notify(session, { type: 'stage', stage, ...(step === undefined ? {} : { step }) })
       }
       preview(session, frame)
     },
@@ -183,6 +184,8 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
   // Sessions with a turn between its start and end, and the steering messages
   // each one has not claimed yet.
   const open = new Map<string, Set<string>>()
+  const hostTurns = new Map<string, number>()
+  const steps = new Map<string, number>()
   ctx.on('agent/inbox/claimed', (payload: unknown) => {
     const session = sessionId(record(payload)?.['agent'])
     const id = record(record(payload)?.['message'])?.['id']
@@ -195,14 +198,37 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
     const type = record(event)?.['type']
     if (session === undefined) return
     if (type === 'turn/start') {
-      if (open.size >= 256 && !open.has(session)) open.clear()
+      if (open.size >= 256 && !open.has(session)) {
+        open.clear()
+        hostTurns.clear()
+        steps.clear()
+      }
       open.set(session, new Set())
+      const turn = count(record(record(event)?.['data'])?.['turn'])
+      if (turn !== undefined) hostTurns.set(session, turn)
+      else hostTurns.delete(session)
+      steps.delete(session)
     } else if (type === 'turn/end') {
       // The host ends a turn only with an empty next-step inbox, or clears the
       // inbox when it cancels: whatever is still unclaimed was not delivered.
       open.delete(session)
+      hostTurns.delete(session)
+      steps.delete(session)
     }
-    if (type === 'todo/write') {
+    if (type === 'step/start' || type === 'step/end') {
+      const data = record(record(event)?.['data'])
+      const step = count(data?.['step'])
+      const turn = count(data?.['turn'])
+      if (step !== undefined && turn !== undefined && hostTurns.get(session) === turn && open.has(session)) {
+        if (type === 'step/start') {
+          const previous = steps.get(session)
+          if (previous !== undefined && step <= previous) return
+          steps.set(session, step)
+        } else if (steps.get(session) !== step) return
+        flush(session)
+        notify(session, { type: 'step', step, state: type === 'step/start' ? 'start' : 'end' })
+      }
+    } else if (type === 'todo/write') {
       const todos = todosOf(record(event)?.['data'])
       if (todos !== undefined) notify(session, { type: 'todos', todos })
     } else if (type === 'llm/retry') {

@@ -29,7 +29,7 @@ pub enum ToolLifecycle {
     Unknown,
 }
 
-/// 有界对话摘要，不保留原始工具输出、参数或结果。
+/// 有界对话投影。输出只保留于内存，不进入序列化历史、journal 或诊断。
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationTool {
@@ -44,6 +44,10 @@ pub struct ConversationTool {
     pub output_lines: Option<usize>,
     pub added_lines: Option<usize>,
     pub removed_lines: Option<usize>,
+    #[serde(skip)]
+    pub output: Option<Arc<str>>,
+    #[serde(skip)]
+    pub output_clipped: bool,
 }
 
 impl fmt::Debug for ConversationTool {
@@ -65,6 +69,7 @@ impl ConversationTool {
                 .iter()
                 .map(|field| field.as_ref().map_or(0, String::len))
                 .sum::<usize>()
+            + self.output.as_ref().map_or(0, |output| output.len())
     }
 
     pub fn from_detail(detail: &ToolDetail) -> Self {
@@ -73,8 +78,22 @@ impl ConversationTool {
                 .char_indices()
                 .nth(512)
                 .map_or(text.len(), |(end, _)| end);
-            crate::state::display_text(&text[..end])
+            let mut text_shown = crate::state::display_text(&text[..end]);
+            if end < text.len() {
+                text_shown.push('…');
+            }
+            text_shown
         };
+        let body = if detail.output_source != ToolTextSource::Unavailable {
+            Some(detail.output.as_str())
+        } else {
+            detail.result.as_deref()
+        };
+        let output = body.map(crate::state::display_text);
+        let end = output
+            .as_deref()
+            .map_or(0, |text| clipped_end(text, ITEM_BYTES));
+        let output_clipped = detail.clipped || output.as_ref().is_some_and(|text| end < text.len());
         Self {
             item_id: detail.locator.item_id.clone(),
             category: detail.category,
@@ -97,6 +116,8 @@ impl ConversationTool {
                 .then(|| detail.output.lines().count()),
             added_lines: detail.diff.map(|diff| diff.added),
             removed_lines: detail.diff.map(|diff| diff.removed),
+            output: output.map(|text| Arc::from(&text[..end])),
+            output_clipped,
         }
     }
 }

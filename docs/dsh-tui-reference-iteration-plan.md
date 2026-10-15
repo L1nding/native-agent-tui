@@ -1,6 +1,12 @@
 # 参考 dsh-tui 并结合建模工作流的迭代计划
 
-日期：2026-10-13。状态：实施中，尚未完成全部迭代。原基线：`feat/dsh-first` 的 `4785e50`；当前已快进整合建模分支的 `eeb1bf9`。逐项证据及未完成项见 [实施记录](dsh-tui-reference-progress.md)。
+日期：2026-10-13，更新：2026-10-15。状态：**迭代0–4已完成**。原基线：`feat/dsh-first` 的 `4785e50`；已快进整合建模分支的 `f72f14c`。逐项完成证据见[完成审计](dsh-tui-completion-audit.md)；下文保留原计划与当时调研。
+
+## 2026-10-15 完成索引
+
+原迭代逐项证据及旧入口能力迁移，见[完成审计](dsh-tui-completion-audit.md)。旧独立CLI、专用UI与Rust Python工作流owner已删除；当前655项Rust测试（另4可选跳过）、全部native/release/examples、729项模型器测试及20项插件测试通过。
+
+TUI交互真实补验见`target/dsh-conversation-live-47348cf8`；医院487来源范围三批建成208实例、保留279未决来源及逐批批准／Blender／PNG／独立DXF证据见[实施记录](dsh-tui-reference-progress.md)。楼层激活、CAD初始化中断、Blender断连unknown恢复、主动取消、连接／总报告及相邻两层来源连接均已验收。最后的定位回退和已应用家具移动／形状参数替换／删除已补齐，实际批准、构建、只读恢复及看图证据见[入口迁移记录](dsh-modeling-entry-migration.md#2026-10-15-已应用编辑与入口收口)。医院未决来源、14doubt及人工／规范检查仍按业务事实保留；可选`@session`未实施。
 
 ## 结论
 
@@ -94,6 +100,8 @@ TypeScript 写的 dsh 插件，运行在 dsh 进程内，基于 pi-tui 渲染。
 - 参考：dsh-tui 的 `src/extension/overlay-manager.ts` 把叠加视图做成了扩展机制。
 - 边界：Core 拥有领域事实，UI 只读快照、提交类型化命令。这与 `ui-module-boundaries.md` 一致。
 - 结果：领域会话路线跑通建模全流程后，删除独立入口 `--modeling`，不再维护两套。
+
+迁移及删除验收见[独立入口迁移核对](dsh-modeling-entry-migration.md)，已满足原删除前提。
 
 ### 1.2 Core 为工具消息提供结构化状态
 
@@ -290,7 +298,7 @@ src/view.ts
 
 1. （已回答）ACP 会话下 `exit_plan_mode` 的评审原本不能发起：没有提问应答者。插件注册为应答者后可以，真实 dsh 验证过。
 2. steering 在审批等待期间的行为。纯文本引导已接通：消息用宿主自己的 `createUserMessage` 构造，不走附件准入；带附件的引导没有做。
-3. 领域会话路线能否覆盖独立入口的全部建模阶段。它决定 `--modeling` 何时可以删除。
+3. （已回答）项目目标、结构、来源、图纸修正、构件增补／编辑、楼栋／连接及复核恢复均已有新路径证据；2026-10-15移除`--modeling`独立入口。
 4. 真实模型是否发思考增量。实测的 `hi/gpt-6-luna` 没有发，思考阶段没有被观察到。
 
 已回答：dsh 不通过 ACP 提供计划更新、块序号和重试事件，这些由插件通道补发；滚动漂移在真实终端里存在，已修复。
