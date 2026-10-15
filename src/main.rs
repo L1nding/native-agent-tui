@@ -46,6 +46,7 @@ Options:
                    workspace-write | danger-full-access (default: dsh's own default)
   --domain-context FILE  Attach pure modeling tools and the F6 modeling view to this dsh session
   --domain-project RELATIVE_PATH  Discover floor/building targets in a modeler project via dsh
+  --domain-preview   Start the local Blender preview/feedback child for this domain session
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)

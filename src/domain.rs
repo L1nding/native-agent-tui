@@ -55,6 +55,9 @@ pub struct DomainSetup {
 }
 
 pub fn configure(mut config: Config) -> Result<Config, String> {
+    if config.domain_preview && config.domain_context.is_none() && config.domain_project.is_none() {
+        return Err("--domain-preview 需要 --domain-context 或 --domain-project".into());
+    }
     if config.domain_context.is_none() && config.domain_project.is_none() {
         return Ok(config);
     }
@@ -180,7 +183,8 @@ pub struct ProposalBinding {
     pub candidate_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProposalFact {
     pub binding: ProposalBinding,
     pub state: String,
@@ -272,6 +276,18 @@ pub struct VerifiedFact {
     pub bytes: usize,
 }
 
+impl std::fmt::Debug for ProposalFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProposalFact")
+            .field("revision", &self.binding.revision)
+            .field("state", &self.state)
+            .field("objects", &self.objects.len())
+            .field("diagnostics", &self.diagnostics.len())
+            .field("ready", &self.ready)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct DomainSnapshot {
     pub enabled: bool,
@@ -292,6 +308,8 @@ pub struct DomainSnapshot {
     pub notice: Option<String>,
     pub fact_sync_notice: Option<String>,
     pub verified_fact: Option<VerifiedFact>,
+    pub preview_connection: Option<String>,
+    pub preview_selection: Option<crate::preview::Selection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,6 +801,7 @@ impl DomainFacts {
                                 self.fact_sequences.remove(kind);
                             }
                         }
+                        self.snapshot.preview_selection = None;
                         self.snapshot.proposal = Some(proposal);
                         accepted = true;
                     }
@@ -1151,10 +1170,29 @@ impl DomainFacts {
             let key = self.control_messages.keys().next().cloned().unwrap();
             self.control_messages.remove(&key);
         }
+        let opinion = text
+            .rsplit_once('\n')
+            .filter(|(_, payload)| {
+                serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .is_some_and(|v| {
+                        matches!(
+                            v["user_action"].as_str(),
+                            Some("revise_preview_selection" | "selected_preview_context")
+                        )
+                    })
+            })
+            .map(|(visible, _)| visible);
         self.control_messages.insert(
             text.into(),
-            text.lines().next().unwrap_or("具体版本已批准").into(),
+            opinion
+                .unwrap_or_else(|| text.lines().next().unwrap_or("具体版本已批准"))
+                .into(),
         );
+    }
+
+    pub fn is_control_message(&self, text: &str) -> bool {
+        self.control_messages.contains_key(text)
     }
 
     pub fn project_control_messages(&self, messages: &mut [crate::state::ConversationItem]) {

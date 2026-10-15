@@ -94,7 +94,13 @@ pub fn from_tool(
         unwrap_receipt(&item["result"], 0).ok_or("领域事实回执缺失或损坏；完整事实尚未同步")?;
     let receipt: FactReceipt =
         serde_json::from_value(value).map_err(|_| "领域事实回执字段无效；完整事实尚未同步")?;
-    if receipt.run_id != setup.run_id
+    validate(setup, &receipt)?;
+    Ok(Some(receipt))
+}
+
+pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String> {
+    if receipt.contract != RECEIPT_CONTRACT
+        || receipt.run_id != setup.run_id
         || receipt.context_sha256 != setup.context_sha256
         || receipt.kind.is_empty()
         || receipt.kind.len() > 64
@@ -131,7 +137,7 @@ pub fn from_tool(
     {
         return Err("领域事实回执身份或大小无效；完整事实尚未同步".into());
     }
-    Ok(Some(receipt))
+    Ok(())
 }
 
 pub fn verify(setup: &DomainSetup, receipt: &FactReceipt, raw: &[u8]) -> Result<Value, String> {

@@ -27,7 +27,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         .conversation_viewport
         .set(super::ConversationViewport::default());
     local.extension.clear_displayed();
-    let area = frame.area();
+    let mut area = frame.area();
     let theme = theme::current();
     frame.render_widget(Block::default().style(theme.base()), area);
     if local.palette.visible {
@@ -71,6 +71,31 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             area,
         );
         return;
+    }
+    if let Some(selection) = snapshot
+        .extensions
+        .iter()
+        .find_map(crate::extensions::ExtensionSnapshot::modeling)
+        .and_then(|domain| domain.preview_selection.as_ref())
+        .filter(|s| !s.objects.is_empty())
+    {
+        if area.height > 22 {
+            let banner = ratatui::layout::Rect { height: 5, ..area };
+            let text = selection
+                .details()
+                .into_iter()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("\n");
+            frame.render_widget(
+                Paragraph::new(display_text(&text))
+                    .style(theme.secondary())
+                    .block(Block::default().borders(Borders::BOTTOM)),
+                banner,
+            );
+            area.y += 5;
+            area.height -= 5;
+        }
     }
     let request = selected_request(snapshot, local);
     let waiting = snapshot.gate.as_ref().filter(|gate| gate.pending);

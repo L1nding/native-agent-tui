@@ -30,6 +30,10 @@ use crate::transport::{PipeTransport, TransportError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    PreviewEvent {
+        epoch: u64,
+        event: crate::preview::Event,
+    },
     SubmitRootInput {
         text: String,
     },
@@ -322,6 +326,9 @@ impl ClientHandle {
                 steer_count: 0,
                 backend_command: None,
                 backend_command_count: 0,
+                preview_bridge: None,
+                preview_epoch: 0,
+                preview_target: None,
                 config,
                 server,
                 command_rx,
@@ -504,6 +511,9 @@ struct Core {
     /// 正在执行的 dsh 命令：(对话里的提示 id, 命令行)。同一时刻只有一条。
     backend_command: Option<(String, String)>,
     backend_command_count: u64,
+    preview_bridge: Option<crate::preview::Bridge>,
+    preview_epoch: u64,
+    preview_target: Option<crate::preview::WorkTarget>,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
     completed_waits: VecDeque<(RpcId, String, String)>,
@@ -718,6 +728,7 @@ impl Core {
     }
 
     async fn run(mut self) -> ExitReport {
+        self.start_preview();
         if let Err(error) = self.send_rpc(RpcKind::Initialize) {
             self.state.error(SessionPhase::Failed, error.to_string());
         } else {
@@ -899,6 +910,7 @@ impl Core {
             }
         }
 
+        self.preview_bridge.take();
         if let Some(task) = self.domain_authorization_task.take() {
             task.abort();
             let _ = task.await;
@@ -1027,6 +1039,28 @@ impl Core {
         self.state.view.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
             self.domain.snapshot.clone(),
         )];
+        if let (Some(bridge), Some(setup)) = (&self.preview_bridge, &self.config.domain_setup) {
+            let preparing = self
+                .state
+                .view
+                .thread_id
+                .as_deref()
+                .zip(self.state.view.turn_id.as_deref())
+                .and_then(|(thread, turn)| {
+                    crate::preview::prepare_target(
+                        &self.domain.snapshot,
+                        &self.state.view.tool_details,
+                        thread,
+                        turn,
+                    )
+                });
+            bridge.activity(
+                setup,
+                self.state.view.phase,
+                self.preview_target.as_ref().or(preparing.as_ref()),
+                !self.state.view.requests.is_empty(),
+            );
+        }
         self.domain
             .project_control_messages(&mut self.state.view.messages);
         let transport = self.pipe.stats();
@@ -1448,6 +1482,93 @@ impl Core {
             } => {
                 self.finish_domain_fact_read(attempt_id, generation, outcome);
             }
+            Command::PreviewEvent { epoch, event } => {
+                if epoch != self.preview_epoch {
+                    return;
+                }
+                match event {
+                    crate::preview::Event::Ready { connection_file } => {
+                        self.domain.snapshot.preview_connection = Some(connection_file);
+                    }
+                    crate::preview::Event::Closed => {
+                        self.domain.snapshot.preview_connection = None;
+                        self.domain.snapshot.preview_selection = None;
+                        self.preview_target = None;
+                        self.domain.snapshot.notice =
+                            Some("Blender 预览已断开；场景与产物保持原状态".into());
+                    }
+                    crate::preview::Event::Feedback(feedback) => {
+                        let outcome = if !self.idle_for_backend_change()
+                            || self.domain.snapshot.authorizing
+                        {
+                            Err("平台正在执行或等待交互；请在 idle 后重新提交对象反馈".into())
+                        } else {
+                            crate::preview::feedback_text(&feedback, &self.domain.snapshot)
+                        };
+                        match outcome {
+                            Ok(text) => {
+                                self.preview_target = Some(crate::preview::WorkTarget {
+                                    binding: feedback.binding.clone(),
+                                    snapshot_id: Some(feedback.snapshot_id.clone()),
+                                    parts: feedback.object_ids.clone(),
+                                    instances: feedback.instances.clone(),
+                                });
+                                self.domain.remember_control(&text);
+                                let before = self.state.view.root_start_requests;
+                                self.command(Command::SubmitRootInput { text });
+                                // Queue acceptance is not submission. Confirm the
+                                // normal scheduler's owned outbox write first.
+                                self.dispatch_root();
+                                let status = if self.state.view.root_start_requests > before {
+                                    "submitted"
+                                } else {
+                                    "unknown"
+                                };
+                                if let Some(bridge) = &self.preview_bridge {
+                                    bridge.receipt(&feedback.request_id, status, "Feedback passed to the owning platform session; approval remains in TUI");
+                                }
+                                self.domain.snapshot.notice =
+                                    Some("Blender 对象意见已送入同一平台会话，等待新候选".into());
+                            }
+                            Err(reason) => {
+                                if let Some(bridge) = &self.preview_bridge {
+                                    bridge.receipt(&feedback.request_id, "rejected", &reason);
+                                }
+                                self.domain.snapshot.notice = Some(reason);
+                            }
+                        }
+                    }
+                    crate::preview::Event::Selection(selection) => {
+                        let old = self.domain.snapshot.preview_selection.as_ref();
+                        if selection.valid(&self.domain.snapshot)
+                            && old.is_none_or(|s| {
+                                s.client_id != selection.client_id
+                                    || s.sequence < selection.sequence
+                            })
+                        {
+                            self.domain.snapshot.preview_selection = Some(*selection);
+                        }
+                    }
+                    crate::preview::Event::SelectionClosed { client_id } => {
+                        if self
+                            .domain
+                            .snapshot
+                            .preview_selection
+                            .as_ref()
+                            .is_some_and(|s| s.client_id == client_id)
+                        {
+                            self.domain.snapshot.preview_selection = None;
+                        }
+                    }
+                    crate::preview::Event::Fact(receipt) => {
+                        if self.config.domain_setup.as_ref().is_some_and(|setup| {
+                            crate::domain::receipt::validate(setup, &receipt).is_ok()
+                        }) {
+                            self.queue_domain_fact(*receipt);
+                        }
+                    }
+                }
+            }
             Command::ConfirmExtension { confirmation } => match confirmation {
                 crate::extensions::ExtensionConfirmation::Modeling(binding) => {
                     self.approve_domain_change(binding)
@@ -1511,6 +1632,24 @@ impl Core {
                         "Wait for the current turn to finish, or interrupt it with Ctrl+C.".into(),
                     );
                     return;
+                }
+                let mut text = text;
+                if !self.domain.is_control_message(&text) {
+                    self.preview_target = None;
+                    if let Some(selection) = &self.domain.snapshot.preview_selection {
+                        if let Some(bound) =
+                            crate::preview::selected_input(&text, selection, &self.domain.snapshot)
+                        {
+                            if bound.len() > MESSAGE_BYTES {
+                                self.state.view.notice =
+                                    Some("对象上下文与意见超过消息预算，请缩短意见".into());
+                                return;
+                            }
+                            self.preview_target = Some(crate::preview::WorkTarget::from(selection));
+                            self.domain.remember_control(&bound);
+                            text = bound;
+                        }
+                    }
                 }
                 let mut spec = RootTaskSpec::input(text);
                 if self.wait.is_some() {
@@ -1794,8 +1933,25 @@ impl Core {
         }
         self.domain_fact_attempt = self.domain_fact_attempt.wrapping_add(1);
         self.domain_fact_queue.clear();
+        self.start_preview();
         self.session_ready = false;
         self.state.view.phase = SessionPhase::Initializing;
+    }
+
+    fn start_preview(&mut self) {
+        self.preview_bridge.take();
+        self.preview_target = None;
+        self.domain.snapshot.preview_selection = None;
+        self.preview_epoch = self.preview_epoch.wrapping_add(1);
+        if self.config.domain_preview {
+            if let Some(setup) = self.config.domain_setup.clone() {
+                self.preview_bridge = Some(crate::preview::Bridge::start(
+                    setup,
+                    self.preview_epoch,
+                    self.command_tx.clone(),
+                ));
+            }
+        }
     }
 
     fn confirm_configured_permission(&mut self) -> bool {

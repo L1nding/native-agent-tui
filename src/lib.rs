@@ -23,6 +23,7 @@ mod owned_process;
 pub mod path_hints;
 pub mod permission;
 pub mod preferences;
+pub mod preview;
 pub mod protocol;
 pub mod scheduler;
 pub mod skills;

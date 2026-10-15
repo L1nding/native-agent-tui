@@ -268,3 +268,10 @@ source-view/1给来源分页和全层分组附上同一完整来源状态SHA。C
 该修复来源于真实代理用例：scan_source_groups缓存的序号低于较新的单页scan_source_instances，同一场景与来源状态也被拒绝切回。专项先红后绿，domain与UI相关48项通过。完整验证outputs/proxy-source-view-tui-full-check-20261014-01.log：633 Rust通过、4项optional live跳过，fmt/check/Clippy/doctest（0）/release/全部夹具通过。
 
 真实target/dsh-e2e-061543fd使用hi/gpt-6.1-sol：一次请求对29个实际来源逐项回答，记录7项测试跳过和16组assumed分类，4 PASS。模型器独立复验valid=true，完整场景应用与构建仍在后续批次，不把代理意见阶段称为完整建模通过。新增hospital-floor-proxy验收夹具尚在实施中，独立于本次缓存切换修复。
+
+2026-10-15 与 dsh-first 合并：来源视图身份沿用 dsh-first 的 `SourceViewIdentity`（同时绑定 source_view_sha256、scan_id 与 scene_sha256）。同一视图下分组与台账两种形态并存，仅在某形态缺失时允许按较旧序号补回；已存在形态的重放判为 Superseded，不再切换并清空另一形态。复核策略、source-view 能力声明后拒收未封存数据及回执表头保护保持不变。
+
+# Blender 实时预览
+
+`--domain-context FILE` 或 `--domain-project PATH` 加 `--domain-preview` 在同一会话挂接本地 Blender Extension 预览/所选对象反馈。
+Core 持有子进程和 session epoch，审批继续使用当前页实际渲染的 binding；详情见 [预览接入](blender-preview.md)。
