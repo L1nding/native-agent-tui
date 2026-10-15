@@ -1016,6 +1016,15 @@ fn ordinary_project_launch_creates_a_bound_context_and_registers_pure_tools() {
     )
     .unwrap();
     std::fs::write(root.join("projects/test/project.yaml"), "sources: []").unwrap();
+    let bad_root = configure(Config {
+        cwd: root.clone(),
+        domain_project: Some(".".into()),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(bad_root.contains("projects/test"), "{bad_root}");
+    assert!(bad_root.contains("--domain-project ."), "{bad_root}");
+    assert!(!root.join("outputs").exists());
     let config = configure(Config {
         cwd: root.clone(),
         domain_project: Some("projects/test".into()),

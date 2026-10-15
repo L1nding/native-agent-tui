@@ -206,7 +206,26 @@ pub(super) fn create_context(root: &Path, project: &Path) -> Result<PathBuf, Str
     }
     let path = normalized_path(&root.join(project))?;
     if !path.starts_with(root) || !path.join("project.yaml").is_file() {
-        return Err("建模项目必须在当前工作目录内并包含 project.yaml".into());
+        let candidates = std::fs::read_dir(root.join("projects"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("project.yaml").is_file())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .take(8)
+            .map(|name| crate::state::display_text(&format!("projects/{name}")))
+            .collect::<Vec<_>>();
+        let hint = if candidates.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "；此处是模型器仓库，可用项目：{}。请将 --domain-project . 改为实际项目相对路径",
+                candidates.join("、")
+            )
+        };
+        return Err(format!(
+            "建模项目必须在 --cwd 工作目录内并包含 project.yaml{hint}"
+        ));
     }
     let run_id = format!(
         "project-{}-{}",
