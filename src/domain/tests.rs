@@ -1077,6 +1077,56 @@ fn project_scope(sequence: u64, floor_key: &str, scope_id: &str) -> Value {
 }
 
 #[test]
+fn current_catalog_recovers_persisted_selection_before_floor_scope_without_authorizing() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    let mut catalog = project_catalog(1);
+    catalog["recovery_index"] =
+        json!({"catalog_current":true,"selection":project_selection(2, true)["selection"]});
+    assert_eq!(facts.apply_verified_fact(&catalog), FactProjection::Applied);
+    assert!(
+        facts.snapshot.selection.is_some(),
+        "persisted selection missing from Core after recovery"
+    );
+    assert!(facts.snapshot.proposal.is_none());
+    assert!(facts.snapshot.application.is_none());
+    assert!(!facts.snapshot.authorizing);
+    assert_eq!(
+        facts.apply_verified_fact(&project_scope(3, "f08", &"d".repeat(64))),
+        FactProjection::Applied
+    );
+}
+
+#[test]
+fn catalog_recovery_rejects_foreign_sources_and_does_not_replace_a_newer_selection() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    for key in ["source_sha256", "catalog_id"] {
+        let mut facts = DomainFacts::new(Some(setup.clone()));
+        let mut catalog = project_catalog(1);
+        let mut selection = project_selection(2, true)["selection"].clone();
+        selection[key] = json!("f".repeat(64));
+        catalog["recovery_index"] = json!({"catalog_current":true,"selection":selection});
+        assert_eq!(facts.apply_verified_fact(&catalog), FactProjection::Invalid);
+        assert!(facts.snapshot.selection.is_none());
+    }
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    let mut newer = project_selection(4, true);
+    newer["selection"]["selection_id"] = json!("e".repeat(64));
+    facts.apply_verified_fact(&newer);
+    let mut catalog = project_catalog(5);
+    catalog["recovery_index"] =
+        json!({"catalog_current":true,"selection":project_selection(2, true)["selection"]});
+    assert_eq!(facts.apply_verified_fact(&catalog), FactProjection::Applied);
+    assert_eq!(
+        facts.snapshot.selection.as_ref().unwrap().selection_id,
+        "e".repeat(64)
+    );
+}
+
+#[test]
 fn component_discovery_mode_is_bound_to_the_registered_floor_scope() {
     let mut setup = sequenced_facts().setup.unwrap();
     setup.mode = DomainMode::Project;

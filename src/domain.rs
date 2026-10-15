@@ -675,6 +675,27 @@ impl DomainFacts {
                 let Some(project) = project::catalog_fact(value) else {
                     return FactProjection::Invalid;
                 };
+                // A read-only catalog includes the original persisted target. Restore
+                // this selection before accepting floor facts; it grants no write access.
+                let recovered_selection = if value["recovery_index"]["catalog_current"] == true {
+                    let Some(selection) = project::selection_fact(&json!({
+                        "ok":true,"selection":value["recovery_index"]["selection"]
+                    })) else {
+                        return FactProjection::Invalid;
+                    };
+                    if selection.catalog_id != project.catalog_id
+                        || selection.source_sha256 != project.source_sha256
+                        || selection
+                            .candidate_keys
+                            .iter()
+                            .any(|key| !project.floor_keys.contains(key))
+                    {
+                        return FactProjection::Invalid;
+                    }
+                    Some(selection)
+                } else {
+                    None
+                };
                 if self
                     .snapshot
                     .selection
@@ -687,6 +708,9 @@ impl DomainFacts {
                         building.current = false;
                     }
                     self.clear_project_scope();
+                }
+                if self.snapshot.selection.is_none() {
+                    self.snapshot.selection = recovered_selection;
                 }
                 self.snapshot.project = Some(project);
                 accepted = true;
