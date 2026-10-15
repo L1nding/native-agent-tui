@@ -17,6 +17,7 @@ mod commands;
 mod context;
 mod conversation;
 mod domain;
+mod domain_workflow;
 mod editor;
 mod extensions;
 mod help;
@@ -713,20 +714,26 @@ fn handle_key_inner(
         key
     };
     if key.code == KeyCode::F(6)
+        && !local.workflow.visible
         && (local.extension.visible.is_some() || extensions::REGISTRY.first(snapshot).is_some())
     {
         local.extension.toggle(snapshot);
         local.workflow.visible = false;
         return false;
     }
-    if let Some(action) = extensions::REGISTRY.handle_key(
-        key,
-        snapshot,
-        &mut local.extension,
-        local.viewport,
-        &local.editor.text,
-        local.notice.as_deref(),
-    ) {
+    let extension_action = if local.workflow.visible {
+        None
+    } else {
+        extensions::REGISTRY.handle_key(
+            key,
+            snapshot,
+            &mut local.extension,
+            local.viewport,
+            &local.editor.text,
+            local.notice.as_deref(),
+        )
+    };
+    if let Some(action) = extension_action {
         match action {
             extensions::ExtensionAction::Confirm(confirmation) => {
                 send(Command::ConfirmExtension { confirmation }, tx, local);
@@ -763,6 +770,29 @@ fn handle_key_inner(
                 return false;
             }
             KeyCode::Char('y') | KeyCode::Char('n') | KeyCode::Char('b') => {
+                // 建模方案不是普通的 server request。用户在会话页按 Ctrl+Y 时，
+                // 先打开当前已准备的模型预览，让批准始终绑定用户实际看到的版本。
+                if key.code == KeyCode::Char('y')
+                    && local.extension.visible.is_none()
+                    && snapshot.extensions.iter().any(|extension| {
+                        extension.modeling().is_some_and(|domain| {
+                            domain.enabled
+                                && domain
+                                    .proposal
+                                    .as_ref()
+                                    .is_some_and(|proposal| proposal.ready)
+                        })
+                    })
+                {
+                    local.request_panel = false;
+                    local.workflow.visible = false;
+                    local.extension.visible = Some(crate::extensions::ExtensionId::Modeling);
+                    local.extension.scroll = 0;
+                    local.notice = Some(
+                        "已打开建模预览；请先核对 Blender 候选模型，再按 Ctrl+Y 批准。".into(),
+                    );
+                    return false;
+                }
                 if let Some(request) = selected_request(snapshot, local) {
                     let decision = match key.code {
                         KeyCode::Char('y') => ApprovalDecision::Accept,
@@ -801,6 +831,36 @@ fn handle_key_inner(
                 return false;
             }
             _ => {}
+        }
+    }
+    if local.workflow.visible && domain_workflow::domain(snapshot).is_some() {
+        if key.code == KeyCode::Tab && !control {
+            local.workflow.show_tasks = !local.workflow.show_tasks;
+            return false;
+        }
+        if !local.workflow.show_tasks && !control {
+            match key.code {
+                KeyCode::Up | KeyCode::PageUp => {
+                    local.workflow.modeling_node = local.workflow.modeling_node.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::PageDown => {
+                    local.workflow.modeling_node = (local.workflow.modeling_node + 1)
+                        .min(crate::domain::WorkflowNode::ALL.len() - 1)
+                }
+                KeyCode::Home => local.workflow.modeling_node = 0,
+                KeyCode::End => {
+                    local.workflow.modeling_node = crate::domain::WorkflowNode::ALL.len() - 1
+                }
+                KeyCode::Enter => {
+                    local.workflow.visible = false;
+                    local.extension.visible = Some(crate::extensions::ExtensionId::Modeling);
+                }
+                KeyCode::Esc | KeyCode::F(4) | KeyCode::F(2) => {}
+                _ => return false,
+            }
+            if !matches!(key.code, KeyCode::Esc | KeyCode::F(4) | KeyCode::F(2)) {
+                return false;
+            }
         }
     }
     if key.code == KeyCode::F(5) || local.workflow.visible {
@@ -853,6 +913,27 @@ fn handle_key_inner(
         }
         KeyCode::F(1) => local.help = !local.help,
         KeyCode::F(2) => {
+            // 没有 server request 时，F2 也能恢复到当前建模提案；不能把领域批准
+            // 误报成“所选请求已过期”。进入模型页后，批准只对已展示版本生效。
+            if snapshot.requests.is_empty()
+                && local.extension.visible.is_none()
+                && snapshot.extensions.iter().any(|extension| {
+                    extension.modeling().is_some_and(|domain| {
+                        domain.enabled
+                            && domain
+                                .proposal
+                                .as_ref()
+                                .is_some_and(|proposal| proposal.ready)
+                    })
+                })
+            {
+                local.request_panel = false;
+                local.workflow.visible = false;
+                local.extension.visible = Some(crate::extensions::ExtensionId::Modeling);
+                local.extension.scroll = 0;
+                local.notice = None;
+                return false;
+            }
             if local.request_panel || selected_request(snapshot, local).is_none() {
                 let next = selected_request(snapshot, local)
                     .and_then(|request| {
@@ -1309,6 +1390,123 @@ mod tests {
 
     fn observed_snapshot() -> CoreSnapshot {
         observed_snapshot_with_requests(&[])
+    }
+
+    #[test]
+    fn modeling_graph_navigation_and_tab_do_not_dispatch_execution_commands() {
+        let snapshot = CoreSnapshot {
+            extensions: vec![crate::extensions::ExtensionSnapshot::Modeling(
+                crate::domain::DomainSnapshot {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        local.workflow.visible = true;
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(local.workflow.modeling_node, 1);
+        handle_key(
+            KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(local.workflow.show_tasks);
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.workflow.show_tasks);
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.workflow.visible);
+        assert_eq!(
+            local.extension.visible,
+            Some(crate::extensions::ExtensionId::Modeling)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn f2_recovers_modeling_approval_when_no_server_request_is_pending() {
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Completed,
+            extensions: vec![crate::extensions::ExtensionSnapshot::Modeling(
+                crate::domain::DomainSnapshot {
+                    enabled: true,
+                    proposal: Some(crate::domain::ProposalFact {
+                        binding: crate::domain::ProposalBinding {
+                            run_id: "run".into(),
+                            context_sha256: "context".into(),
+                            proposal_id: "proposal".into(),
+                            revision: 1,
+                            prepare_token: "token".into(),
+                            base_sha256: "base".into(),
+                            candidate_sha256: "candidate".into(),
+                        },
+                        state: "prepared".into(),
+                        summary: "candidate preview".into(),
+                        objects: vec![],
+                        assumptions: vec![],
+                        diagnostics: vec![],
+                        ready: true,
+                    }),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut local = LocalState::default();
+        handle_key(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            local.extension.visible,
+            Some(crate::extensions::ExtensionId::Modeling)
+        );
+        assert!(!local.request_panel);
+        assert!(rx.try_recv().is_err());
+
+        // Ctrl+Y from the conversation opens the same review page instead of
+        // reporting that a nonexistent server request expired.
+        local.extension.visible = None;
+        handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert_eq!(
+            local.extension.visible,
+            Some(crate::extensions::ExtensionId::Modeling)
+        );
+        assert!(local.notice.is_some());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

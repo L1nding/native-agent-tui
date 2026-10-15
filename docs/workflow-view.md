@@ -1,6 +1,6 @@
 # 工作流关系视图
 
-F4 打开只读工作流视图。Core 的 `SchedulerSnapshot` 是执行事实的唯一来源；UI 投影仅决定显示顺序和导航，不修改调度状态。
+F4 打开只读工作流视图。调度页使用 Core 的 `SchedulerSnapshot`，建模页使用 Core 校验后的领域快照；UI 投影仅决定显示顺序和导航，不修改执行状态。
 
 ## 关系语义
 
@@ -31,3 +31,13 @@ F4 打开只读工作流视图。Core 的 `SchedulerSnapshot` 是执行事实的
 - Rust 测试：288 个库测试和 6 个集成测试通过；另有 8 个库级 live 测试和 1 个 JSONL live 测试通过，均锁定 Codex 0.159.2。Windows 与 ConPTY fixtures（含 workflow fixture）全部通过。
 - Workflow ConPTY 使用 fake app-server，验证真实终端按键、导航不发额外执行 RPC、会话关闭、进程清理确认及未完成任务保留恢复状态。真实 provider 覆盖来自现有锁定版本 live 回归，不来自该 fake fixture。
 - 此验证记录不表示完整 multi-child V2 已实现或验收。
+
+## 建模循环节点
+
+领域会话的 F4 默认展示建模节点图：左侧为主流程，中间为复用、新定义、修订、待处理与只读对账等分支，右侧仅展示当前选中节点的证据和可走路径。中等终端将分支与详情上下排布，小终端按选择滚动主流程并在底部显示详情。按 ↑↓ 选节点，Enter 回到具体方案；Tab 单独切到 Agent 调度列表。节点图不混入所有节点的长回执或内部槽位清单。
+
+主流程：01 选层 → 02 结构 → 03 审图 → 04 解释识别 → 05 能力 → 08 准备校验 → 09 具体批准 → 11 应用 → 12 构建回读 → 13 看图复核 → 15 结果与未决项。能力判断可进入 06 复用实例或 07 新定义并回到08，缺能力进入14。阻塞、修改意见、部分采纳及可修正失败通过10修订回到04；13发现问题或下一批在预算允许时回到04。应用或构建unknown进入16只读对账，不自动重放副作用。
+
+连线表示有条件的路线，不能证明已发生迁移。Core 的 `DomainSnapshot::workflow_evidence` 从当前已验证事实派生节点证据；UI 不向 scheduler DAG 注入循环，也不新建模型执行器。符号与文字共同区分未记录、有回执、等待、进行中、需处理和未知。“有回执”不等于业务完成；当前缺少独立投影的复用、新定义、实际看图保持未记录，不能从模型文字或后续构建成功倒推。正式构建回执必须匹配当前提案版本、token、输入与权威哈希，预览和旧版不替代。人工验收和规范检查分别报告。
+
+Windows 演示入口：在任意目录运行 `D:/project/native-agent-tui/scripts/start-modeling.ps1`，默认打开相邻 Modeler 仓库的 `projects/hospital-site`，固定read-only。`-ModelerRepo`、`-Project`和`-Binary`可显式覆盖路径，`-Model`可选择模型。项目在启动前检查project.yaml；仓库根目录`.`不是项目时，CLI列出实际项目路径，不再只给泛化报错。脚本默认使用本轮验证的`target/workflow-final/release/native-agent-tui.exe`；缺少该文件时脚本会先构建该目录。

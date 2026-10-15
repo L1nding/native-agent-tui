@@ -93,3 +93,13 @@
 - 医院当前图纸：`target/drawing-review-live-2206ec5e`16项记录（14doubt／2not_error），不是人工通过。
 - 新跨层基线/批准执行/恢复：`target/project-live-708a4d47`、`target/project-connection-live-01f0fb5b`、`target/project-connection-recovery-4009bb8d`。
 - 首次连接4c77ef5a的界面夹具失败保留，未授权；续验只读恢复同原proposal，没有重新prepare。
+
+## 2026-10-15 演示后的循环节点与布局补验
+
+用户指出原六项阶段列表遗漏循环节点，随后原始线条图又把流程、所有回执和调度明细堆在一页。此前阶段摘要的检查不能证明循环图或布局体验已验收。本次将 F4 改为独立建模节点图：主流程、条件分支/回边、当前选中节点证据分开显示；Tab 单独打开原调度列表，Enter 返回具体方案。↑↓只改变选中节点，图页的重试键不发调度命令。Core只读派生节点证据，未新增模型循环或自动副作用。旧版/预览产物、未决来源、unknown应用和独立看图证据边界由回归保护。
+
+演示启动命令之前错误地使用仓库根目录`.`作为项目并指定workspace-write；现提供`scripts/start-modeling.ps1`，独立解析目录、检查project.yaml并固定read-only。CLI错误项目路径现在列出实际候选。真实短回复区原固定占6–10行，导致重复图纸候选被挤掉，已改为按实际换行收缩；小窗口的分支和选中节点回路也分别压缩，避免裁掉待处理/对账节点。
+
+当前验证：`target/dsh-workflow-layout-tests.log`670项通过、4可选跳过；fmt/check/Clippy/doctest及release/examples通过。`target/dsh-workflow-layout-native-verified.log`全部native通过，普通项目夹具新增实际F4图、Tab调度、修订节点详情、Enter回方案及原重复图纸选择检查，全程不调用模型、不授权、不写场景。原失败目录保留。
+
+可见终端通过启动脚本运行`target/workflow-final/release/native-agent-tui.exe`，医院项目、hi/gpt-6-sol、read-only，实际进入Ready，已切到F4并选中09批准节点；当前屏幕保存`target/dsh-workflow-visible-frame.txt`。该演示未发送新的建模任务；节点无执行回执时仍如实显示未记录。实际任务此前的模型服务过载不被归因于CLI或伪装成功。本次修复未追加提交，其他并发改动保留。

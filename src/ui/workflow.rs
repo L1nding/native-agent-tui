@@ -11,6 +11,8 @@ use crate::state::CoreSnapshot;
 #[derive(Debug, Default)]
 pub(super) struct WorkflowPanel {
     pub(super) visible: bool,
+    pub(super) show_tasks: bool,
+    pub(super) modeling_node: usize,
     pub(super) selected_id: Option<TaskId>,
     pub(super) scroll: usize,
     pub(super) manual_scroll: bool,
@@ -86,7 +88,8 @@ pub(super) fn allows_key(key: KeyEvent) -> bool {
         || plain
             && matches!(
                 key.code,
-                KeyCode::F(2)
+                KeyCode::Tab
+                    | KeyCode::F(2)
                     | KeyCode::F(4)
                     | KeyCode::F(5)
                     | KeyCode::F(6)
@@ -119,6 +122,7 @@ pub(super) fn handle_key(
     }
     let plain = key.modifiers.is_empty();
     match key.code {
+        KeyCode::Tab => Some(WorkflowKeyResult::handled()),
         KeyCode::PageUp => Some(scroll(panel.scroll.saturating_sub(8))),
         KeyCode::PageDown => Some(scroll(panel.scroll.saturating_add(8))),
         KeyCode::Home => Some(scroll(0)),

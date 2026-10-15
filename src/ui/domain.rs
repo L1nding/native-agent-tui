@@ -8,105 +8,27 @@ use super::layout::wrap_text;
 use crate::extensions::{ExtensionConfirmation, ExtensionId, ExtensionSnapshot};
 use crate::state::display_text;
 
-/// Business milestones from verified facts, independent of Agent turn completion.
-pub(super) fn modeling_workflow_lines(domain: &crate::domain::DomainSnapshot) -> Vec<String> {
-    use crate::domain::{ArtifactState, SelectionState};
-    let selected = domain
-        .selection
-        .as_ref()
-        .is_some_and(|selection| selection.state == SelectionState::Selected)
-        || (domain.project.is_none() && !domain.floor_id.is_empty());
-    let mut lines = vec!["建模工作流 · 各步骤按实际回执更新".into()];
-    lines.push(format!(
-        "1 选择楼层 · {}",
-        if selected {
-            "已绑定目标"
-        } else {
-            "等待定位或选择图纸"
-        }
-    ));
-    lines.push(format!(
-        "2 结构与方案 · {}",
-        if domain.project_scope.is_some() {
-            "已有楼层作用域；具体方案状态见第 5 步"
-        } else {
-            "尚无楼层准备回执"
-        }
-    ));
-    lines.push(match &domain.drawing_audit {
-        Some(audit) => format!(
-            "3 图纸审查 · 已判断 {}/{} 项；未覆盖范围及人工复核仍须核对",
-            audit.judged_count, audit.candidate_count
-        ),
-        None => "3 图纸审查 · 尚无审查回执".into(),
-    });
-    lines.push(match domain.component_progress() {
-        Some(progress) => format!(
-            "4 发现与识别构件 · 已发现 {} · 已建 {} · 待处理 {}",
-            progress.total, progress.built, progress.pending
-        ),
-        None => "4 发现与识别构件 · 尚未扫描；结构之后继续家具、洁具和设备".into(),
-    });
-    if let Some(groups) = &domain.groups {
-        lines.push(format!(
-            "  类别识别 · 已评估 {}/{} 组；新类别由 Agent 提出定义",
-            groups.assessed_groups, groups.total_groups
-        ));
-    }
-    let proposal_status = match &domain.proposal {
-        _ if domain
-            .operation
-            .as_ref()
-            .is_some_and(|operation| operation.state == "applied") =>
-        {
-            "当前方案已有应用回执"
-        }
-        _ if domain.operation.as_ref().is_some_and(|operation| {
-            matches!(operation.state.as_str(), "applying" | "unknown")
-        }) =>
-        {
-            "应用结果未确认，先对账原操作"
-        }
-        Some(proposal) if !proposal.diagnostics.is_empty() => "方案存在诊断，需处理后重新准备",
-        Some(proposal) if proposal.state == "applied" || proposal.state == "built" => {
-            "当前方案已应用"
-        }
-        Some(proposal) if proposal.ready => "当前具体方案待批准；Ctrl+Y 查看并批准",
-        Some(_) => "当前方案尚未就绪",
-        None => "等待 Agent 准备具体方案",
-    };
-    lines.push(format!("5 批准、应用与构建 · {proposal_status}"));
-    if let Some(artifact) = domain.artifacts.last() {
-        let state = match artifact.state {
-            ArtifactState::Queued => "排队中",
-            ArtifactState::Building => "构建中",
-            ArtifactState::Unknown => "结果未确认，需对账",
-            ArtifactState::Cancelled => "已取消",
-            ArtifactState::Failed => "失败，需处理诊断",
-            ArtifactState::Built => "已生成；有效性与当前版本仍按验证回执核对",
-        };
-        lines.push(format!(
-            "  Blender {} · {state}",
-            if artifact.binding.candidate {
-                "预览"
-            } else {
-                "正式产物"
-            }
-        ));
-    }
-    lines.push("6 最终对账与复核 · 仍须核对来源覆盖、未决项及实际看图；人工验收未执行".into());
-    if domain.fact_sync_notice.is_some() {
-        lines.push("事实同步存在提示；以上为已收到的回执，不能据此宣告整层完成".into());
-    }
-    lines
+fn has_verified_candidate_preview(
+    domain: &crate::domain::DomainSnapshot,
+    proposal: &crate::domain::ProposalFact,
+) -> bool {
+    domain.artifacts.iter().any(|artifact| {
+        artifact.binding.candidate
+            && artifact.binding.proposal_id == proposal.binding.proposal_id
+            && artifact.binding.revision == proposal.binding.revision
+            && artifact.binding.prepare_token == proposal.binding.prepare_token
+            && artifact.binding.input_sha256 == proposal.binding.candidate_sha256
+            && matches!(artifact.state, crate::domain::ArtifactState::Built)
+            && artifact.valid == Some(true)
+    })
 }
 
-fn sections(area: Rect, has_reply: bool) -> [Rect; 5] {
-    let reply_height = if has_reply && area.height >= 20 {
-        (area.height / 3).clamp(6, 10)
-    } else {
-        0
-    };
+fn sections(area: Rect, reply: Option<&str>) -> [Rect; 5] {
+    let reply_height = reply.filter(|_| area.height >= 20).map_or(0, |reply| {
+        let rows = wrap_text(reply, usize::from(area.width.saturating_sub(2).max(1))).len();
+        rows.saturating_add(2)
+            .min(usize::from((area.height / 3).clamp(3, 10))) as u16
+    });
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
@@ -124,7 +46,48 @@ fn business_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.extend(modeling_workflow_lines(domain).into_iter().map(Line::from));
+    if let Some(groups) = &domain.groups {
+        lines.push(Line::from(format!(
+            "构件识别 · 已评估 {}/{} 组 · 未定类别 {} 个候选",
+            groups.assessed_groups,
+            groups.total_groups,
+            groups
+                .category_counts
+                .get("unresolved")
+                .copied()
+                .unwrap_or(0)
+        )));
+        let labels = groups
+            .category_counts
+            .iter()
+            .filter(|(category, count)| category.as_str() != "unresolved" && **count > 0)
+            .map(|(category, count)| format!("{} {count}", display_text(category)))
+            .collect::<Vec<_>>();
+        lines.push(Line::from(if labels.is_empty() {
+            "尚无已标注类别；来源扫描数量不代表已识别构件".into()
+        } else {
+            format!(
+                "已标注类别：{} · 分类仍保留实际依据与假设",
+                labels.join("、")
+            )
+        }));
+    }
+    if let Some(proposal) = domain.proposal.as_ref().filter(|proposal| proposal.ready) {
+        if !has_verified_candidate_preview(domain, proposal) {
+            lines.push(Line::from(
+                "当前版本还没有已验证的 Blender 候选预览；请先生成并查看模型预览，之后才能批准。",
+            ));
+        } else {
+            lines.push(Line::from(if context.phase.can_submit() {
+                "等待批准当前具体方案：按 Ctrl+Y 批准并继续。普通问答选项不生成场景授权。"
+            } else {
+                "方案已准备；Agent 当前仍在执行，结束本轮后才能批准。请勿在普通问答中重复批准。"
+            }));
+        }
+    }
+    lines.push(Line::from(
+        "流程：选层与结构方案 → 全层构件识别 → 批准结构 → 图纸审查与构件建模 → 对账复核 · F4 查看各步进度",
+    ));
     for notice in [
         domain.notice.as_deref(),
         domain.fact_sync_notice.as_deref(),
@@ -155,7 +118,7 @@ fn business_lines(
         .is_some_and(|scope| scope.assembly_binding.is_none())
     {
         lines.push(Line::from(
-            "构件发现尚未扫描；结构完成后继续识别家具、洁具等构件",
+            "构件发现尚未扫描；读取楼层来源并逐组识别家具、洁具等构件",
         ));
     }
     if let Some(project) = &domain.project {
@@ -464,7 +427,7 @@ pub(super) fn max_scroll(
     context: &ViewContext<'_>,
     area: Rect,
 ) -> u16 {
-    let business = sections(area, context.reply.is_some())[1];
+    let business = sections(area, context.reply)[1];
     business_lines(
         snapshot.modeling().expect("registered modeling projection"),
         context,
@@ -483,7 +446,7 @@ pub(super) fn draw(
 ) {
     let domain = snapshot.modeling().expect("registered modeling projection");
     let reply = context.reply;
-    let chunks = sections(area, reply.is_some());
+    let chunks = sections(area, reply);
     let reply_height = chunks[2].height;
     frame.render_widget(
         Paragraph::new(format!(
@@ -567,7 +530,18 @@ SHA256 {}",
         .wrap(Wrap { trim: false }),
         chunks[3],
     );
-    frame.render_widget(Paragraph::new("Enter 发送反馈 · Ctrl+Y 批准已展示版本 · Ctrl+C 中断 · F6/Esc 返回会话 · PgUp/PgDn 滚动"), chunks[4]);
+    let approval_hint = if let Some(proposal) = domain.proposal.as_ref().filter(|p| p.ready) {
+        if !has_verified_candidate_preview(domain, proposal) {
+            "等待 Blender 候选预览"
+        } else if context.phase.can_submit() {
+            "Ctrl+Y 批准已展示版本"
+        } else {
+            "等待本轮结束后批准"
+        }
+    } else {
+        "等待本轮结束后批准"
+    };
+    frame.render_widget(Paragraph::new(format!("Enter 发送反馈 · {approval_hint} · Ctrl+C 中断 · F4 工作流 · F6/Esc 返回会话 · PgUp/PgDn 滚动")), chunks[4]);
 }
 
 pub(super) struct ModelingView;
@@ -605,6 +579,7 @@ impl ExtensionView for ModelingView {
             .proposal
             .as_ref()
             .filter(|proposal| proposal.ready)
+            .filter(|proposal| has_verified_candidate_preview(domain, proposal))
             .map(|proposal| ExtensionConfirmation::Modeling(proposal.binding.clone()))
     }
 }
@@ -617,6 +592,17 @@ mod tests {
     };
     use super::*;
     use crate::state::CoreSnapshot;
+    #[test]
+    fn short_agent_reply_leaves_room_for_project_choices() {
+        let area = Rect::new(0, 0, 120, 36);
+        let without = sections(area, None);
+        let short = sections(area, Some("请选择重复图纸"));
+        assert_eq!(short[2].height, 3);
+        assert_eq!(without[1].height - short[1].height, 3);
+        let long = sections(area, Some(&"多行回复\n".repeat(40)));
+        assert_eq!(long[2].height, 10);
+        assert!(short[1].height > long[1].height);
+    }
     fn draw(
         frame: &mut ratatui::Frame<'_>,
         area: Rect,
@@ -666,30 +652,39 @@ mod tests {
     }
 
     #[test]
-    fn modeling_workflow_keeps_pending_sources_after_structure_application() {
-        let domain = DomainSnapshot {
-            enabled: true,
-            proposal: Some(proposal(1)),
-            operation: Some(crate::domain::OperationFact {
-                operation_id: "structure".into(),
-                state: "applied".into(),
-                recovery: "candidate_present".into(),
-                current_sha256: "candidate".into(),
-            }),
-            ledger: Some(crate::domain::SourceLedgerFact {
-                scan_id: "scan".into(),
-                scene_sha256: "candidate".into(),
-                rows: vec![],
-                counts: [("pending_confirmation".into(), 323)].into(),
-            }),
+    fn classified_components_are_visible_separately_from_unresolved_symbols_and_builds() {
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
+                enabled: true,
+                groups: Some(crate::domain::SourceGroupsFact {
+                    scan_id: "scan".into(),
+                    scene_sha256: "scene".into(),
+                    total_objects: 10,
+                    total_groups: 2,
+                    assessed_groups: 1,
+                    category_counts: [("候诊座椅".into(), 8), ("unresolved".into(), 2)].into(),
+                    counts: [
+                        ("pending_addition".into(), 8),
+                        ("pending_confirmation".into(), 2),
+                    ]
+                    .into(),
+                    rows: vec![],
+                }),
+                ..Default::default()
+            })],
             ..Default::default()
         };
-        let lines = modeling_workflow_lines(&domain).join("\n");
-        assert!(lines.contains("待处理 323"), "{lines}");
-        assert!(lines.contains("已有应用回执"), "{lines}");
-        assert!(!lines.contains("待批准"), "{lines}");
-        assert!(lines.contains("人工验收未执行"), "{lines}");
-        assert!(!lines.contains("整层完成"), "{lines}");
+        let local = LocalState::default();
+        let context = ViewContext::new(&snapshot, &local.extension, "", None);
+        let text = business_lines(snapshot.extensions[0].modeling().unwrap(), &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("已评估 1/2 组"), "{text}");
+        assert!(text.contains("候诊座椅 8"), "{text}");
+        assert!(text.contains("未定类别 2"), "{text}");
+        assert!(text.contains("已建 0"), "{text}");
     }
 
     fn message(thread: &str, turn: &str, text: &str) -> crate::state::ConversationItem {
@@ -1364,6 +1359,7 @@ mod tests {
                     total_objects: 1000,
                     total_groups: 200,
                     assessed_groups: 200,
+                    category_counts: Default::default(),
                     rows: (0..200).map(|i| format!("GROUP_ROW_{i}")).collect(),
                     counts: Default::default(),
                 }),

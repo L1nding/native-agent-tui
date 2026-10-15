@@ -33,6 +33,8 @@ A session is ready once dsh confirms it; nothing is executed at startup. Command
 
 ## 建模
 
+Windows 可运行 `./scripts/start-modeling.ps1` 打开医院项目（默认使用 `target/workflow-final/release/native-agent-tui.exe`）。脚本固定只读通用工具权限并检查项目路径，支持 `-ModelerRepo`、`-Project`、`-Model`、`-Binary`。F4 查看节点图，↑↓ 选择节点看详情，Tab 单独查看 Agent 调度；F6 查看具体建模方案。
+
 建模使用普通 dsh 会话、模型和权限配置。Agent 通过领域工具选择楼层或楼栋、准备方案、应用及构建；F6 展示 Core 校验后的业务事实，`Ctrl+Y` / `Ctrl+N` 批准或拒绝当前具体版本。
 
 ```text

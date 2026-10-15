@@ -53,7 +53,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.notice.as_deref(),
     );
     extension_context.activity_marker = local.activity.marker();
-    if super::extensions::REGISTRY.draw(frame, snapshot, &extension_context) {
+    if !local.workflow.visible
+        && super::extensions::REGISTRY.draw(frame, snapshot, &extension_context)
+    {
         return;
     }
     if area.width < 24 || area.height < 8 {
@@ -471,15 +473,21 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         frame.render_widget(Paragraph::new(todo_lines), todo_area);
     }
     if local.workflow.visible {
-        workflow_view::draw_workflow(
-            frame,
-            chunks[1],
-            snapshot,
-            local.workflow.selected_id,
-            local.workflow.link_cursor,
-            local.workflow.scroll,
-            local.workflow.manual_scroll,
-        );
+        if let Some(domain) =
+            super::domain_workflow::domain(snapshot).filter(|_| !local.workflow.show_tasks)
+        {
+            super::domain_workflow::draw(frame, chunks[1], domain, local.workflow.modeling_node);
+        } else {
+            workflow_view::draw_workflow(
+                frame,
+                chunks[1],
+                snapshot,
+                local.workflow.selected_id,
+                local.workflow.link_cursor,
+                local.workflow.scroll,
+                local.workflow.manual_scroll,
+            );
+        }
     }
     if local.evidence {
         draw_evidence(
@@ -664,7 +672,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             chunks[3].y + 1 + input.cursor.1.saturating_sub(input_start) as u16,
         ));
     }
-    let hints = if local.workflow.visible {
+    let hints = if local.workflow.visible
+        && !local.workflow.show_tasks
+        && super::domain_workflow::domain(snapshot).is_some()
+    {
+        "↑↓ 选择节点 · Tab 调度任务 · Enter 具体方案 · Esc 返回".into()
+    } else if local.workflow.visible {
         tr(
             "Up/Down select  F5 workflow  F6 pause  F7 cancel  F8 retry  +/- priority  F9 stop",
             "Up/Down 选择  F5 工作流  F6 暂停  F7 取消  F8 重试  +/- 优先级  F9 停止",
@@ -1569,6 +1582,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn workflow_panel_is_visible_over_the_modeling_extension() {
+        let snapshot = CoreSnapshot {
+            extensions: vec![crate::extensions::ExtensionSnapshot::Modeling(
+                crate::domain::DomainSnapshot {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            extension: super::super::extensions::ExtensionPanel::new(Some(
+                crate::extensions::ExtensionId::Modeling,
+            )),
+            ..Default::default()
+        };
+        local.workflow.visible = true;
+        let screen = rows(&snapshot, &local, 120, 40).join("\n");
+        assert!(
+            screen.contains("Workflow") || screen.contains("工作流 · F4"),
+            "{screen}"
+        );
+        for label in ["建模工作流", "解释与识别构件", "修订/补资料", "↺04"] {
+            assert!(screen.contains(label), "{screen}");
+        }
+        assert!(!screen.contains("方案与执行事实"), "{screen}");
     }
 
     #[test]

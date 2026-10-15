@@ -176,6 +176,14 @@ impl Registry<'_> {
         view.draw(frame, area, projection, context);
         *context.panel.displayed.borrow_mut() = view
             .confirmation(projection)
+            .filter(|_| {
+                snapshot.phase.can_submit()
+                    && !snapshot
+                        .scheduler
+                        .tasks
+                        .iter()
+                        .any(|task| task.state.active())
+            })
             .filter(|confirmation| confirmation.id() == id);
         true
     }
@@ -250,7 +258,9 @@ pub(super) enum ExtensionAction {
 mod tests {
     use super::super::LocalState;
     use super::*;
-    use crate::domain::{DomainSnapshot, ProposalBinding, ProposalFact};
+    use crate::domain::{
+        ArtifactBinding, ArtifactFact, ArtifactState, DomainSnapshot, ProposalBinding, ProposalFact,
+    };
     use ratatui::{backend::TestBackend, Terminal};
 
     fn snapshot() -> CoreSnapshot {
@@ -275,10 +285,63 @@ mod tests {
                     diagnostics: Vec::new(),
                     ready: true,
                 }),
+                artifacts: vec![ArtifactFact {
+                    binding: ArtifactBinding {
+                        build_id: "preview".into(),
+                        proposal_id: "proposal".into(),
+                        revision: 7,
+                        prepare_token: "PRIVATE_TOKEN".into(),
+                        candidate: true,
+                        authority_sha256: "base".into(),
+                        input_sha256: "candidate".into(),
+                        output: "preview.blend".into(),
+                    },
+                    state: ArtifactState::Built,
+                    current: Some(false),
+                    valid: Some(true),
+                }],
                 ..Default::default()
             })],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn workflow_overlay_owns_escape_without_hiding_the_modeling_page() {
+        let snapshot = snapshot();
+        let mut local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            ..Default::default()
+        };
+        local.workflow.visible = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(!local.workflow.visible);
+        assert_eq!(local.extension.visible, Some(ExtensionId::Modeling));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn running_model_turn_cannot_present_an_actionable_modeling_approval() {
+        let mut snapshot = snapshot();
+        snapshot.phase = SessionPhase::Running;
+        let local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+            .unwrap();
+        assert!(
+            local.extension.displayed.borrow().is_none(),
+            "running turn offered approval that Core will reject"
+        );
     }
 
     #[test]
@@ -307,6 +370,25 @@ mod tests {
         local.extension.toggle(&snapshot);
         assert_eq!(local.extension.visible, None);
         assert!(local.extension.displayed.borrow().is_none());
+    }
+
+    #[test]
+    fn modeling_confirmation_requires_a_verified_candidate_preview() {
+        let mut snapshot = snapshot();
+        let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+        domain.artifacts.clear();
+        let local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+            .unwrap();
+        assert!(
+            local.extension.displayed.borrow().is_none(),
+            "approval must wait for a verified Blender candidate preview"
+        );
     }
 
     #[test]

@@ -131,6 +131,21 @@ def main():
                        "--dsh", str(launcher), "--domain-project", str(project.relative_to(modeler))], repo)
     try:
         console.wait(lambda screen: "Ready" in screen, "ready")
+        console.write("\x1bOS")  # F4: graph and scheduler have separate surfaces.
+        console.wait(lambda screen: "建模工作流" in screen and "分支与循环" in screen,
+                     "initial modeling node graph is visible without a model request")
+        graph = console.stable()
+        assert "修订/补资料" in graph and "对账原操作" in graph
+        assert "Root slots" not in graph and "Agent 调度明细" not in graph
+        (evidence / "workflow-graph.txt").write_text(graph, encoding="utf-8")
+        console.write("\t")
+        console.wait(lambda screen: "No workflow tasks." in screen, "separate scheduler tab")
+        (evidence / "scheduler-tab.txt").write_text(console.stable(), encoding="utf-8")
+        console.write("\t\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B")
+        console.wait(lambda screen: "补充资料、解释与约束" in screen, "revision node detail and return route")
+        (evidence / "revision-node.txt").write_text(console.stable(), encoding="utf-8")
+        console.write("\r")  # Enter opens the proposal view; it must not submit a task.
+        console.wait(lambda screen: "方案与执行事实" in screen, "proposal view after graph navigation")
         console.write("建模整栋\r")
         console.wait(lambda screen: "Completed" in screen, "first turn completed")
         if "建模 · " not in console.read():

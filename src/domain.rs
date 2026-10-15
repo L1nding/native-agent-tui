@@ -12,6 +12,8 @@ use crate::config::{Config, McpServerConfig};
 use crate::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 
 mod component_edit;
+mod workflow;
+pub use workflow::{WorkflowEvidence, WorkflowEvidenceState, WorkflowNode};
 mod project;
 pub(crate) mod receipt;
 pub use project::{
@@ -204,6 +206,7 @@ pub struct SourceGroupsFact {
     pub total_objects: usize,
     pub total_groups: usize,
     pub assessed_groups: usize,
+    pub category_counts: BTreeMap<String, usize>,
     pub rows: Vec<String>,
     pub counts: BTreeMap<String, usize>,
 }
@@ -1207,6 +1210,7 @@ fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
     }
     let mut sum = 0usize;
     let mut assessed = 0usize;
+    let mut category_counts = BTreeMap::<String, usize>::new();
     let mut ids = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
     for group in groups {
@@ -1224,6 +1228,22 @@ fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
         };
         let group_counts: BTreeMap<String, usize> =
             serde_json::from_value(group["state_counts"].clone()).ok()?;
+        let categories: BTreeMap<String, usize> =
+            serde_json::from_value(group["category_counts"].clone()).ok()?;
+        if categories
+            .values()
+            .try_fold(0usize, |n, count| n.checked_add(*count))?
+            != count
+            || categories
+                .keys()
+                .any(|category| category.is_empty() || category.chars().count() > 80)
+        {
+            return None;
+        }
+        for (category, count) in categories {
+            let total = category_counts.entry(category).or_default();
+            *total = total.checked_add(count)?;
+        }
         if group_counts
             .values()
             .try_fold(0usize, |n, c| n.checked_add(*c))?
@@ -1265,6 +1285,7 @@ fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
         total_objects,
         total_groups,
         assessed_groups,
+        category_counts,
         rows,
         counts,
     })
