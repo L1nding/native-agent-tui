@@ -33,7 +33,7 @@ def run_hospital_readiness_check(report, tui, send, finished, fact, context_path
         tui.wait("current floor readiness ready", lambda s: "建模" in s and "Initializing" not in s, 180)
         tui.type(
             "只读核对医院八层当前来源状态。先describe_capabilities，读取capability_version和"
-            "reusable_category_profiles，再scan_source_groups。只报告已建、可继续准备和真实关系／"
+            "reusable_category_profiles及source_coincidence_review，再scan_source_groups。读取coincident_sources中不同INSERT的对照依据；疑似重复保持不同ID，不确认同一物理对象、不自动合并／跳过。只报告已建、可继续准备、疑似重复和真实关系／"
             "定义缺口，不准备、不批准、不应用、不构建，不修改解释或来源处置。"
             "已实际应用的落地类别应按复用数据定义解释，pending_addition不表示碰撞已解决；"
             "缺宿主不能通过profile省略，人工语义／视觉未复核保持未确认。"
@@ -44,7 +44,7 @@ def run_hospital_readiness_check(report, tui, send, finished, fact, context_path
             tui.keys(F6, 0.5)
         fact("current floor profile readiness counts visible",
              lambda s: all(value in business(s) for value in
-                           ["built 265", "pending_addition 29", "capability_missing 193"]), 1800)
+                           ["built 265", "pending_addition 22", "suspected_duplicate 7", "capability_missing 193"]), 1800)
         finished()
         expect(scene.read_bytes() == baseline, "readiness check wrote scene")
         expect(records("authorization-*.json") == grants and records("operation-*.json") == operations,
@@ -63,8 +63,11 @@ def run_hospital_readiness_check(report, tui, send, finished, fact, context_path
         groups = max((f for f in facts if f["kind"] == "source_groups"
                       and f["scene_sha256"] == lineage["scene_sha256"]
                       and f["capability_version"] == "floor-components/6"), key=lambda f:f["fact_sequence"])
-        expect(groups["state_counts"] == {"built":265,"pending_addition":29,"capability_missing":193},
+        expect(groups["state_counts"] == {"built":265,"pending_addition":22,"suspected_duplicate":7,"capability_missing":193},
                "actual whole-floor readiness counts differ")
+        expect(groups.get("source_coincidence_contract_version") == "source-coincidence/1", "missing source coincidence policy")
+        duplicates = [m for g in groups["groups"] for m in g["instances"] if m["state"] == "suspected_duplicate"]
+        expect(len(duplicates) == 7 and all(m.get("coincident_sources", {}).get("peers") for m in duplicates), "duplicate review omitted counterpart identities")
         (evidence / "readiness-core-fact.json").write_bytes(raw)
         (evidence / "readiness-core-screen.txt").write_text(screen, encoding="utf-8")
         result = {"groups":groups,"core_fact":{"kind":kind,"sequence":int(sequence),

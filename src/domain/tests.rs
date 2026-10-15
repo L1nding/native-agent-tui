@@ -2071,3 +2071,163 @@ fn edit_projection_validates_all_parts_after_the_hundredth_row() {
     value["proposal"]["draft"]["operations"][150]["target_id"] = json!("foreign");
     assert!(proposal_fact(&value).is_none());
 }
+
+#[test]
+fn source_policy_change_clears_old_views_and_rejects_late_legacy_facts() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    let proposal = facts.snapshot.proposal.clone();
+    deliver_fact(&mut facts, "old-groups", grouped_source_view(4));
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"capabilities","fact_sequence":5,"capabilities":{"source_coincidence_review":{"contract_version":"source-coincidence/1"}}});
+    facts.apply_verified_fact(&cap);
+    assert!(facts.snapshot.groups.is_none());
+    assert!(facts.snapshot.ledger.is_none());
+    assert_eq!(facts.snapshot.proposal, proposal);
+    assert_eq!(
+        facts.apply_verified_fact(&grouped_source_view(100)),
+        FactProjection::Superseded
+    );
+    let mut fresh = grouped_source_view(6);
+    fresh["source_coincidence_contract_version"] = json!("source-coincidence/1");
+    assert_eq!(facts.apply_verified_fact(&fresh), FactProjection::Applied);
+    assert!(facts.snapshot.groups.is_some());
+}
+
+#[test]
+fn source_policy_matching_cached_view_survives_newer_capabilities() {
+    let mut facts = sequenced_facts();
+    let mut groups = grouped_source_view(3);
+    groups["source_coincidence_contract_version"] = json!("source-coincidence/1");
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"capabilities","fact_sequence":5,"capabilities":{"source_coincidence_review":{"contract_version":"source-coincidence/1"}}});
+    facts.apply_verified_fact(&cap);
+    assert!(facts.snapshot.groups.is_some());
+    let mut ledger = instance_source_view(6);
+    ledger["source_coincidence_contract_version"] = json!("source-coincidence/1");
+    assert_eq!(facts.apply_verified_fact(&ledger), FactProjection::Applied);
+    assert!(facts.snapshot.groups.is_none());
+    assert!(facts.snapshot.ledger.is_some());
+}
+
+#[test]
+fn malformed_source_policy_cannot_clear_or_poison_a_verified_view() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "groups", grouped_source_view(4));
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"capabilities","fact_sequence":100,"capabilities":{"source_coincidence_review":{"contract_version":false}}});
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Invalid);
+    assert!(facts.snapshot.groups.is_some());
+    assert_eq!(
+        facts.apply_verified_fact(&instance_source_view(5)),
+        FactProjection::Applied
+    );
+}
+
+#[test]
+fn superseded_source_policy_receipt_cannot_become_the_displayed_fact() {
+    let mut facts = sequenced_facts();
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"capabilities","fact_sequence":5,"capabilities":{"source_coincidence_review":{"contract_version":"source-coincidence/1"}}});
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Applied);
+    facts.synchronization_finished(&private_receipt(&cap));
+    let older = grouped_source_view(100);
+    assert_eq!(
+        facts.apply_verified_fact(&older),
+        FactProjection::Superseded
+    );
+    facts.synchronization_finished(&private_receipt(&older));
+    assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().sequence, 5);
+    assert!(facts.snapshot.groups.is_none());
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+}
+
+#[test]
+fn newer_page_of_the_same_source_state_keeps_both_shapes_and_header() {
+    let mut facts = sequenced_facts();
+    let groups = sealed_source_view(grouped_source_view(3), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let page = sealed_source_view(instance_source_view(9), 'a');
+    assert_eq!(facts.apply_verified_fact(&page), FactProjection::Applied);
+    facts.synchronization_finished(&private_receipt(&page));
+    // Same sealed view: both shapes stay; replaying a present shape is stale.
+    assert!(facts.snapshot.groups.is_some());
+    assert!(facts.snapshot.ledger.is_some());
+    assert_eq!(
+        facts.apply_verified_fact(&groups),
+        FactProjection::Superseded
+    );
+    facts.synchronization_finished(&private_receipt(&groups));
+    assert_eq!(
+        facts.snapshot.verified_fact.as_ref().unwrap().kind,
+        "source_ledger"
+    );
+    assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().sequence, 9);
+    // The presentation choice must not lower the watermark for different source state.
+    let older_other_state = sealed_source_view(instance_source_view(8), 'b');
+    assert_eq!(
+        facts.apply_verified_fact(&older_other_state),
+        FactProjection::Superseded
+    );
+    assert!(facts.snapshot.groups.is_some());
+}
+
+#[test]
+fn source_view_stamp_declaration_clears_legacy_views_and_rejects_late_unstamped_data() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "old-groups", grouped_source_view(4));
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx", "kind":"capabilities",
+        "fact_sequence":5,"capabilities":{"source_view":{"contract_version":"source-view/1"}}});
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Applied);
+    assert!(facts.snapshot.groups.is_none());
+    assert_eq!(
+        facts.apply_verified_fact(&grouped_source_view(100)),
+        FactProjection::Superseded
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&sealed_source_view(grouped_source_view(6), 'a')),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.groups.is_some());
+}
+
+#[test]
+fn malformed_source_view_stamp_cannot_poison_state_or_lower_its_watermark() {
+    let mut facts = sequenced_facts();
+    let groups = sealed_source_view(grouped_source_view(4), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let mut bad = sealed_source_view(instance_source_view(100), 'a');
+    bad["source_view_sha256"] = json!("invalid");
+    assert_eq!(facts.apply_verified_fact(&bad), FactProjection::Invalid);
+    assert!(facts.snapshot.groups.is_some());
+    assert_eq!(
+        facts.apply_verified_fact(&sealed_source_view(instance_source_view(5), 'b')),
+        FactProjection::Applied
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&groups),
+        FactProjection::Superseded
+    );
+}
+
+#[test]
+fn source_view_capability_preserves_stamped_cache_and_stale_receipt_cannot_replace_header() {
+    let mut facts = sequenced_facts();
+    let groups = sealed_source_view(grouped_source_view(4), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let cap = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx", "kind":"capabilities",
+        "fact_sequence":5,"capabilities":{"source_view":{"contract_version":"source-view/1"}}});
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Applied);
+    assert!(facts.snapshot.groups.is_some());
+    let page = sealed_source_view(instance_source_view(6), 'b');
+    assert_eq!(facts.apply_verified_fact(&page), FactProjection::Applied);
+    facts.synchronization_finished(&private_receipt(&page));
+    assert_eq!(
+        facts.apply_verified_fact(&groups),
+        FactProjection::Superseded
+    );
+    facts.synchronization_finished(&private_receipt(&groups));
+    assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().sequence, 6);
+    assert!(facts.snapshot.ledger.is_some());
+}

@@ -250,3 +250,21 @@ CAD初始化新增可选`slab_opening_source_ids`，仅从当前裁切内明确�
 
 
 真实TUI验证：`target/project-live-708a4d47`为新的CAD结构／孔洞基线，`target/project-connection-live-01f0fb5b`对同一原连接提案独立批准并应用16级楼梯，新派生楼栋三阶段各34个精确mesh，连接passed／来源complete／技术complete，整体attention及human_review=not_run。新会话只读恢复`target/project-connection-recovery-4009bb8d`通过，原提案／授权／操作／job及产物哈希不变。之前4c77ef5a的界面夹具同屏条件失败保留，未生成批准，续验没有重做prepare。
+新版profile领域接入复验：`target/dsh-e2e-b1da3fe1`实际2项PASS，hi/gpt-6.1-sol读取当前医院上下文；Core source_groups seq253完整497462字节，显示487来源的265／29／193。场景、CAD、解释／处置、授权／操作保持，模型器独立复验valid=true，`outputs/batch-domain-readiness-independent-20261014-final.log`。读取器进一步核对私有分组字节／上下文／序号、业务页scan_id／scene_sha；同事实直接对应页眉，合法缓存允许更新的同运行／上下文／基线capabilities，实际更旧capabilities seq252被替换为页眉的反例拒绝。七项专项及模型器最终508项全量通过；该审计限制只作用本来源核查，不冒充医院新增构建或人工批准。
+
+## 同位来源复核策略与当前事实（2026-10-14）
+
+模型器声明 source-coincidence/1：保留不同 INSERT 身份，依据同来源、同几何及变换后的 CAD 边界标记疑似同位来源。当前医院事实为 265 已建、22 待新增、7 疑似重复、193 缺能力。七对坐标近似一致仅作为复核依据，不自动合并、跳过或生成授权；原 29 项 blocked 提案保持。
+
+Core 记录能力事实中的来源策略与当前来源视图策略。新策略清除不兼容的旧来源快照和显示绑定；更高序号的旧策略来源事实仍视为 Superseded，不得覆盖当前视图或页眉。匹配策略的缓存可保留，错误策略元数据不能污染当前状态。提案、授权、操作及产物绑定保持独立。
+
+真实验收 target/dsh-e2e-019a2245 使用 hi/gpt-6.1-sol 和 zf-tui-modeling-batch，2 PASS、0 FAIL。模型器独立核验从 CAD 和实际已建来源映射推导七对身份，核对 Core 私有完整事实及显示绑定，valid=true，日志 outputs/hospital-source-coincidence-independent-20261014.log。该验收是只读来源分类，不代表新增构建或人工审批。
+
+完整验证 outputs/source-coincidence-tui-full-check-20261014-03.log：629 项 Rust 通过、4 项可选 live 跳过，fmt/check/Clippy/doctest/release/夹具通过；模型器 outputs/source-coincidence-workspace-check-20261014-04.log：547 项通过。此前编译器崩溃、并行构建内存不足及受资源压力影响的模型器检查失败保留原日志；串行构建和最终完整检查通过。
+## 同状态来源视图切换（2026-10-14）
+
+source-view/1给来源分页和全层分组附上同一完整来源状态SHA。Core允许相同SHA的缓存视图重新显示，同时保留最大来源序号水位；不同SHA的旧事实仍Superseded。缺合同的历史数据在新能力声明下不能倒灌，损坏字段不能清空或污染视图。页眉绑定实际显示的已验证来源视图，提案与授权绑定保持独立。
+
+该修复来源于真实代理用例：scan_source_groups缓存的序号低于较新的单页scan_source_instances，同一场景与来源状态也被拒绝切回。专项先红后绿，domain与UI相关48项通过。完整验证outputs/proxy-source-view-tui-full-check-20261014-01.log：633 Rust通过、4项optional live跳过，fmt/check/Clippy/doctest（0）/release/全部夹具通过。
+
+真实target/dsh-e2e-061543fd使用hi/gpt-6.1-sol：一次请求对29个实际来源逐项回答，记录7项测试跳过和16组assumed分类，4 PASS。模型器独立复验valid=true，完整场景应用与构建仍在后续批次，不把代理意见阶段称为完整建模通过。新增hospital-floor-proxy验收夹具尚在实施中，独立于本次缓存切换修复。
