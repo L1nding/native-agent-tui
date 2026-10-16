@@ -39,6 +39,8 @@ pub struct Config {
     pub domain_project: Option<PathBuf>,
     pub domain_setup: Option<crate::domain::DomainSetup>,
     pub domain_preview: bool,
+    /// `--no-domain-preview`: keep preview off even for a project chosen later.
+    pub no_domain_preview: bool,
     pub model: Option<String>,
     /// `model` came from saved preferences, not `--model`: a backend that no
     /// longer offers it keeps its own default instead of failing startup.
@@ -71,6 +73,7 @@ impl Default for Config {
             domain_project: None,
             domain_setup: None,
             domain_preview: false,
+            no_domain_preview: false,
             model: None,
             model_is_preference: false,
             strict_outcome: false,
@@ -169,6 +172,8 @@ where
     let mut mode = None;
     let mut goal = None;
     let mut headless = false;
+    // Blender preview follows a floor context unless the user says otherwise.
+    let mut preview = None;
     let mut index = 0;
     let mut attention_file = None;
     let mut attention_overrides = Vec::new();
@@ -204,7 +209,8 @@ where
             "--domain-project" => {
                 config.domain_project = Some(PathBuf::from(value(&args, &mut index, option)?))
             }
-            "--domain-preview" => config.domain_preview = true,
+            "--domain-preview" => preview = Some(true),
+            "--no-domain-preview" => preview = Some(false),
             "--domain-context" => {
                 config.domain_context = Some(PathBuf::from(value(&args, &mut index, option)?))
             }
@@ -298,6 +304,9 @@ where
     if config.domain_context.is_some() && config.domain_project.is_some() {
         return Err(CliError::ConflictingModes);
     }
+    config.no_domain_preview = preview == Some(false);
+    config.domain_preview =
+        preview.unwrap_or(config.domain_context.is_some() || config.domain_project.is_some());
     if (config.domain_context.is_some() || config.domain_project.is_some())
         && !matches!(mode, None | Some("--tui" | "--run"))
     {
@@ -455,6 +464,24 @@ mod tests {
         ] {
             assert!(parse_args(args).is_err());
         }
+    }
+
+    #[test]
+    fn blender_preview_follows_a_modeling_session_unless_turned_off() {
+        let preview = |args: &[&str]| match parse_args(args.iter().copied()).unwrap() {
+            CliCommand::Tui { config, .. } => config.domain_preview,
+            _ => panic!("expected ordinary TUI"),
+        };
+        assert!(preview(&["--domain-context", "ctx.json"]));
+        assert!(!preview(&[
+            "--domain-context",
+            "ctx.json",
+            "--no-domain-preview"
+        ]));
+        assert!(preview(&["--domain-project", "projects/hospital-site"]));
+        assert!(!preview(&["--domain-project", "p", "--no-domain-preview"]));
+        assert!(!preview(&[]));
+        assert!(preview(&["--domain-project", "p", "--domain-preview"]));
     }
 
     #[test]

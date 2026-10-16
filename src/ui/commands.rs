@@ -227,6 +227,8 @@ pub(super) enum Slash<'a> {
     Tools,
     Settings,
     New,
+    /// `/project`: switch to or create a modeling project.
+    Project,
     /// `/steer TEXT`: guide the running turn at its next step.
     Steer(&'a str),
     Quit,
@@ -260,7 +262,9 @@ pub(super) struct SlashHint {
     pub skill: bool,
 }
 
-const BUILT_IN: [&str; 6] = ["model", "setting", "tools", "new", "steer", "quit"];
+const BUILT_IN: [&str; 7] = [
+    "model", "setting", "tools", "new", "project", "steer", "quit",
+];
 
 fn built_in(name: &str) -> bool {
     name == "settings"
@@ -377,6 +381,10 @@ pub(super) fn slash_hints(text: &str, skills: &[SkillEntry]) -> Vec<SlashHint> {
                 ),
             ),
             command("new", tr("Start a new conversation", "新建会话")),
+            command(
+                "project",
+                tr("Switch or create a modeling project", "切换或新建建模项目"),
+            ),
             command(
                 "steer",
                 tr(
@@ -607,6 +615,7 @@ pub(super) fn parse_slash<'a>(text: &'a str, skills: &'a [SkillEntry]) -> Option
         "tools" => Slash::Tools,
         "setting" | "settings" => Slash::Settings,
         "new" => Slash::New,
+        "project" => Slash::Project,
         "quit" => Slash::Quit,
         name => SLASH_ACTIONS
             .iter()
@@ -1095,7 +1104,7 @@ mod tests {
             assert!(names.contains(&format!("/{name}")), "{names}");
         }
         assert!(
-            names.ends_with("/model /setting /tools /new /steer /quit"),
+            names.ends_with("/model /setting /tools /new /project /steer /quit"),
             "{names}"
         );
         assert_eq!(parse_slash("/setting", &[]), Some(Slash::Settings));

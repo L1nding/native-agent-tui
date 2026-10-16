@@ -1,5 +1,6 @@
 //! Interactive and read-only terminal runtime loops.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEventKind};
@@ -11,6 +12,7 @@ use crate::scheduler::RootTaskSpec;
 use super::history::HistoryPanel;
 use super::input::InputEvent;
 use super::lang;
+use super::projects::{ProjectChoice, ProjectsEvent, ProjectsPanel};
 use super::search::SearchHandle;
 use super::terminal::TerminalGuard;
 use super::{
@@ -129,11 +131,100 @@ fn urgent_snapshot_change(
             })
 }
 
+/// Where projects live and what this session was started with.
+#[derive(Clone, Debug)]
+pub struct ProjectContext {
+    pub cwd: PathBuf,
+    /// The `--domain-context` file of the launch, kept selectable after a switch.
+    pub launch: Option<PathBuf>,
+    pub current: ProjectChoice,
+}
+
+/// How the interactive session ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunExit {
+    Quit,
+    /// Restart the backend for this project; the session was shut down cleanly.
+    Switch(ProjectChoice),
+}
+
+/// Switching ends the backend session, so it waits for running work and open questions.
+fn switch_blocked(snapshot: &crate::state::CoreSnapshot) -> Option<&'static str> {
+    use crate::state::SessionPhase;
+    let authorizing = snapshot
+        .extensions
+        .iter()
+        .filter_map(|extension| extension.modeling())
+        .any(|domain| domain.authorizing);
+    (matches!(
+        snapshot.phase,
+        SessionPhase::StartingTurn | SessionPhase::Running | SessionPhase::GatePending
+    ) || authorizing
+        || !snapshot.requests.is_empty())
+    .then_some("Agent 正在执行、审批或等待回答；请等本轮结束或按 Ctrl+C 中断后再切换")
+}
+
+async fn create_project(
+    cwd: &std::path::Path,
+    request: crate::domain::NewProject,
+) -> Result<String, String> {
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::domain::create_project(&cwd, &request))
+        .await
+        .unwrap_or_else(|error| Err(error.to_string()))
+}
+
+/// Startup page when no project was named: returns `None` when the user quits.
+pub async fn pick_project(context: ProjectContext) -> Result<Option<ProjectChoice>, UiError> {
+    let mut terminal = TerminalGuard::enter()?;
+    let mut panel = ProjectsPanel::default();
+    let projects = crate::domain::list_projects(&context.cwd);
+    panel.open(projects, context.launch.clone(), None, true);
+    let mut tick = tokio::time::interval(Duration::from_millis(25));
+    let mut dirty = true;
+    loop {
+        if dirty {
+            terminal.terminal.draw(|frame| {
+                let base = ratatui::widgets::Block::default().style(super::theme::current().base());
+                frame.render_widget(base, frame.area());
+                panel.draw(frame);
+            })?;
+            dirty = false;
+        }
+        tick.tick().await;
+        while let Some(event) = terminal.input.read_ready()? {
+            dirty = true;
+            match event {
+                InputEvent::Key(key) if key.kind != KeyEventKind::Release => match panel.key(key) {
+                    ProjectsEvent::Choose(choice) => return Ok(Some(choice)),
+                    ProjectsEvent::Quit | ProjectsEvent::Close => return Ok(None),
+                    ProjectsEvent::Create(request) => {
+                        panel.notice = Some("正在创建项目…".into());
+                        terminal.terminal.draw(|frame| panel.draw(frame))?;
+                        match create_project(&context.cwd, request).await {
+                            Ok(path) => {
+                                panel.refresh(crate::domain::list_projects(&context.cwd), &path);
+                                panel.notice = Some(format!("已创建 {path}；按 Enter 打开"));
+                            }
+                            Err(reason) => panel.notice = Some(reason),
+                        }
+                    }
+                    ProjectsEvent::Consumed => {}
+                },
+                InputEvent::Paste(text) => panel.paste(&text),
+                _ => {}
+            }
+        }
+    }
+}
+
 pub async fn run_tasks_with_history(
     mut client: ClientHandle,
     tasks: Vec<RootTaskSpec>,
     mut history: HistoryHandle,
-) -> Result<(), UiError> {
+    projects: ProjectContext,
+) -> Result<RunExit, UiError> {
+    let mut exit = RunExit::Quit;
     let mut history_panel = HistoryPanel::default();
     let mut sessions_panel = super::sessions::SessionsPanel::default();
     let mut history_open = true;
@@ -158,7 +249,7 @@ pub async fn run_tasks_with_history(
     }
     let result = async {
         let mut terminal = TerminalGuard::enter()?;
-        let mut local = LocalState { extension: super::extensions::ExtensionPanel::new(super::extensions::REGISTRY.first(&client.snapshots.borrow())), ..Default::default() };
+        let mut local = LocalState { extension: super::extensions::ExtensionPanel::new(None), ..Default::default() };
         if !tasks.is_empty() {
             client.commands.send(Command::QueueRootTasks { tasks }).await
                 .map_err(|_| UiError::Shutdown("client is closed".into()))?;
@@ -181,7 +272,10 @@ pub async fn run_tasks_with_history(
                     if local.palette.visible { draw(frame, &snapshot, &local); }
                     else if sessions_panel.visible { sessions_panel.draw(frame, &snapshot); }
                     else if history_panel.visible { history_panel.draw(frame, Some(&snapshot)); }
-                    else { draw(frame, &snapshot, &local); }
+                    else {
+                        draw(frame, &snapshot, &local);
+                        if local.projects.visible { local.projects.draw(frame); }
+                    }
                 })?;
                 last_drawn = Some(snapshot);
                 redraw.drawn(tokio::time::Instant::now());
@@ -230,6 +324,41 @@ pub async fn run_tasks_with_history(
                         match event {
                             InputEvent::Key(key) if key.kind != KeyEventKind::Release => {
                                 let snapshot = client.snapshots.borrow().clone();
+                                if local.projects.visible || sessions_panel.visible || history_panel.visible {
+                                    local.extension.clear_displayed();
+                                }
+                                if local.projects.visible {
+                                    match local.projects.key(key) {
+                                        ProjectsEvent::Choose(choice) if choice == projects.current => {
+                                            local.projects.visible = false;
+                                        }
+                                        ProjectsEvent::Choose(choice) => {
+                                            if let Some(reason) = switch_blocked(&snapshot) {
+                                                local.projects.notice = Some(reason.into());
+                                            } else {
+                                                exit = RunExit::Switch(choice);
+                                                return Ok(());
+                                            }
+                                        }
+                                        ProjectsEvent::Create(request) => {
+                                            local.projects.notice = Some("正在创建项目…".into());
+                                            terminal.terminal.draw(|frame| {
+                                                draw(frame, &snapshot, &local);
+                                                local.projects.draw(frame);
+                                            })?;
+                                            match create_project(&projects.cwd, request).await {
+                                                Ok(path) => {
+                                                    local.projects.refresh(crate::domain::list_projects(&projects.cwd), &path);
+                                                    local.projects.notice = Some(format!("已创建 {path}；按 Enter 切换到该项目"));
+                                                }
+                                                Err(reason) => local.projects.notice = Some(reason),
+                                            }
+                                        }
+                                        ProjectsEvent::Quit | ProjectsEvent::Close | ProjectsEvent::Consumed => {}
+                                    }
+                                    redraw.request();
+                                    continue;
+                                }
                                 if local.palette.visible {
                                     if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
                                 } else if sessions_panel.visible {
@@ -255,9 +384,22 @@ pub async fn run_tasks_with_history(
                                     sessions_panel.open();
                                     let _ = client.commands.try_send(Command::ListConversations);
                                 } else if handle_key(key, &snapshot, &mut local, &client.commands) { return Ok(()); }
+                                if local.projects.request_open {
+                                    local.projects.open(
+                                        crate::domain::list_projects(&projects.cwd),
+                                        projects.launch.clone(),
+                                        Some(projects.current.clone()),
+                                        false,
+                                    );
+                                }
                                 redraw.request();
                             }
                             InputEvent::Paste(text) => {
+                                if local.projects.visible {
+                                    local.projects.paste(&text);
+                                    redraw.request();
+                                    continue;
+                                }
                                 if local.palette.visible {
                                     local.palette.paste(&text);
                                     redraw.request();
@@ -285,7 +427,11 @@ pub async fn run_tasks_with_history(
                                     redraw.request();
                                 }
                             }
-                            InputEvent::Resize(_, _) => redraw.request(),
+                            InputEvent::Resize(width, height) => {
+                                local.extension.clear_displayed();
+                                local.viewport = ratatui::layout::Rect::new(0, 0, width, height);
+                                redraw.request();
+                            }
                             _ => {}
                         }
                     }
@@ -306,7 +452,7 @@ pub async fn run_tasks_with_history(
     if let Some(error) = report.journal_error {
         return Err(UiError::Shutdown(error.to_string()));
     }
-    result.and(history_result)
+    result.and(history_result).map(|()| exit)
 }
 
 /// Offline observation recovery. This runtime has no ClientHandle or execution sender.

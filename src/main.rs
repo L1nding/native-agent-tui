@@ -46,7 +46,8 @@ Options:
                    workspace-write | danger-full-access (default: dsh's own default)
   --domain-context FILE  Attach pure modeling tools and the F6 modeling view to this dsh session
   --domain-project RELATIVE_PATH  Discover floor/building targets in a modeler project via dsh
-  --domain-preview   Start the local Blender preview/feedback child for this domain session
+  --domain-preview   Start the local Blender preview child (default for modeling sessions)
+  --no-domain-preview  Do not start the Blender preview child
   --journal-dir PATH  Override the managed journal data directory
   --max-native-children N  Maximum direct native children (1-64; default: 8)
   --max-native-depth N     Maximum observed native depth (1-8; default: 2)
@@ -489,16 +490,81 @@ async fn execute() -> Result<(), (u8, String)> {
     Ok(())
 }
 
-async fn run_tui(config: Config, tasks: Vec<RootTaskSpec>) -> Result<(), (u8, String)> {
-    let config = native_agent_tui::domain::configure(config).map_err(|e| (2, e))?;
-    let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
-        .map_err(|error| (3, error.to_string()))?;
-    let client = ClientHandle::spawn(config)
-        .await
-        .map_err(|error| (3, error.to_string()))?;
-    ui::run_tasks_with_history(client, tasks, history)
-        .await
-        .map_err(|error| (3, error.to_string()))
+/// The launch configuration with one project choice applied.
+fn with_project(base: &Config, choice: &ui::ProjectChoice) -> Config {
+    let mut config = base.clone();
+    match choice {
+        ui::ProjectChoice::Project(path) => {
+            config.domain_project = Some(path.into());
+            config.domain_context = None;
+            config.domain_preview = !base.no_domain_preview;
+        }
+        ui::ProjectChoice::Context(path) => {
+            config.domain_context = Some(path.clone());
+            config.domain_project = None;
+            config.domain_preview = !base.no_domain_preview;
+        }
+        ui::ProjectChoice::Plain => {
+            config.domain_context = None;
+            config.domain_project = None;
+            config.domain_preview = false;
+        }
+    }
+    config
+}
+
+async fn run_tui(base: Config, mut tasks: Vec<RootTaskSpec>) -> Result<(), (u8, String)> {
+    let launch = base.domain_context.clone();
+    let mut current = match (&base.domain_project, &launch) {
+        (Some(path), _) => ui::ProjectChoice::Project(
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_owned(),
+        ),
+        (None, Some(path)) => ui::ProjectChoice::Context(path.clone()),
+        (None, None) => ui::ProjectChoice::Plain,
+    };
+    // In a modeler repository without a named project, ask which one to open.
+    if current == ui::ProjectChoice::Plain
+        && tasks.is_empty()
+        && !native_agent_tui::domain::list_projects(&base.cwd).is_empty()
+    {
+        let context = ui::ProjectContext {
+            cwd: base.cwd.clone(),
+            launch: None,
+            current: current.clone(),
+        };
+        match ui::pick_project(context)
+            .await
+            .map_err(|error| (3, error.to_string()))?
+        {
+            Some(choice) => current = choice,
+            None => return Ok(()),
+        }
+    }
+    loop {
+        let config = native_agent_tui::domain::configure(with_project(&base, &current))
+            .map_err(|e| (2, e))?;
+        let history = HistoryHandle::start(config.journal.clone(), config.cwd.clone())
+            .map_err(|error| (3, error.to_string()))?;
+        let client = ClientHandle::spawn(config)
+            .await
+            .map_err(|error| (3, error.to_string()))?;
+        let projects = ui::ProjectContext {
+            cwd: base.cwd.clone(),
+            launch: launch.clone(),
+            current: current.clone(),
+        };
+        // The previous client and history were fully shut down before a switch returns.
+        match ui::run_tasks_with_history(client, std::mem::take(&mut tasks), history, projects)
+            .await
+            .map_err(|error| (3, error.to_string()))?
+        {
+            ui::RunExit::Quit => return Ok(()),
+            ui::RunExit::Switch(next) => current = next,
+        }
+    }
 }
 
 async fn run_headless(

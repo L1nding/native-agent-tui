@@ -9,6 +9,8 @@ pub struct ProjectCatalogFact {
     pub source_sha256: String,
     pub total_floors: usize,
     pub floor_keys: Vec<String>,
+    /// Drawing title of each floor key, e.g. `f02` → `二层平面`.
+    pub floor_titles: std::collections::BTreeMap<String, String>,
     pub component_source_layers: Option<Vec<String>>,
     pub rows: Vec<String>,
 }
@@ -113,6 +115,15 @@ pub struct ProjectAssemblyBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectOpeningCompletionBinding {
+    pub parent_scope_id: String,
+    pub bootstrap_proposal_id: String,
+    pub base_sha256: String,
+    pub source_sha256: String,
+    pub opening_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentDiscovery {
     AllLayers,
     ConfiguredLayers,
@@ -122,6 +133,7 @@ pub enum ComponentDiscovery {
 pub struct ProjectScopeFact {
     pub activation_revision: Option<u64>,
     pub assembly_binding: Option<ProjectAssemblyBinding>,
+    pub opening_completion_binding: Option<ProjectOpeningCompletionBinding>,
     pub wall_layer_choice: Option<ProjectWallLayerChoice>,
     pub component_discovery: Option<ComponentDiscovery>,
     pub scope_id: String,
@@ -180,6 +192,50 @@ pub(super) fn scope_fact(value: &Value) -> Option<ProjectScopeFact> {
             })
         }
     };
+    let opening_completion_binding = match scope.get("opening_completion_binding") {
+        None => None,
+        Some(binding) => {
+            if binding["contract"] != "project-opening-completion/1"
+                || activation_revision.is_none()
+                || assembly_binding.is_some()
+                || wall_layer_choice.is_some()
+                || binding["source_sha256"] != scope["source_sha256"]
+                || binding["parent_scope_id"] == scope["scope_id"]
+            {
+                return None;
+            }
+            let bootstrap_proposal_id = label(binding, "bootstrap_proposal_id")?;
+            if bootstrap_proposal_id.len() != 32
+                || !bootstrap_proposal_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            let ids = binding["opening_ids"].as_array()?;
+            if ids.is_empty() || ids.len() > 100 {
+                return None;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let opening_ids = ids
+                .iter()
+                .map(|value| {
+                    let id = value.as_str()?;
+                    if id.is_empty() || id.len() > 500 || !seen.insert(id) {
+                        return None;
+                    }
+                    Some(id.to_owned())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(ProjectOpeningCompletionBinding {
+                parent_scope_id: sha(binding, "parent_scope_id")?,
+                bootstrap_proposal_id,
+                base_sha256: sha(binding, "base_sha256")?,
+                source_sha256: sha(binding, "source_sha256")?,
+                opening_ids,
+            })
+        }
+    };
     Some(ProjectScopeFact {
         component_discovery: match scope.get("component_discovery") {
             None => None,
@@ -192,6 +248,7 @@ pub(super) fn scope_fact(value: &Value) -> Option<ProjectScopeFact> {
         activation_revision,
         wall_layer_choice,
         assembly_binding,
+        opening_completion_binding,
         scope_id: sha(scope, "scope_id")?,
         floor_key: label(scope, "floor_key")?,
         floor_id: label(scope, "floor_id")?,
@@ -353,6 +410,10 @@ pub(super) fn catalog_fact(value: &Value) -> Option<ProjectCatalogFact> {
             .iter()
             .map(|floor| label(floor, "key"))
             .collect::<Option<Vec<_>>>()?,
+        floor_titles: floors
+            .iter()
+            .filter_map(|floor| Some((label(floor, "key")?, label(floor, "title")?)))
+            .collect(),
     })
 }
 
@@ -460,6 +521,131 @@ pub struct BuildingReportFact {
     pub unresolved_drawing: u64,
     pub missing_floor_reviews: usize,
     pub connection_issues: usize,
+    pub source_discovery: BuildingSourceDiscoveryFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BuildingSourceDiscoveryFact {
+    pub state: String,
+    pub missing_floors: Vec<String>,
+    pub unresolved_member_count: u64,
+    pub unclassified_candidate_count: u64,
+    pub uncovered_count: u64,
+    pub diagnostic_member_count: u64,
+    pub stale_selection_count: u64,
+    pub region_count: u64,
+    pub unreviewed_region_count: u64,
+    pub structure_represented_region_count: u64,
+    pub uncertain_region_count: u64,
+    pub stale_review_count: u64,
+    pub orphaned_stale_review_count: u64,
+}
+
+fn building_source_discovery(floors: &[Value]) -> Option<BuildingSourceDiscoveryFact> {
+    let mut fact = BuildingSourceDiscoveryFact {
+        state: "complete".into(),
+        missing_floors: Vec::new(),
+        unresolved_member_count: 0,
+        unclassified_candidate_count: 0,
+        uncovered_count: 0,
+        diagnostic_member_count: 0,
+        stale_selection_count: 0,
+        region_count: 0,
+        unreviewed_region_count: 0,
+        structure_represented_region_count: 0,
+        uncertain_region_count: 0,
+        stale_review_count: 0,
+        orphaned_stale_review_count: 0,
+    };
+    for floor in floors {
+        let linework = linework_coverage_fact(floor).ok()?;
+        let structure = existing_structure_coverage_fact(floor, linework.as_ref()).ok()?;
+        let regions =
+            source_region_review_fact(floor, linework.as_ref(), structure.as_ref()).ok()?;
+        if linework.is_some() {
+            sha(floor, "scan_id")?;
+            sha(floor, "source_view_sha256")?;
+        }
+        if linework.is_none()
+            || regions.is_none()
+            || linework
+                .as_ref()
+                .is_some_and(|l| l.unselected_member_count > 0 && structure.is_none())
+        {
+            fact.missing_floors.push(label(floor, "floor_key")?);
+        }
+        if let Some(linework) = linework {
+            let covered = structure.map_or(0, |s| s.unselected_complete_member_count);
+            for (total, count) in [
+                (
+                    &mut fact.unresolved_member_count,
+                    linework.unselected_member_count.checked_sub(covered)?,
+                ),
+                (
+                    &mut fact.unclassified_candidate_count,
+                    linework.unclassified_candidate_count,
+                ),
+                (&mut fact.uncovered_count, linework.uncovered_count),
+                (
+                    &mut fact.diagnostic_member_count,
+                    linework.diagnostic_member_count,
+                ),
+                (
+                    &mut fact.stale_selection_count,
+                    linework.stale_selection_count,
+                ),
+            ] {
+                *total = total.checked_add(count as u64)?;
+            }
+        }
+        if let Some(regions) = regions {
+            for (total, count) in [
+                (&mut fact.region_count, regions.region_count),
+                (
+                    &mut fact.unreviewed_region_count,
+                    regions.unreviewed_region_count,
+                ),
+                (
+                    &mut fact.structure_represented_region_count,
+                    regions.structure_represented_region_count,
+                ),
+                (
+                    &mut fact.uncertain_region_count,
+                    regions.uncertain_region_count,
+                ),
+                (&mut fact.stale_review_count, regions.stale_review_count),
+                (
+                    &mut fact.orphaned_stale_review_count,
+                    regions.orphaned_stale_review_count,
+                ),
+            ] {
+                *total = total.checked_add(count as u64)?;
+            }
+        }
+    }
+    fact.missing_floors.sort();
+    fact.state = if !fact.missing_floors.is_empty() {
+        "unknown"
+    } else if [
+        fact.unresolved_member_count,
+        fact.unclassified_candidate_count,
+        fact.uncovered_count,
+        fact.diagnostic_member_count,
+        fact.stale_selection_count,
+        fact.unreviewed_region_count,
+        fact.uncertain_region_count,
+        fact.stale_review_count,
+        fact.orphaned_stale_review_count,
+    ]
+    .into_iter()
+    .any(|count| count > 0)
+    {
+        "attention"
+    } else {
+        "complete"
+    }
+    .into();
+    Some(fact)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +668,7 @@ pub struct ProjectBuildingFact {
     pub floor_keys: Vec<String>,
     pub floor_authorities: BTreeMap<String, String>,
     pub source_reconciliation: String,
+    pub source_discovery: BuildingSourceDiscoveryFact,
     pub connection_check: String,
     pub report: Option<BuildingReportFact>,
     pub connection_authority: Option<ProjectConnectionAuthority>,
@@ -570,7 +757,9 @@ pub(super) fn building_fact(
         }
     }
     let source_reconciliation = label(record, "source_reconciliation")?;
-    if (source_reconciliation == "complete" && has_unbuilt_sources)
+    let source_discovery = building_source_discovery(floors)?;
+    if (source_reconciliation == "complete"
+        && (has_unbuilt_sources || source_discovery.state != "complete"))
         || !matches!(source_reconciliation.as_str(), "complete" | "attention")
         || record["human_review"] != "not_run"
     {
@@ -622,6 +811,7 @@ pub(super) fn building_fact(
         floor_keys,
         floor_authorities,
         source_reconciliation,
+        source_discovery,
         connection_check,
         report,
         output: label(record, "output")?,
@@ -784,10 +974,24 @@ fn building_report_fact(
         return None;
     }
     let current = report["current"].as_bool()?;
+    let source_discovery = building_source_discovery(floors)?;
+    if report.get("source_discovery").is_some_and(|observed| {
+        let mut observed = observed.clone();
+        if let Some(fields) = observed.as_object_mut() {
+            fields
+                .entry("structure_represented_region_count")
+                .or_insert(Value::from(0));
+        }
+        serde_json::to_value(&source_discovery).ok().as_ref() != Some(&observed)
+    }) || (report.get("source_discovery").is_none() && source_discovery.state == "complete")
+    {
+        return None;
+    }
     let expected = if valid != Some(true) {
         "not_ready"
     } else if !current
         || unresolved_sources > 0
+        || source_discovery.state != "complete"
         || unresolved_drawing > 0
         || !missing.is_empty()
         || record["connection_check"] != "passed"
@@ -816,7 +1020,15 @@ fn building_report_fact(
         unresolved_drawing,
         missing_floor_reviews: missing.len(),
         connection_issues,
+        source_discovery,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StairLineworkFact {
+    pub line_count: usize,
+    pub region_count: usize,
+    pub reviewed_region_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,6 +1040,7 @@ pub struct DrawingAuditFact {
     pub ai_review: String,
     pub offset: usize,
     pub next_offset: Option<usize>,
+    pub stair_linework: Option<StairLineworkFact>,
     pub rows: Vec<String>,
 }
 
@@ -883,6 +1096,46 @@ pub(super) fn drawing_audit_fact(value: &Value) -> Option<DrawingAuditFact> {
     {
         return None;
     }
+    let stair_linework = match audit.get("stair_linework") {
+        None => None,
+        Some(stairs) => {
+            let line_count = usize::try_from(stairs["line_count"].as_u64()?).ok()?;
+            let region_count = usize::try_from(stairs["region_count"].as_u64()?).ok()?;
+            let reviewed_region_count =
+                usize::try_from(stairs["reviewed_region_count"].as_u64()?).ok()?;
+            if region_count > candidate_count
+                || region_count > line_count
+                || (line_count == 0) != (region_count == 0)
+                || reviewed_region_count > region_count
+                || reviewed_region_count > judged_count
+            {
+                return None;
+            }
+            let visible = candidates
+                .iter()
+                .filter(|c| c["detector"] == "stair_linework_reference")
+                .count();
+            let reviewed = candidates
+                .iter()
+                .filter(|c| {
+                    c["detector"] == "stair_linework_reference" && !c["judgement"].is_null()
+                })
+                .count();
+            if visible > region_count
+                || reviewed > reviewed_region_count
+                || (offset == 0
+                    && end == candidate_count
+                    && (visible != region_count || reviewed != reviewed_region_count))
+            {
+                return None;
+            }
+            Some(StairLineworkFact {
+                line_count,
+                region_count,
+                reviewed_region_count,
+            })
+        }
+    };
     let rows = candidates
         .iter()
         .map(|candidate| {
@@ -907,8 +1160,27 @@ pub(super) fn drawing_audit_fact(value: &Value) -> Option<DrawingAuditFact> {
                     bounded_text(&record["judgement"], "explanation", 4000)?
                 )
             };
+            let location = if candidate["detector"] == "stair_linework_reference" {
+                let bbox = candidate["bbox_m"].as_array()?;
+                if bbox.len() != 4 {
+                    return None;
+                }
+                let bounds = bbox.iter().map(Value::as_f64).collect::<Option<Vec<_>>>()?;
+                if bounds.iter().any(|value| !value.is_finite())
+                    || bounds[0] > bounds[2]
+                    || bounds[1] > bounds[3]
+                {
+                    return None;
+                }
+                format!(
+                    " · 位置 ({:.2}, {:.2})—({:.2}, {:.2}) 米",
+                    bounds[0], bounds[1], bounds[2], bounds[3]
+                )
+            } else {
+                String::new()
+            };
             Some(format!(
-                "{} · {} · {} · {observation}",
+                "{} · {}{location} · {} · {observation}",
                 label(candidate, "id")?,
                 label(candidate, "detector")?,
                 label(candidate, "message")?
@@ -923,6 +1195,115 @@ pub(super) fn drawing_audit_fact(value: &Value) -> Option<DrawingAuditFact> {
         ai_review,
         offset,
         next_offset,
+        stair_linework,
         rows,
     })
+}
+
+/// A modeler project the user can open: `projects/<dir>/project.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEntry {
+    /// Relative to the modeler repository, e.g. `projects/hospital-site`.
+    pub path: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Drawing units the modeler accepts for a new project's DXF source.
+pub const PROJECT_UNITS: [&str; 3] = ["millimeters", "centimeters", "meters"];
+
+/// A user's request to create a project from one DXF drawing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NewProject {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub units: String,
+}
+
+/// Top-level scalar from project.yaml. Only display fields are read here;
+/// the modeler owns and validates the full format.
+fn yaml_field(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix(key)?.strip_prefix(':')?.trim();
+        let value = value.trim_matches(|c| c == '"' || c == '\'');
+        (!value.is_empty() && value != "null").then(|| value.to_owned())
+    })
+}
+
+/// Projects under `<cwd>/projects`, sorted by directory name. Empty when the
+/// working directory is not a modeler repository.
+pub fn list_projects(cwd: &Path) -> Vec<ProjectEntry> {
+    let mut entries: Vec<ProjectEntry> = std::fs::read_dir(cwd.join("projects"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let dir = entry.file_name().into_string().ok()?;
+            let text = std::fs::read_to_string(entry.path().join("project.yaml")).ok()?;
+            Some(ProjectEntry {
+                path: format!("projects/{dir}"),
+                name: crate::state::display_text(&yaml_field(&text, "name").unwrap_or(dir.clone())),
+                description: crate::state::display_text(
+                    &yaml_field(&text, "description").unwrap_or_default(),
+                ),
+            })
+        })
+        .take(200)
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
+}
+
+/// The modeler repository's own interpreter, as used for the domain tools.
+pub(super) fn modeler_python(repository: &Path) -> PathBuf {
+    repository.join(if cfg!(windows) {
+        ".venv/Scripts/python.exe"
+    } else {
+        ".venv/bin/python"
+    })
+}
+
+/// Create a project through the modeler's `init-project` command, which owns
+/// the project format. Returns the new project's relative path.
+pub fn create_project(cwd: &Path, request: &NewProject) -> Result<String, String> {
+    let repository = normalized_path(cwd)?;
+    let python = modeler_python(&repository);
+    if !python.is_file() {
+        return Err("当前工作目录不是带 .venv 的模型器仓库，无法新建项目".into());
+    }
+    let source = request.source.trim().trim_matches('"');
+    if request.name.trim().is_empty() || source.is_empty() {
+        return Err("请填写项目名称和 DXF 图纸路径".into());
+    }
+    let output = std::process::Command::new(&python)
+        .current_dir(&repository)
+        .env("PYTHONUTF8", "1")
+        .args(["-m", "blender_agent.cli.main", "init-project"])
+        .arg(request.name.trim())
+        .arg("--source")
+        .arg(source)
+        .arg("--units")
+        .arg(&request.units)
+        .arg("--description")
+        .arg(request.description.trim())
+        .arg("--root")
+        .arg(&repository)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("无法运行模型器新建项目命令：{error}"))?;
+    let reply: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        format!(
+            "新建项目失败：{}",
+            crate::state::display_text(detail.lines().last().unwrap_or("模型器没有返回结果"))
+        )
+    })?;
+    match (reply["ok"].as_bool(), reply["project_path"].as_str()) {
+        (Some(true), Some(path)) if output.status.success() => Ok(path.to_owned()),
+        _ => Err(format!(
+            "新建项目失败：{}",
+            crate::state::display_text(reply["error"].as_str().unwrap_or("未知错误"))
+        )),
+    }
 }
