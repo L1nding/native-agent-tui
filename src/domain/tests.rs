@@ -88,6 +88,44 @@ fn authorization_must_match_exact_binding_and_cannot_repeat_while_pending() {
 }
 
 #[test]
+fn automatic_approval_requires_current_eligibility_and_the_existing_candidate_review() {
+    let mut facts = sequenced_facts();
+    let mut value = envelope();
+    value["source_current"] = json!(true);
+    value["auto_approval"] = json!({"contract":"reviewed-template-approval/1","eligible":true});
+    value["proposal"]["component_first_use_requirements"]["reused"] =
+        json!([{"review_key":"reviewed"}]);
+    deliver_fact(&mut facts, "eligible", value.clone());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(!facts.can_auto_authorize(&binding));
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_auto_authorize(&binding));
+    let mut stale = binding.clone();
+    stale.prepare_token = "different".into();
+    assert!(!facts.can_auto_authorize(&stale));
+    for (index, pointer, invalid) in [
+        (0, "/auto_approval/eligible", json!(false)),
+        (1, "/auto_approval/contract", json!("unknown")),
+        (2, "/source_current", json!(false)),
+        (3, "/diagnostics", json!([{"message":"collision"}])),
+        (
+            4,
+            "/proposal/component_first_use_requirements/reused",
+            json!([]),
+        ),
+    ] {
+        let mut blocked = value.clone();
+        *blocked.pointer_mut(pointer).unwrap() = invalid;
+        deliver_fact(&mut facts, &format!("blocked-{index}"), blocked);
+        assert!(!facts.can_auto_authorize(&binding), "{pointer}");
+        deliver_fact(&mut facts, &format!("restored-{index}"), value.clone());
+        assert!(facts.can_auto_authorize(&binding));
+    }
+    facts.snapshot.artifacts[0].valid = Some(false);
+    assert!(!facts.can_auto_authorize(&binding));
+}
+
+#[test]
 fn a_current_new_proposal_family_can_restart_at_revision_one_without_reviving_stale_facts() {
     let mut facts = sequenced_facts();
     let deliver = deliver_fact;

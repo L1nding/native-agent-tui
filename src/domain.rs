@@ -617,6 +617,7 @@ pub struct DomainFacts {
     source_view_policy: Option<String>,
     source_view_required: Option<String>,
     source_view_sequence: Option<u64>,
+    auto_approval_binding: Option<ProposalBinding>,
     pub(crate) synchronizing: bool,
     synchronization_errors: BTreeMap<String, u64>,
 }
@@ -641,6 +642,7 @@ impl DomainFacts {
             source_view_policy: None,
             source_view_required: None,
             source_view_sequence: None,
+            auto_approval_binding: None,
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
         }
@@ -1124,6 +1126,19 @@ impl DomainFacts {
                         self.replace_review_images(images, true);
                         self.snapshot.proposal_categories =
                             proposal_category_counts(&value["proposal"]);
+                        self.auto_approval_binding = (value["auto_approval"]["contract"]
+                            == "reviewed-template-approval/1"
+                            && value["auto_approval"]["eligible"] == true
+                            && value["current"] == true
+                            && value["source_current"] == true
+                            && value["proposal"]["component_first_use_requirements"]["required"]
+                                .as_array()
+                                .is_some_and(Vec::is_empty)
+                            && value["proposal"]["component_first_use_requirements"]["reused"]
+                                .as_array()
+                                .is_some_and(|items| !items.is_empty())
+                            && value["diagnostics"].as_array().is_some_and(Vec::is_empty))
+                        .then(|| proposal.binding.clone());
                         self.snapshot.proposal = Some(proposal);
                         accepted = true;
                     }
@@ -1617,6 +1632,16 @@ impl DomainFacts {
                 message.text.clone_from(display);
             }
         }
+    }
+
+    pub(crate) fn can_auto_authorize(&self, binding: &ProposalBinding) -> bool {
+        self.auto_approval_binding.as_ref() == Some(binding)
+            && self
+                .snapshot
+                .first_use_review
+                .as_ref()
+                .is_some_and(|review| review.required_count == 0)
+            && self.can_authorize(binding)
     }
 
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
@@ -2643,6 +2668,24 @@ pub async fn authorize(
     review_set_sha256: Option<String>,
     images: Vec<ReviewImageBinding>,
 ) -> Result<String, String> {
+    authorize_with_policy(
+        setup,
+        binding,
+        review_set_sha256,
+        images,
+        crate::config::DomainApprovalPolicy::Manual,
+    )
+    .await
+}
+
+pub async fn authorize_with_policy(
+    setup: DomainSetup,
+    binding: ProposalBinding,
+    review_set_sha256: Option<String>,
+    images: Vec<ReviewImageBinding>,
+    policy: crate::config::DomainApprovalPolicy,
+) -> Result<String, String> {
+    let automatic = policy == crate::config::DomainApprovalPolicy::ReviewedTemplate;
     for image in &images {
         if image.proposal != binding
             || (image.review_set_sha256.is_some() && image.review_set_sha256 != review_set_sha256)
@@ -2689,7 +2732,11 @@ pub async fn authorize(
             "--prepare-token",
             &binding.prepare_token,
             "--actor",
-            "native-agent-tui:user",
+            if automatic {
+                "native-agent-tui:policy:reviewed-template"
+            } else {
+                "native-agent-tui:user"
+            },
         ]);
     if let Some(review_set) = &review_set_sha256 {
         command.args(["--expected-review-set-sha256", review_set]);
@@ -2713,15 +2760,22 @@ pub async fn authorize(
         || value["grant"]["revision"] != binding.revision
         || value["grant"]["prepare_token"] != binding.prepare_token
         || value["grant"]["review_set_sha256"].as_str() != review_set_sha256.as_deref()
+        || (automatic && value["grant"]["approval_policy"] != "reviewed-template")
     {
         return Err("批准未通过版本核对；请检查当前方案".into());
     }
     let authorization_id = text(&value["grant"], "authorization_id")?;
+    let approval = if automatic {
+        "已按用户配置的已审模板策略自动批准"
+    } else {
+        "用户已批准"
+    };
     let display = format!(
-        "已批准当前方案的第 {} 版；请应用并完成构建与验证。",
+        "{approval}当前方案的第 {} 版；请应用并完成构建与验证。",
         binding.revision
     );
-    let payload = json!({"user_action":"approve_concrete_change", "proposal":binding,
+    let mut payload = json!({"user_action":if automatic { "policy_approve_concrete_change" } else { "approve_concrete_change" }, "proposal":binding,
+              "approval_policy": if automatic { "reviewed-template" } else { "manual" },
               "authorization_id":authorization_id,
               "apply_change_arguments": {
                   "proposal_id": binding.proposal_id, "revision": binding.revision,
@@ -2730,6 +2784,19 @@ pub async fn authorize(
                   "authorization_id": authorization_id
               },
               "instruction":"用户已批准此具体版本。使用 apply_change_arguments 并补充稳定 operation_id 调用领域 apply_change；expected_sha256 必须是 base_sha256。再独立正式构建、验证和复核产物，保留假设标签。有来源输入时，先调用 scan_source_instances 取得当前完整汇总，再读取本批相关分组及完整必要分页，逐项核对本批来源、稳定身份与实际已建结果；展示全层已建、跳过、未决数量及仍未读取的范围。汇总不代表逐项全读，本批对账不代表整层对账完成；最终宣称整层完成前必须覆盖全部绑定来源并完成逐项对账。完成本版后，沿对话中原始用户目标和后续范围约束继续推进。原目标为完整楼层时，主动识别剩余来源、准备下一批可复核方案并集中提出必要业务问题；个别对象缺能力或待澄清时保留记录，继续其他可推进对象，不要求用户反复回复继续。原目标仅局部修改或预览时保持该边界；目标范围不明先核对对话。后续每个具体版本仍须独立批准，本次授权仅适用于以上绑定版本。"});
+    if automatic {
+        payload["instruction"] = json!(payload["instruction"]
+            .as_str()
+            .unwrap_or_default()
+            .replace(
+                "用户已批准此具体版本。",
+                "此具体版本已由用户配置的已审模板策略自动批准；不代表新的人工确认。"
+            )
+            .replace(
+                "后续每个具体版本仍须独立批准",
+                "后续每个具体版本仍须由平台按当前策略独立批准"
+            ));
+    }
     Ok(format!("{display}\n{payload}"))
 }
 

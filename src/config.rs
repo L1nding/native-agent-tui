@@ -27,6 +27,13 @@ pub enum McpServerConfig {
 /// The dsh profile the TUI boots unless `--profile` names another.
 pub const DEFAULT_PROFILE: &str = "zf-tui";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DomainApprovalPolicy {
+    #[default]
+    Manual,
+    ReviewedTemplate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub cwd: PathBuf,
@@ -41,6 +48,7 @@ pub struct Config {
     pub domain_preview: bool,
     /// `--no-domain-preview`: keep preview off even for a project chosen later.
     pub no_domain_preview: bool,
+    pub domain_approval_policy: DomainApprovalPolicy,
     pub model: Option<String>,
     /// `model` came from saved preferences, not `--model`: a backend that no
     /// longer offers it keeps its own default instead of failing startup.
@@ -74,6 +82,7 @@ impl Default for Config {
             domain_setup: None,
             domain_preview: false,
             no_domain_preview: false,
+            domain_approval_policy: DomainApprovalPolicy::Manual,
             model: None,
             model_is_preference: false,
             strict_outcome: false,
@@ -211,6 +220,19 @@ where
             }
             "--domain-preview" => preview = Some(true),
             "--no-domain-preview" => preview = Some(false),
+            "--domain-approval" => {
+                let raw = value(&args, &mut index, option)?;
+                config.domain_approval_policy = match raw.as_str() {
+                    "manual" => DomainApprovalPolicy::Manual,
+                    "reviewed-template" => DomainApprovalPolicy::ReviewedTemplate,
+                    _ => {
+                        return Err(CliError::InvalidValue {
+                            option: option.clone(),
+                            value: "expected manual or reviewed-template".into(),
+                        })
+                    }
+                };
+            }
             "--domain-context" => {
                 config.domain_context = Some(PathBuf::from(value(&args, &mut index, option)?))
             }
@@ -482,6 +504,28 @@ mod tests {
         assert!(!preview(&["--domain-project", "p", "--no-domain-preview"]));
         assert!(!preview(&[]));
         assert!(preview(&["--domain-project", "p", "--domain-preview"]));
+    }
+
+    #[test]
+    fn domain_approval_defaults_to_manual_and_requires_an_explicit_known_policy() {
+        for (args, expected) in [
+            (vec![], DomainApprovalPolicy::Manual),
+            (
+                vec!["--domain-approval", "manual"],
+                DomainApprovalPolicy::Manual,
+            ),
+            (
+                vec!["--domain-approval", "reviewed-template"],
+                DomainApprovalPolicy::ReviewedTemplate,
+            ),
+        ] {
+            let CliCommand::Tui { config, .. } = parse_args(args).unwrap() else {
+                panic!("TUI");
+            };
+            assert_eq!(config.domain_approval_policy, expected);
+        }
+        assert!(parse_args(["--domain-approval", "all"]).is_err());
+        assert!(parse_args(["--domain-approval"]).is_err());
     }
 
     #[test]

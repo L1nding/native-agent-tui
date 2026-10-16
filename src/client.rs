@@ -74,6 +74,7 @@ pub enum Command {
         root_turn_count: u64,
         binding: crate::domain::ProposalBinding,
         review_set_sha256: Option<String>,
+        policy: crate::config::DomainApprovalPolicy,
         outcome: Result<String, String>,
     },
     DomainFactReadFinished {
@@ -337,6 +338,7 @@ impl ClientHandle {
                 domain_image_open_task: None,
                 domain_image_attempt: 0,
                 domain_generation: 0,
+                domain_auto_approval_attempt: None,
                 domain_fact_attempt: 0,
                 domain_fact_task: None,
                 domain_fact_queue: VecDeque::new(),
@@ -525,6 +527,7 @@ struct Core {
     domain_image_open_task: Option<(u64, JoinHandle<()>)>,
     domain_image_attempt: u64,
     domain_generation: u64,
+    domain_auto_approval_attempt: Option<crate::domain::ProposalBinding>,
     domain_fact_attempt: u64,
     domain_fact_task: Option<PendingDomainFact>,
     domain_fact_queue: VecDeque<(u64, crate::domain::receipt::FactReceipt)>,
@@ -1016,6 +1019,7 @@ impl Core {
 
     fn publish(&mut self) {
         self.check_domain_images();
+        self.maybe_auto_approve_domain();
         if self.wait.is_some() {
             let targets = self.gate.targets();
             if let Some(gate) = &mut self.state.view.gate {
@@ -1684,6 +1688,7 @@ impl Core {
                 root_turn_count,
                 binding,
                 review_set_sha256,
+                policy,
                 outcome,
             } => {
                 if attempt_id != self.domain_generation || !self.domain.snapshot.authorizing {
@@ -1696,6 +1701,8 @@ impl Core {
                     || !self.idle_for_backend_change()
                     || !self.domain.can_authorize(&binding)
                     || self.domain.snapshot.review_set_sha256() != review_set_sha256
+                    || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
+                        && !self.domain.can_auto_authorize(&binding))
                 {
                     self.domain.snapshot.notice = Some("批准结果已过期；请核对当前方案".into());
                     return;
@@ -1703,8 +1710,13 @@ impl Core {
                 match outcome {
                     Ok(text) => {
                         self.domain.remember_control(&text);
-                        self.domain.snapshot.notice =
-                            Some("具体版本已批准，交给平台 Agent 应用和构建".into());
+                        self.domain.snapshot.notice = Some(
+                            if policy == crate::config::DomainApprovalPolicy::ReviewedTemplate {
+                                "已审模板策略已自动批准此版本，交给平台 Agent 应用和构建".into()
+                            } else {
+                                "具体版本已批准，交给平台 Agent 应用和构建".into()
+                            },
+                        );
                         self.command(Command::SubmitRootInput { text });
                     }
                     Err(reason) => {
@@ -2498,11 +2510,46 @@ impl Core {
     }
 
     fn approve_domain_change(&mut self, confirmation: crate::extensions::ModelingConfirmation) {
+        self.approve_domain_change_with_policy(
+            confirmation,
+            crate::config::DomainApprovalPolicy::Manual,
+        );
+    }
+
+    fn maybe_auto_approve_domain(&mut self) {
+        if self.config.domain_approval_policy
+            != crate::config::DomainApprovalPolicy::ReviewedTemplate
+            || !self.idle_for_backend_change()
+            || self.scheduler.snapshot().queued_roots > 0
+        {
+            return;
+        }
+        if self.domain.snapshot.proposal.is_none() {
+            return;
+        }
+        let confirmation = self.domain.snapshot.confirmation();
+        if self.domain_auto_approval_attempt.as_ref() != Some(&confirmation.proposal)
+            && self.domain.can_auto_authorize(&confirmation.proposal)
+        {
+            self.approve_domain_change_with_policy(
+                confirmation,
+                crate::config::DomainApprovalPolicy::ReviewedTemplate,
+            );
+        }
+    }
+
+    fn approve_domain_change_with_policy(
+        &mut self,
+        confirmation: crate::extensions::ModelingConfirmation,
+        policy: crate::config::DomainApprovalPolicy,
+    ) {
         let binding = confirmation.proposal;
         let review_set_sha256 = confirmation.review_set_sha256;
         if !self.idle_for_backend_change()
             || !self.domain.can_authorize(&binding)
             || self.domain.snapshot.review_set_sha256() != review_set_sha256
+            || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
+                && !self.domain.can_auto_authorize(&binding))
             || self
                 .state
                 .view
@@ -2517,6 +2564,10 @@ impl Core {
         let Some(setup) = self.config.domain_setup.clone() else {
             return;
         };
+        if policy == crate::config::DomainApprovalPolicy::ReviewedTemplate {
+            // An uncertain private authorization result must never trigger an automatic retry.
+            self.domain_auto_approval_attempt = Some(binding.clone());
+        }
         self.domain_generation = self.domain_generation.wrapping_add(1);
         let attempt_id = self.domain_generation;
         let generation = self.generation;
@@ -2532,9 +2583,14 @@ impl Core {
         self.domain.snapshot.authorizing = true;
         let commands = self.command_tx.clone();
         self.domain_authorization_task = Some(tokio::spawn(async move {
-            let outcome =
-                crate::domain::authorize(setup, binding.clone(), review_set_sha256.clone(), images)
-                    .await;
+            let outcome = crate::domain::authorize_with_policy(
+                setup,
+                binding.clone(),
+                review_set_sha256.clone(),
+                images,
+                policy,
+            )
+            .await;
             if let Some(commands) = commands.upgrade() {
                 let _ = commands
                     .send(Command::DomainAuthorizationFinished {
@@ -2543,6 +2599,7 @@ impl Core {
                         root_turn_count,
                         binding,
                         review_set_sha256,
+                        policy,
                         outcome,
                     })
                     .await;

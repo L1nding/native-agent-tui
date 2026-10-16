@@ -1,5 +1,133 @@
 use super::*;
 
+#[tokio::test]
+async fn reviewed_template_policy_waits_for_turn_end_and_uses_the_private_authorization_chain() {
+    use crate::config::DomainApprovalPolicy;
+    use sha2::{Digest, Sha256};
+    for policy in [
+        DomainApprovalPolicy::Manual,
+        DomainApprovalPolicy::ReviewedTemplate,
+    ] {
+        let directory = std::env::temp_dir().join(format!(
+            "tui-policy-{}-{:?}-{}",
+            std::process::id(),
+            policy,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(directory.join("blender_agent/cli")).unwrap();
+        std::fs::write(directory.join("blender_agent/__init__.py"), "").unwrap();
+        std::fs::write(directory.join("blender_agent/cli/__init__.py"), "").unwrap();
+        std::fs::write(directory.join("context.json"), b"{}").unwrap();
+        let context_hash = format!("{:x}", Sha256::digest(b"{}"));
+        std::fs::write(directory.join("blender_agent/cli/main.py"), format!(r#"
+import sys,json
+from pathlib import Path
+a=sys.argv
+actor=a[a.index('--actor')+1]
+Path('actor.txt').write_text(actor)
+print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha256':'{context_hash}',
+'grant':{{'authorization_id':'unit-policy-grant','proposal_id':'p','revision':1,'prepare_token':'token','approval_policy':'reviewed-template'}}}}))
+"#)).unwrap();
+        let png = [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+        ];
+        let path = directory.join("review.png");
+        std::fs::write(&path, png).unwrap();
+        let image_sha = format!("{:x}", Sha256::digest(png));
+        let config = Config {
+            permission: Some("read-only".into()),
+            domain_approval_policy: policy,
+            domain_setup: Some(crate::domain::DomainSetup {
+                mode: crate::domain::DomainMode::Floor,
+                context_path: directory.join("context.json"),
+                repository: directory.clone(),
+                python: crate::domain::receipt::tests::python(),
+                run_id: "run".into(),
+                context_sha256: context_hash.clone(),
+                floor_id: "floor".into(),
+            }),
+            ..Default::default()
+        };
+        let (mut client, mut server) = harness_with_config(config).await;
+        initialized(&mut server).await;
+        let set = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":set["id"],"result":{"current":"read-only","presets":[]}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+        skip_skills(&mut server).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "建模二层".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        let proposal = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+            "kind":"proposal","fact_sequence":1,"current":true,"source_current":true,"diagnostics":[],
+            "auto_approval":{"contract":"reviewed-template-approval/1","eligible":true},
+            "proposal":{"proposal_id":"p","revision":1,"prepare_token":"token","base_sha256":"base",
+            "candidate_sha256":"candidate","state":"prepared","summary":"reviewed chair","draft":{"operations":[]},
+            "assumed":[],"issues":[],"pending":[],"component_first_use_requirements":{
+                "contract":"component-first-use/1","required":[],"reused":[{"review_key":"human-reviewed"}]}}});
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+            "item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal}}}})).await;
+        let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,"kind":"artifact_validation","fact_sequence":2,
+            "artifact":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","candidate":true,"authority_sha256":"base","input_sha256":"candidate","state":"built","output":"model.glb","valid":true,"current":true,
+            "review_image":{"delivery":"attached_png","image_sha256":image_sha,"image_path":path,"dimensions_px":[1,1],"request":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","input_sha256":"candidate","blend_sha256":"a".repeat(64),"focus_m":null}}}});
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+            "item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.snapshots.wait_for(|s| {
+                s.extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .review_images
+                    .first()
+                    .is_some_and(|i| i.file_state == crate::domain::ImageFileState::Available)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!directory.join("actor.txt").exists());
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        observation_event(&mut client,&mut server,json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        if policy == DomainApprovalPolicy::ReviewedTemplate {
+            let approved = next(&mut server).await;
+            assert_eq!(approved["method"], "turn/start");
+            let text = approved["params"]["input"][0]["text"].as_str().unwrap();
+            assert!(text.contains("policy_approve_concrete_change"));
+            assert!(text.contains("不代表新的人工确认"));
+            assert!(!text.contains("用户已批准此具体版本"));
+            assert_eq!(
+                std::fs::read_to_string(directory.join("actor.txt")).unwrap(),
+                "native-agent-tui:policy:reviewed-template"
+            );
+        } else {
+            phase(&mut client, SessionPhase::Completed).await;
+            assert!(!directory.join("actor.txt").exists());
+            assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        }
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 fn selection(sequence: u64) -> crate::preview::Selection {
     serde_json::from_value(json!({"client_id":"gui", "sequence":sequence,
         "binding":{"run_id":"run", "context_sha256":"context", "proposal_id":"proposal", "revision":1,
