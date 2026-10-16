@@ -1,10 +1,18 @@
 # Blender 预览会话接入
 
+审批审阅图采用独立的系统看图入口，Core 读取领域封存事实中的 `image_path`、`image_sha256` 和具体提案绑定，核验文件后向 UI 投影只读可用路径。首用模板的 Blender 单构件／CAD／尺寸对照图与总览、局部图一同出现在本版审批页；缺失、篡改或版本不符的图片不能成为本版可打开证据。打开时 Core 再次校验，系统程序启动失败保留未打开状态；成功打开不等于人工复核通过。Blender 实时预览仍由下述独立 bridge 管理。
+
+2026-10-16 在实际 Orca 1.4.227、Windows ConPTY 新建独立终端进行图形协议探测：开启控制台 VT 输入／输出，分别发送 DA1 `ESC[c`、Sixel XTSMGRAPHICS `ESC[?1;1;S`、Kitty 一像素 `a=q`、iTerm2 `OSC 1337;ReportCellSize`、XTVERSION `ESC[>q`，每项读取输入两秒。必须先用 `terminal create --focus` 打开终端、确认前台已挂载，再发送探测；后台输出后才切到前台会得到不同结果。前台 DA1 返回 `ESC[?61;4c`，Sixel 返回 `ESC[?1;0;4096S`，Kitty 返回 `ESC_Gi=424242;OK ESC\\`，iTerm2 返回 `ReportCellSize=16.000;8.000;1.000`，版本为 `xterm.js(6.1.0-beta.303)`。继续分别发送 Sixel、Kitty 直接 PNG、iTerm2 IIP 的 192×72 蓝框黑色细线测试图，实际窗口截图中三图均可见。后台对照只有 DA1 和 `xterm.js(6.0.0)` 回复，三图未呈现，不能把后台探测当作前台能力结论。复测脚本与回包保存在本地 `target/orca-graphics-probe.py`／`.json`，发送脚本为 `target/orca-graphics-display.py`，前台截图为 `target/orca-graphics-display-foreground.png`；这些是忽略的验收产物。
+
+当前先交付外部看图，未引入 `ratatui-image`，未使用半块字符显示 CAD。前台三种协议实际可用；内嵌显示仍需专项处理 ConPTY 回包、窗口缩放后的尺寸／字体单元重查与图片重编码、切换后台后重新前台时强制重传，以及有限时探测失败时回到外部打开。协议探测不能与 TUI 输入读取器争用 stdin，也不能将超时自动降级为半块字符。后台和前台不同意味着仅启动时缓存一次检测不足以保证后续可见。
+
+依赖评估使用 crates.io 实际下载的原始 manifest／源码：`ratatui-image 11.0.0` 依赖 `ratatui ^0.30.0`，`12.0.0-rc.2` 依赖 `^0.30.1`，均可与当前 `0.30.2` 在版本约束上统一，库最低 Rust 1.86 不高于本项目 1.89。此结论只涉及声明兼容，尚未构建集成。若后续接入，应关闭默认 `chafa-dyn` 和全格式 image 特性，仅启用必要 PNG／crossterm；11.0.0 在查询失败时默认选择 Halfblocks，必须由本项目显式改为外部打开。12.0.0-rc.2 已增加 ConPTY 缺字体回包处理与 Windows 限时读取，但它仍是候选版本，不因单项兼容就直接升级生产依赖。
+
 来源：2026-10-12 Blender 实时预览 MVP 授权及模型器领域协议 v2。
 基线：`4f932c749cde12507da7797471c6cffd8c88f50c`；在独立 Orca 工作树
 `L1nding/blender-preview-tui` 实施，原 TUI 和建模工作树保持只读。
 
-启动时使用 `--domain-context FILE` 或 `--domain-project PATH`，并加 `--domain-preview`。Core 持有外部 Python
+建模会话默认开启预览：`--domain-context FILE` 楼层上下文、`--domain-project PATH` 项目，以及启动选择页或 `/project` 选中的项目都适用；`--no-domain-preview` 关闭且对后续切换的项目同样生效。项目模式下，预览服务以项目身份显示当前激活楼层作用域里 Agent 最近写入的方案；换楼层时序号单调递增，作用域失效后保留原显示但不再是当前版本、不能提交意见。Core 持有外部 Python
 `blender_agent.integrations.preview_service` 子进程，其连接文件路径显示于 F6 业务页。
 配套模型器必须包含预览 publisher/service，并在独立 `.venv` 安装 `.[mcp]`。
 用户在 Blender 安装本地 Extension ZIP、选择连接文件并连接；完整安装/协议见模型器

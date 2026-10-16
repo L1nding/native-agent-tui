@@ -421,15 +421,17 @@ impl Bridge {
             p if p.can_submit() => "idle",
             _ => "unavailable",
         };
-        let label = if status == "processing" {
-            format!(
-                "Agent is preparing a candidate{}",
+        // The label is display text for the Blender panel; `status` stays the protocol code.
+        let label = match status {
+            "processing" => format!(
+                "Agent 正在准备候选{}",
                 target
-                    .map(|t| format!(": {}", t.instances.join(", ")))
+                    .map(|t| format!("：{}", t.instances.join("、")))
                     .unwrap_or_default()
-            )
-        } else {
-            format!("Agent: {status}")
+            ),
+            "waiting" => "Agent：等待交互".into(),
+            "idle" => "Agent：空闲".into(),
+            _ => "Agent：不可用".into(),
         };
         let value = json!({"run_id":setup.run_id, "context_sha256":setup.context_sha256,
             "status":status, "binding":target.map(|t| &t.binding),

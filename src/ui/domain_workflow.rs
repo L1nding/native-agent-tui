@@ -22,7 +22,7 @@ fn label(node: WorkflowNode) -> &'static str {
         Target => "选择楼层",
         Structure => "结构方案",
         Drawing => "图纸审查",
-        Interpret => "解释与识别构件",
+        Interpret => "对象发现与AI识别",
         Capability => "能力与已有定义",
         Instance => "实例新增/修改",
         Definition => "新定义及实例",
@@ -36,6 +36,65 @@ fn label(node: WorkflowNode) -> &'static str {
         Result => "结果与未决项",
         Reconcile => "对账原操作",
     }
+}
+
+/// Main-flow order the progress line reads; branches report through these nodes.
+const MAIN_PATH: [WorkflowNode; 11] = [
+    WorkflowNode::Target,
+    WorkflowNode::Structure,
+    WorkflowNode::Drawing,
+    WorkflowNode::Interpret,
+    WorkflowNode::Capability,
+    WorkflowNode::Prepare,
+    WorkflowNode::Feedback,
+    WorkflowNode::Apply,
+    WorkflowNode::Build,
+    WorkflowNode::Review,
+    WorkflowNode::Result,
+];
+
+/// One line for the conversation: where the modeling work stands, from Core's
+/// verified facts only (never inferred from the agent's words).
+pub(super) fn progress_line(domain: &DomainSnapshot, width: usize) -> Option<Line<'static>> {
+    use WorkflowEvidenceState::*;
+    let evidence = domain.workflow_evidence();
+    let state = |node: WorkflowNode| {
+        evidence
+            .iter()
+            .find(|item| item.node == node)
+            .map(|item| item.state)
+    };
+    // Something needing the user wins over work in progress, then waiting.
+    let current = [Attention, Unknown, Running, Waiting]
+        .into_iter()
+        .find_map(|wanted| {
+            MAIN_PATH
+                .into_iter()
+                .chain([WorkflowNode::Reconcile, WorkflowNode::Revision])
+                .find(|node| state(*node) == Some(wanted))
+                .map(|node| (node, wanted))
+        })
+        .or_else(|| {
+            MAIN_PATH
+                .into_iter()
+                .rev()
+                .find(|node| state(*node) == Some(Recorded))
+                .map(|node| (node, Recorded))
+        })?;
+    let (marker, style) = status(current.1);
+    let floor = crate::state::display_text(&domain.floor_title());
+    let palette = theme::current();
+    let mut spans = vec![Span::styled("◆ ", Style::default().fg(palette.accent))];
+    if !floor.is_empty() && floor != "项目目标" {
+        spans.push(Span::styled(format!("{floor} · "), palette.heading()));
+    }
+    spans.push(Span::styled(label(current.0).to_owned(), palette.heading()));
+    spans.push(Span::raw(" · "));
+    spans.push(Span::styled(marker.to_owned(), style));
+    if width >= 48 {
+        spans.push(Span::styled("  · F4 查看流程", palette.secondary()));
+    }
+    Some(Line::from(spans))
 }
 
 fn status(state: WorkflowEvidenceState) -> (&'static str, Style) {
@@ -54,6 +113,21 @@ fn status(state: WorkflowEvidenceState) -> (&'static str, Style) {
 fn branches(node: WorkflowNode) -> &'static [&'static str] {
     use WorkflowNode::*;
     match node {
+        Interpret => &[
+            "全层图块、纯线稿与上下文；散线按图层、连通与邻近聚区域（区域不等于物体）",
+            "区域裁图 + 附近文字 + 尺寸 → AI 开放类别判读",
+            "AI 可拆分、合并、识别非构件或保留不确定",
+            "家具、楼梯、电梯、设备等均为识别对象，类别不限于预设名称",
+            "与图块共用选线/解释 → 复用或定义 → 准备校验 → 具体批准 → 建模",
+            "已知类型复用 / 新类型定义 → 05；歧义澄清 → 10；缺能力 → 14",
+            "通用纯线稿逐成员核对选择、分类及覆盖",
+            "既有结构仅完整覆盖可抵扣未选待处理；部分覆盖、参考线和无证据仍需处理",
+            "区域与注释数不是物体数；二维记录不等于已建对象",
+            "缺通用判读汇总、未判读、不确定或过期区域 → 14 保留缺口",
+            "旧判读完全失去当前源成员仍保留未决缺口，不能计为当前区域或整层完成",
+            "缺覆盖汇总、未选、未分类、未覆盖、诊断或过期选择 → 14",
+            "逐组保留依据、缺参和未覆盖范围；二维符号不等于已建三维对象",
+        ],
         Capability => &[
             "复用已有定义 → 06 → 08",
             "组合现有能力 → 07 → 08",
@@ -77,7 +151,11 @@ fn branches(node: WorkflowNode) -> &'static [&'static str] {
             "结果未知 → 16 对账原构建",
         ],
         Review => &["问题/下一批且预算允许 ↺04", "复核到位 → 15 结果与未决项"],
-        Pending => &["保留来源问题 → 15 如实报告", "明确解决缺口后再提出新方案"],
+        Pending => &[
+            "保留来源问题、洞口待核验与门窗实体缺失 → 15 如实报告",
+            "缺已批准洞口清单时完整性未知；洞口存在不等于门窗实体已建",
+            "明确解决缺口后再提出新方案",
+        ],
         Reconcile => &[
             "只读核对原 operation/build",
             "不自动重放；unknown 不视为完成",
@@ -390,6 +468,47 @@ mod tests {
         assert!(!text.contains("Root slots"));
     }
 
+    fn progress(domain: &DomainSnapshot, width: usize) -> Option<String> {
+        progress_line(domain, width).map(|line| line.to_string())
+    }
+
+    #[test]
+    fn progress_line_names_the_floor_and_the_stage_from_verified_facts() {
+        let mut domain = DomainSnapshot {
+            enabled: true,
+            floor_id: "八层".into(),
+            proposal: Some(crate::domain::ProposalFact {
+                binding: crate::domain::ProposalBinding {
+                    run_id: "run".into(),
+                    context_sha256: "context".into(),
+                    proposal_id: "proposal".into(),
+                    revision: 1,
+                    prepare_token: "token".into(),
+                    base_sha256: "base".into(),
+                    candidate_sha256: "candidate".into(),
+                },
+                state: "prepared".into(),
+                summary: String::new(),
+                objects: vec![],
+                assumptions: vec![],
+                diagnostics: vec![],
+                ready: true,
+            }),
+            ..Default::default()
+        };
+        let line = progress(&domain, 100).unwrap();
+        assert!(line.starts_with("◆ 八层 · "), "{line}");
+        assert!(line.contains("F4 查看流程"), "{line}");
+        assert!(
+            !line.contains("proposal") && !line.contains("token"),
+            "{line}"
+        );
+        // A project session without a chosen floor shows the stage only.
+        domain.floor_id = "项目目标".into();
+        assert!(!progress(&domain, 40).unwrap().contains("项目目标"));
+        assert!(!progress(&domain, 40).unwrap().contains("F4"));
+    }
+
     #[test]
     fn selected_loop_nodes_remain_reachable_at_small_terminal_sizes() {
         for (width, height) in [(30, 18), (60, 24), (120, 22), (120, 40)] {
@@ -406,6 +525,29 @@ mod tests {
                 assert!(text.contains("Tab"), "{text}");
                 assert!(!text.contains("已完成"));
             }
+        }
+    }
+
+    #[test]
+    fn identification_node_routes_arbitrary_object_types_through_ai_and_capability_checks() {
+        let text = screen(160, 50, WorkflowNode::Interpret.number() - 1)
+            .split_whitespace()
+            .collect::<String>();
+        for expected in [
+            "对象发现与AI识别",
+            "全层图块、纯线稿与上下文",
+            "区域裁图+附近文字+尺寸→AI开放类别判读",
+            "旧判读完全失去当前源成员仍保留未决缺口",
+            "类别不限于预设名称",
+            "已知类型复用/新类型定义",
+            "歧义澄清",
+            "缺能力",
+            "通用纯线稿逐成员核对",
+            "区域与注释数不是物体数",
+            "缺覆盖汇总",
+            "二维符号不等于",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
         }
     }
 }
