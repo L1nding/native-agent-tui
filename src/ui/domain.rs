@@ -8,21 +8,6 @@ use super::layout::wrap_text;
 use crate::extensions::{ExtensionConfirmation, ExtensionId, ExtensionSnapshot};
 use crate::state::display_text;
 
-fn has_verified_candidate_preview(
-    domain: &crate::domain::DomainSnapshot,
-    proposal: &crate::domain::ProposalFact,
-) -> bool {
-    domain.artifacts.iter().any(|artifact| {
-        artifact.binding.candidate
-            && artifact.binding.proposal_id == proposal.binding.proposal_id
-            && artifact.binding.revision == proposal.binding.revision
-            && artifact.binding.prepare_token == proposal.binding.prepare_token
-            && artifact.binding.input_sha256 == proposal.binding.candidate_sha256
-            && matches!(artifact.state, crate::domain::ArtifactState::Built)
-            && artifact.valid == Some(true)
-    })
-}
-
 fn sections(area: Rect, reply: Option<&str>) -> [Rect; 5] {
     let reply_height = reply.filter(|_| area.height >= 20).map_or(0, |reply| {
         let rows = wrap_text(reply, usize::from(area.width.saturating_sub(2).max(1))).len();
@@ -46,9 +31,95 @@ fn business_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if let Some(review) = &domain.first_use_review {
+        let opened = domain
+            .review_images
+            .iter()
+            .filter(|image| image.required && image.externally_opened)
+            .count();
+        let total = domain
+            .review_images
+            .iter()
+            .filter(|image| image.required)
+            .count();
+        lines.push(Line::from(format!(
+            "首用三维/CAD对照：{} · 需 {} 组 · 必需图已外部打开 {opened}/{total}",
+            match review.status.as_str() {
+                "ready" => "可复核",
+                "blocked" => "尚未满足",
+                "not_required" => "无需首用对照",
+                _ => "未知",
+            },
+            review.required_count
+        )));
+        if !domain.first_use_satisfied() {
+            lines.push(Line::from(
+                "批准前需本版真实Blender对照图，并成功外部打开所有必需图；附件交付不等于AI观察。",
+            ));
+        }
+    }
+    if domain.first_use_review.is_some() || !domain.review_images.is_empty() {
+        let count = domain.review_images.len();
+        lines.push(Line::from(format!(
+            "本版 {count} 张图片 · Alt+←/→ 选图 · Ctrl+O 外部打开"
+        )));
+        if let Some(image) = domain
+            .review_images
+            .get(context.panel.selected_image.min(count.saturating_sub(1)))
+        {
+            lines.push(Line::from(format!(
+                "[{}/{}] {} · {} · {}",
+                context.panel.selected_image.min(count - 1) + 1,
+                count,
+                display_text(&image.label),
+                match image.file_state {
+                    crate::domain::ImageFileState::Available => "文件SHA已核对",
+                    crate::domain::ImageFileState::Unavailable => "图片不可用",
+                    _ => "正在校验图片",
+                },
+                if image.externally_opened {
+                    "已外部打开"
+                } else {
+                    "尚未外部打开"
+                }
+            )));
+            if let Some(path) = image.verified_path() {
+                lines.push(Line::from(display_text(&path.to_string_lossy())));
+            }
+            if let Some(detail) = &image.detail {
+                lines.extend(
+                    wrap_text(&display_text(detail), usize::from(width.max(1)))
+                        .into_iter()
+                        .map(Line::from),
+                );
+            }
+            if let Some(notice) = &image.notice {
+                lines.push(Line::from(display_text(notice)));
+            }
+        }
+    }
+    if let Some(review) = &domain.structure_review {
+        let problems: Vec<_> = review.checks.iter().filter(|c| c.attention).collect();
+        if problems.is_empty() {
+            lines.push(Line::from(
+                "结构自检：楼板覆盖、墙线与柱线识别、墙体连通均正常",
+            ));
+        } else {
+            lines.push(Line::from(format!(
+                "结构自检：发现 {} 个问题",
+                problems.len()
+            )));
+            for check in problems {
+                lines.push(Line::from(format!("  ! {}", check.message)));
+                if !check.suggestion.is_empty() {
+                    lines.push(Line::from(format!("    {}", check.suggestion)));
+                }
+            }
+        }
+    }
     if let Some(groups) = &domain.groups {
         lines.push(Line::from(format!(
-            "构件识别 · 已评估 {}/{} 组 · 未定类别 {} 个候选",
+            "对象AI识别 · 已评估 {}/{} 组 · 未定类别 {} 个候选",
             groups.assessed_groups,
             groups.total_groups,
             groups
@@ -61,7 +132,12 @@ fn business_lines(
             .category_counts
             .iter()
             .filter(|(category, count)| category.as_str() != "unresolved" && **count > 0)
-            .map(|(category, count)| format!("{} {count}", display_text(category)))
+            .map(|(category, count)| {
+                format!(
+                    "{} {count}",
+                    display_text(crate::domain::review::category_label(category))
+                )
+            })
             .collect::<Vec<_>>();
         lines.push(Line::from(if labels.is_empty() {
             "尚无已标注类别；来源扫描数量不代表已识别构件".into()
@@ -72,11 +148,42 @@ fn business_lines(
             )
         }));
     }
+    lines.push(Line::from(domain.opening_inventory_detail()));
+    match domain.current_linework() {
+        Some(coverage) => {
+            lines.push(Line::from(format!(
+                "通用纯线稿覆盖：{} 个来源成员 · 已选 {} · 未选 {}",
+                coverage.member_count,
+                coverage.selected_member_count,
+                coverage.unselected_member_count
+            )));
+            lines.push(Line::from(format!(
+                "对象候选 {} · 未分类 {} · 区域 {} · 注释 {}；区域和注释数不等于物体数",
+                coverage.candidate_count,
+                coverage.unclassified_candidate_count,
+                coverage.region_count,
+                coverage.annotation_count
+            )));
+            lines.push(Line::from(format!(
+                "未覆盖 {} · 有诊断成员 {} · 过期选择 {}；覆盖记录不代表已建三维对象",
+                coverage.uncovered_count,
+                coverage.diagnostic_member_count,
+                coverage.stale_selection_count
+            )));
+        }
+        None if domain.linework.is_some() => lines.push(Line::from(
+            "通用纯线稿覆盖已过期或未与当前来源绑定，需重新排查；旧计数不代表当前覆盖",
+        )),
+        None => lines.push(Line::from("通用纯线稿覆盖未知，尚未排查；所有类别均需核对")),
+    }
+    lines.push(Line::from(domain.source_region_review_detail()));
     if let Some(proposal) = domain.proposal.as_ref().filter(|proposal| proposal.ready) {
-        if !has_verified_candidate_preview(domain, proposal) {
+        if !domain.candidate_review_delivered(&proposal.binding) {
             lines.push(Line::from(
-                "当前版本还没有已验证的 Blender 候选预览；请先生成并查看模型预览，之后才能批准。",
+                "等待当前已验证的 Blender 候选复核图交付 Agent，之后才能批准。",
             ));
+        } else if !domain.first_use_satisfied() {
+            lines.push(Line::from("首用图复核尚未满足，暂不能批准。"));
         } else {
             lines.push(Line::from(if context.phase.can_submit() {
                 "等待批准当前具体方案：按 Ctrl+Y 批准并继续。普通问答选项不生成场景授权。"
@@ -86,7 +193,7 @@ fn business_lines(
         }
     }
     lines.push(Line::from(
-        "流程：选层与结构方案 → 全层构件识别 → 批准结构 → 图纸审查与构件建模 → 对账复核 · F4 查看各步进度",
+        "散线流程：聚区域 → 裁图/文字/尺寸 → AI 开放判读/拆合 → 与图块共用定义、批准及建模 · F4 查看流程",
     ));
     for notice in [
         domain.notice.as_deref(),
@@ -101,7 +208,15 @@ fn business_lines(
     if let Some(progress) = domain.component_progress() {
         lines.push(Line::from(format!(
             "{} · 已发现 {} · 已建 {} · 待处理 {} · 已跳过 {} · 已排除 {}",
-            if progress.pending > 0 {
+            if progress.pending > 0
+                || domain
+                    .current_openings()
+                    .is_none_or(|inventory| !inventory.complete())
+                || domain.workflow_evidence().iter().any(|entry| {
+                    entry.node == crate::domain::WorkflowNode::Interpret
+                        && entry.state != crate::domain::WorkflowEvidenceState::Recorded
+                })
+            {
                 "整层尚未完成"
             } else {
                 "当前扫描范围的构件处理情况"
@@ -118,7 +233,7 @@ fn business_lines(
         .is_some_and(|scope| scope.assembly_binding.is_none())
     {
         lines.push(Line::from(
-            "构件发现尚未扫描；读取楼层来源并逐组识别家具、洁具等构件",
+            "对象尚未扫描；读取全层来源，由 AI 判读类别和用途，保留未知对象及线稿覆盖缺口",
         ));
     }
     if let Some(project) = &domain.project {
@@ -139,9 +254,6 @@ fn business_lines(
                     crate::domain::SelectionState::NeedsSelection => "重复图纸待选择",
                 }
             )));
-            lines.push(Line::from(
-                "选层操作：场景应用 not_run · 写入授权 not_granted；实际建模进度见下方",
-            ));
             if !selection.selected_keys.is_empty() {
                 lines.push(Line::from(format!(
                     "已选择 {}",
@@ -149,7 +261,7 @@ fn business_lines(
                         .selected_keys
                         .iter()
                         .take(100)
-                        .cloned()
+                        .map(|key| project.floor_titles.get(key).unwrap_or(key).clone())
                         .collect::<Vec<_>>()
                         .join("、")
                 )));
@@ -157,16 +269,13 @@ fn business_lines(
                     lines.push(Line::from("其余已选楼层见完整事实"));
                 }
             }
-            for row in &selection.rows {
-                lines.push(Line::from(row.clone()));
-            }
-        } else {
-            for row in &project.rows {
-                lines.push(Line::from(row.clone()));
+            // Drawing locations matter only while the user picks a duplicate drawing.
+            if selection.state == crate::domain::SelectionState::NeedsSelection {
+                for row in &selection.rows {
+                    lines.push(Line::from(row.clone()));
+                }
             }
         }
-        lines.push(Line::from(format!("目录 {}", project.catalog_id)));
-        lines.push(Line::from(format!("来源 SHA256 {}", project.source_sha256)));
     }
     for building in &domain.buildings {
         lines.push(Line::from(format!(
@@ -201,6 +310,16 @@ fn business_lines(
                 report.missing_floor_reviews,
                 report.connection_issues
             )));
+            lines.push(Line::from(format!(
+                "散线判读 {} · 结构已表示 {} · 未判读 {} · 待确认 {} · 过期 {} · 失去对应 {} · 缺汇总楼层 {}",
+                report.source_discovery.state,
+                report.source_discovery.structure_represented_region_count,
+                report.source_discovery.unreviewed_region_count,
+                report.source_discovery.uncertain_region_count,
+                report.source_discovery.stale_review_count,
+                report.source_discovery.orphaned_stale_review_count,
+                report.source_discovery.missing_floors.len(),
+            )));
         }
         lines.push(Line::from(format!(
             "楼栋产物 {}",
@@ -229,15 +348,12 @@ fn business_lines(
             "楼层定位 {} · {} · 仅证据，未批准",
             location.floor_key, location.status
         )));
-        lines.push(Line::from(format!("定位证据 {}", location.location_id)));
-        lines.extend(location.rows.iter().cloned().map(Line::from));
+        if location.status == "needs_wall_layers" {
+            lines.extend(location.rows.iter().cloned().map(Line::from));
+        }
     }
     if let Some(scope) = &domain.project_scope {
-        lines.push(Line::from(format!(
-            "当前楼层 {} · {}",
-            scope.floor_key, scope.floor_id
-        )));
-        lines.push(Line::from(format!("作用域 {}", scope.scope_id)));
+        lines.push(Line::from(format!("当前楼层 {}", domain.floor_title())));
         lines.push(Line::from(match scope.component_discovery {
             Some(crate::domain::ComponentDiscovery::AllLayers) => {
                 "构件发现：检查本层各图层的图纸符号，由 Agent 逐组识别用途"
@@ -258,10 +374,6 @@ fn business_lines(
                     .join(", ")
             )));
             lines.push(Line::from(format!("图层选择理由 {}", choice.reason)));
-            lines.push(Line::from(format!(
-                "所用定位证据 {}",
-                choice.expected_location_id
-            )));
         }
         if let Some(binding) = &scope.assembly_binding {
             lines.push(Line::from(format!(
@@ -322,20 +434,25 @@ fn business_lines(
             "输入意见会携带该选中对象及版本上下文；选择不会启动 Agent。",
         ));
     }
-    if let Some(path) = &domain.preview_connection {
-        lines.push(Line::from(format!(
-            "Blender 连接文件：{}",
-            display_text(path)
-        )));
-    }
+    lines.push(Line::from(if domain.preview_connection.is_some() {
+        "Blender 预览已开启：打开 Blender 的 Agent 预览页签即可自动连接"
+    } else {
+        "Blender 预览未开启"
+    }));
     if let Some(p) = &domain.proposal {
         lines.push(Line::from(format!(
-            "方案 {} · 修订 {} · {}",
-            p.binding.proposal_id, p.binding.revision, p.state
+            "方案 · 修订 {} · {}",
+            p.binding.revision,
+            match p.state.as_str() {
+                "prepared" => "已准备，待批准",
+                "blocked" => "有问题待处理",
+                "applied" => "已应用",
+                "built" => "已应用并构建",
+                "superseded" => "已被新版本取代",
+                other => other,
+            }
         )));
         lines.push(Line::from(display_text(&p.summary)));
-        lines.push(Line::from(format!("场景基线 {}", p.binding.base_sha256)));
-        lines.push(Line::from(format!("候选 {}", p.binding.candidate_sha256)));
         lines.push(Line::from(format!(
             "领域校验 {} · 场景应用 {}",
             if p.diagnostics.is_empty()
@@ -364,6 +481,7 @@ fn business_lines(
             ));
         }
     }
+    lines.push(Line::from(domain.existing_structure_detail()));
     if domain.artifacts.is_empty() {
         lines.push(Line::from("Blender 产物 not_run"));
         lines.push(Line::from("产物验证 not_run"));
@@ -467,27 +585,15 @@ pub(super) fn draw(
     let reply_height = chunks[2].height;
     frame.render_widget(
         Paragraph::new(format!(
-            "建模 · {} · {:?} · 平台模型 {}\n{}",
-            domain.floor_id,
-            context.phase,
+            "建模 · {} · {} · 平台模型 {}\n{}",
+            domain.floor_title(),
+            super::lang::phase(context.phase),
             context.model.unwrap_or("default"),
             domain
                 .fact_sync_notice
                 .as_ref()
                 .map(|notice| display_text(notice))
-                .unwrap_or_else(|| {
-                    domain
-                        .verified_fact
-                        .as_ref()
-                        .map(|fact| {
-                            format!(
-                                "Core事实 {} · seq {} · {} B
-SHA256 {}",
-                                fact.kind, fact.sequence, fact.bytes, fact.sha256
-                            )
-                        })
-                        .unwrap_or_default()
-                })
+                .unwrap_or_default()
         )),
         chunks[0],
     );
@@ -548,8 +654,10 @@ SHA256 {}",
         chunks[3],
     );
     let approval_hint = if let Some(proposal) = domain.proposal.as_ref().filter(|p| p.ready) {
-        if !has_verified_candidate_preview(domain, proposal) {
-            "等待 Blender 候选预览"
+        if !domain.candidate_review_delivered(&proposal.binding) {
+            "等待已验证候选的复核图交付"
+        } else if !domain.first_use_satisfied() {
+            "等待首用必需图外部打开"
         } else if context.phase.can_submit() {
             "Ctrl+Y 批准已展示版本"
         } else {
@@ -558,10 +666,141 @@ SHA256 {}",
     } else {
         "等待本轮结束后批准"
     };
-    frame.render_widget(Paragraph::new(format!("Enter 发送反馈 · {approval_hint} · Ctrl+C 中断 · F4 工作流 · F6/Esc 返回会话 · PgUp/PgDn 滚动")), chunks[4]);
+    frame.render_widget(Paragraph::new(format!("Ctrl+O 外部打开 · Alt+←/→ 选图 · {approval_hint} · Enter 反馈 · F4 工作流 · F6/Esc 会话 · PgUp/PgDn 滚动")), chunks[4]);
 }
 
 pub(super) struct ModelingView;
+
+pub(super) fn approval_card_lines(
+    domain: &crate::domain::DomainSnapshot,
+    selected_image: usize,
+) -> Vec<String> {
+    let Some(proposal) = &domain.proposal else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "建模审批 · {} · 修订 {} · {}",
+        display_text(&proposal.binding.proposal_id),
+        proposal.binding.revision,
+        display_text(&proposal.summary)
+    )];
+    lines.push(if domain.proposal_categories.is_empty() {
+        "本版类别数量未知；详见选中对象清单".into()
+    } else {
+        format!(
+            "本版选中对象：{}",
+            domain
+                .proposal_categories
+                .iter()
+                .map(|(category, count)| format!(
+                    "{} {count}",
+                    display_text(crate::domain::review::category_label(category))
+                ))
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    });
+    let mut assumptions: std::collections::BTreeSet<_> = proposal
+        .assumptions
+        .iter()
+        .map(|text| {
+            format!(
+                "示意假设：{}",
+                display_text(&crate::domain::review::evidence_labels(text))
+            )
+        })
+        .collect();
+    if let Some(review) = &domain.first_use_review {
+        assumptions.extend(review.dimensions.iter().map(|text| display_text(text)));
+    }
+    if assumptions.is_empty() {
+        lines.push("示意假设：本版未列出".into());
+    }
+    lines.extend(assumptions);
+    let artifacts: Vec<_> = domain
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.binding.candidate)
+        .collect();
+    if artifacts.is_empty() {
+        lines.push("Blender构建：尚无本版产物".into());
+    }
+    for artifact in artifacts {
+        lines.push(format!(
+            "Blender构建 {} · {} · 验证：{} · 版本：{}",
+            display_text(&artifact.binding.build_id),
+            match artifact.state {
+                crate::domain::ArtifactState::Queued => "排队中",
+                crate::domain::ArtifactState::Building => "构建中",
+                crate::domain::ArtifactState::Unknown => "结果未知",
+                crate::domain::ArtifactState::Cancelled => "已取消",
+                crate::domain::ArtifactState::Failed => "构建失败",
+                crate::domain::ArtifactState::Built => "已构建",
+            },
+            match artifact.valid {
+                Some(true) => "通过",
+                Some(false) => "未通过",
+                None => "未知",
+            },
+            match artifact.current {
+                Some(true) => "当前",
+                Some(false) => "已过期",
+                None => "未知",
+            }
+        ));
+    }
+    lines.push("GLB：未知（当前投影未提供独立GLB校验事实）".into());
+    let images = &domain.review_images;
+    let required = images.iter().filter(|image| image.required).count();
+    let opened = images
+        .iter()
+        .filter(|image| image.required && image.externally_opened)
+        .count();
+    lines.push(format!(
+        "本版 {} 张图（对照 {} · 总览 {} · 局部 {}）· 必需图外部打开 {opened}/{required} · Ctrl+O 打开 · Alt+←/→ 选图",
+        images.len(),
+        images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Comparison).count(),
+        images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Overview).count(),
+        images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Detail).count()
+    ));
+    if let Some(image) = images.get(selected_image.min(images.len().saturating_sub(1))) {
+        lines.push(format!(
+            "[{}/{}] {} · {} · {}",
+            selected_image.min(images.len() - 1) + 1,
+            images.len(),
+            display_text(&image.label),
+            if image.verified_path().is_some() {
+                "SHA已核对"
+            } else {
+                "图片不可用/校验中"
+            },
+            if image.externally_opened {
+                "已外部打开"
+            } else {
+                "未外部打开"
+            }
+        ));
+        if let Some(notice) = &image.notice {
+            lines.push(display_text(notice));
+        }
+    }
+    lines.push("未纳入项：本提案仅包含上述选中对象；其他来源范围/剩余对象尚未完整核对，不能据此宣称整层完成。".into());
+    for diagnostic in &proposal.diagnostics {
+        lines.push(display_text(diagnostic));
+    }
+    if let Some(notice) = &domain.fact_sync_notice {
+        lines.push(display_text(notice));
+    }
+    lines.push(
+        if domain.candidate_review_delivered(&proposal.binding) && domain.first_use_satisfied() {
+            "Ctrl+Y 批准本版 · F6 查看建模详情（外部打开不代表已经看见或完成AI观察）"
+        } else {
+            "尚未满足批准条件：需有效候选复核图及本版首用图外部打开 · F6 详情"
+        }
+        .into(),
+    );
+    lines
+}
 
 impl ExtensionView for ModelingView {
     fn id(&self) -> ExtensionId {
@@ -596,8 +835,9 @@ impl ExtensionView for ModelingView {
             .proposal
             .as_ref()
             .filter(|proposal| proposal.ready)
-            .filter(|proposal| has_verified_candidate_preview(domain, proposal))
-            .map(|proposal| ExtensionConfirmation::Modeling(proposal.binding.clone()))
+            .filter(|proposal| domain.candidate_review_delivered(&proposal.binding))
+            .filter(|_| domain.first_use_satisfied())
+            .map(|_| ExtensionConfirmation::Modeling(domain.confirmation()))
     }
 }
 
@@ -609,6 +849,93 @@ mod tests {
     };
     use super::*;
     use crate::state::CoreSnapshot;
+    #[test]
+    fn structure_problems_and_the_floor_title_lead_the_page() {
+        use crate::domain::{
+            ProjectCatalogFact, ProjectScopeFact, StructureCheck, StructureReview,
+        };
+        let domain = DomainSnapshot {
+            enabled: true,
+            floor_id: "floor.f02.trial".into(),
+            project: Some(ProjectCatalogFact {
+                catalog_id: "c".repeat(64),
+                project_path: "projects/h".into(),
+                source_sha256: "s".repeat(64),
+                total_floors: 1,
+                floor_keys: vec!["f02".into()],
+                floor_titles: [("f02".to_owned(), "二层平面".to_owned())].into(),
+                component_source_layers: None,
+                rows: vec!["f02 · 二层平面 · CAD (1,2)".into()],
+            }),
+            selection: Some(crate::domain::ProjectSelectionFact {
+                selection_id: "selection".into(),
+                catalog_id: "c".repeat(64),
+                source_sha256: "s".repeat(64),
+                target: "二层".into(),
+                state: crate::domain::SelectionState::Selected,
+                selected_keys: vec!["f02".into()],
+                candidate_keys: vec!["f02".into()],
+                rows: vec![],
+            }),
+            project_scope: Some(ProjectScopeFact {
+                activation_revision: Some(1),
+                assembly_binding: None,
+                opening_completion_binding: None,
+                wall_layer_choice: None,
+                component_discovery: None,
+                scope_id: "a".repeat(64),
+                floor_key: "f02".into(),
+                floor_id: "floor.f02.trial".into(),
+                selection_id: "b".repeat(64),
+                source_sha256: "s".repeat(64),
+            }),
+            structure_review: Some(StructureReview {
+                attention: true,
+                checks: vec![
+                    StructureCheck {
+                        attention: true,
+                        message: "楼板覆盖了 50% 的墙体".into(),
+                        suggestion: "向用户说明缺楼板的区域".into(),
+                    },
+                    StructureCheck {
+                        attention: false,
+                        message: "图纸墙线识别出 94%".into(),
+                        suggestion: String::new(),
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(domain.floor_title(), "二层");
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(domain)],
+            ..Default::default()
+        };
+        let local = LocalState::default();
+        let context = ViewContext::new(&snapshot, &local.extension, "", None);
+        let text = business_lines(snapshot.extensions[0].modeling().unwrap(), &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(text.starts_with("结构自检：发现 1 个问题"), "{text}");
+        assert!(text.contains("! 楼板覆盖了 50% 的墙体"), "{text}");
+        assert!(!text.contains("94%"), "passing checks stay quiet: {text}");
+        assert!(text.contains("已选择 二层平面"), "{text}");
+        assert!(text.contains("当前楼层 二层"), "{text}");
+        for hidden in [
+            "CAD (1,2)",
+            "floor.f02.trial",
+            &"a".repeat(64),
+            &"c".repeat(64),
+            &"s".repeat(64),
+        ] {
+            assert!(!text.contains(hidden), "{hidden}: {text}");
+        }
+    }
     #[test]
     fn short_agent_reply_leaves_room_for_project_choices() {
         let area = Rect::new(0, 0, 120, 36);
@@ -813,6 +1140,7 @@ mod tests {
                             "USER-FIXTURES".into(),
                         ]),
                         floor_keys: vec!["f09.a".into(), "f09.b".into()],
+                        floor_titles: Default::default(),
                         rows: vec!["f09.a · 九层图纸A".into(), "f09.b · 九层图纸B".into()],
                     }),
                     selection: Some(ProjectSelectionFact {
@@ -856,11 +1184,11 @@ mod tests {
                 "九层图纸A",
                 "九层图纸B",
                 "PL-家具",
-                "not_run",
-                "not_granted",
             ] {
                 assert!(screen.contains(text), "{width}: {text}");
             }
+            // Internal action states stay out of the user's page.
+            assert!(!screen.contains("not_granted"), "{width}");
             assert!(ModelingView.confirmation(&snapshot.extensions[0]).is_none());
         }
     }
@@ -884,6 +1212,7 @@ mod tests {
                 component_discovery: None,
                 activation_revision: Some(1),
                 assembly_binding: None,
+                opening_completion_binding: None,
                 scope_id: "d".repeat(64),
                 floor_key: "f10".into(),
                 floor_id: "floor.f10".into(),
@@ -928,6 +1257,46 @@ mod tests {
                 assert!(screen.contains(expected), "{width}: {expected}\n{screen}");
             }
             assert!(ModelingView.confirmation(&snapshot.extensions[0]).is_none());
+            for hidden in ["定位证据", "作用域", &"d".repeat(64), &"e".repeat(64)] {
+                assert!(!screen.contains(hidden), "{hidden}: {screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_and_derived_locations_do_not_show_internal_layer_evidence() {
+        for status in ["configured", "derived"] {
+            let snapshot = CoreSnapshot {
+                extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
+                    enabled: true,
+                    project_location: Some(crate::domain::ProjectLocationFact {
+                        location_id: "e".repeat(64),
+                        catalog_id: "a".repeat(64),
+                        selection_id: "c".repeat(64),
+                        source_sha256: "b".repeat(64),
+                        floor_key: "f02".into(),
+                        status: status.into(),
+                        layers: vec!["WALLS".into()],
+                        rows: vec!["WALLS · 211 线实体".into()],
+                    }),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            };
+            let panel = ExtensionPanel::default();
+            let text = business_lines(
+                snapshot.extensions[0].modeling().unwrap(),
+                &ViewContext::new(&snapshot, &panel, "", None),
+                120,
+            )
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(text.contains("楼层定位"), "{text}");
+            for hidden in ["线实体", "WALLS", "定位证据", &"e".repeat(64)] {
+                assert!(!text.contains(hidden), "{hidden}: {text}");
+            }
         }
     }
 
@@ -1144,7 +1513,7 @@ mod tests {
                 );
             }
             assert_eq!(local.extension.scroll, 0);
-            assert!(render(&local).contains("方案 proposal-3"));
+            assert!(render(&local).contains("方案 · 修订"));
         }
         assert!(rx.try_recv().is_err());
     }
@@ -1219,12 +1588,14 @@ mod tests {
                         state: ArtifactState::Built,
                         current: Some(false),
                         valid: Some(true),
+                        reviewed: true,
                     },
                     ArtifactFact {
                         binding: binding("build-failed"),
                         state: ArtifactState::Failed,
                         current: Some(true),
                         valid: Some(false),
+                        reviewed: true,
                     },
                 ],
                 ..Default::default()
@@ -1307,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn business_approval_submits_the_rendered_version_and_not_an_unseen_update() {
+    fn business_approval_rejects_a_rendered_version_after_an_unseen_update() {
         let displayed = proposal(1);
         let snapshot = CoreSnapshot {
             phase: SessionPhase::Completed,
@@ -1323,9 +1694,9 @@ mod tests {
             extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
             ..Default::default()
         };
-        local
-            .extension
-            .displayed(ExtensionConfirmation::Modeling(displayed.binding.clone()));
+        local.extension.displayed(ExtensionConfirmation::Modeling(
+            displayed.binding.clone().into(),
+        ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         super::super::handle_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -1333,12 +1704,8 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Command::ConfirmExtension {
-                confirmation: ExtensionConfirmation::Modeling(displayed.binding)
-            }
-        );
+        assert!(rx.try_recv().is_err());
+        assert!(local.notice.is_some());
     }
 
     #[test]
@@ -1373,7 +1740,7 @@ mod tests {
         assert!(local.editor.text.is_empty());
     }
     #[test]
-    fn long_fact_kind_and_sequence_keep_entire_sha_visible_in_real_acceptance_width() {
+    fn header_names_the_floor_and_phase_without_fact_digests() {
         use crate::domain::VerifiedFact;
         use ratatui::{backend::TestBackend, Terminal};
         let digest = "ab".repeat(32);
@@ -1402,9 +1769,10 @@ mod tests {
         let header: String = (0..3)
             .flat_map(|y| (0..120).map(move |x| buffer[(x, y)].symbol().to_owned()))
             .collect();
-        assert!(header.contains("artifact_validation"));
-        assert!(header.contains("123456"));
-        assert!(header.contains(&digest), "{header}");
+        // The header names the floor and phase; fact digests stay in the journal.
+        assert!(header.replace(' ', "").contains("建模"), "{header}");
+        assert!(!header.contains(&digest), "{header}");
+        assert!(!header.contains("artifact_validation"), "{header}");
     }
     #[test]
     fn execution_state_precedes_large_group_ledger_and_component_detail_lists() {
@@ -1446,6 +1814,7 @@ mod tests {
                     state: ArtifactState::Built,
                     current: Some(true),
                     valid: Some(true),
+                    reviewed: true,
                 }],
                 ..Default::default()
             })],
@@ -1511,6 +1880,206 @@ mod tests {
     }
 
     #[test]
+    fn object_identification_displays_open_categories_and_keeps_old_stair_evidence_unconfirmed() {
+        let mut domain = DomainSnapshot {
+            enabled: true,
+            groups: Some(crate::domain::SourceGroupsFact {
+                scan_id: "scan".into(),
+                scene_sha256: "current".into(),
+                total_objects: 3,
+                total_groups: 1,
+                assessed_groups: 1,
+                category_counts: [("air_handling_unit".into(), 3)].into(),
+                rows: vec![],
+                counts: [("built".into(), 3)].into(),
+            }),
+            drawing_audit: Some(crate::domain::DrawingAuditFact {
+                audit_id: "audit".into(),
+                scene_sha256: "current".into(),
+                candidate_count: 1,
+                judged_count: 1,
+                ai_review: "recorded".into(),
+                offset: 0,
+                next_offset: None,
+                stair_linework: Some(crate::domain::StairLineworkFact {
+                    line_count: 10,
+                    region_count: 1,
+                    reviewed_region_count: 1,
+                }),
+                rows: vec![],
+            }),
+            ..Default::default()
+        };
+        let snapshot = CoreSnapshot::default();
+        let panel = ExtensionPanel::default();
+        let context = ViewContext::new(&snapshot, &panel, "", None);
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("对象AI识别"));
+        assert!(text.contains("air_handling_unit 3"));
+        assert!(!text.contains("楼梯专层排查"));
+        assert!(text.contains("通用纯线稿覆盖未知，尚未排查"));
+        assert!(text.contains("既有结构覆盖未知"));
+        assert!(text.contains("通用区域判读未知"));
+        assert!(text.contains("整层尚未完成"));
+        assert!(text.contains("已建 3 · 待处理 0"));
+        domain.linework = Some(crate::domain::LineworkCoverageFact {
+            scan_id: "scan".into(),
+            scene_sha256: "current".into(),
+            member_count: 90,
+            selected_member_count: 50,
+            unselected_member_count: 40,
+            candidate_count: 3,
+            unclassified_candidate_count: 2,
+            region_count: 5,
+            annotation_count: 7,
+            uncovered_count: 11,
+            diagnostic_member_count: 13,
+            stale_selection_count: 17,
+        });
+        domain.existing_structure = Some(crate::domain::ExistingStructureCoverageFact {
+            scan_id: "scan".into(),
+            scene_sha256: "current".into(),
+            member_count: 90,
+            complete_member_count: 40,
+            partial_member_count: 10,
+            reference_only_member_count: 20,
+            unproven_member_count: 20,
+            unselected_complete_member_count: 40,
+        });
+        domain.source_regions = Some(crate::domain::SourceRegionReviewFact {
+            scan_id: "scan".into(),
+            scene_sha256: "current".into(),
+            region_count: 5,
+            reviewed_region_count: 2,
+            unreviewed_region_count: 2,
+            structure_represented_region_count: 1,
+            uncertain_region_count: 1,
+            stale_review_count: 1,
+            orphaned_stale_review_count: 2,
+        });
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "90 个来源成员 · 已选 50 · 未选 40",
+            "对象候选 3 · 未分类 2 · 区域 5 · 注释 7",
+            "区域和注释数不等于物体数",
+            "未覆盖 11 · 有诊断成员 13 · 过期选择 17",
+            "覆盖记录不代表已建三维对象",
+            "既有结构覆盖：完整 40、部分 10、仅参考 20、无证据 20",
+            "未选且已完整覆盖 40",
+            "不改写来源选择及对象建模状态",
+            "通用区域判读：5 个区域 · 已判读 2 · 未判读 2 · 不确定 1 · 过期 1",
+            "失去源成员的判读 2",
+            "结构已表示 1",
+            "结构表示不等于 AI 已判读",
+            "区域不等于物体，判读不代表已建模",
+        ] {
+            assert!(
+                text.replace('\n', "").contains(expected),
+                "missing {expected}: {text}"
+            );
+        }
+        assert!(text.contains("整层尚未完成"));
+        domain.linework.as_mut().unwrap().scan_id = "old-scan".into();
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("通用纯线稿覆盖已过期"));
+        assert!(text.contains("既有结构覆盖已过期"));
+        assert!(text.contains("通用区域判读已过期"));
+        assert!(!text.contains("既有结构覆盖：完整 40"));
+        assert!(!text.contains("90 个来源成员"));
+        domain.linework.as_mut().unwrap().scan_id = "scan".into();
+        domain.groups.as_mut().unwrap().scene_sha256 = "new".into();
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("通用区域判读已过期"));
+        assert!(text.contains("通用纯线稿覆盖已过期"));
+        domain.groups.as_mut().unwrap().scene_sha256 = "current".into();
+        domain.operation = Some(crate::domain::OperationFact {
+            operation_id: "latest".into(),
+            state: "applied".into(),
+            recovery: "not_required".into(),
+            current_sha256: "new".into(),
+        });
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("通用区域判读已过期"));
+        assert!(!text.contains("楼梯专层排查：10"));
+        assert!(text.contains("通用纯线稿覆盖已过期"));
+    }
+
+    #[test]
+    fn approved_apertures_do_not_hide_missing_or_unverified_door_and_window_entities() {
+        let mut domain = DomainSnapshot {
+            enabled: true,
+            groups: Some(crate::domain::SourceGroupsFact {
+                scan_id: "scan".into(),
+                scene_sha256: "scene".into(),
+                total_objects: 2,
+                total_groups: 1,
+                assessed_groups: 1,
+                category_counts: [("chair".into(), 2)].into(),
+                rows: vec![],
+                counts: [("built".into(), 2)].into(),
+            }),
+            openings: Some(crate::domain::OpeningInventoryFact {
+                scan_id: Some("scan".into()),
+                scene_sha256: "scene".into(),
+                inventory_verified: true,
+                total_count: 4,
+                verified_aperture_count: 3,
+                missing_entity_count: 2,
+                complete_entity_count: 1,
+                unverified_count: 2,
+            }),
+            ..Default::default()
+        };
+        let snapshot = CoreSnapshot::default();
+        let panel = ExtensionPanel::default();
+        let context = ViewContext::new(&snapshot, &panel, "", None);
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("洞口已核验 3、待核验 1"));
+        assert!(text.contains("门窗实体已建 1、缺失 2、待核验 1"));
+        assert!(text.contains("洞口或实体未核验项 2"));
+        assert!(text.contains("整层尚未完成"));
+        domain.openings.as_mut().unwrap().scene_sha256 = "old".into();
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("清单已过期"));
+        assert!(!text.contains("门窗实体已建 1"));
+        domain.openings = None;
+        let text = business_lines(&domain, &context, 120)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("清单未知"));
+    }
+
+    #[test]
     fn building_success_keeps_source_attention_and_unchecked_connections_visible_without_approval()
     {
         let domain = DomainSnapshot {
@@ -1527,6 +2096,21 @@ mod tests {
                 floor_keys: vec!["f08".into(), "f09".into()],
                 floor_authorities: Default::default(),
                 source_reconciliation: "attention".into(),
+                source_discovery: crate::domain::BuildingSourceDiscoveryFact {
+                    state: "unknown".into(),
+                    missing_floors: vec!["f08".into(), "f09".into()],
+                    unresolved_member_count: 0,
+                    unclassified_candidate_count: 0,
+                    uncovered_count: 0,
+                    diagnostic_member_count: 0,
+                    stale_selection_count: 0,
+                    region_count: 0,
+                    unreviewed_region_count: 0,
+                    structure_represented_region_count: 0,
+                    uncertain_region_count: 0,
+                    stale_review_count: 0,
+                    orphaned_stale_review_count: 0,
+                },
                 connection_check: "not_run".into(),
                 report: Some(crate::domain::BuildingReportFact {
                     state: "attention".into(),
@@ -1538,6 +2122,21 @@ mod tests {
                     unresolved_drawing: 15,
                     missing_floor_reviews: 0,
                     connection_issues: 1,
+                    source_discovery: crate::domain::BuildingSourceDiscoveryFact {
+                        state: "unknown".into(),
+                        missing_floors: vec!["f08".into(), "f09".into()],
+                        unresolved_member_count: 0,
+                        unclassified_candidate_count: 0,
+                        uncovered_count: 0,
+                        diagnostic_member_count: 0,
+                        stale_selection_count: 0,
+                        region_count: 0,
+                        unreviewed_region_count: 0,
+                        structure_represented_region_count: 0,
+                        uncertain_region_count: 0,
+                        stale_review_count: 0,
+                        orphaned_stale_review_count: 0,
+                    },
                 }),
                 output: "building/model.glb".into(),
             }],
@@ -1549,6 +2148,7 @@ mod tests {
                 ai_review: "not_run".into(),
                 offset: 0,
                 next_offset: Some(40),
+                stair_linework: None,
                 rows: vec!["gap · wall_gap · review required".into()],
             }),
             ..Default::default()
@@ -1579,6 +2179,7 @@ mod tests {
             assert!(text.contains("图纸审查候选 41 项"));
             assert!(text.contains("下一页 40"));
             assert!(text.contains("人工复核 not_run"));
+            assert!(text.contains("通用区域判读未知"));
         }
     }
 }

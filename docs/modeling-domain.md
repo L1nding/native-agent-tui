@@ -1,5 +1,11 @@
 # 建模业务视图
 
+首用构件复核：新类别／模板首次使用时，Python 在 prepare 阶段冻结 `component_first_use_requirements`，候选构建后用 Blender 生成“完整单构件 3D＋CAD 原线稿＋尺寸／assumed 假设”对照图。图像事实提供 `image_path`、`image_sha256` 和 proposal／template／source 绑定；不可变复核集合另封哈希，不修改已经封存的 prepare token。批准与最终 writer 均复验本版集合，模板、来源、参数或图像字节变化后旧证据失效。重复实例按经过批准的定义／来源形状证据复用，不按模板名称推断已复核。
+
+审阅图先通过系统看图程序展示。Core 校验文件字节、SHA 和当前版本后才向 UI 提供可用路径；缺文件或 SHA 不符显示“图片不可用”。本版图集包含对照图、总览和局部；Alt+左／右选择图片，Ctrl+O 提交有类型的打开命令，由 Core 再验绑定并调用系统程序。外部打开成功与人工已复核分别记录，前者不表示用户已经看见或认可。必需对照图的打开状态参与本次具体批准，旧版本／旧图集的打开记录不能复用。ACP 图像字节仍不进入日志。
+
+会话页输入框上方直接显示建模审批卡，内容由与建模详情页相同的 `view.confirmation(projection)` 和领域快照派生：具体版本、本批各类别数量、assumed 假设、构建／GLB／复核图状态和未纳入项。类别数量来自本提案，不使用楼层库存代替。卡片完整渲染后通过同一个 `panel.displayed` 登记确认；Ctrl+Y 在会话页核对 displayed 与当前一致、can_submit、无运行中任务和当前复核图交付／首用门槛，再进入原具体授权。新版或图集变化立即使旧确认失效。窗口不足以完整显示卡片时不登记，提示打开详情。建模页保留为 F6 详情入口，准备提案和批准不再自动跳页。
+
 2026-10-15 类别展示：Core 从完整来源分组核验并汇总 category_counts，逐组数量必须等于实例数。建模页优先展示已评估组数、未定类别候选、实际类别及来源数量，与已建数量分开。专项覆盖 8 个已标注候诊座椅、2 个未定类别、0 个已建，完整 nextest 665 项通过、4 项可选跳过，Clippy 与 release 构建通过。原八层真实 Agent 已读完 36 组／889 条 CAD 来源，保留 18 条用途或归属待确认；分类保留推断，未应用结构或构件，不能把来源数当实物数。
 
 最终验收：全量 Rust 664 项通过、4 项可选跳过。新版 TUI 已从原运行 `project-36156-1792032656143688800` 恢复原结构提案第 1 版，Core 正确绑定八层、无事实同步失败；Agent 实际结束回合并指向建模页 Ctrl+Y，没有再弹批准问答。F4 实际展示六步业务进度，Esc 返回原建模页。此轮未代替真实用户触发批准，尚未执行应用／构建；已知旧问答的批准意见不是平台授权回执。
@@ -18,7 +24,7 @@
 
 项目模式的楼层定位另提供`inspect_project_floor_location`只读事实：绑定catalog_id、selection_id、source SHA、floor_key及location_id，完整逐图层实体数支持分页。未配置楼层在默认墙线不足时，Agent提出`wall_layer_choice`（exact location_id／已见wall_layers／reason），随结构准备提交；选择不是授权，进入同一具体结构摘要后经原批准通道确认。配置/定位证书和CAD依赖在prepare、授权及唯一writer处检查；配置过的楼层保持原图层，定位阈值保持不变。Core仅在当前所选楼层与定位身份/图层匹配时接纳带选择的scope；恢复/切换该scope前先恢复定位事实。F6分别显示证据、绑定选择、原结构状态，不将已应用选择继续称为待执行。真实证据与未完成边界见[完成审计](dsh-tui-completion-audit.md)。
 
---domain-context 在 config 中注入 stdio modeling_domain MCP。领域会话的通用工具必须 read-only，resume/reload/new 后重新确认；失败不启动 turn。普通 TUI 默认显示建模业务页，可 F6/Esc 返回会话、Enter 发反馈、Ctrl+Y 批准、PgUp/PgDn 查看依据及各阶段。小终端、平台问答和其他覆盖面板不会记录可批准的展示 binding。
+--domain-context 在 config 中注入 stdio modeling_domain MCP。领域会话的通用工具必须 read-only，resume/reload/new 后重新确认；失败不启动 turn。普通会话通过输入框上方审批卡直接 Ctrl+Y 批准，可 F6 查看建模详情、Esc 返回会话、Enter 发反馈，详情中 PgUp/PgDn 查看依据及各阶段。小终端、平台问答和其他覆盖面板不会记录可批准的展示 binding。
 
 Core 从已校验线程／回合身份、带 registry-derived MCP identity 的 completed 事件读取 modeling-fact-receipt/v1 小回执，再使用自己持有的 Python domain-read-fact 通道取完整封存事实。小回执含 run/context SHA、kind、ok、fact_sequence、fact_sha256、fact_bytes、具体绑定和模型摘要；模型摘要最多6,000字节，省略部分由 Agent 经 read_fact_view 分页读取。Core 逐项核对完整事实的字节数、SHA256、上下文、序号和绑定后投影；生产路径不再将模型所见完整 envelope 作为事实输入。回执接收上限16KiB，完整事实读取上限8MiB；stdout/stderr在读取过程中有界。单个读取任务及最多32条等待回执由Core持有，10秒deadline、kill_on_drop、会话重置／shutdown取消、执行generation及读取attempt拒绝迟到结果。
 
@@ -273,5 +279,5 @@ source-view/1给来源分页和全层分组附上同一完整来源状态SHA。C
 
 # Blender 实时预览
 
-`--domain-context FILE` 或 `--domain-project PATH` 加 `--domain-preview` 在同一会话挂接本地 Blender Extension 预览/所选对象反馈。
+楼层上下文和项目（含 `/project` 切换的项目）默认在同一会话挂接本地 Blender Extension 预览/所选对象反馈。
 Core 持有子进程和 session epoch，审批继续使用当前页实际渲染的 binding；详情见 [预览接入](blender-preview.md)。

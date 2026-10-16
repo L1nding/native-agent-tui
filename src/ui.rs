@@ -27,6 +27,7 @@ mod lang;
 mod layout;
 mod models;
 mod overlays;
+mod projects;
 mod provider_form;
 mod reminders;
 mod render;
@@ -43,6 +44,7 @@ mod theme;
 mod timeline;
 mod todos;
 mod tool_detail;
+mod tool_labels;
 mod tool_search;
 mod tool_trace;
 #[cfg(test)]
@@ -61,7 +63,8 @@ use request_state::{request_locked, selected_request, sync_local_requests};
 use skills::skills_panel_entries_capacity;
 use workflow::{WorkflowAction, WorkflowConversation, WorkflowKeyResult, WorkflowScheduleRequest};
 
-pub use runtime::{run_history, run_tasks_with_history};
+pub use projects::ProjectChoice;
+pub use runtime::{pick_project, run_history, run_tasks_with_history, ProjectContext, RunExit};
 
 #[cfg(test)]
 use crate::observation::{ActivityScope, AttentionLevel, ExecutionState};
@@ -142,6 +145,7 @@ struct LocalState {
     models: models::ModelPicker,
     settings: settings::SettingsPanel,
     provider_form: provider_form::ProviderForm,
+    projects: projects::ProjectsPanel,
     /// 输入 `/名称` 时提示列表里的选中行。
     slash_selected: usize,
     /// 已经为哪个会话问过 dsh 的命令清单。
@@ -380,6 +384,15 @@ fn handle_key_inner(
 ) -> bool {
     local.reminders.sync(&snapshot.observation);
     sync_local_requests(local, snapshot);
+    if local.help
+        || local.evidence
+        || local.request_panel
+        || local.workflow.visible
+        || local.attention_editor.is_some()
+        || (local.agent_id.is_some() && local.extension.visible.is_none())
+    {
+        local.extension.clear_displayed();
+    }
     // dsh 自己的命令只在用户开始输入 `/` 时问一次，启动时不多发请求。
     if key.code != KeyCode::Enter && local.editor.text.starts_with('/') {
         request_backend_commands(snapshot, local, tx);
@@ -708,7 +721,14 @@ fn handle_key_inner(
     // These control letters remain distinct when a host drops Enter modifiers.
     let key = if control && key.code == KeyCode::Char('s') {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
-    } else if control && key.code == KeyCode::Char('o') {
+    } else if control
+        && key.code == KeyCode::Char('o')
+        && !snapshot.extensions.iter().any(|extension| {
+            extension
+                .modeling()
+                .is_some_and(|domain| domain.enabled && domain.proposal.is_some())
+        })
+    {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
     } else {
         key
@@ -721,7 +741,12 @@ fn handle_key_inner(
         local.workflow.visible = false;
         return false;
     }
-    let extension_action = if local.workflow.visible {
+    let extension_action = if local.workflow.visible
+        || local.help
+        || local.evidence
+        || local.request_panel
+        || (local.agent_id.is_some() && local.extension.visible.is_none())
+    {
         None
     } else {
         extensions::REGISTRY.handle_key(
@@ -737,6 +762,12 @@ fn handle_key_inner(
         match action {
             extensions::ExtensionAction::Confirm(confirmation) => {
                 send(Command::ConfirmExtension { confirmation }, tx, local);
+            }
+            extensions::ExtensionAction::OpenImage(binding) => {
+                send(Command::OpenDomainImage { binding }, tx, local);
+            }
+            extensions::ExtensionAction::ImageUnavailable => {
+                local.notice = Some("图片不可用：请等待本版文件校验或重新生成图片".into());
             }
             extensions::ExtensionAction::NoDisplayedConfirmation => {
                 local.notice = Some("当前尚无已展示的可批准方案".into())
@@ -770,29 +801,6 @@ fn handle_key_inner(
                 return false;
             }
             KeyCode::Char('y') | KeyCode::Char('n') | KeyCode::Char('b') => {
-                // 建模方案不是普通的 server request。用户在会话页按 Ctrl+Y 时，
-                // 先打开当前已准备的模型预览，让批准始终绑定用户实际看到的版本。
-                if key.code == KeyCode::Char('y')
-                    && local.extension.visible.is_none()
-                    && snapshot.extensions.iter().any(|extension| {
-                        extension.modeling().is_some_and(|domain| {
-                            domain.enabled
-                                && domain
-                                    .proposal
-                                    .as_ref()
-                                    .is_some_and(|proposal| proposal.ready)
-                        })
-                    })
-                {
-                    local.request_panel = false;
-                    local.workflow.visible = false;
-                    local.extension.visible = Some(crate::extensions::ExtensionId::Modeling);
-                    local.extension.scroll = 0;
-                    local.notice = Some(
-                        "已打开建模预览；请先核对 Blender 候选模型，再按 Ctrl+Y 批准。".into(),
-                    );
-                    return false;
-                }
                 if let Some(request) = selected_request(snapshot, local) {
                     let decision = match key.code {
                         KeyCode::Char('y') => ApprovalDecision::Accept,
@@ -1195,6 +1203,11 @@ fn handle_key_inner(
                     Slash::New => {
                         send(Command::NewConversation, tx, local);
                     }
+                    Slash::Project => {
+                        // The runtime lists projects; switching restarts the backend there.
+                        overlays::close_mutual_overlays(local);
+                        local.projects.request_open = true;
+                    }
                     Slash::Steer("") => {
                         local.notice = Some(
                             lang::tr(
@@ -1492,8 +1505,7 @@ mod tests {
         assert!(!local.request_panel);
         assert!(rx.try_recv().is_err());
 
-        // Ctrl+Y from the conversation opens the same review page instead of
-        // reporting that a nonexistent server request expired.
+        // Conversation approval stays on this page; an incomplete card cannot approve.
         local.extension.visible = None;
         handle_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -1501,10 +1513,7 @@ mod tests {
             &mut local,
             &tx,
         );
-        assert_eq!(
-            local.extension.visible,
-            Some(crate::extensions::ExtensionId::Modeling)
-        );
+        assert_eq!(local.extension.visible, None);
         assert!(local.notice.is_some());
         assert!(rx.try_recv().is_err());
     }

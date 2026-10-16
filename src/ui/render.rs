@@ -53,7 +53,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.notice.as_deref(),
     );
     extension_context.activity_marker = local.activity.marker();
-    if !local.workflow.visible
+    if !local.projects.visible
+        && !local.workflow.visible
+        && !local.help
+        && !local.evidence
+        && local.attention_editor.is_none()
+        && !local.request_panel
         && super::extensions::REGISTRY.draw(frame, snapshot, &extension_context)
     {
         return;
@@ -96,6 +101,18 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             area.y += 5;
             area.height -= 5;
         }
+    }
+    // Modeling sessions: one line of verified progress above the conversation.
+    if let Some(line) = super::domain_workflow::domain(snapshot)
+        .filter(|_| area.height > 16 && !local.workflow.visible)
+        .and_then(|domain| super::domain_workflow::progress_line(domain, usize::from(area.width)))
+    {
+        frame.render_widget(
+            Paragraph::new(line).block(Block::default().borders(Borders::BOTTOM)),
+            ratatui::layout::Rect { height: 2, ..area },
+        );
+        area.y += 2;
+        area.height -= 2;
     }
     let request = selected_request(snapshot, local);
     let waiting = snapshot.gate.as_ref().filter(|gate| gate.pending);
@@ -341,8 +358,26 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         return;
     }
 
+    let workspace_area = if selected_agent.is_none()
+        && !local.projects.visible
+        && !local.workflow.visible
+        && !local.evidence
+        && !local.help
+        && local.attention_editor.is_none()
+        && !local.request_panel
+        && snapshot.requests.is_empty()
+    {
+        super::extensions::REGISTRY.draw_conversation_card(
+            frame,
+            chunks[1],
+            snapshot,
+            &local.extension,
+        )
+    } else {
+        chunks[1]
+    };
     let workspace = workspace_layout(
-        chunks[1],
+        workspace_area,
         !snapshot.agents.is_empty(),
         wants_inspector(snapshot, local),
     );
@@ -386,6 +421,11 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         local.scroll_from_bottom,
         local.tool_display(),
     );
+    let modeling_review = snapshot.extensions.iter().any(|extension| {
+        extension
+            .modeling()
+            .is_some_and(|domain| domain.enabled && domain.proposal.is_some())
+    });
     let focused_row = projected.transcript.focused;
     let foldable_tools = projected.transcript.foldable > 0;
     let below = projected.below;
@@ -414,7 +454,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             for (key, label) in [
                 ("Ctrl+P", tr("commands and panels", "命令与面板")),
                 ("Ctrl+F", tr("search this conversation", "搜索当前对话")),
-                ("Ctrl+O", tr("new line in the task", "任务内换行")),
+                (
+                    "Ctrl+O",
+                    if modeling_review {
+                        "外部打开本版复核图"
+                    } else {
+                        tr("new line in the task", "任务内换行")
+                    },
+                ),
                 ("F1", tr("all keys", "全部快捷键")),
             ] {
                 transcript.push(Line::from(vec![
@@ -644,6 +691,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
                     tr("Write an answer…", "输入回答…")
                 } else if let Some(label) = super::busy::label(snapshot) {
                     label
+                } else if modeling_review {
+                    "输入任务…  Shift+Enter 换行 · Ctrl+O 打开复核图"
                 } else {
                     tr(
                         "Write a task…  Ctrl+O for a new line",
@@ -1368,8 +1417,10 @@ mod tests {
                     assert!(!screen.contains("first 中文"), "{screen}");
                     continue;
                 }
-                assert!(
+                // The summary row names the tool; the card title is expanded detail only.
+                assert_eq!(
                     screen.contains(&format!("Tool / {kind} / 测试👩‍💻")),
+                    mode == ToolDisplay::Expanded,
                     "{screen}"
                 );
                 assert!(screen.contains("first 中文👩‍💻e\u{301}"), "{screen}");
@@ -1632,7 +1683,7 @@ mod tests {
             screen.contains("Workflow") || screen.contains("工作流 · F4"),
             "{screen}"
         );
-        for label in ["建模工作流", "解释与识别构件", "修订/补资料", "↺04"] {
+        for label in ["建模工作流", "对象发现与AI识别", "修订/补资料", "↺04"] {
             assert!(screen.contains(label), "{screen}");
         }
         assert!(!screen.contains("方案与执行事实"), "{screen}");
