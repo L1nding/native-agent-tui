@@ -2,11 +2,69 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::extensions::{ExtensionView, ViewContext};
 use super::layout::wrap_text;
 use crate::extensions::{ExtensionConfirmation, ExtensionId, ExtensionSnapshot};
 use crate::state::display_text;
+
+pub(super) fn floor_progress_lines(domain: &crate::domain::DomainSnapshot) -> Vec<Line<'static>> {
+    let Some(progress) = domain.current_floor_progress() else {
+        return vec![Line::from(
+            "整层尚未完成：全层进度尚未对账 · 已建 / 待建 / 卡住 / 未识别 · 图纸覆盖率未知",
+        )];
+    };
+    let mut lines = vec![Line::from(
+        "类别               已建    待建    卡住  未识别",
+    )];
+    for row in &progress.categories {
+        let name = if row.category == "unidentified" {
+            "未识别来源"
+        } else {
+            crate::domain::review::category_label(&row.category)
+        };
+        let padding = " ".repeat(18usize.saturating_sub(name.width()));
+        lines.push(Line::from(format!(
+            "{}{padding}{:>6}  {:>6}  {:>6}  {:>6}",
+            display_text(name),
+            row.built,
+            row.pending,
+            row.blocked,
+            row.unidentified
+        )));
+    }
+    let percentage = if progress.total == 0 {
+        "未知".to_owned()
+    } else {
+        format!(
+            "{:.1}%",
+            progress.covered as f64 * 100.0 / progress.total as f64
+        )
+    };
+    lines.push(Line::from(format!(
+        "图纸覆盖率 {percentage}（{}/{} · {}）· 未判读散线区域 {} · F6 查看详情",
+        progress.covered,
+        progress.total,
+        display_text(&progress.coverage_unit),
+        progress.unreviewed_regions
+    )));
+    lines.push(Line::from(
+        if progress
+            .categories
+            .iter()
+            .any(|row| row.pending > 0 || row.blocked > 0 || row.unidentified > 0)
+            || progress.total == 0
+            || progress.covered < progress.total
+            || progress.unreviewed_regions > 0
+        {
+            "整层尚未完成：仍有待建、卡住、未识别或未完成图纸覆盖的范围。"
+        } else {
+            "本表来源状态已对账；整层完成仍需结构、门窗及连接验收。"
+        },
+    ));
+    lines
+}
 
 fn sections(area: Rect, reply: Option<&str>) -> [Rect; 5] {
     let reply_height = reply.filter(|_| area.height >= 20).map_or(0, |reply| {
@@ -31,6 +89,135 @@ fn business_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    if let Some(review) = &domain.structure_review {
+        let problems: Vec<_> = review.checks.iter().filter(|c| c.attention).collect();
+        if problems.is_empty() {
+            lines.push(Line::from(
+                "结构自检：楼板覆盖、墙线与柱线识别、墙体连通均正常",
+            ));
+        } else {
+            lines.push(Line::from(format!(
+                "结构自检：发现 {} 个问题",
+                problems.len()
+            )));
+            for check in problems {
+                lines.push(Line::from(format!("  ! {}", check.message)));
+                if !check.suggestion.is_empty() {
+                    lines.push(Line::from(format!("    {}", check.suggestion)));
+                }
+            }
+        }
+    }
+    for notice in [
+        domain.notice.as_deref(),
+        domain.fact_sync_notice.as_deref(),
+        context.notice,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        lines.push(Line::from(display_text(notice)));
+    }
+    if let Some(p) = &domain.proposal {
+        lines.push(Line::from(format!(
+            "方案 · 修订 {} · {}",
+            p.binding.revision,
+            match p.state.as_str() {
+                "prepared" => "已准备，待批准",
+                "blocked" => "有问题待处理",
+                "applied" => "已应用",
+                "built" => "已应用并构建",
+                "superseded" => "已被新版本取代",
+                other => other,
+            }
+        )));
+        lines.push(Line::from(display_text(&p.summary)));
+        lines.push(Line::from(format!(
+            "领域校验 {} · 场景应用 {}",
+            if p.diagnostics.is_empty()
+                && matches!(p.state.as_str(), "prepared" | "applied" | "built")
+            {
+                "passed"
+            } else {
+                p.state.as_str()
+            },
+            domain.application.as_deref().unwrap_or("not_run")
+        )));
+    } else {
+        lines.push(Line::from(
+            "等待平台 Agent 读取楼层并准备方案。可直接输入目标和修改意见。",
+        ));
+    }
+    if let Some(operation) = &domain.operation {
+        lines.push(Line::from(format!(
+            "操作 {} · {} · 对账 {}",
+            operation.operation_id, operation.state, operation.recovery
+        )));
+        lines.push(Line::from(format!("当前场景 {}", operation.current_sha256)));
+        if operation.state == "applying" {
+            lines.push(Line::from(
+                "应用结果未确认；先查询操作与场景，再沿原操作恢复。",
+            ));
+        }
+    }
+    if domain.artifacts.is_empty() {
+        lines.push(Line::from("Blender 产物 not_run"));
+        lines.push(Line::from("产物验证 not_run"));
+    }
+    for artifact in domain.artifacts.iter().rev() {
+        lines.push(Line::from(format!(
+            "构建任务 {} · {}",
+            artifact.binding.build_id,
+            if artifact.binding.candidate {
+                "候选预览"
+            } else {
+                "已应用场景"
+            }
+        )));
+        let current = artifact
+            .current
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        lines.push(Line::from(format!(
+            "Blender 产物 {} · current={} · build_id={}",
+            artifact.state.as_str(),
+            current,
+            artifact.binding.build_id
+        )));
+        let valid = artifact
+            .valid
+            .map(|v| format!("valid={v}"))
+            .unwrap_or_else(|| "not_run".into());
+        lines.push(Line::from(format!(
+            "产物验证 {valid} · current={current} · build_id={}",
+            artifact.binding.build_id
+        )));
+        lines.push(Line::from(format!(
+            "产物位置 {}",
+            display_text(&artifact.binding.output)
+        )));
+        lines.push(Line::from("Agent 看图观察见回复 · 人工复核 not_run"));
+    }
+    if domain.authorizing {
+        lines.push(Line::from("正在记录具体版本批准…"));
+    }
+    if let Some(selection) = &domain.preview_selection {
+        lines.extend(
+            selection
+                .details()
+                .into_iter()
+                .map(|line| Line::from(display_text(&line))),
+        );
+        lines.push(Line::from(
+            "输入意见会携带该选中对象及版本上下文；选择不会启动 Agent。",
+        ));
+    }
+    lines.push(Line::from(if domain.preview_connection.is_some() {
+        "Blender 预览已开启：打开 Blender 的 Agent 预览页签即可自动连接"
+    } else {
+        "Blender 预览未开启"
+    }));
+    lines.extend(floor_progress_lines(domain));
     if let Some(review) = &domain.first_use_review {
         let opened = domain
             .review_images
@@ -98,85 +285,6 @@ fn business_lines(
             }
         }
     }
-    if let Some(review) = &domain.structure_review {
-        let problems: Vec<_> = review.checks.iter().filter(|c| c.attention).collect();
-        if problems.is_empty() {
-            lines.push(Line::from(
-                "结构自检：楼板覆盖、墙线与柱线识别、墙体连通均正常",
-            ));
-        } else {
-            lines.push(Line::from(format!(
-                "结构自检：发现 {} 个问题",
-                problems.len()
-            )));
-            for check in problems {
-                lines.push(Line::from(format!("  ! {}", check.message)));
-                if !check.suggestion.is_empty() {
-                    lines.push(Line::from(format!("    {}", check.suggestion)));
-                }
-            }
-        }
-    }
-    if let Some(groups) = &domain.groups {
-        lines.push(Line::from(format!(
-            "对象AI识别 · 已评估 {}/{} 组 · 未定类别 {} 个候选",
-            groups.assessed_groups,
-            groups.total_groups,
-            groups
-                .category_counts
-                .get("unresolved")
-                .copied()
-                .unwrap_or(0)
-        )));
-        let labels = groups
-            .category_counts
-            .iter()
-            .filter(|(category, count)| category.as_str() != "unresolved" && **count > 0)
-            .map(|(category, count)| {
-                format!(
-                    "{} {count}",
-                    display_text(crate::domain::review::category_label(category))
-                )
-            })
-            .collect::<Vec<_>>();
-        lines.push(Line::from(if labels.is_empty() {
-            "尚无已标注类别；来源扫描数量不代表已识别构件".into()
-        } else {
-            format!(
-                "已标注类别：{} · 分类仍保留实际依据与假设",
-                labels.join("、")
-            )
-        }));
-    }
-    lines.push(Line::from(domain.opening_inventory_detail()));
-    match domain.current_linework() {
-        Some(coverage) => {
-            lines.push(Line::from(format!(
-                "通用纯线稿覆盖：{} 个来源成员 · 已选 {} · 未选 {}",
-                coverage.member_count,
-                coverage.selected_member_count,
-                coverage.unselected_member_count
-            )));
-            lines.push(Line::from(format!(
-                "对象候选 {} · 未分类 {} · 区域 {} · 注释 {}；区域和注释数不等于物体数",
-                coverage.candidate_count,
-                coverage.unclassified_candidate_count,
-                coverage.region_count,
-                coverage.annotation_count
-            )));
-            lines.push(Line::from(format!(
-                "未覆盖 {} · 有诊断成员 {} · 过期选择 {}；覆盖记录不代表已建三维对象",
-                coverage.uncovered_count,
-                coverage.diagnostic_member_count,
-                coverage.stale_selection_count
-            )));
-        }
-        None if domain.linework.is_some() => lines.push(Line::from(
-            "通用纯线稿覆盖已过期或未与当前来源绑定，需重新排查；旧计数不代表当前覆盖",
-        )),
-        None => lines.push(Line::from("通用纯线稿覆盖未知，尚未排查；所有类别均需核对")),
-    }
-    lines.push(Line::from(domain.source_region_review_detail()));
     if let Some(proposal) = domain.proposal.as_ref().filter(|proposal| proposal.ready) {
         if !domain.candidate_review_delivered(&proposal.binding) {
             lines.push(Line::from(
@@ -195,47 +303,6 @@ fn business_lines(
     lines.push(Line::from(
         "散线流程：聚区域 → 裁图/文字/尺寸 → AI 开放判读/拆合 → 与图块共用定义、批准及建模 · F4 查看流程",
     ));
-    for notice in [
-        domain.notice.as_deref(),
-        domain.fact_sync_notice.as_deref(),
-        context.notice,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        lines.push(Line::from(display_text(notice)));
-    }
-    if let Some(progress) = domain.component_progress() {
-        lines.push(Line::from(format!(
-            "{} · 已发现 {} · 已建 {} · 待处理 {} · 已跳过 {} · 已排除 {}",
-            if progress.pending > 0
-                || domain
-                    .current_openings()
-                    .is_none_or(|inventory| !inventory.complete())
-                || domain.workflow_evidence().iter().any(|entry| {
-                    entry.node == crate::domain::WorkflowNode::Interpret
-                        && entry.state != crate::domain::WorkflowEvidenceState::Recorded
-                })
-            {
-                "整层尚未完成"
-            } else {
-                "当前扫描范围的构件处理情况"
-            },
-            progress.total,
-            progress.built,
-            progress.pending,
-            progress.skipped,
-            progress.rejected
-        )));
-    } else if domain
-        .project_scope
-        .as_ref()
-        .is_some_and(|scope| scope.assembly_binding.is_none())
-    {
-        lines.push(Line::from(
-            "对象尚未扫描；读取全层来源，由 AI 判读类别和用途，保留未知对象及线稿覆盖缺口",
-        ));
-    }
     if let Some(project) = &domain.project {
         lines.push(Line::from(format!(
             "项目 {} · {} 个楼层候选",
@@ -386,6 +453,68 @@ fn business_lines(
             ));
         }
     }
+    lines.push(Line::from("来源详情（候选、区域与部件不等于物体）"));
+    if let Some(groups) = &domain.groups {
+        lines.push(Line::from(format!(
+            "对象AI识别 · 已评估 {}/{} 组 · 未定类别 {} 个候选",
+            groups.assessed_groups,
+            groups.total_groups,
+            groups
+                .category_counts
+                .get("unresolved")
+                .copied()
+                .unwrap_or(0)
+        )));
+        let labels = groups
+            .category_counts
+            .iter()
+            .filter(|(category, count)| category.as_str() != "unresolved" && **count > 0)
+            .map(|(category, count)| {
+                format!(
+                    "{} {count}",
+                    display_text(crate::domain::review::category_label(category))
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(if labels.is_empty() {
+            "尚无已标注类别；来源扫描数量不代表已识别构件".into()
+        } else {
+            format!(
+                "已标注类别：{} · 分类仍保留实际依据与假设",
+                labels.join("、")
+            )
+        }));
+    }
+    lines.push(Line::from(domain.opening_inventory_detail()));
+    match domain.current_linework() {
+        Some(coverage) => {
+            lines.push(Line::from(format!(
+                "通用纯线稿覆盖：{} 个来源成员 · 已选 {} · 未选 {}",
+                coverage.member_count,
+                coverage.selected_member_count,
+                coverage.unselected_member_count
+            )));
+            lines.push(Line::from(format!(
+                "对象候选 {} · 未分类 {} · 区域 {} · 注释 {}；区域和注释数不等于物体数",
+                coverage.candidate_count,
+                coverage.unclassified_candidate_count,
+                coverage.region_count,
+                coverage.annotation_count
+            )));
+            lines.push(Line::from(format!(
+                "未覆盖 {} · 有诊断成员 {} · 过期选择 {}；覆盖记录不代表已建三维对象",
+                coverage.uncovered_count,
+                coverage.diagnostic_member_count,
+                coverage.stale_selection_count
+            )));
+        }
+        None if domain.linework.is_some() => lines.push(Line::from(
+            "通用纯线稿覆盖已过期或未与当前来源绑定，需重新排查；旧计数不代表当前覆盖",
+        )),
+        None => lines.push(Line::from("通用纯线稿覆盖未知，尚未排查；所有类别均需核对")),
+    }
+    lines.push(Line::from(domain.existing_structure_detail()));
+    lines.push(Line::from(domain.source_region_review_detail()));
     if let Some(groups) = &domain.groups {
         lines.push(Line::from(format!(
             "全层来源分组 · {} 组 · {} 实例 · 已评估 {} 组",
@@ -422,106 +551,6 @@ fn business_lines(
                 .collect::<Vec<_>>()
                 .join(" · "),
         ));
-    }
-    if let Some(selection) = &domain.preview_selection {
-        lines.extend(
-            selection
-                .details()
-                .into_iter()
-                .map(|line| Line::from(display_text(&line))),
-        );
-        lines.push(Line::from(
-            "输入意见会携带该选中对象及版本上下文；选择不会启动 Agent。",
-        ));
-    }
-    lines.push(Line::from(if domain.preview_connection.is_some() {
-        "Blender 预览已开启：打开 Blender 的 Agent 预览页签即可自动连接"
-    } else {
-        "Blender 预览未开启"
-    }));
-    if let Some(p) = &domain.proposal {
-        lines.push(Line::from(format!(
-            "方案 · 修订 {} · {}",
-            p.binding.revision,
-            match p.state.as_str() {
-                "prepared" => "已准备，待批准",
-                "blocked" => "有问题待处理",
-                "applied" => "已应用",
-                "built" => "已应用并构建",
-                "superseded" => "已被新版本取代",
-                other => other,
-            }
-        )));
-        lines.push(Line::from(display_text(&p.summary)));
-        lines.push(Line::from(format!(
-            "领域校验 {} · 场景应用 {}",
-            if p.diagnostics.is_empty()
-                && matches!(p.state.as_str(), "prepared" | "applied" | "built")
-            {
-                "passed"
-            } else {
-                p.state.as_str()
-            },
-            domain.application.as_deref().unwrap_or("not_run")
-        )));
-    } else {
-        lines.push(Line::from(
-            "等待平台 Agent 读取楼层并准备方案。可直接输入目标和修改意见。",
-        ));
-    }
-    if let Some(operation) = &domain.operation {
-        lines.push(Line::from(format!(
-            "操作 {} · {} · 对账 {}",
-            operation.operation_id, operation.state, operation.recovery
-        )));
-        lines.push(Line::from(format!("当前场景 {}", operation.current_sha256)));
-        if operation.state == "applying" {
-            lines.push(Line::from(
-                "应用结果未确认；先查询操作与场景，再沿原操作恢复。",
-            ));
-        }
-    }
-    lines.push(Line::from(domain.existing_structure_detail()));
-    if domain.artifacts.is_empty() {
-        lines.push(Line::from("Blender 产物 not_run"));
-        lines.push(Line::from("产物验证 not_run"));
-    }
-    for artifact in domain.artifacts.iter().rev() {
-        lines.push(Line::from(format!(
-            "构建任务 {} · {}",
-            artifact.binding.build_id,
-            if artifact.binding.candidate {
-                "候选预览"
-            } else {
-                "已应用场景"
-            }
-        )));
-        let current = artifact
-            .current
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".into());
-        lines.push(Line::from(format!(
-            "Blender 产物 {} · current={} · build_id={}",
-            artifact.state.as_str(),
-            current,
-            artifact.binding.build_id
-        )));
-        let valid = artifact
-            .valid
-            .map(|v| format!("valid={v}"))
-            .unwrap_or_else(|| "not_run".into());
-        lines.push(Line::from(format!(
-            "产物验证 {valid} · current={current} · build_id={}",
-            artifact.binding.build_id
-        )));
-        lines.push(Line::from(format!(
-            "产物位置 {}",
-            display_text(&artifact.binding.output)
-        )));
-        lines.push(Line::from("Agent 看图观察见回复 · 人工复核 not_run"));
-    }
-    if domain.authorizing {
-        lines.push(Line::from("正在记录具体版本批准…"));
     }
     if let Some(groups) = &domain.groups {
         lines.push(Line::from("来源分组明细"));
@@ -849,6 +878,171 @@ mod tests {
     };
     use super::*;
     use crate::state::CoreSnapshot;
+    fn floor_progress_domain() -> DomainSnapshot {
+        DomainSnapshot {
+            enabled: true,
+            ledger: Some(crate::domain::SourceLedgerFact {
+                scan_id: "scan".into(),
+                scene_sha256: "scene".into(),
+                rows: vec![],
+                counts: [("built".into(), 999)].into(),
+            }),
+            linework: Some(crate::domain::LineworkCoverageFact {
+                scan_id: "scan".into(),
+                scene_sha256: "scene".into(),
+                member_count: 100,
+                selected_member_count: 90,
+                unselected_member_count: 10,
+                candidate_count: 0,
+                unclassified_candidate_count: 0,
+                region_count: 2,
+                annotation_count: 0,
+                uncovered_count: 10,
+                diagnostic_member_count: 0,
+                stale_selection_count: 0,
+            }),
+            floor_progress: Some(crate::domain::FloorProgress {
+                scan_id: "scan".into(),
+                scene_sha256: "scene".into(),
+                categories: vec![
+                    crate::domain::CategoryProgress {
+                        category: "armchair".into(),
+                        built: 322,
+                        pending: 495,
+                        blocked: 7,
+                        unidentified: 0,
+                    },
+                    crate::domain::CategoryProgress {
+                        category: "stair".into(),
+                        built: 0,
+                        pending: 0,
+                        blocked: 13,
+                        unidentified: 0,
+                    },
+                    crate::domain::CategoryProgress {
+                        category: "unidentified".into(),
+                        built: 0,
+                        pending: 0,
+                        blocked: 0,
+                        unidentified: 2,
+                    },
+                ],
+                covered: 90,
+                total: 100,
+                coverage_unit: "来源成员".into(),
+                unreviewed_regions: 2,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn floor_progress_uses_complete_fact_counts_without_recounting_source_pages() {
+        let domain = floor_progress_domain();
+        let lines: Vec<_> = floor_progress_lines(&domain)
+            .iter()
+            .map(|line| {
+                line.to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        assert_eq!(lines[0], "类别 已建 待建 卡住 未识别");
+        assert_eq!(lines[1], "扶手椅 322 495 7 0");
+        assert_eq!(lines[2], "示意楼梯 0 0 13 0");
+        assert_eq!(lines[3], "未识别来源 0 0 0 2");
+        assert!(lines[4].contains("图纸覆盖率 90.0%（90/100 · 来源成员）"));
+        assert!(lines[4].contains("未判读散线区域 2"));
+        assert!(lines[5].contains("整层尚未完成"));
+        assert!(!lines.join("\n").contains("999"));
+    }
+
+    #[test]
+    fn floor_progress_requires_current_source_binding_and_does_not_invent_counts() {
+        let mut domain = floor_progress_domain();
+        domain.floor_progress.as_mut().unwrap().scan_id = "stale".into();
+        let text = floor_progress_lines(&domain)[0].to_string();
+        assert!(text.contains("尚未对账"));
+        assert!(text.contains("图纸覆盖率未知"));
+        assert!(!text.contains("322"));
+        domain.floor_progress.as_mut().unwrap().scan_id = "scan".into();
+        domain.operation = Some(crate::domain::OperationFact {
+            operation_id: "new".into(),
+            state: "applied".into(),
+            recovery: "not_required".into(),
+            current_sha256: "new-scene".into(),
+        });
+        assert!(floor_progress_lines(&domain)[0]
+            .to_string()
+            .contains("尚未对账"));
+        domain.operation = None;
+        domain.floor_progress = None;
+        assert!(floor_progress_lines(&domain)[0]
+            .to_string()
+            .contains("尚未对账"));
+    }
+
+    #[test]
+    fn reconciled_progress_does_not_claim_whole_floor_acceptance() {
+        let mut domain = floor_progress_domain();
+        let progress = domain.floor_progress.as_mut().unwrap();
+        progress.categories.truncate(1);
+        progress.categories[0].pending = 0;
+        progress.categories[0].blocked = 0;
+        progress.covered = progress.total;
+        progress.unreviewed_regions = 0;
+        let text = floor_progress_lines(&domain)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("图纸覆盖率 100.0%"));
+        assert!(text.contains("整层完成仍需结构、门窗及连接验收"));
+    }
+
+    #[test]
+    fn conversation_and_modeling_views_share_the_floor_progress_table() {
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(floor_progress_domain())],
+            ..Default::default()
+        };
+        for business in [false, true] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 75)).unwrap();
+            let local = LocalState {
+                extension: ExtensionPanel::new(business.then_some(ExtensionId::Modeling)),
+                ..Default::default()
+            };
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let screen = (0..75)
+                .map(|y| {
+                    (0..160)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+            for expected in [
+                "类别已建待建卡住未识别",
+                "扶手椅32249570",
+                "示意楼梯00130",
+                "未识别来源0002",
+                "图纸覆盖率90.0%",
+                "整层尚未完成",
+            ] {
+                assert!(
+                    compact.contains(expected),
+                    "{business}: missing {expected}: {screen}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn structure_problems_and_the_floor_title_lead_the_page() {
         use crate::domain::{
@@ -1060,7 +1254,7 @@ mod tests {
                     .into(),
                     rows: vec![],
                 }),
-                ..Default::default()
+                ..floor_progress_domain()
             })],
             ..Default::default()
         };
@@ -1073,8 +1267,12 @@ mod tests {
             .join("\n");
         assert!(text.contains("已评估 1/2 组"), "{text}");
         assert!(text.contains("候诊座椅 8"), "{text}");
-        assert!(text.contains("未定类别 2"), "{text}");
-        assert!(text.contains("已建 0"), "{text}");
+        assert!(text.contains("未定类别 2 个候选"), "{text}");
+        let table = floor_progress_lines(snapshot.extensions[0].modeling().unwrap());
+        assert_eq!(
+            table[1].to_string().split_whitespace().collect::<Vec<_>>(),
+            ["扶手椅", "322", "495", "7", "0"]
+        );
     }
 
     fn message(thread: &str, turn: &str, text: &str) -> crate::state::ConversationItem {
@@ -1538,11 +1736,10 @@ mod tests {
             ..Default::default()
         };
         for (width, height) in [(120, 34), (60, 24)] {
-            let mut local = LocalState {
+            let local = LocalState {
                 extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
                 ..Default::default()
             };
-            local.extension.scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|f| draw(f, f.area(), &snapshot, &local))
@@ -1925,7 +2122,8 @@ mod tests {
         assert!(text.contains("既有结构覆盖未知"));
         assert!(text.contains("通用区域判读未知"));
         assert!(text.contains("整层尚未完成"));
-        assert!(text.contains("已建 3 · 待处理 0"));
+        assert!(text.contains("全层进度尚未对账"));
+        assert!(!text.contains("已建 3 · 待处理 0"));
         domain.linework = Some(crate::domain::LineworkCoverageFact {
             scan_id: "scan".into(),
             scene_sha256: "current".into(),

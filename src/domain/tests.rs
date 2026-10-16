@@ -2934,6 +2934,43 @@ fn source_region_review_view(mut value: Value) -> Value {
 }
 
 #[test]
+fn floor_progress_uses_sealed_complete_counts_and_invalidates_with_the_source_view() {
+    let mut facts = sequenced_facts();
+    let mut value = source_region_review_view(existing_structure_view(linework_source_view(
+        instance_source_view(4),
+        'a',
+    )));
+    value["floor_progress"] = json!({
+        "contract":"floor-progress/1", "scan_id":value["scan_id"],
+        "scene_sha256":value["scene_sha256"],
+        "categories":[{"category":"chair","built":322,"pending":100,"blocked":7,"unidentified":0}],
+        "drawing_coverage":{"covered":50,"total":100,"unit":"图块实例和散线区域来源单位"},
+        "unreviewed_regions":2
+    });
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let progress = facts.snapshot.current_floor_progress().unwrap().clone();
+    assert_eq!(progress.categories[0].built, 322);
+    let mut bad = value.clone();
+    bad["fact_sequence"] = json!(99);
+    bad["floor_progress"]["scene_sha256"] = json!("other");
+    assert_eq!(facts.apply_verified_fact(&bad), FactProjection::Invalid);
+    assert_eq!(facts.snapshot.current_floor_progress(), Some(&progress));
+    bad["floor_progress"] = value["floor_progress"].clone();
+    bad["floor_progress"]["drawing_coverage"]["covered"] = json!(101);
+    assert_eq!(facts.apply_verified_fact(&bad), FactProjection::Invalid);
+    let mut next = value.clone();
+    next["fact_sequence"] = json!(5);
+    next.as_object_mut().unwrap().remove("floor_progress");
+    assert_eq!(facts.apply_verified_fact(&next), FactProjection::Applied);
+    assert!(facts.snapshot.current_floor_progress().is_none());
+    assert_eq!(
+        facts.apply_verified_fact(&value),
+        FactProjection::Superseded
+    );
+    assert!(facts.snapshot.current_floor_progress().is_none());
+}
+
+#[test]
 fn source_region_reviews_share_current_source_shapes_and_keep_missing_or_stale_summary_unknown() {
     let mut facts = sequenced_facts();
     for (sequence, kind) in [

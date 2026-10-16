@@ -206,6 +206,26 @@ pub struct SourceLedgerFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryProgress {
+    pub category: String,
+    pub built: usize,
+    pub pending: usize,
+    pub blocked: usize,
+    pub unidentified: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorProgress {
+    pub scan_id: String,
+    pub scene_sha256: String,
+    pub categories: Vec<CategoryProgress>,
+    pub covered: usize,
+    pub total: usize,
+    pub coverage_unit: String,
+    pub unreviewed_regions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceGroupsFact {
     pub scan_id: String,
     pub scene_sha256: String,
@@ -371,6 +391,7 @@ pub struct DomainSnapshot {
     pub buildings: Vec<ProjectBuildingFact>,
     pub drawing_audit: Option<DrawingAuditFact>,
     pub ledger: Option<SourceLedgerFact>,
+    pub floor_progress: Option<FloorProgress>,
     pub groups: Option<SourceGroupsFact>,
     pub linework: Option<LineworkCoverageFact>,
     pub existing_structure: Option<ExistingStructureCoverageFact>,
@@ -441,6 +462,15 @@ fn structure_review(value: &Value) -> Option<StructureReview> {
 }
 
 impl DomainSnapshot {
+    pub fn current_floor_progress(&self) -> Option<&FloorProgress> {
+        self.floor_progress.as_ref().filter(|progress| {
+            self.current_linework().is_some_and(|linework| {
+                progress.scan_id == linework.scan_id
+                    && progress.scene_sha256 == linework.scene_sha256
+            })
+        })
+    }
+
     pub fn first_use_satisfied(&self) -> bool {
         self.first_use_review
             .as_ref()
@@ -906,6 +936,14 @@ impl DomainFacts {
         if openings.is_some() && sequence.is_none() {
             return FactProjection::Invalid;
         }
+        let floor_progress = if source_kind {
+            match floor_progress_fact(value) {
+                Ok(progress) => progress,
+                Err(()) => return FactProjection::Invalid,
+            }
+        } else {
+            None
+        };
         let mut accepted = false;
         match Some(kind) {
             Some("project_building") => {
@@ -1383,6 +1421,7 @@ impl DomainFacts {
                     .insert("opening_inventory".into(), sequence.unwrap());
             }
             if source_kind {
+                self.snapshot.floor_progress = floor_progress;
                 self.snapshot.linework = linework;
                 self.snapshot.existing_structure = existing_structure;
                 self.snapshot.source_regions = source_regions;
@@ -1413,6 +1452,7 @@ impl DomainFacts {
         self.snapshot.proposal = None;
         self.snapshot.proposal_categories.clear();
         self.snapshot.ledger = None;
+        self.snapshot.floor_progress = None;
         self.snapshot.groups = None;
         self.snapshot.linework = None;
         self.snapshot.existing_structure = None;
@@ -1427,6 +1467,7 @@ impl DomainFacts {
     }
 
     fn clear_source_view(&mut self) {
+        self.snapshot.floor_progress = None;
         self.snapshot.groups = None;
         self.snapshot.ledger = None;
         self.snapshot.linework = None;
@@ -2092,6 +2133,60 @@ fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
         rows,
         counts,
     })
+}
+
+fn floor_progress_fact(value: &Value) -> Result<Option<FloorProgress>, ()> {
+    let Some(progress) = value.get("floor_progress") else {
+        return Ok(None);
+    };
+    let parse = || {
+        let count = |row: &Value, key: &str| usize::try_from(row[key].as_u64()?).ok();
+        let entries = progress["categories"].as_array()?;
+        if progress["contract"] != "floor-progress/1"
+            || progress["scan_id"] != value["scan_id"]
+            || progress["scene_sha256"] != value["scene_sha256"]
+            || entries.len() > 256
+        {
+            return None;
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let categories = entries
+            .iter()
+            .map(|row| {
+                let category = bounded_text(row, "category", 80)?;
+                if !names.insert(category.clone()) {
+                    return None;
+                }
+                Some(CategoryProgress {
+                    category,
+                    built: count(row, "built")?,
+                    pending: count(row, "pending")?,
+                    blocked: count(row, "blocked")?,
+                    unidentified: count(row, "unidentified")?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let coverage = &progress["drawing_coverage"];
+        let covered = count(coverage, "covered")?;
+        let total = count(coverage, "total")?;
+        let unreviewed_regions = count(progress, "unreviewed_regions")?;
+        if covered > total
+            || Some(unreviewed_regions as u64)
+                != value["source_region_summary"]["unreviewed_region_count"].as_u64()
+        {
+            return None;
+        }
+        Some(FloorProgress {
+            scan_id: text(value, "scan_id").ok()?,
+            scene_sha256: text(value, "scene_sha256").ok()?,
+            categories,
+            covered,
+            total,
+            coverage_unit: bounded_text(coverage, "unit", 240)?,
+            unreviewed_regions,
+        })
+    };
+    parse().map(Some).ok_or(())
 }
 
 fn source_ledger_fact(value: &Value) -> Option<SourceLedgerFact> {

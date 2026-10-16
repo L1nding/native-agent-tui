@@ -102,7 +102,47 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
             area.height -= 5;
         }
     }
-    // Modeling sessions: one line of verified progress above the conversation.
+    if let Some(domain) = super::domain_workflow::domain(snapshot)
+        .filter(|domain| {
+            area.height > 25
+                && (domain.floor_progress.is_some()
+                    || domain.groups.is_some()
+                    || domain.ledger.is_some()
+                    || domain.linework.is_some())
+        })
+        .filter(|_| !local.workflow.visible && !local.help && !local.projects.visible)
+    {
+        let mut lines = super::domain::floor_progress_lines(domain);
+        let footer = lines.split_off(lines.len().saturating_sub(2));
+        let mut lines: Vec<_> = lines
+            .into_iter()
+            .flat_map(|line| wrap_text(&line.to_string(), usize::from(area.width)))
+            .map(Line::from)
+            .collect();
+        let footer: Vec<_> = footer
+            .into_iter()
+            .flat_map(|line| wrap_text(&line.to_string(), usize::from(area.width)))
+            .map(Line::from)
+            .collect();
+        let budget = usize::from((area.height / 3).min(10));
+        if lines.len() + footer.len() > budget {
+            lines.truncate(budget.saturating_sub(footer.len() + 1));
+            lines.push(Line::from("其余类别见 F6 详情"));
+        }
+        lines.extend(footer);
+        if lines.len() > budget {
+            lines.truncate(budget.saturating_sub(1));
+            lines.push(Line::from("进度表未完整显示，F6 查看详情"));
+        }
+        let height = lines.len() as u16 + 1;
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::BOTTOM)),
+            ratatui::layout::Rect { height, ..area },
+        );
+        area.y += height;
+        area.height -= height;
+    }
+    // Modeling sessions keep the current verified workflow stage visible.
     if let Some(line) = super::domain_workflow::domain(snapshot)
         .filter(|_| area.height > 16 && !local.workflow.visible)
         .and_then(|domain| super::domain_workflow::progress_line(domain, usize::from(area.width)))
