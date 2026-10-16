@@ -781,7 +781,12 @@ pub(super) fn approval_card_lines(
         ));
     }
     if let Some(review) = &domain.first_use_review {
-        assumptions.extend(review.dimensions.iter().map(|text| display_text(text)));
+        if !review.dimensions.is_empty() {
+            assumptions.insert(format!(
+                "首用对照图参数：{}项（详细尺寸与判读说明见 F6）",
+                review.dimensions.len()
+            ));
+        }
     }
     if assumptions.is_empty() {
         lines.push("示意假设：本版未列出".into());
