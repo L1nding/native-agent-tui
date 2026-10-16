@@ -12,14 +12,20 @@ use crate::config::{Config, McpServerConfig};
 use crate::protocol::{ObservedTool, ObservedToolOutcome, ToolCategory};
 
 mod component_edit;
+pub(crate) mod review;
+pub use review::{
+    FirstUseReviewFact, ImageFileState, ReviewImageBinding, ReviewImageFact, ReviewImageView,
+};
 mod workflow;
 pub use workflow::{WorkflowEvidence, WorkflowEvidenceState, WorkflowNode};
 mod project;
 pub(crate) mod receipt;
+pub use project::{create_project, list_projects, NewProject, ProjectEntry, PROJECT_UNITS};
 pub use project::{
-    BuildingReportFact, ComponentDiscovery, DrawingAuditFact, ProjectAssemblyBinding,
-    ProjectBuildingFact, ProjectCatalogFact, ProjectConnectionAuthority, ProjectLocationFact,
-    ProjectScopeFact, ProjectSelectionFact, ProjectWallLayerChoice, SelectionState,
+    BuildingReportFact, BuildingSourceDiscoveryFact, ComponentDiscovery, DrawingAuditFact,
+    ProjectAssemblyBinding, ProjectBuildingFact, ProjectCatalogFact, ProjectConnectionAuthority,
+    ProjectLocationFact, ProjectOpeningCompletionBinding, ProjectScopeFact, ProjectSelectionFact,
+    ProjectWallLayerChoice, SelectionState, StairLineworkFact,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -73,11 +79,7 @@ pub fn configure(mut config: Config) -> Result<Config, String> {
     }
     config.permission = Some("read-only".into());
     let repository = normalized_path(&config.cwd)?;
-    let python = repository.join(if cfg!(windows) {
-        ".venv/Scripts/python.exe"
-    } else {
-        ".venv/bin/python"
-    });
+    let python = project::modeler_python(&repository);
     if !python.is_file() {
         return Err("模型器 .venv Python 不存在".into());
     }
@@ -216,6 +218,69 @@ pub struct SourceGroupsFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineworkCoverageFact {
+    pub scan_id: String,
+    pub scene_sha256: String,
+    pub member_count: usize,
+    pub selected_member_count: usize,
+    pub unselected_member_count: usize,
+    pub candidate_count: usize,
+    pub unclassified_candidate_count: usize,
+    pub region_count: usize,
+    pub annotation_count: usize,
+    pub uncovered_count: usize,
+    pub diagnostic_member_count: usize,
+    pub stale_selection_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingStructureCoverageFact {
+    pub scan_id: String,
+    pub scene_sha256: String,
+    pub member_count: usize,
+    pub complete_member_count: usize,
+    pub partial_member_count: usize,
+    pub reference_only_member_count: usize,
+    pub unproven_member_count: usize,
+    pub unselected_complete_member_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRegionReviewFact {
+    pub scan_id: String,
+    pub scene_sha256: String,
+    pub region_count: usize,
+    pub reviewed_region_count: usize,
+    pub unreviewed_region_count: usize,
+    pub structure_represented_region_count: usize,
+    pub uncertain_region_count: usize,
+    pub stale_review_count: usize,
+    pub orphaned_stale_review_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpeningInventoryFact {
+    pub scan_id: Option<String>,
+    pub scene_sha256: String,
+    pub inventory_verified: bool,
+    pub total_count: usize,
+    pub verified_aperture_count: usize,
+    pub missing_entity_count: usize,
+    pub complete_entity_count: usize,
+    pub unverified_count: usize,
+}
+
+impl OpeningInventoryFact {
+    pub fn complete(&self) -> bool {
+        self.inventory_verified
+            && self.verified_aperture_count == self.total_count
+            && self.complete_entity_count == self.total_count
+            && self.missing_entity_count == 0
+            && self.unverified_count == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationFact {
     pub operation_id: String,
     pub state: String,
@@ -266,6 +331,9 @@ pub struct ArtifactFact {
     /// Whether this job's authority is current at the last query; None is unknown.
     pub current: Option<bool>,
     pub valid: Option<bool>,
+    /// A review image of this build was delivered by `read_artifact_review_image`;
+    /// this proves delivery only, not successful visual analysis.
+    pub reviewed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,17 +361,26 @@ pub struct DomainSnapshot {
     pub enabled: bool,
     pub floor_id: String,
     pub proposal: Option<ProposalFact>,
+    pub proposal_categories: BTreeMap<String, usize>,
     pub project: Option<ProjectCatalogFact>,
     pub selection: Option<ProjectSelectionFact>,
     pub project_location: Option<ProjectLocationFact>,
     pub project_scope: Option<ProjectScopeFact>,
+    /// Measured plausibility of the current floor structure, from the modeler.
+    pub structure_review: Option<StructureReview>,
     pub buildings: Vec<ProjectBuildingFact>,
     pub drawing_audit: Option<DrawingAuditFact>,
     pub ledger: Option<SourceLedgerFact>,
     pub groups: Option<SourceGroupsFact>,
+    pub linework: Option<LineworkCoverageFact>,
+    pub existing_structure: Option<ExistingStructureCoverageFact>,
+    pub source_regions: Option<SourceRegionReviewFact>,
+    pub openings: Option<OpeningInventoryFact>,
     pub application: Option<String>,
     pub operation: Option<OperationFact>,
     pub artifacts: Vec<ArtifactFact>,
+    pub first_use_review: Option<FirstUseReviewFact>,
+    pub review_images: Vec<ReviewImageFact>,
     pub authorizing: bool,
     pub notice: Option<String>,
     pub fact_sync_notice: Option<String>,
@@ -321,7 +398,112 @@ pub struct ComponentProgress {
     pub rejected: usize,
 }
 
+/// One measured check of a reconstructed floor: `ok` or needs attention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureCheck {
+    pub attention: bool,
+    pub message: String,
+    pub suggestion: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureReview {
+    pub attention: bool,
+    pub checks: Vec<StructureCheck>,
+}
+
+/// Bounded display text only; an unknown or malformed review is simply absent.
+fn structure_review(value: &Value) -> Option<StructureReview> {
+    if value["contract"] != "structure-review/v1" {
+        return None;
+    }
+    let checks = value["checks"]
+        .as_array()?
+        .iter()
+        .take(16)
+        .map(|check| {
+            let text = |key: &str| {
+                check[key].as_str().map(|text| {
+                    crate::state::display_text(&text.chars().take(240).collect::<String>())
+                })
+            };
+            Some(StructureCheck {
+                attention: check["status"] == "attention",
+                message: text("message")?,
+                suggestion: text("suggestion").unwrap_or_default(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(StructureReview {
+        attention: checks.iter().any(|check| check.attention),
+        checks,
+    })
+}
+
 impl DomainSnapshot {
+    pub fn first_use_satisfied(&self) -> bool {
+        self.first_use_review
+            .as_ref()
+            .is_none_or(|review| review.satisfied(&self.review_images))
+    }
+
+    pub fn review_set_sha256(&self) -> Option<String> {
+        self.first_use_review
+            .as_ref()
+            .and_then(|review| review.review_set_sha256.clone())
+    }
+
+    pub fn confirmation(&self) -> crate::extensions::ModelingConfirmation {
+        crate::extensions::ModelingConfirmation {
+            proposal: self
+                .proposal
+                .as_ref()
+                .expect("current proposal")
+                .binding
+                .clone(),
+            review_set_sha256: self.review_set_sha256(),
+        }
+    }
+
+    /// Image delivery and validation must belong to the same current candidate build.
+    pub fn candidate_review_delivered(&self, proposal: &ProposalBinding) -> bool {
+        self.artifacts.iter().any(|artifact| {
+            artifact.binding.candidate
+                && artifact.binding.proposal_id == proposal.proposal_id
+                && artifact.binding.revision == proposal.revision
+                && artifact.binding.prepare_token == proposal.prepare_token
+                && artifact.binding.authority_sha256 == proposal.base_sha256
+                && artifact.binding.input_sha256 == proposal.candidate_sha256
+                && artifact.state == ArtifactState::Built
+                && artifact.current == Some(true)
+                && artifact.valid == Some(true)
+                && artifact.reviewed
+                && self.review_images.iter().any(|image| {
+                    !image.required
+                        && image.binding.proposal == *proposal
+                        && image.binding.review_key == artifact.binding.build_id
+                        && image.file_state == ImageFileState::Available
+                })
+        })
+    }
+
+    /// The floor as the drawing names it (`二层`), falling back to the scene id.
+    pub fn floor_title(&self) -> String {
+        let key = self
+            .project_scope
+            .as_ref()
+            .map(|scope| scope.floor_key.as_str());
+        let title = key.and_then(|key| {
+            self.project
+                .as_ref()
+                .and_then(|project| project.floor_titles.get(key))
+        });
+        match title {
+            Some(title) => title.trim_end_matches("平面").to_owned(),
+            None => self.floor_id.clone(),
+        }
+    }
+
     /// Report scanned source work independently of a completed model turn or structure build.
     pub fn component_progress(&self) -> Option<ComponentProgress> {
         let counts = self
@@ -383,6 +565,7 @@ pub(crate) enum FactProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceViewIdentity {
+    contract: String,
     sha256: String,
     scan_id: String,
     scene_sha256: String,
@@ -395,7 +578,10 @@ impl SourceViewIdentity {
         {
             return Ok(None);
         }
-        if value["source_view_contract_version"] != "source-view/1" {
+        if !matches!(
+            value["source_view_contract_version"].as_str(),
+            Some("source-view/1" | "source-view/2")
+        ) {
             return Err(());
         }
         let hash = |key: &str| {
@@ -410,6 +596,10 @@ impl SourceViewIdentity {
             Ok(raw.to_owned())
         };
         Ok(Some(Self {
+            contract: value["source_view_contract_version"]
+                .as_str()
+                .ok_or(())?
+                .to_owned(),
             sha256: hash("source_view_sha256")?,
             scene_sha256: hash("scene_sha256")?,
             scan_id: text(value, "scan_id").map_err(|_| ())?,
@@ -425,7 +615,7 @@ pub struct DomainFacts {
     source_view: Option<SourceViewIdentity>,
     source_policy: Option<String>,
     source_view_policy: Option<String>,
-    source_view_required: bool,
+    source_view_required: Option<String>,
     source_view_sequence: Option<u64>,
     pub(crate) synchronizing: bool,
     synchronization_errors: BTreeMap<String, u64>,
@@ -449,7 +639,7 @@ impl DomainFacts {
             source_view: None,
             source_policy: None,
             source_view_policy: None,
-            source_view_required: false,
+            source_view_required: None,
             source_view_sequence: None,
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
@@ -510,6 +700,40 @@ impl DomainFacts {
                 && self.snapshot.project_scope.as_ref() != Some(&scope))
             {
                 return FactProjection::Invalid;
+            }
+            if let Some(binding) = &scope.opening_completion_binding {
+                if value["project_structure"] != false {
+                    return FactProjection::Invalid;
+                }
+                if matches!(kind, "project_scope" | "proposal") {
+                    let proposal = &value["proposal"];
+                    let proof = &proposal["opening_completion_source"];
+                    let operations = proposal["draft"]["operations"].as_array();
+                    if proposal["base_sha256"] != binding.base_sha256
+                        || proposal["scope"]["floor_id"] != scope.floor_id
+                        || proof["contract"] != "project-opening-completion/1"
+                        || text(proof, "path").is_err()
+                        || proof["sha256"].as_str().is_none_or(|sha| {
+                            sha.len() != 64
+                                || !sha.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                        || operations.is_none_or(|operations| {
+                            operations.len() > binding.opening_ids.len()
+                                || operations.iter().any(|op| {
+                                    op["op"] != "set"
+                                        || op["collection"] != "openings"
+                                        || op["field"] != "assets"
+                                        || op["target_id"].as_str().is_none_or(|id| {
+                                            !binding.opening_ids.iter().any(|allowed| allowed == id)
+                                        })
+                                })
+                        })
+                    {
+                        return FactProjection::Invalid;
+                    }
+                }
             }
             if kind == "project_scope" {
                 if let Some(choice) = &scope.wall_layer_choice {
@@ -573,7 +797,10 @@ impl DomainFacts {
             }
             None
         };
-        let source_kind = matches!(kind, "source_ledger" | "source_groups");
+        let source_kind = matches!(
+            kind,
+            "source_ledger" | "source_groups" | "source_linework" | "source_linework_selection"
+        );
         let incoming_source_view = if source_kind {
             match SourceViewIdentity::read(value) {
                 Ok(view) => view,
@@ -589,6 +816,7 @@ impl DomainFacts {
             && match kind {
                 "source_groups" => self.snapshot.groups.is_none(),
                 "source_ledger" => self.snapshot.ledger.is_none(),
+                "source_linework" | "source_linework_selection" => self.snapshot.linework.is_none(),
                 _ => false,
             };
         let artifact_kind = matches!(kind, "artifact" | "artifact_validation");
@@ -602,7 +830,7 @@ impl DomainFacts {
                 return FactProjection::Invalid;
             };
             format!("artifact:{id}")
-        } else if matches!(kind, "source_ledger" | "source_groups") {
+        } else if source_kind {
             // Both shapes describe the same mutable source state. Delayed pages
             // from either shape must not replace a newer verified source view.
             "sources".to_owned()
@@ -610,8 +838,26 @@ impl DomainFacts {
             kind.to_owned()
         };
         let sequence = value["fact_sequence"].as_u64();
+        if kind == "capabilities"
+            && ["sources", "opening_inventory"].iter().any(|key| {
+                self.fact_sequences
+                    .get(*key)
+                    .is_some_and(|last| sequence.is_none_or(|seq| seq < *last))
+            })
+        {
+            return FactProjection::Superseded;
+        }
         // Once the server declares sealed source views, unsealed pages are stale.
-        if source_kind && incoming_source_view.is_none() && self.source_view_required {
+        if source_kind
+            && self
+                .source_view_required
+                .as_deref()
+                .is_some_and(|required| {
+                    incoming_source_view
+                        .as_ref()
+                        .is_none_or(|view| view.contract != required)
+                })
+        {
             return FactProjection::Superseded;
         }
         if self
@@ -621,6 +867,42 @@ impl DomainFacts {
             && !recover_source_shape
         {
             return FactProjection::Superseded;
+        }
+        let linework = if source_kind {
+            match linework_coverage_fact(value) {
+                Ok(summary) => summary,
+                Err(()) => return FactProjection::Invalid,
+            }
+        } else {
+            None
+        };
+        let inventory_kind = source_kind || kind == "capabilities";
+        let existing_structure = if source_kind {
+            match existing_structure_coverage_fact(value, linework.as_ref()) {
+                Ok(summary) if summary.is_none() || incoming_source_view.is_some() => summary,
+                _ => return FactProjection::Invalid,
+            }
+        } else {
+            None
+        };
+        let source_regions = if source_kind {
+            match source_region_review_fact(value, linework.as_ref(), existing_structure.as_ref()) {
+                Ok(summary) if summary.is_none() || incoming_source_view.is_some() => summary,
+                _ => return FactProjection::Invalid,
+            }
+        } else {
+            None
+        };
+        let openings = if inventory_kind {
+            match opening_inventory_fact(value) {
+                Ok(summary) => summary,
+                Err(()) => return FactProjection::Invalid,
+            }
+        } else {
+            None
+        };
+        if openings.is_some() && sequence.is_none() {
+            return FactProjection::Invalid;
         }
         let mut accepted = false;
         match Some(kind) {
@@ -651,6 +933,8 @@ impl DomainFacts {
                     if fact.report.is_none()
                         && fact.connection_check == "not_run"
                         && old.state == fact.state
+                        && fact.source_discovery == old.source_discovery
+                        && fact.source_reconciliation == old.source_reconciliation
                     {
                         fact.report = old.report.clone();
                         fact.connection_check.clone_from(&old.connection_check);
@@ -670,6 +954,11 @@ impl DomainFacts {
                 let Some(fact) = project::drawing_audit_fact(value) else {
                     return FactProjection::Invalid;
                 };
+                if self.snapshot.operation.as_ref().is_some_and(|operation| {
+                    operation.state == "applied" && operation.current_sha256 != fact.scene_sha256
+                }) {
+                    return FactProjection::Superseded;
+                }
                 self.snapshot.drawing_audit = Some(fact);
                 accepted = true;
             }
@@ -680,12 +969,27 @@ impl DomainFacts {
                 let Some(proposal) = proposal_fact(value) else {
                     return FactProjection::Invalid;
                 };
+                let Some(first_use) = review::requirements(&value["proposal"]) else {
+                    return FactProjection::Invalid;
+                };
                 if self.snapshot.project_scope.as_ref() != Some(&scope) {
                     self.clear_project_scope();
                 }
                 self.snapshot.floor_id = scope.floor_id.clone();
                 self.snapshot.project_scope = Some(scope);
+                if self
+                    .snapshot
+                    .proposal
+                    .as_ref()
+                    .is_none_or(|old| old.binding != proposal.binding)
+                {
+                    self.snapshot.review_images.clear();
+                    self.snapshot.artifacts.clear();
+                }
+                self.snapshot.first_use_review = Some(first_use);
+                self.snapshot.proposal_categories = proposal_category_counts(&value["proposal"]);
                 self.snapshot.proposal = Some(proposal);
+                self.snapshot.structure_review = structure_review(&value["structure_review"]);
                 accepted = true;
             }
             Some("project_location") => {
@@ -779,6 +1083,19 @@ impl DomainFacts {
             }
             Some("proposal") => {
                 if let Some(proposal) = proposal_fact(value) {
+                    let Some(mut first_use) = review::requirements(&value["proposal"]) else {
+                        return FactProjection::Invalid;
+                    };
+                    let mut images = Vec::new();
+                    if value.get("component_first_use_review").is_some() {
+                        let Some((projected, projected_images)) =
+                            review::project(value, &proposal.binding, &first_use)
+                        else {
+                            return FactProjection::Invalid;
+                        };
+                        first_use = projected;
+                        images = projected_images;
+                    }
                     let old = self.snapshot.proposal.as_ref();
                     let same = old.is_some_and(|p| p.binding == proposal.binding);
                     let parent = value["proposal"]["parent_id"].as_str();
@@ -795,6 +1112,7 @@ impl DomainFacts {
                             self.snapshot.application = None;
                             self.snapshot.operation = None;
                             self.snapshot.artifacts.clear();
+                            self.snapshot.review_images.clear();
                             self.fact_sequences
                                 .retain(|key, _| !key.starts_with("artifact:"));
                             for kind in ["application", "operation"] {
@@ -802,6 +1120,10 @@ impl DomainFacts {
                             }
                         }
                         self.snapshot.preview_selection = None;
+                        self.snapshot.first_use_review = Some(first_use);
+                        self.replace_review_images(images, true);
+                        self.snapshot.proposal_categories =
+                            proposal_category_counts(&value["proposal"]);
                         self.snapshot.proposal = Some(proposal);
                         accepted = true;
                     }
@@ -827,6 +1149,18 @@ impl DomainFacts {
                     self.snapshot.ledger = Some(ledger);
                     if !same_source_view {
                         self.snapshot.groups = None;
+                    }
+                    accepted = true;
+                }
+            }
+            Some("source_linework" | "source_linework_selection") => {
+                if linework.is_some() && incoming_source_view.is_some() {
+                    if let Err(projection) = self.accept_source_policy(value) {
+                        return projection;
+                    }
+                    if !same_source_view {
+                        self.snapshot.groups = None;
+                        self.snapshot.ledger = None;
                     }
                     accepted = true;
                 }
@@ -881,6 +1215,29 @@ impl DomainFacts {
                 }
                 accepted = true;
             }
+            Some("component_first_use_review") => {
+                if let (Some(proposal), Some(first_use)) =
+                    (&self.snapshot.proposal, &self.snapshot.first_use_review)
+                {
+                    let owner = &value["component_first_use_review"];
+                    if owner["proposal_id"] != proposal.binding.proposal_id
+                        || owner["revision"] != proposal.binding.revision
+                        || owner["prepare_token"] != proposal.binding.prepare_token
+                        || owner["base_sha256"] != proposal.binding.base_sha256
+                        || owner["candidate_sha256"] != proposal.binding.candidate_sha256
+                    {
+                        return FactProjection::Superseded;
+                    }
+                    let Some((first_use, images)) =
+                        review::project(value, &proposal.binding, first_use)
+                    else {
+                        return FactProjection::Invalid;
+                    };
+                    self.snapshot.first_use_review = Some(first_use);
+                    self.replace_review_images(images, true);
+                    accepted = true;
+                }
+            }
             Some("artifact" | "artifact_validation") => {
                 if let Some(mut artifact) = self
                     .snapshot
@@ -915,6 +1272,8 @@ impl DomainFacts {
                             if kind == "artifact" && old.state == artifact.state {
                                 artifact.valid = old.valid;
                             }
+                            // A later receipt without an image never erases a delivered review.
+                            artifact.reviewed |= old.reviewed && old.state == artifact.state;
                             *old = artifact;
                             accepted = true;
                         }
@@ -927,6 +1286,14 @@ impl DomainFacts {
                         }
                         self.snapshot.artifacts.push(artifact);
                         accepted = true;
+                    }
+                    if accepted {
+                        if let Some(image) = review::artifact_image(
+                            value,
+                            &self.snapshot.proposal.as_ref().unwrap().binding,
+                        ) {
+                            self.replace_review_images(vec![image], false);
+                        }
                     }
                 }
             }
@@ -944,7 +1311,12 @@ impl DomainFacts {
                     None
                 };
                 let view_declaration = value["capabilities"].get("source_view");
-                if view_declaration.is_some_and(|d| d["contract_version"] != "source-view/1") {
+                if view_declaration.is_some_and(|d| {
+                    !matches!(
+                        d["contract_version"].as_str(),
+                        Some("source-view/1" | "source-view/2")
+                    )
+                }) {
                     return FactProjection::Invalid;
                 }
                 if (policy.is_some() || view_declaration.is_some()) && sequence.is_none() {
@@ -959,11 +1331,19 @@ impl DomainFacts {
                     }
                     accepted = true;
                 }
-                if view_declaration.is_some() {
-                    self.source_view_required = true;
-                    if self.source_view.is_none() {
+                if let Some(declaration) = view_declaration {
+                    let required = declaration["contract_version"].as_str().unwrap();
+                    self.source_view_required = Some(required.to_owned());
+                    if self
+                        .source_view
+                        .as_ref()
+                        .is_none_or(|view| view.contract != required)
+                    {
                         self.clear_source_view();
                     }
+                    accepted = true;
+                }
+                if openings.is_some() {
                     accepted = true;
                 }
             }
@@ -976,7 +1356,21 @@ impl DomainFacts {
             _ => {}
         }
         if accepted {
+            if inventory_kind
+                && sequence.is_some_and(|seq| {
+                    self.fact_sequences
+                        .get("opening_inventory")
+                        .is_none_or(|last| seq >= *last)
+                })
+            {
+                self.snapshot.openings = openings;
+                self.fact_sequences
+                    .insert("opening_inventory".into(), sequence.unwrap());
+            }
             if source_kind {
+                self.snapshot.linework = linework;
+                self.snapshot.existing_structure = existing_structure;
+                self.snapshot.source_regions = source_regions;
                 self.source_view = incoming_source_view;
             }
             if let Some(sequence) = sequence {
@@ -989,7 +1383,7 @@ impl DomainFacts {
                     .or_insert(sequence);
             }
             FactProjection::Applied
-        } else if matches!(kind, "proposal" | "source_ledger" | "source_groups") {
+        } else if kind == "proposal" || source_kind {
             FactProjection::Invalid
         } else {
             FactProjection::Unrelated
@@ -999,25 +1393,37 @@ impl DomainFacts {
     fn clear_project_scope(&mut self) {
         self.source_view = None;
         self.snapshot.project_scope = None;
+        self.snapshot.structure_review = None;
         self.snapshot.drawing_audit = None;
         self.snapshot.proposal = None;
+        self.snapshot.proposal_categories.clear();
         self.snapshot.ledger = None;
         self.snapshot.groups = None;
+        self.snapshot.linework = None;
+        self.snapshot.existing_structure = None;
+        self.snapshot.source_regions = None;
+        self.snapshot.openings = None;
         self.snapshot.operation = None;
         self.snapshot.application = None;
         self.snapshot.artifacts.clear();
+        self.snapshot.review_images.clear();
+        self.snapshot.first_use_review = None;
         self.snapshot.floor_id = "项目目标".into();
     }
 
     fn clear_source_view(&mut self) {
         self.snapshot.groups = None;
         self.snapshot.ledger = None;
-        if self
-            .snapshot
-            .verified_fact
-            .as_ref()
-            .is_some_and(|f| matches!(f.kind.as_str(), "source_groups" | "source_ledger"))
-        {
+        self.snapshot.linework = None;
+        self.snapshot.existing_structure = None;
+        self.snapshot.source_regions = None;
+        self.snapshot.openings = None;
+        if self.snapshot.verified_fact.as_ref().is_some_and(|f| {
+            matches!(
+                f.kind.as_str(),
+                "source_groups" | "source_ledger" | "source_linework" | "source_linework_selection"
+            )
+        }) {
             self.snapshot.verified_fact = None;
         }
         self.source_view_policy = None;
@@ -1026,6 +1432,9 @@ impl DomainFacts {
         self.fact_sequences.remove("sources");
         self.synchronization_errors.remove("source_groups");
         self.synchronization_errors.remove("source_ledger");
+        self.synchronization_errors.remove("source_linework");
+        self.synchronization_errors
+            .remove("source_linework_selection");
     }
 
     fn accept_source_policy(&mut self, value: &Value) -> Result<(), FactProjection> {
@@ -1066,11 +1475,18 @@ impl DomainFacts {
                 self.synchronization_errors.remove(key);
             }
         }
-        let source_receipt = matches!(receipt.kind.as_str(), "source_groups" | "source_ledger");
+        let source_receipt = matches!(
+            receipt.kind.as_str(),
+            "source_groups" | "source_ledger" | "source_linework" | "source_linework_selection"
+        );
         let current_source_receipt = !source_receipt
             || (self.source_view_sequence == Some(receipt.fact_sequence)
                 && ((receipt.kind == "source_groups" && self.snapshot.groups.is_some())
-                    || (receipt.kind == "source_ledger" && self.snapshot.ledger.is_some())));
+                    || (receipt.kind == "source_ledger" && self.snapshot.ledger.is_some())
+                    || (matches!(
+                        receipt.kind.as_str(),
+                        "source_linework" | "source_linework_selection"
+                    ) && self.snapshot.linework.is_some())));
         let stamped_current_source =
             source_receipt && current_source_receipt && self.source_view.is_some();
         if current_source_receipt
@@ -1226,11 +1642,45 @@ impl DomainFacts {
             && self.synchronization_errors.is_empty()
             && !self.snapshot.authorizing
             && self.snapshot.operation.is_none()
+            && self.snapshot.candidate_review_delivered(binding)
+            && self.snapshot.first_use_satisfied()
             && self
                 .snapshot
                 .proposal
                 .as_ref()
                 .is_some_and(|p| p.ready && p.binding == *binding)
+    }
+
+    fn replace_review_images(&mut self, mut images: Vec<ReviewImageFact>, required: bool) {
+        for image in &mut images {
+            if let Some(old) = self
+                .snapshot
+                .review_images
+                .iter()
+                .find(|old| old.binding == image.binding)
+            {
+                image.file_state = old.file_state.clone();
+                image.externally_opened = old.externally_opened;
+                image.notice.clone_from(&old.notice);
+            }
+        }
+        self.snapshot.review_images.retain(|image| {
+            if required {
+                !image.required
+            } else {
+                !images.iter().any(|new| new.binding == image.binding)
+            }
+        });
+        if required {
+            let remaining = review::MAX_IMAGES.saturating_sub(images.len());
+            images.extend(self.snapshot.review_images.drain(..).take(remaining));
+            self.snapshot.review_images = images;
+        } else {
+            let remaining = review::MAX_IMAGES.saturating_sub(self.snapshot.review_images.len());
+            self.snapshot
+                .review_images
+                .extend(images.into_iter().take(remaining));
+        }
     }
 }
 
@@ -1277,11 +1727,18 @@ fn artifact_fact(value: &Value, proposal: &ProposalBinding) -> Option<ArtifactFa
     if valid == Some(true) && state != ArtifactState::Built {
         return None;
     }
+    let image = &a["review_image"];
+    let reviewed = value["kind"] == "artifact_validation"
+        && image["delivery"] == "attached_png"
+        && image["image_sha256"]
+            .as_str()
+            .is_some_and(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
     Some(ArtifactFact {
         binding,
         state,
         current: a["current"].as_bool(),
         valid,
+        reviewed,
     })
 }
 
@@ -1341,6 +1798,174 @@ fn matches_proposal(snapshot: &DomainSnapshot, value: &Value) -> bool {
     })
 }
 
+fn linework_coverage_fact(value: &Value) -> Result<Option<LineworkCoverageFact>, ()> {
+    let Some(summary) = value.get("linework_summary") else {
+        return if value["source_view_contract_version"] == "source-view/2" {
+            Err(())
+        } else {
+            Ok(None)
+        };
+    };
+    if summary["contract_version"] != "source-linework/1" {
+        return Err(());
+    }
+    let count = |key: &str| usize::try_from(summary[key].as_u64().ok_or(())?).map_err(|_| ());
+    let fact = LineworkCoverageFact {
+        scan_id: text(value, "scan_id").map_err(|_| ())?,
+        scene_sha256: text(value, "scene_sha256").map_err(|_| ())?,
+        member_count: count("member_count")?,
+        selected_member_count: count("selected_member_count")?,
+        unselected_member_count: count("unselected_member_count")?,
+        candidate_count: count("candidate_count")?,
+        unclassified_candidate_count: count("unclassified_candidate_count")?,
+        region_count: count("region_count")?,
+        annotation_count: count("annotation_count")?,
+        uncovered_count: count("uncovered_count")?,
+        diagnostic_member_count: count("diagnostic_member_count")?,
+        stale_selection_count: count("stale_selection_count")?,
+    };
+    if fact
+        .selected_member_count
+        .checked_add(fact.unselected_member_count)
+        != Some(fact.member_count)
+        || fact.candidate_count > fact.selected_member_count
+        || fact.unclassified_candidate_count > fact.candidate_count
+        || fact.diagnostic_member_count > fact.member_count
+    {
+        return Err(());
+    }
+    Ok(Some(fact))
+}
+
+fn source_region_review_fact(
+    value: &Value,
+    linework: Option<&LineworkCoverageFact>,
+    structure: Option<&ExistingStructureCoverageFact>,
+) -> Result<Option<SourceRegionReviewFact>, ()> {
+    let Some(summary) = value.get("source_region_summary") else {
+        return Ok(None);
+    };
+    if summary["contract_version"] != "source-region-review/1" {
+        return Err(());
+    }
+    let linework = linework.ok_or(())?;
+    let count = |key: &str| usize::try_from(summary[key].as_u64().ok_or(())?).map_err(|_| ());
+    let fact = SourceRegionReviewFact {
+        scan_id: linework.scan_id.clone(),
+        scene_sha256: linework.scene_sha256.clone(),
+        region_count: count("region_count")?,
+        reviewed_region_count: count("reviewed_region_count")?,
+        unreviewed_region_count: count("unreviewed_region_count")?,
+        structure_represented_region_count: match summary.get("structure_represented_region_count")
+        {
+            None => 0,
+            Some(_) => count("structure_represented_region_count")?,
+        },
+        uncertain_region_count: count("uncertain_region_count")?,
+        stale_review_count: count("stale_review_count")?,
+        orphaned_stale_review_count: count("orphaned_stale_review_count")?,
+    };
+    if fact
+        .reviewed_region_count
+        .checked_add(fact.unreviewed_region_count)
+        .and_then(|total| total.checked_add(fact.structure_represented_region_count))
+        != Some(fact.region_count)
+        || fact.region_count != linework.region_count
+        || fact.uncertain_region_count > fact.reviewed_region_count
+        || fact.stale_review_count > fact.unreviewed_region_count
+        || (fact.structure_represented_region_count > 0
+            && structure.is_none_or(|coverage| {
+                coverage.complete_member_count < fact.structure_represented_region_count
+            }))
+    {
+        return Err(());
+    }
+    Ok(Some(fact))
+}
+
+fn existing_structure_coverage_fact(
+    value: &Value,
+    linework: Option<&LineworkCoverageFact>,
+) -> Result<Option<ExistingStructureCoverageFact>, ()> {
+    let Some(summary) = value.get("existing_structure_summary") else {
+        return Ok(None);
+    };
+    if summary["contract_version"] != "source-structure-coverage/1" {
+        return Err(());
+    }
+    let linework = linework.ok_or(())?;
+    let count = |key: &str| usize::try_from(summary[key].as_u64().ok_or(())?).map_err(|_| ());
+    let fact = ExistingStructureCoverageFact {
+        scan_id: linework.scan_id.clone(),
+        scene_sha256: linework.scene_sha256.clone(),
+        member_count: count("member_count")?,
+        complete_member_count: count("complete_member_count")?,
+        partial_member_count: count("partial_member_count")?,
+        reference_only_member_count: count("reference_only_member_count")?,
+        unproven_member_count: count("unproven_member_count")?,
+        unselected_complete_member_count: count("unselected_complete_member_count")?,
+    };
+    if [
+        fact.complete_member_count,
+        fact.partial_member_count,
+        fact.reference_only_member_count,
+        fact.unproven_member_count,
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+        != Some(fact.member_count)
+        || fact.member_count != linework.member_count
+        || fact.unselected_complete_member_count > fact.complete_member_count
+        || fact.unselected_complete_member_count > linework.unselected_member_count
+    {
+        return Err(());
+    }
+    Ok(Some(fact))
+}
+
+fn opening_inventory_fact(value: &Value) -> Result<Option<OpeningInventoryFact>, ()> {
+    let Some(summary) = value.get("opening_summary") else {
+        return Ok(None);
+    };
+    if summary["contract"] != "approved-opening-inventory/1" {
+        return Err(());
+    }
+    let count = |key: &str| usize::try_from(summary[key].as_u64().ok_or(())?).map_err(|_| ());
+    let fact = OpeningInventoryFact {
+        scan_id: if value["kind"] == "capabilities" && value.get("scan_id").is_none() {
+            None
+        } else {
+            Some(text(value, "scan_id").map_err(|_| ())?)
+        },
+        scene_sha256: text(value, "scene_sha256").map_err(|_| ())?,
+        inventory_verified: match summary["inventory_status"].as_str() {
+            Some("verified") => true,
+            Some("unverified") => false,
+            _ => return Err(()),
+        },
+        total_count: count("total_count")?,
+        verified_aperture_count: count("verified_aperture_count")?,
+        missing_entity_count: count("missing_entity_count")?,
+        complete_entity_count: count("complete_entity_count")?,
+        unverified_count: count("unverified_count")?,
+    };
+    if fact.scene_sha256.len() != 64
+        || !fact
+            .scene_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || fact.verified_aperture_count > fact.total_count
+        || fact
+            .missing_entity_count
+            .checked_add(fact.complete_entity_count)
+            .is_none_or(|count| count > fact.total_count)
+        || fact.unverified_count > fact.total_count
+    {
+        return Err(());
+    }
+    Ok(Some(fact))
+}
+
 fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
     let groups = value["groups"].as_array()?;
     let total_groups = usize::try_from(value["total_groups"].as_u64()?).ok()?;
@@ -1393,16 +2018,28 @@ fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
             return None;
         }
         if ids.len() <= 100 {
+            let block = match group["block"].as_str() {
+                Some("") if group["evidence_kind"] == "linework" => "AI 选择的线稿对象".to_owned(),
+                _ => text(group, "block").ok()?,
+            };
             rows.push(format!(
                 "{} · {} 个 · 类别 {} · 状态 {} · {}",
-                text(group, "block").ok()?,
-                count,
-                group["category_counts"],
-                group["state_counts"],
-                id
+                block, count, group["category_counts"], group["state_counts"], id
             ));
             if let Some(reason) = assessment {
-                rows.push(format!("评估依据／问题：{reason}"));
+                rows.push(format!(
+                    "{}：{reason}",
+                    if group["assessment"]["non_component"] == true
+                        && group["instances"]
+                            .as_array()?
+                            .iter()
+                            .all(|instance| instance["non_component"] == true)
+                    {
+                        "AI 判为非构件 · assumed · 依据"
+                    } else {
+                        "评估依据／问题"
+                    }
+                ));
             }
         }
     }
@@ -1458,6 +2095,35 @@ fn source_ledger_fact(value: &Value) -> Option<SourceLedgerFact> {
             row["origin_m"],
             row["matched_component_ids"]
         ));
+        if row["non_component"] == true {
+            let reason = bounded_text(row, "classification_reason", 2000)?;
+            let basis = text(row, "classification_basis").ok()?;
+            if !matches!(basis.as_str(), "assumed" | "user_confirmed") {
+                return None;
+            }
+            rows.push(format!("判为非构件 · {basis} · 依据：{reason}"));
+        }
+        if let Some(aperture) = row["aperture_status"].as_str() {
+            let entity = row["entity_status"].as_str()?;
+            if !matches!(aperture, "verified" | "unverified")
+                || !matches!(entity, "complete" | "missing" | "unverified")
+            {
+                return None;
+            }
+            rows.push(format!(
+                "洞口 {} · 门窗实体 {}",
+                if aperture == "verified" {
+                    "已核验"
+                } else {
+                    "待核验"
+                },
+                match entity {
+                    "complete" => "已建",
+                    "missing" => "缺失",
+                    _ => "待核验",
+                }
+            ));
+        }
     }
     if let Some(total_counts) = value["state_counts"].as_object() {
         counts = total_counts
@@ -1477,6 +2143,76 @@ fn bounded_text(value: &Value, key: &str, max_characters: usize) -> Option<Strin
     let text = value[key].as_str()?;
     (!text.is_empty() && text.chars().count() <= max_characters)
         .then(|| crate::state::display_text(text))
+}
+
+fn proposal_category_counts(proposal: &Value) -> BTreeMap<String, usize> {
+    let mut components = BTreeMap::new();
+    for key in ["required", "reused"] {
+        for item in proposal["component_first_use_requirements"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for id in item["component_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                components.insert(
+                    id.to_owned(),
+                    item["category"].as_str().unwrap_or("未分类").to_owned(),
+                );
+            }
+        }
+    }
+    if let Some(selected) = proposal["component_edit"]["selected_parts"].as_object() {
+        for (id, parts) in selected {
+            components.entry(id.clone()).or_insert_with(|| {
+                parts[0]["metadata"]["category"]
+                    .as_str()
+                    .unwrap_or("未分类")
+                    .to_owned()
+            });
+        }
+    }
+    for op in proposal["draft"]["operations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if !matches!(
+            op["collection"].as_str(),
+            Some("solids" | "elements" | "walls" | "slabs" | "openings")
+        ) || op["op"] == "remove"
+        {
+            continue;
+        }
+        let Some(entity) = op["value_json"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        else {
+            continue;
+        };
+        let Some(id) = entity["metadata"]["component_id"]
+            .as_str()
+            .or_else(|| entity["id"].as_str())
+        else {
+            continue;
+        };
+        let category = entity["metadata"]["category"]
+            .as_str()
+            .or_else(|| entity["role"].as_str())
+            .unwrap_or("未分类");
+        components
+            .entry(id.to_owned())
+            .or_insert_with(|| category.to_owned());
+    }
+    let mut counts = BTreeMap::new();
+    for category in components.values() {
+        *counts.entry(category.clone()).or_default() += 1;
+    }
+    counts
 }
 
 fn proposal_fact(value: &Value) -> Option<ProposalFact> {
@@ -1632,6 +2368,42 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             continue;
         }
         if op["collection"] == "openings" {
+            if op["op"] == "set" {
+                let target = text(op, "target_id").ok()?;
+                let specs = p["component_plan"]["openings"].as_array()?;
+                let spec = specs.iter().find(|spec| {
+                    spec["operation"] == "complete-entity"
+                        && spec["target_opening_id"].as_str() == Some(target.as_str())
+                })?;
+                let assets: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+                let kind = spec["kind"].as_str()?;
+                if op["field"] != "assets"
+                    || op["basis"] != "assumed"
+                    || assets != spec["assets"]
+                    || !assets.is_object()
+                    || !matches!(
+                        (kind, assets["style"].as_str()),
+                        ("door", Some("door")) | ("window", Some("window" | "curtain_wall"))
+                    )
+                    || spec["height"].as_f64().is_none_or(|v| v <= 0.0)
+                    || spec["sill_height"].as_f64().is_none_or(|v| v < 0.0)
+                    || op["source_ids"].as_array()?.is_empty()
+                {
+                    return None;
+                }
+                let source = text(spec, "source_instance_id").ok()?;
+                let evidence = p["hosted_sources"].get(&source)?;
+                objects.push(format!(
+                    "{target} · {kind} 实体补全 · 宿主 {} · 来源位置 {}",
+                    text(spec, "host_wall_id").ok()?,
+                    evidence["origin_m"]
+                ));
+                objects.push(format!(
+                    "保留既有洞口尺寸与位置 · 高 {} · 窗台 {} · 实体参数 assumed：{assets}",
+                    spec["height"], spec["sill_height"]
+                ));
+                continue;
+            }
             let opening: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
             let kind = opening["kind"].as_str()?;
             if !matches!(kind, "door" | "window")
@@ -1671,13 +2443,21 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         }
         if op["collection"] == "elements" {
             let element: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+            let metadata = &element["metadata"];
+            let schematic = metadata["relation_validator"] == "vertical-schematic/1";
             let role = element["role"].as_str()?;
             let boundary = element["boundary"].as_array()?;
-            if !matches!(role, "stair_step" | "shaft_wall")
-                || !matches!(
-                    element["metadata"]["relation_validator"].as_str(),
-                    Some("vertical-connection/1" | "vertical-connection/2")
-                )
+            let valid_role = if schematic {
+                matches!(role, "stair_step" | "landing")
+            } else {
+                matches!(role, "stair_step" | "shaft_wall")
+            };
+            if !valid_role
+                || !schematic
+                    && !matches!(
+                        metadata["relation_validator"].as_str(),
+                        Some("vertical-connection/1" | "vertical-connection/2")
+                    )
                 || element["height"].as_f64()? <= 0.0
                 || element["base_z"].as_f64().is_none()
                 || boundary.len() < 3
@@ -1697,20 +2477,60 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                 element["height"],
                 op["basis"].as_str().unwrap_or("unknown")
             ));
-            let component = element["metadata"]["component_id"].as_str()?;
-            if seen_connections.insert(component.to_owned()) {
-                let connection = p["component_plan"]["connections"]
-                    .as_array()?
-                    .iter()
-                    .find(|c| c["component_id"].as_str() == Some(component))?;
-                let source = element["metadata"]["source_instance_id"].as_str()?;
-                objects.push(format!(
-                    "服务楼层 {} · 既有洞口 {} · 来源位置 {} · 台阶参数依据 {}",
-                    connection["served_floors"],
-                    connection["openings"],
-                    p["vertical_sources"][source]["origin_m"],
-                    element["metadata"]["step_dimension_basis"]
-                ));
+            let component = metadata["component_id"].as_str()?;
+            let first_connection = seen_connections.insert(component.to_owned());
+            if !schematic && !first_connection {
+                continue;
+            }
+            let connection = p["component_plan"]["connections"]
+                .as_array()?
+                .iter()
+                .find(|c| c["component_id"].as_str() == Some(component))?;
+            let source = metadata["source_instance_id"].as_str()?;
+            if schematic
+                && (connection["kind"] != "stair"
+                    || connection["mode"] != "single_floor_schematic"
+                    || connection["dimension_basis"] != "assumed"
+                    || connection["rise_m"].as_f64().is_none_or(|v| v <= 0.0)
+                    || connection["served_floors"].as_array()?.len() != 1
+                    || connection["served_floors"][0] != p["scope"]["floor_id"]
+                    || p["scope"]["floor_id"].as_str().is_none()
+                    || !connection["openings"].as_array()?.is_empty()
+                    || connection["source_instance_id"].as_str() != Some(source)
+                    || !p["vertical_sources"][source].is_object()
+                    || metadata["modeling_mode"] != "single_floor_schematic"
+                    || metadata["connection_status"] != "unverified"
+                    || metadata["step_dimension_basis"] != "assumed"
+                    || !matches!(
+                        metadata["geometry_status"].as_str(),
+                        Some("schematic" | "partial_schematic")
+                    )
+                    || bounded_text(metadata, "solid_representation", 1000).is_none()
+                    || op["basis"] != "assumed")
+            {
+                return None;
+            }
+            if first_connection {
+                if schematic {
+                    objects.push(format!(
+                        "单层示意楼梯 · 层高 {} m · assumed · 连接待核验 · 楼层 {} · 来源位置 {}",
+                        connection["rise_m"],
+                        connection["served_floors"],
+                        p["vertical_sources"][source]["origin_m"]
+                    ));
+                    objects.push(format!(
+                        "体量表示：{}",
+                        bounded_text(metadata, "solid_representation", 1000)?
+                    ));
+                } else {
+                    objects.push(format!(
+                        "服务楼层 {} · 既有洞口 {} · 来源位置 {} · 台阶参数依据 {}",
+                        connection["served_floors"],
+                        connection["openings"],
+                        p["vertical_sources"][source]["origin_m"],
+                        metadata["step_dimension_basis"]
+                    ));
+                }
                 objects.push(format!(
                     "未检查：{}",
                     element["metadata"]["not_checked"].as_str()?
@@ -1734,8 +2554,18 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     let assumptions = p["assumed"]
         .as_array()?
         .iter()
-        .take(100)
-        .filter_map(|i| i["message"].as_str().map(str::to_owned))
+        .map(|i| {
+            if i.as_object().is_some_and(|object| object.len() == 1) {
+                i["message"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| i.to_string())
+            } else {
+                i.to_string()
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect();
     let diagnostics: Vec<String> = value["diagnostics"]
         .as_array()?
@@ -1807,7 +2637,20 @@ fn unwrap_envelope(value: Value, depth: usize) -> Option<Value> {
     None
 }
 
-pub async fn authorize(setup: DomainSetup, binding: ProposalBinding) -> Result<String, String> {
+pub async fn authorize(
+    setup: DomainSetup,
+    binding: ProposalBinding,
+    review_set_sha256: Option<String>,
+    images: Vec<ReviewImageBinding>,
+) -> Result<String, String> {
+    for image in &images {
+        if image.proposal != binding
+            || (image.review_set_sha256.is_some() && image.review_set_sha256 != review_set_sha256)
+        {
+            return Err("首用图片与当前批准版本不一致".into());
+        }
+        review::verify_image(image).await?;
+    }
     let raw = tokio::fs::read(&setup.context_path)
         .await
         .map_err(|e| e.to_string())?;
@@ -1848,9 +2691,12 @@ pub async fn authorize(setup: DomainSetup, binding: ProposalBinding) -> Result<S
             "--actor",
             "native-agent-tui:user",
         ]);
+    if let Some(review_set) = &review_set_sha256 {
+        command.args(["--expected-review-set-sha256", review_set]);
+    }
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+    let output = tokio::time::timeout(std::time::Duration::from_secs(600), command.output())
         .await
         .map_err(|_| "批准进程中断或超时；需检查记录，不能自动重试".to_owned())?
         .map_err(|e| e.to_string())?;
@@ -1866,6 +2712,7 @@ pub async fn authorize(setup: DomainSetup, binding: ProposalBinding) -> Result<S
         || value["grant"]["proposal_id"] != binding.proposal_id
         || value["grant"]["revision"] != binding.revision
         || value["grant"]["prepare_token"] != binding.prepare_token
+        || value["grant"]["review_set_sha256"].as_str() != review_set_sha256.as_deref()
     {
         return Err("批准未通过版本核对；请检查当前方案".into());
     }
@@ -1882,7 +2729,7 @@ pub async fn authorize(setup: DomainSetup, binding: ProposalBinding) -> Result<S
                   "expected_sha256": binding.base_sha256,
                   "authorization_id": authorization_id
               },
-              "instruction":"用户已批准此具体版本。使用 apply_change_arguments 并补充稳定 operation_id 调用领域 apply_change；expected_sha256 必须是 base_sha256。再独立构建和验证产物，保留假设标签。有来源输入时，最后调用 scan_source_instances 并按 next_offset 读完全部页，展示已建、跳过和未决来源的完整对账；仅完成构建不能报告来源对账已完成。"});
+              "instruction":"用户已批准此具体版本。使用 apply_change_arguments 并补充稳定 operation_id 调用领域 apply_change；expected_sha256 必须是 base_sha256。再独立正式构建、验证和复核产物，保留假设标签。有来源输入时，先调用 scan_source_instances 取得当前完整汇总，再读取本批相关分组及完整必要分页，逐项核对本批来源、稳定身份与实际已建结果；展示全层已建、跳过、未决数量及仍未读取的范围。汇总不代表逐项全读，本批对账不代表整层对账完成；最终宣称整层完成前必须覆盖全部绑定来源并完成逐项对账。完成本版后，沿对话中原始用户目标和后续范围约束继续推进。原目标为完整楼层时，主动识别剩余来源、准备下一批可复核方案并集中提出必要业务问题；个别对象缺能力或待澄清时保留记录，继续其他可推进对象，不要求用户反复回复继续。原目标仅局部修改或预览时保持该边界；目标范围不明先核对对话。后续每个具体版本仍须独立批准，本次授权仅适用于以上绑定版本。"});
     Ok(format!("{display}\n{payload}"))
 }
 

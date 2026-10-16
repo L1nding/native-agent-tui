@@ -5,7 +5,34 @@ fn envelope() -> Value {
         "diagnostics":[],"proposal":{"proposal_id":"proposal", "revision":2,"prepare_token":"token",
         "base_sha256":"base","candidate_sha256":"candidate", "state":"prepared", "summary":"two beds",
         "draft":{"operations":[{"collection":"solids","value_json":json!({"id":"bed.1.body", "origin":[6,2,0],"source_ids":[]}).to_string(),"basis":"assumed"}]},
-        "issues":[],"pending":[],"assumed":[{"message":"assumed dimensions"}]}})
+        "issues":[],"pending":[],"assumed":[{"message":"assumed dimensions"}],"component_first_use_requirements":{"contract":"component-first-use/1","required":[],"reused":[]}}})
+}
+
+fn reviewed_candidate(proposal: &ProposalBinding) -> ArtifactFact {
+    ArtifactFact {
+        binding: ArtifactBinding {
+            build_id: format!("review-{}-{}", proposal.proposal_id, proposal.revision),
+            proposal_id: proposal.proposal_id.clone(),
+            revision: proposal.revision,
+            prepare_token: proposal.prepare_token.clone(),
+            candidate: true,
+            authority_sha256: proposal.base_sha256.clone(),
+            input_sha256: proposal.candidate_sha256.clone(),
+            output: "candidate.glb".into(),
+        },
+        state: ArtifactState::Built,
+        current: Some(true),
+        valid: Some(true),
+        reviewed: true,
+    }
+}
+
+fn add_reviewed_candidate(snapshot: &mut DomainSnapshot, proposal: &ProposalBinding) {
+    let artifact = reviewed_candidate(proposal);
+    snapshot
+        .review_images
+        .push(review::test_image(proposal, &artifact.binding.build_id));
+    snapshot.artifacts.push(artifact);
 }
 
 #[test]
@@ -25,6 +52,7 @@ fn stale_or_blocked_proposal_cannot_authorize() {
     let fact = proposal_fact(&value).unwrap();
     let mut facts = sequenced_facts();
     facts.snapshot.proposal = Some(fact.clone());
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
     assert!(!facts.can_authorize(&fact.binding));
     value["current"] = json!(true);
     value["proposal"]["pending"] = json!([{"message":"which side?"}]);
@@ -50,6 +78,7 @@ fn authorization_must_match_exact_binding_and_cannot_repeat_while_pending() {
     let fact = proposal_fact(&envelope()).unwrap();
     let mut facts = sequenced_facts();
     facts.snapshot.proposal = Some(fact.clone());
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
     assert!(facts.can_authorize(&fact.binding));
     let mut old = fact.binding.clone();
     old.revision -= 1;
@@ -77,6 +106,7 @@ fn a_current_new_proposal_family_can_restart_at_revision_one_without_reviving_st
     stale["proposal"]["state"] = json!("superseded");
     deliver(&mut facts, "old-inspect", stale);
     assert_eq!(facts.snapshot.proposal.as_ref().unwrap().binding, active);
+    add_reviewed_candidate(&mut facts.snapshot, &active);
     assert!(facts.can_authorize(&active));
 }
 
@@ -92,7 +122,18 @@ fn sequenced_facts() -> DomainFacts {
     }))
 }
 
-fn deliver_fact(facts: &mut DomainFacts, id: &str, value: Value) {
+fn deliver_fact(facts: &mut DomainFacts, id: &str, mut value: Value) {
+    // Existing transport tests model successful Core file verification separately.
+    if value["artifact"]["review_image"].is_object() {
+        let artifact = value["artifact"].clone();
+        value["artifact"]["review_image"]["image_path"] =
+            json!(std::env::temp_dir().join("candidate.png"));
+        value["artifact"]["review_image"]["dimensions_px"] = json!([1, 1]);
+        value["artifact"]["review_image"]["request"] = json!({
+            "build_id":artifact["build_id"],"proposal_id":artifact["proposal_id"],
+            "revision":artifact["revision"],"prepare_token":artifact["prepare_token"],
+            "input_sha256":artifact["input_sha256"],"blend_sha256":"b".repeat(64),"focus_m":null});
+    }
     let item = json!({"id":id,"type":"mcpToolCall","server":"modeling_domain",
         "tool":"inspect_change","status":"completed","result":{"structuredContent":value}});
     let notice = crate::protocol::decode_observed_tool(
@@ -102,6 +143,11 @@ fn deliver_fact(facts: &mut DomainFacts, id: &str, value: Value) {
     .unwrap()
     .unwrap();
     facts.observe(&notice, &item);
+    for image in &mut facts.snapshot.review_images {
+        if image.file_state == ImageFileState::Pending {
+            image.file_state = ImageFileState::Available;
+        }
+    }
 }
 
 #[test]
@@ -195,6 +241,7 @@ fn hosted_aperture_fact_shows_host_dimensions_pose_and_provenance_with_exact_bin
     assert!(fact.objects[2].contains("宽 source · 高 assumed · 窗台 assumed"));
     let mut facts = sequenced_facts();
     facts.snapshot.proposal = Some(fact.clone());
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
     assert!(facts.can_authorize(&fact.binding));
     let mut stale = fact.binding;
     stale.revision = 1;
@@ -212,6 +259,41 @@ fn malformed_hosted_dimensions_cannot_become_an_approval_fact() {
     .unwrap();
     opening["width"] = json!("unknown");
     value["proposal"]["draft"]["operations"][0]["value_json"] = json!(opening.to_string());
+    assert!(proposal_fact(&value).is_none());
+}
+
+#[test]
+fn opening_entity_completion_projects_exact_assets_and_keeps_concrete_approval_binding() {
+    let mut value = hosted_proposal();
+    let assets = json!({"style":"door","leaf_count":1,"leaf_thickness":0.04});
+    value["proposal"]["component_plan"] = json!({"openings":[{
+        "operation":"complete-entity", "target_opening_id":"door.1", "component_id":"component.door",
+        "source_instance_id":"source.door","kind":"door","host_wall_id":"wall.host",
+        "height":2.1,"sill_height":0.0,"assets":assets
+    }]});
+    value["proposal"]["draft"]["operations"] = json!([{
+        "op":"set","target_id":"door.1","collection":"openings","field":"assets",
+        "basis":"assumed","source_ids":["source.door"],"value_json":assets.to_string()
+    }]);
+    let fact = proposal_fact(&value).unwrap();
+    assert!(fact.objects[0].contains("door.1 · door 实体补全"));
+    assert!(fact.objects[1].contains("保留既有洞口尺寸与位置"));
+    assert!(fact.objects[1].contains("assumed"));
+    let mut facts = sequenced_facts();
+    facts.snapshot.proposal = Some(fact.clone());
+    assert!(!facts.can_authorize(&fact.binding));
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
+    assert!(facts.can_authorize(&fact.binding));
+    for (field, invalid) in [
+        ("field", json!("width")),
+        ("target_id", json!("other")),
+        ("basis", json!("user_confirmed")),
+    ] {
+        let mut bad = value.clone();
+        bad["proposal"]["draft"]["operations"][0][field] = invalid;
+        assert!(proposal_fact(&bad).is_none(), "{field}");
+    }
+    value["proposal"]["component_plan"]["openings"][0]["assets"]["leaf_count"] = json!(2);
     assert!(proposal_fact(&value).is_none());
 }
 
@@ -238,6 +320,7 @@ fn interrupted_operation_blocks_new_approval_and_late_facts_cannot_undo_recovery
     let prepared = recovery_proposal();
     deliver_fact(&mut facts, "prepare", prepared.clone());
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));
     let applying = operation_envelope("applying", "candidate_present", 2);
     deliver_fact(&mut facts, "inspect-operation", applying.clone());
@@ -276,6 +359,8 @@ fn interrupted_operation_blocks_new_approval_and_late_facts_cannot_undo_recovery
     next["proposal"]["revision"] = json!(3);
     deliver_fact(&mut facts, "next", next);
     assert!(facts.snapshot.operation.is_none());
+    let active = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &active);
     assert!(facts.can_authorize(&facts.snapshot.proposal.as_ref().unwrap().binding));
 }
 
@@ -295,6 +380,7 @@ fn foreign_or_malformed_operation_cannot_change_approval_or_its_watermark() {
         let mut facts = sequenced_facts();
         deliver_fact(&mut facts, "prepared", recovery_proposal());
         let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        add_reviewed_candidate(&mut facts.snapshot, &binding);
         let mut invalid_operation = operation_envelope("applying", "candidate_present", 999);
         invalid_operation["receipt"][field] = invalid;
         deliver_fact(&mut facts, "invalid", invalid_operation);
@@ -351,6 +437,87 @@ fn artifact_envelope(id: &str, sequence: u64, state: &str, valid: Option<bool>) 
         value["artifact"]["valid"] = json!(valid);
     }
     value
+}
+
+#[test]
+fn authorization_requires_validation_and_image_delivery_from_the_same_current_build() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(!facts.can_authorize(&binding));
+    let mut validation = artifact_envelope("a", 1, "built", Some(true));
+    validation["artifact"]["review_image"] = json!({
+        "delivery":"reference_only", "image_sha256":"a".repeat(64), "visual_analysis":"not_run"
+    });
+    deliver_fact(&mut facts, "render", validation.clone());
+    assert!(!facts.can_authorize(&binding));
+    validation["fact_sequence"] = json!(2);
+    validation["artifact"]["review_image"]["delivery"] = json!("attached_png");
+    deliver_fact(&mut facts, "image", validation.clone());
+    assert!(facts.can_authorize(&binding));
+
+    validation["fact_sequence"] = json!(3);
+    validation["artifact"]["current"] = json!(false);
+    deliver_fact(&mut facts, "stale", validation.clone());
+    assert!(!facts.can_authorize(&binding));
+    validation["fact_sequence"] = json!(4);
+    validation["artifact"]["current"] = json!(true);
+    validation["artifact"]["valid"] = json!(false);
+    deliver_fact(&mut facts, "invalidated", validation);
+    deliver_fact(
+        &mut facts,
+        "different-build",
+        artifact_envelope("b", 5, "built", Some(true)),
+    );
+    assert!(facts.snapshot.artifacts[0].reviewed);
+    assert_eq!(facts.snapshot.artifacts[1].valid, Some(true));
+    assert!(
+        !facts.can_authorize(&binding),
+        "different builds must not combine their evidence"
+    );
+}
+
+#[test]
+fn candidate_review_delivery_requires_every_field_of_the_current_proposal_binding() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "proposal", envelope());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    let artifact = reviewed_candidate(&binding);
+    facts
+        .snapshot
+        .review_images
+        .push(review::test_image(&binding, &artifact.binding.build_id));
+    for field in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "authority_sha256",
+        "input_sha256",
+        "candidate",
+        "state",
+        "current",
+        "valid",
+        "reviewed",
+    ] {
+        let mut changed = artifact.clone();
+        match field {
+            "proposal_id" => changed.binding.proposal_id = "foreign".into(),
+            "revision" => changed.binding.revision += 1,
+            "prepare_token" => changed.binding.prepare_token = "foreign".into(),
+            "authority_sha256" => changed.binding.authority_sha256 = "foreign".into(),
+            "input_sha256" => changed.binding.input_sha256 = "foreign".into(),
+            "candidate" => changed.binding.candidate = false,
+            "state" => changed.state = ArtifactState::Failed,
+            "current" => changed.current = None,
+            "valid" => changed.valid = None,
+            "reviewed" => changed.reviewed = false,
+            _ => unreachable!(),
+        }
+        facts.snapshot.artifacts = vec![changed];
+        assert!(!facts.can_authorize(&binding), "{field}");
+    }
+    facts.snapshot.artifacts = vec![artifact];
+    assert!(facts.can_authorize(&binding));
 }
 
 #[test]
@@ -518,6 +685,33 @@ fn actual_operation_query_marks_old_applied_artifact_noncurrent_after_later_edit
     assert_eq!(facts.snapshot.artifacts[0].current, Some(false));
 }
 
+#[test]
+fn a_delayed_drawing_audit_cannot_restore_identification_for_a_previous_scene() {
+    let mut facts = sequenced_facts();
+    facts.apply_verified_fact(&recovery_proposal());
+    let mut audit = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"drawing_audit","fact_sequence":90,"ok":true,"drawing_audit":{
+        "audit_id":"d".repeat(64),"scene_sha256":"a".repeat(64),"candidate_count":0,
+        "judged_count":0,"ai_review":"not_run","scene_application":"not_run",
+        "offset":0,"next_offset":null,"candidates":[],
+        "stair_linework":{"line_count":0,"region_count":0,"reviewed_region_count":0}}});
+    assert_eq!(facts.apply_verified_fact(&audit), FactProjection::Applied);
+    assert_eq!(
+        facts.apply_verified_fact(&operation_envelope("applied", "not_required", 100)),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.drawing_audit.is_none());
+    audit["fact_sequence"] = json!(99);
+    assert_eq!(
+        facts.apply_verified_fact(&audit),
+        FactProjection::Superseded
+    );
+    assert!(facts.snapshot.drawing_audit.is_none());
+    audit["fact_sequence"] = json!(101);
+    audit["drawing_audit"]["scene_sha256"] = json!("b".repeat(64));
+    assert_eq!(facts.apply_verified_fact(&audit), FactProjection::Applied);
+}
+
 fn vertical_proposal() -> Value {
     let mut value = envelope();
     let element = json!({"id":"stair.1.step.01","role":"stair_step",
@@ -546,6 +740,7 @@ fn vertical_elements_show_actual_geometry_read_only_dependencies_and_unchecked_r
     assert!(fact.objects[2].contains("headroom; structural design"));
     let mut facts = sequenced_facts();
     facts.snapshot.proposal = Some(fact.clone());
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
     assert!(facts.can_authorize(&fact.binding));
     let mut stale = fact.binding;
     stale.revision = 1;
@@ -588,6 +783,97 @@ fn vertical_anchor_proof_contract_keeps_concrete_approval_bound() {
         fact.binding,
         proposal_fact(&vertical_proposal()).unwrap().binding
     );
+    let mut following = element;
+    following["id"] = json!("stair.1.step.02");
+    following["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_instance_id");
+    value["proposal"]["draft"]["operations"]
+        .as_array_mut()
+        .unwrap()
+        .push(
+            json!({"collection":"elements","basis":"assumed","value_json":following.to_string()}),
+        );
+    assert!(proposal_fact(&value).is_some());
+}
+
+#[test]
+fn schematic_stair_parts_preserve_assumed_rise_and_unverified_connection_for_approval() {
+    let mut value = vertical_proposal();
+    value["proposal"]["scope"] = json!({"floor_id":"floor.lower"});
+    value["proposal"]["component_plan"]["connections"][0] = json!({
+        "component_id":"stair.1", "source_instance_id":"source.stair", "kind":"stair",
+        "mode":"single_floor_schematic", "served_floors":["floor.lower"],
+        "openings":[], "dimension_basis":"assumed", "rise_m":3.6
+    });
+    let mut step: Value = serde_json::from_str(
+        value["proposal"]["draft"]["operations"][0]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    step["metadata"]["relation_validator"] = json!("vertical-schematic/1");
+    step["metadata"]["modeling_mode"] = json!("single_floor_schematic");
+    step["metadata"]["connection_status"] = json!("unverified");
+    step["metadata"]["geometry_status"] = json!("schematic");
+    step["metadata"]["solid_representation"] =
+        json!("closed massing from the current floor; suspended stair structure not modeled");
+    let mut landing = step.clone();
+    landing["id"] = json!("stair.1.landing.01");
+    landing["role"] = json!("landing");
+    landing["height"] = json!(1.8);
+    value["proposal"]["draft"]["operations"] = json!([
+        {"collection":"elements","basis":"assumed","value_json":step.to_string()},
+        {"collection":"elements","basis":"assumed","value_json":landing.to_string()}
+    ]);
+    let fact = proposal_fact(&value).unwrap();
+    assert!(fact.ready);
+    assert!(fact.objects[1].contains("单层示意楼梯 · 层高 3.6 m · assumed · 连接待核验"));
+    assert!(fact.objects[2].contains("suspended stair structure not modeled"));
+    assert!(fact.objects[4].contains("stair.1.landing.01 · landing"));
+    assert!(!fact.objects.iter().any(|text| text.contains("既有洞口")));
+    let mut facts = sequenced_facts();
+    facts.snapshot.proposal = Some(fact.clone());
+    assert!(!facts.can_authorize(&fact.binding));
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
+    assert!(facts.can_authorize(&fact.binding));
+
+    for (key, invalid) in [
+        ("mode", json!("two_floor")),
+        ("kind", json!("shaft")),
+        ("dimension_basis", json!("source")),
+        ("rise_m", json!(0)),
+        ("rise_m", json!("3.6")),
+        ("served_floors", json!(["floor.lower", "floor.upper"])),
+        ("served_floors", json!(["floor.other"])),
+        ("openings", json!([{"floor_id":"floor.upper"}])),
+        ("source_instance_id", json!("source.other")),
+    ] {
+        let mut malformed = value.clone();
+        malformed["proposal"]["component_plan"]["connections"][0][key] = invalid;
+        assert!(proposal_fact(&malformed).is_none(), "{key}");
+    }
+    for (key, invalid) in [
+        ("relation_validator", json!("unknown")),
+        ("modeling_mode", json!("two_floor")),
+        ("connection_status", json!("verified")),
+        ("step_dimension_basis", json!("source")),
+        ("geometry_status", json!("verified")),
+        ("solid_representation", Value::Null),
+        ("source_instance_id", json!("source.other")),
+    ] {
+        let mut malformed = value.clone();
+        let mut invalid_landing = landing.clone();
+        invalid_landing["metadata"][key] = invalid;
+        malformed["proposal"]["draft"]["operations"][1]["value_json"] =
+            json!(invalid_landing.to_string());
+        assert!(proposal_fact(&malformed).is_none(), "landing {key}");
+    }
+    let mut legacy_landing = value;
+    landing["metadata"]["relation_validator"] = json!("vertical-connection/2");
+    legacy_landing["proposal"]["draft"]["operations"][1]["value_json"] = json!(landing.to_string());
+    assert!(proposal_fact(&legacy_landing).is_none());
 }
 
 fn private_receipt(value: &Value) -> receipt::FactReceipt {
@@ -652,6 +938,7 @@ fn private_fact_verification_checks_all_receipt_bindings_above_model_budget() {
     let mut facts = DomainFacts::new(Some(setup));
     assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));
     facts.synchronizing = true;
     assert!(!facts.can_authorize(&binding));
@@ -739,6 +1026,8 @@ fn large_multipart_batch_projects_every_approved_part_after_512_operations() {
     );
     let mut facts = sequenced_facts();
     assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let active = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &active);
     let proposal = facts.snapshot.proposal.as_ref().unwrap();
     assert_eq!(proposal.objects.len(), 600);
     assert!(proposal.objects.last().unwrap().contains("bed.99.part.5"));
@@ -758,6 +1047,7 @@ fn valid_historical_proposal_inspection_is_superseded_not_a_sync_failure() {
     current["proposal"]["proposal_id"] = json!("current-family");
     assert_eq!(facts.apply_verified_fact(&current), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     let mut old = envelope();
     old["current"] = json!(false);
     old["fact_sequence"] = json!(21);
@@ -779,6 +1069,7 @@ fn drained_fact_queue_preserves_specific_unresolved_failures_and_blocks_approval
         FactProjection::Applied
     );
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     facts.synchronization_failed("proposal", 21, "actual malformed proposal".into());
     facts.synchronizing = true;
     facts.snapshot.fact_sync_notice = Some("正在同步完整领域事实".into());
@@ -849,6 +1140,7 @@ fn source_views_new_ledger_replaces_group_snapshot_and_rejects_late_groups() {
     let proposal = envelope();
     deliver_fact(&mut facts, "proposal", proposal);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     deliver_fact(&mut facts, "groups", grouped_source_view(4));
     assert!(facts.snapshot.groups.is_some());
     deliver_fact(&mut facts, "ledger", instance_source_view(5));
@@ -1163,6 +1455,86 @@ fn component_discovery_mode_is_bound_to_the_registered_floor_scope() {
 }
 
 #[test]
+fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["project_structure"] = json!(false);
+    scope["project_scope"]["activation_revision"] = json!(1);
+    scope["project_scope"]["opening_completion_binding"] = json!({
+        "contract":"project-opening-completion/1","parent_scope_id":"e".repeat(64),
+        "bootstrap_proposal_id":"a".repeat(32),"base_sha256":"f".repeat(64),
+        "source_sha256":"b".repeat(64),"opening_ids":["door.1"]
+    });
+    let assets = json!({"style":"door","leaf_count":1,"frame_width":0.05});
+    scope["proposal"] = hosted_proposal()["proposal"].clone();
+    scope["proposal"]["base_sha256"] = json!("f".repeat(64));
+    scope["proposal"]["scope"]["floor_id"] = json!("floor.f08");
+    scope["proposal"]["opening_completion_source"] = json!({
+        "contract":"project-opening-completion/1","path":"proof.json","sha256":"1".repeat(64)
+    });
+    scope["proposal"]["component_plan"] = json!({"openings":[{
+        "operation":"complete-entity","target_opening_id":"door.1","component_id":"door.1",
+        "source_instance_id":"door.1","kind":"door","host_wall_id":"wall.host",
+        "height":2.1,"sill_height":0.0,"assets":assets
+    }]});
+    scope["proposal"]["hosted_sources"] = json!({"door.1":{"origin_m":[2,2]}});
+    scope["proposal"]["draft"]["operations"] = json!([{
+        "op":"set","target_id":"door.1","collection":"openings","field":"assets",
+        "basis":"assumed","source_ids":["cad.door"],"value_json":assets.to_string()
+    }]);
+    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(!facts.can_authorize(&binding));
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    for fault in [
+        "source",
+        "target",
+        "base",
+        "field",
+        "proof",
+        "structure",
+        "duplicate",
+    ] {
+        let mut bad = scope.clone();
+        bad["fact_sequence"] = json!(100);
+        match fault {
+            "source" => {
+                bad["project_scope"]["opening_completion_binding"]["source_sha256"] =
+                    json!("2".repeat(64))
+            }
+            "target" => {
+                bad["proposal"]["draft"]["operations"][0]["target_id"] = json!("door.other")
+            }
+            "base" => bad["proposal"]["base_sha256"] = json!("3".repeat(64)),
+            "field" => bad["proposal"]["draft"]["operations"][0]["field"] = json!("width"),
+            "proof" => bad["proposal"]["opening_completion_source"]["sha256"] = Value::Null,
+            "structure" => bad["project_structure"] = json!(true),
+            "duplicate" => {
+                bad["project_scope"]["opening_completion_binding"]["opening_ids"] =
+                    json!(["door.1", "door.1"])
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{fault}"
+        );
+        assert_eq!(facts.snapshot.proposal.as_ref().unwrap().binding, binding);
+    }
+    let mut changed = scope.clone();
+    changed["kind"] = json!("proposal");
+    changed["fact_sequence"] = json!(4);
+    changed["project_scope"]["opening_completion_binding"]["opening_ids"] = json!(["door.other"]);
+    assert_eq!(facts.apply_verified_fact(&changed), FactProjection::Invalid);
+}
+
+#[test]
 fn lost_project_scope_rejects_proposal_until_read_only_scope_and_proposal_recovery() {
     let mut setup = sequenced_facts().setup.unwrap();
     setup.mode = DomainMode::Project;
@@ -1183,6 +1555,7 @@ fn lost_project_scope_rejects_proposal_until_read_only_scope_and_proposal_recove
     assert!(!facts.can_authorize(&binding));
 
     assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     facts.synchronization_finished(&private_receipt(&scope));
     assert!(!facts.can_authorize(&binding));
     assert!(facts.snapshot.fact_sync_notice.is_some());
@@ -1205,12 +1578,14 @@ fn selected_project_scopes_bind_structure_approval_and_reject_other_floor_or_sta
     let first = project_scope(3, "f08", &"d".repeat(64));
     assert_eq!(facts.apply_verified_fact(&first), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));
     assert!(facts.snapshot.proposal.as_ref().unwrap().objects[0].contains("墙"));
     let second = project_scope(6, "f09.b", &"e".repeat(64));
     assert_eq!(facts.apply_verified_fact(&second), FactProjection::Applied);
     assert!(!facts.can_authorize(&binding));
     let current = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &current);
     let mut late = first.clone();
     late["kind"] = json!("proposal");
     late["fact_sequence"] = json!(100);
@@ -1333,6 +1708,7 @@ fn drawing_audit_pages_are_scope_bound_and_never_mean_ai_review_or_scene_approva
     let scope = project_scope(3, "f08", &"d".repeat(64));
     facts.apply_verified_fact(&scope);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     let mut audit = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx","ok":true,
         "kind":"drawing_audit","fact_sequence":4,"project_scope":scope["project_scope"],
         "drawing_audit":{"audit_id":"a".repeat(64),"scene_sha256":"b".repeat(64),"candidate_count":2,
@@ -1438,6 +1814,50 @@ fn drawing_audit_validates_and_projects_every_candidate_in_a_two_hundred_item_pa
 }
 
 #[test]
+fn stair_linework_summary_is_page_independent_and_missing_legacy_evidence_stays_unknown() {
+    let mut value = json!({"ok":true,"drawing_audit":{
+        "audit_id":"a".repeat(64),"scene_sha256":"b".repeat(64),
+        "candidate_count":3,"judged_count":0,"ai_review":"not_run",
+        "scene_application":"not_run","offset":0,"next_offset":1,
+        "candidates":[{"id":"gap.1","detector":"gap","message":"gap"}]}});
+    assert!(project::drawing_audit_fact(&value)
+        .unwrap()
+        .stair_linework
+        .is_none());
+    value["drawing_audit"]["stair_linework"] = json!({
+        "line_count":1216,"region_count":2,"reviewed_region_count":0
+    });
+    let first = project::drawing_audit_fact(&value).unwrap();
+    value["drawing_audit"]["offset"] = json!(1);
+    value["drawing_audit"]["next_offset"] = Value::Null;
+    value["drawing_audit"]["candidates"] = json!([
+        {"id":"stair.1","detector":"stair_linework_reference","message":"plan region","bbox_m":[1,2,3,4]},
+        {"id":"stair.2","detector":"stair_linework_reference","message":"plan region","bbox_m":[5,6,7,8]}
+    ]);
+    assert_eq!(
+        project::drawing_audit_fact(&value).unwrap().stair_linework,
+        first.stair_linework
+    );
+    assert!(project::drawing_audit_fact(&value).unwrap().rows[0]
+        .contains("位置 (1.00, 2.00)—(3.00, 4.00) 米"));
+    for (field, count) in [
+        ("region_count", 0),
+        ("region_count", 4),
+        ("line_count", 1),
+        ("reviewed_region_count", 1),
+    ] {
+        let mut wrong = value.clone();
+        wrong["drawing_audit"]["stair_linework"][field] = json!(count);
+        assert!(
+            project::drawing_audit_fact(&wrong).is_none(),
+            "{field}={count}"
+        );
+    }
+    value["drawing_audit"]["candidates"][0]["bbox_m"] = json!([3, 2, 1, 4]);
+    assert!(project::drawing_audit_fact(&value).is_none());
+}
+
+#[test]
 fn project_component_source_layers_are_explicit_bounded_and_not_inferred_from_catalog_count() {
     let mut value = project_catalog(1);
     assert!(project::catalog_fact(&value)
@@ -1491,6 +1911,11 @@ fn project_building_report(sequence: u64) -> Value {
         "input_binding":"d".repeat(64),"input_sha256":"e".repeat(64),"current":true,
         "state":"attention","technical_status":"attention","artifact_valid":true,"human_review":"not_run",
         "source_counts":{"built":1,"unresolved":1},"source_total":2,"unresolved_source_count":1,
+        "source_discovery":{"state":"unknown","missing_floors":["f08","f09.b"],
+            "unresolved_member_count":0,"unclassified_candidate_count":0,"uncovered_count":0,
+            "diagnostic_member_count":0,"stale_selection_count":0,"region_count":0,
+            "unreviewed_region_count":0,"uncertain_region_count":0,"stale_review_count":0,
+            "orphaned_stale_review_count":0},
         "drawing_review":{"candidate_count":0,"judged_count":0,"unresolved_count":0,"missing_floors":["f08","f09.b"]},
         "connections":connection});
     value
@@ -1542,13 +1967,22 @@ fn building_reports_retain_explicit_gaps_across_inspection_without_approving_a_s
     }
 }
 
-#[test]
-fn technical_building_checks_require_bound_connection_proof_and_keep_human_review_unrun() {
-    let mut value = project_building_report(3);
+fn complete_building_report(sequence: u64) -> Value {
+    let mut value = project_building_report(sequence);
     let record = &mut value["project_building"];
     for floor in record["inputs"]["floors"].as_array_mut().unwrap() {
         floor["source_counts"] = json!({"built":1});
         floor["drawing_review"] = json!({"candidate_count":0,"judged_count":0,"verdict_counts":{}});
+        floor["scan_id"] = json!("a".repeat(64));
+        floor["source_view_sha256"] = json!("b".repeat(64));
+        floor["linework_summary"] = json!({"contract_version":"source-linework/1",
+            "member_count":1,"selected_member_count":1,"unselected_member_count":0,
+            "candidate_count":1,"unclassified_candidate_count":0,"region_count":1,
+            "annotation_count":0,"uncovered_count":0,"diagnostic_member_count":0,
+            "stale_selection_count":0});
+        floor["source_region_summary"] = json!({"contract_version":"source-region-review/1",
+            "region_count":1,"reviewed_region_count":1,"unreviewed_region_count":0,
+            "uncertain_region_count":0,"stale_review_count":0,"orphaned_stale_review_count":0});
     }
     record["source_reconciliation"] = json!("complete");
     record["inputs"]["connection_sources_sha256"] = json!("a".repeat(64));
@@ -1562,12 +1996,196 @@ fn technical_building_checks_require_bound_connection_proof_and_keep_human_revie
     record["report"]["source_counts"] = json!({"built":2});
     record["report"]["unresolved_source_count"] = json!(0);
     record["report"]["drawing_review"]["missing_floors"] = json!([]);
+    record["report"]["source_discovery"]["state"] = json!("complete");
+    record["report"]["source_discovery"]["missing_floors"] = json!([]);
+    record["report"]["source_discovery"]["region_count"] = json!(2);
+    value
+}
+
+#[test]
+fn technical_building_checks_require_bound_connection_proof_and_keep_human_review_unrun() {
+    let mut value = complete_building_report(3);
     let selection = project::selection_fact(&project_selection(2, true)).unwrap();
     let fact = project::building_fact(&value, &selection).unwrap();
     assert_eq!(fact.report.as_ref().unwrap().technical_status, "complete");
     assert_eq!(fact.report.as_ref().unwrap().state, "attention");
     value["project_building"]["inputs"]["connection_sources_sha256"] = Value::Null;
     assert!(project::building_fact(&value, &selection).is_none());
+}
+
+#[test]
+fn building_reports_require_full_source_discovery_even_when_every_candidate_is_built() {
+    let selection = project::selection_fact(&project_selection(2, true)).unwrap();
+    for field in [
+        "unreviewed_region_count",
+        "uncertain_region_count",
+        "stale_review_count",
+        "orphaned_stale_review_count",
+        "unclassified_candidate_count",
+        "uncovered_count",
+        "diagnostic_member_count",
+        "stale_selection_count",
+        "unselected_member_count",
+        "missing_region_summary",
+        "missing_summaries",
+    ] {
+        let mut value = complete_building_report(3);
+        let record = &mut value["project_building"];
+        let floor = &mut record["inputs"]["floors"][0];
+        if field.starts_with("missing_") {
+            floor
+                .as_object_mut()
+                .unwrap()
+                .remove("source_region_summary");
+            if field == "missing_summaries" {
+                floor.as_object_mut().unwrap().remove("linework_summary");
+            }
+        } else if floor["source_region_summary"].get(field).is_some() {
+            floor["source_region_summary"][field] = json!(1);
+            if matches!(field, "unreviewed_region_count" | "stale_review_count") {
+                floor["source_region_summary"]["reviewed_region_count"] = json!(0);
+                floor["source_region_summary"]["unreviewed_region_count"] = json!(1);
+            }
+        } else {
+            floor["linework_summary"][field] = json!(1);
+            if field == "unselected_member_count" {
+                floor["linework_summary"]["selected_member_count"] = json!(0);
+                floor["linework_summary"]["candidate_count"] = json!(0);
+            }
+        }
+        assert!(
+            project::building_fact(&value, &selection).is_none(),
+            "{field}: complete cannot pass"
+        );
+        let record = &mut value["project_building"];
+        record["source_reconciliation"] = json!("attention");
+        record["report"]["technical_status"] = json!("attention");
+        let discovery = &mut record["report"]["source_discovery"];
+        if field.starts_with("missing_") || field == "unselected_member_count" {
+            discovery["state"] = json!("unknown");
+            discovery["missing_floors"] = json!(["f08"]);
+        } else {
+            discovery["state"] = json!("attention");
+        }
+        if field.starts_with("missing_") {
+            discovery["region_count"] = json!(1);
+        } else if field == "unselected_member_count" {
+            discovery["unresolved_member_count"] = json!(1);
+        } else {
+            discovery[field] = json!(1);
+            if field == "stale_review_count" {
+                discovery["unreviewed_region_count"] = json!(1);
+            }
+        }
+        assert!(
+            project::building_fact(&value, &selection).is_some(),
+            "{field}: retain explicit gap"
+        );
+        value["project_building"]["report"]["source_discovery"]["state"] = json!("complete");
+        assert!(
+            project::building_fact(&value, &selection).is_none(),
+            "{field}: reject forged totals"
+        );
+    }
+}
+
+#[test]
+fn missing_discovery_cannot_restore_a_previous_complete_building_report() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    assert_eq!(
+        facts.apply_verified_fact(&complete_building_report(3)),
+        FactProjection::Applied
+    );
+    assert_eq!(
+        facts.snapshot.buildings[0]
+            .report
+            .as_ref()
+            .unwrap()
+            .technical_status,
+        "complete"
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&project_building(4, "reported", "built", None)),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.buildings[0].report.is_none());
+    assert_eq!(
+        facts.snapshot.buildings[0].source_discovery.state,
+        "unknown"
+    );
+}
+
+#[test]
+fn no_object_candidates_or_complete_structure_proof_cannot_hide_unread_regions() {
+    let mut value = complete_building_report(3);
+    let record = &mut value["project_building"];
+    for floor in record["inputs"]["floors"].as_array_mut().unwrap() {
+        floor["source_counts"] = json!({});
+        floor["source_total"] = json!(0);
+        floor["linework_summary"]["selected_member_count"] = json!(0);
+        floor["linework_summary"]["unselected_member_count"] = json!(1);
+        floor["linework_summary"]["candidate_count"] = json!(0);
+        floor["existing_structure_summary"] = json!({"contract_version":"source-structure-coverage/1",
+            "member_count":1,"complete_member_count":1,"partial_member_count":0,
+            "reference_only_member_count":0,"unproven_member_count":0,"unselected_complete_member_count":1});
+    }
+    record["report"]["source_counts"] = json!({});
+    record["report"]["source_total"] = json!(0);
+    let selection = project::selection_fact(&project_selection(2, true)).unwrap();
+    assert!(project::building_fact(&value, &selection).is_some());
+    let record = &mut value["project_building"];
+    record["inputs"]["floors"][0]["source_region_summary"]["reviewed_region_count"] = json!(0);
+    record["inputs"]["floors"][0]["source_region_summary"]["unreviewed_region_count"] = json!(1);
+    record["source_reconciliation"] = json!("attention");
+    record["report"]["technical_status"] = json!("attention");
+    record["report"]["source_discovery"]["state"] = json!("attention");
+    record["report"]["source_discovery"]["unreviewed_region_count"] = json!(1);
+    let fact = project::building_fact(&value, &selection).unwrap();
+    assert_eq!(fact.source_discovery.unresolved_member_count, 0);
+    assert_eq!(fact.source_discovery.unreviewed_region_count, 1);
+    value["project_building"]["report"]["technical_status"] = json!("complete");
+    assert!(project::building_fact(&value, &selection).is_none());
+}
+
+#[test]
+fn building_reports_distinguish_structure_representation_and_require_matching_totals() {
+    let mut value = complete_building_report(3);
+    let floor = &mut value["project_building"]["inputs"]["floors"][0];
+    floor["source_region_summary"]["reviewed_region_count"] = json!(0);
+    floor["source_region_summary"]["structure_represented_region_count"] = json!(1);
+    floor["existing_structure_summary"] = json!({"contract_version":"source-structure-coverage/1",
+        "member_count":1,"complete_member_count":1,"partial_member_count":0,
+        "reference_only_member_count":0,"unproven_member_count":0,"unselected_complete_member_count":0});
+    value["project_building"]["report"]["source_discovery"]["structure_represented_region_count"] =
+        json!(1);
+    let selection = project::selection_fact(&project_selection(2, true)).unwrap();
+    let fact = project::building_fact(&value, &selection).unwrap();
+    assert_eq!(fact.source_discovery.structure_represented_region_count, 1);
+    assert_eq!(fact.source_discovery.state, "complete");
+    assert_eq!(fact.report.unwrap().technical_status, "complete");
+    for changed in [json!(0), json!(-1), json!(1.5), json!("1"), Value::Null] {
+        let mut bad = value.clone();
+        bad["project_building"]["report"]["source_discovery"]
+            ["structure_represented_region_count"] = changed;
+        assert!(project::building_fact(&bad, &selection).is_none());
+    }
+    let mut legacy_report = value.clone();
+    legacy_report["project_building"]["report"]["source_discovery"]
+        .as_object_mut()
+        .unwrap()
+        .remove("structure_represented_region_count");
+    assert!(project::building_fact(&legacy_report, &selection).is_none());
+    let mut missing_proof = value;
+    missing_proof["project_building"]["inputs"]["floors"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("existing_structure_summary");
+    assert!(project::building_fact(&missing_proof, &selection).is_none());
+    assert!(project::building_fact(&complete_building_report(3), &selection).is_some());
 }
 
 fn sealed_source_view(mut value: Value, hash: char) -> Value {
@@ -1658,6 +2276,7 @@ fn project_activation_rejects_previous_floor_incarnation_even_with_newer_sequenc
     late["kind"] = json!("project_scope");
     assert_eq!(facts.apply_verified_fact(&late), FactProjection::Invalid);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));
     for invalid in [json!(0), json!(-1), json!("3"), json!(null)] {
         let mut malformed = restored.clone();
@@ -1696,6 +2315,7 @@ fn project_connection_scope_requires_verified_building_and_selected_adjacent_ref
     facts.apply_verified_fact(&project_building(3, "base", "built", Some(true)));
     assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));
     let mut late = scope.clone();
     late["kind"] = json!("proposal");
@@ -1865,6 +2485,7 @@ fn floor_location_is_source_bound_evidence_not_scene_authorization() {
     }
     assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));
     let mut changed = project_selection(5, true);
     changed["selection"]["selection_id"] = json!("f".repeat(64));
@@ -1963,6 +2584,7 @@ fn applied_component_edit_projects_selection_old_parts_shape_and_parameters_befo
     }
     let mut facts = sequenced_facts();
     facts.snapshot.proposal = Some(fact.clone());
+    add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
     assert!(facts.can_authorize(&fact.binding));
 }
 
@@ -2230,4 +2852,1098 @@ fn source_view_capability_preserves_stamped_cache_and_stale_receipt_cannot_repla
     facts.synchronization_finished(&private_receipt(&groups));
     assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().sequence, 6);
     assert!(facts.snapshot.ledger.is_some());
+}
+
+fn linework_source_view(mut value: Value, hash: char) -> Value {
+    value = sealed_source_view(value, hash);
+    value["source_view_contract_version"] = json!("source-view/2");
+    value["linework_summary"] = json!({
+        "contract_version":"source-linework/1", "member_count":8,
+        "selected_member_count":5,"unselected_member_count":3,"candidate_count":2,
+        "unclassified_candidate_count":1,"region_count":4,"annotation_count":6,
+        "uncovered_count":2,"diagnostic_member_count":1,"stale_selection_count":1
+    });
+    value
+}
+
+fn opening_inventory_view(mut value: Value) -> Value {
+    value["opening_summary"] = json!({
+        "contract":"approved-opening-inventory/1", "inventory_status":"verified",
+        "total_count":4,"verified_aperture_count":3,"missing_entity_count":2,
+        "complete_entity_count":1,"unverified_count":2
+    });
+    value
+}
+
+fn existing_structure_view(mut value: Value) -> Value {
+    value["existing_structure_summary"] = json!({
+        "contract_version":"source-structure-coverage/1", "member_count":8,
+        "complete_member_count":3,"partial_member_count":1,
+        "reference_only_member_count":2,"unproven_member_count":2,
+        "unselected_complete_member_count":2
+    });
+    value
+}
+
+fn source_region_review_view(mut value: Value) -> Value {
+    value["source_region_summary"] = json!({
+        "contract_version":"source-region-review/1","region_count":4,
+        "reviewed_region_count":2,"unreviewed_region_count":2,
+        "uncertain_region_count":1,"stale_review_count":1,
+        "orphaned_stale_review_count":5
+    });
+    value
+}
+
+#[test]
+fn source_region_reviews_share_current_source_shapes_and_keep_missing_or_stale_summary_unknown() {
+    let mut facts = sequenced_facts();
+    for (sequence, kind) in [
+        (4, "source_groups"),
+        (5, "source_ledger"),
+        (6, "source_linework"),
+        (7, "source_linework_selection"),
+    ] {
+        let mut value = source_region_review_view(linework_source_view(
+            if kind == "source_groups" {
+                grouped_source_view(sequence)
+            } else {
+                instance_source_view(sequence)
+            },
+            'a',
+        ));
+        value["kind"] = json!(kind);
+        assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+        let regions = facts.snapshot.current_source_regions().unwrap();
+        assert_eq!(regions.region_count, 4);
+        assert_eq!(regions.reviewed_region_count, 2);
+        assert_eq!(regions.unreviewed_region_count, 2);
+        assert_eq!(regions.structure_represented_region_count, 0);
+        assert_eq!(regions.uncertain_region_count, 1);
+        assert_eq!(regions.stale_review_count, 1);
+        assert_eq!(regions.orphaned_stale_review_count, 5);
+    }
+    let current = facts.snapshot.source_regions.clone();
+    let stale = source_region_review_view(linework_source_view(grouped_source_view(5), 'b'));
+    assert_eq!(
+        facts.apply_verified_fact(&stale),
+        FactProjection::Superseded
+    );
+    assert_eq!(facts.snapshot.source_regions, current);
+    assert_eq!(
+        facts.apply_verified_fact(&linework_source_view(grouped_source_view(8), 'c')),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.source_regions.is_none());
+    facts.clear_source_view();
+    assert!(facts.snapshot.source_regions.is_none());
+}
+
+#[test]
+fn malformed_source_region_review_totals_cannot_advance_source_watermark() {
+    let mut facts = sequenced_facts();
+    let current = source_region_review_view(linework_source_view(grouped_source_view(4), 'a'));
+    facts.apply_verified_fact(&current);
+    let previous = facts.snapshot.source_regions.clone();
+    for (field, value) in [
+        ("contract_version", json!("unknown")),
+        ("region_count", json!(5)),
+        ("reviewed_region_count", json!(-1)),
+        ("reviewed_region_count", json!(3)),
+        ("unreviewed_region_count", json!(u64::MAX)),
+        ("structure_represented_region_count", json!(-1)),
+        ("structure_represented_region_count", json!(1.5)),
+        ("structure_represented_region_count", json!("1")),
+        ("structure_represented_region_count", json!(true)),
+        ("structure_represented_region_count", Value::Null),
+        ("structure_represented_region_count", json!(u64::MAX)),
+        ("uncertain_region_count", json!(3)),
+        ("stale_review_count", json!(3)),
+        ("stale_review_count", Value::Null),
+        ("orphaned_stale_review_count", json!(-1)),
+        ("orphaned_stale_review_count", json!(1.5)),
+        ("orphaned_stale_review_count", json!("1")),
+        ("orphaned_stale_review_count", Value::Null),
+    ] {
+        let mut bad =
+            source_region_review_view(linework_source_view(instance_source_view(100), 'b'));
+        bad["source_region_summary"][field] = value;
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{field}"
+        );
+        assert_eq!(facts.snapshot.source_regions, previous);
+    }
+    let mut missing_field = current.clone();
+    missing_field["source_region_summary"]
+        .as_object_mut()
+        .unwrap()
+        .remove("orphaned_stale_review_count");
+    assert_eq!(
+        facts.apply_verified_fact(&missing_field),
+        FactProjection::Invalid
+    );
+    assert_eq!(facts.snapshot.source_regions, previous);
+    let mut no_stamp = current.clone();
+    no_stamp
+        .as_object_mut()
+        .unwrap()
+        .remove("source_view_sha256");
+    no_stamp
+        .as_object_mut()
+        .unwrap()
+        .remove("source_view_contract_version");
+    assert_eq!(
+        facts.apply_verified_fact(&no_stamp),
+        FactProjection::Invalid
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&source_region_review_view(linework_source_view(
+            instance_source_view(5),
+            'b'
+        ))),
+        FactProjection::Applied
+    );
+}
+
+#[test]
+fn structure_represented_regions_require_current_complete_structure_summary() {
+    let mut facts = sequenced_facts();
+    let mut value = existing_structure_view(source_region_review_view(linework_source_view(
+        grouped_source_view(4),
+        'a',
+    )));
+    value["source_region_summary"]["unreviewed_region_count"] = json!(1);
+    value["source_region_summary"]["structure_represented_region_count"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let previous = facts.snapshot.source_regions.clone();
+    assert_eq!(
+        previous
+            .as_ref()
+            .unwrap()
+            .structure_represented_region_count,
+        1
+    );
+    let mut missing = value.clone();
+    missing["fact_sequence"] = json!(100);
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("existing_structure_summary");
+    assert_eq!(facts.apply_verified_fact(&missing), FactProjection::Invalid);
+    let mut partial_only = value.clone();
+    partial_only["fact_sequence"] = json!(100);
+    partial_only["existing_structure_summary"]["complete_member_count"] = json!(0);
+    partial_only["existing_structure_summary"]["partial_member_count"] = json!(4);
+    partial_only["existing_structure_summary"]["unselected_complete_member_count"] = json!(0);
+    assert_eq!(
+        facts.apply_verified_fact(&partial_only),
+        FactProjection::Invalid
+    );
+    assert_eq!(facts.snapshot.source_regions, previous);
+    facts.snapshot.existing_structure.as_mut().unwrap().scan_id = "stale".into();
+    assert!(facts.snapshot.current_source_regions().is_none());
+}
+
+#[test]
+fn source_region_review_cannot_restore_a_previous_floor_scope() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let first = project_scope(3, "f08", &"d".repeat(64));
+    facts.apply_verified_fact(&first);
+    let mut regions = source_region_review_view(linework_source_view(grouped_source_view(4), 'a'));
+    regions["project_scope"] = first["project_scope"].clone();
+    assert_eq!(facts.apply_verified_fact(&regions), FactProjection::Applied);
+    assert!(facts.snapshot.source_regions.is_some());
+    facts.apply_verified_fact(&project_scope(5, "f09.b", &"e".repeat(64)));
+    assert!(facts.snapshot.source_regions.is_none());
+    regions["fact_sequence"] = json!(100);
+    assert_eq!(facts.apply_verified_fact(&regions), FactProjection::Invalid);
+    assert!(facts.snapshot.source_regions.is_none());
+}
+
+#[test]
+fn existing_structure_coverage_is_shared_by_source_shapes_without_selecting_members() {
+    let mut facts = sequenced_facts();
+    for (sequence, kind) in [
+        (4, "source_groups"),
+        (5, "source_ledger"),
+        (6, "source_linework"),
+        (7, "source_linework_selection"),
+    ] {
+        let mut value = existing_structure_view(linework_source_view(
+            if kind == "source_groups" {
+                grouped_source_view(sequence)
+            } else {
+                instance_source_view(sequence)
+            },
+            'a',
+        ));
+        value["kind"] = json!(kind);
+        assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+        let coverage = facts.snapshot.current_existing_structure().unwrap();
+        assert_eq!(coverage.member_count, 8);
+        assert_eq!(coverage.complete_member_count, 3);
+        assert_eq!(coverage.partial_member_count, 1);
+        assert_eq!(coverage.reference_only_member_count, 2);
+        assert_eq!(coverage.unproven_member_count, 2);
+        assert_eq!(coverage.unselected_complete_member_count, 2);
+        assert_eq!(
+            facts
+                .snapshot
+                .linework
+                .as_ref()
+                .unwrap()
+                .unselected_member_count,
+            3
+        );
+        assert_eq!(
+            facts
+                .snapshot
+                .linework
+                .as_ref()
+                .unwrap()
+                .selected_member_count,
+            5
+        );
+    }
+    let stale = existing_structure_view(linework_source_view(grouped_source_view(5), 'b'));
+    assert_eq!(
+        facts.apply_verified_fact(&stale),
+        FactProjection::Superseded
+    );
+    let fresh_missing = linework_source_view(grouped_source_view(8), 'c');
+    assert_eq!(
+        facts.apply_verified_fact(&fresh_missing),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.existing_structure.is_none());
+}
+
+#[test]
+fn structure_coverage_rejects_tampered_counts_without_advancing_source_watermark() {
+    let mut facts = sequenced_facts();
+    let current = existing_structure_view(linework_source_view(grouped_source_view(4), 'a'));
+    facts.apply_verified_fact(&current);
+    let previous = facts.snapshot.existing_structure.clone();
+    for (field, value) in [
+        ("contract_version", json!("unknown")),
+        ("member_count", json!(9)),
+        ("complete_member_count", json!(-1)),
+        ("partial_member_count", json!(0)),
+        ("reference_only_member_count", json!(3)),
+        ("unproven_member_count", json!(u64::MAX)),
+        ("unselected_complete_member_count", json!(4)),
+        ("unselected_complete_member_count", Value::Null),
+    ] {
+        let mut bad = existing_structure_view(linework_source_view(instance_source_view(100), 'b'));
+        bad["existing_structure_summary"][field] = value;
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{field}"
+        );
+        assert_eq!(facts.snapshot.existing_structure, previous);
+    }
+    let mut no_unselected = current.clone();
+    no_unselected["fact_sequence"] = json!(100);
+    no_unselected["linework_summary"]["unselected_member_count"] = json!(1);
+    no_unselected["linework_summary"]["selected_member_count"] = json!(7);
+    assert_eq!(
+        facts.apply_verified_fact(&no_unselected),
+        FactProjection::Invalid
+    );
+    let mut no_seal = current.clone();
+    no_seal
+        .as_object_mut()
+        .unwrap()
+        .remove("source_view_sha256");
+    no_seal
+        .as_object_mut()
+        .unwrap()
+        .remove("source_view_contract_version");
+    assert_eq!(facts.apply_verified_fact(&no_seal), FactProjection::Invalid);
+    assert_eq!(
+        facts.apply_verified_fact(&existing_structure_view(linework_source_view(
+            instance_source_view(5),
+            'b'
+        ))),
+        FactProjection::Applied
+    );
+    facts.clear_source_view();
+    assert!(facts.snapshot.existing_structure.is_none());
+}
+
+#[test]
+fn structure_coverage_cannot_cross_floor_scope_or_activation() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let first = project_scope(3, "f08", &"d".repeat(64));
+    facts.apply_verified_fact(&first);
+    let mut value = existing_structure_view(linework_source_view(grouped_source_view(4), 'a'));
+    value["project_scope"] = first["project_scope"].clone();
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    assert!(facts.snapshot.existing_structure.is_some());
+    facts.apply_verified_fact(&project_scope(5, "f09.b", &"e".repeat(64)));
+    assert!(facts.snapshot.existing_structure.is_none());
+    value["fact_sequence"] = json!(100);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    assert!(facts.snapshot.existing_structure.is_none());
+}
+
+#[test]
+fn approved_opening_inventory_is_projected_from_every_source_shape_and_capabilities() {
+    let mut facts = sequenced_facts();
+    for (sequence, kind) in [
+        (4, "source_groups"),
+        (5, "source_ledger"),
+        (6, "source_linework"),
+        (7, "source_linework_selection"),
+        (8, "capabilities"),
+    ] {
+        let mut value = opening_inventory_view(linework_source_view(
+            if kind == "source_groups" {
+                grouped_source_view(sequence)
+            } else {
+                instance_source_view(sequence)
+            },
+            'a',
+        ));
+        value["kind"] = json!(kind);
+        if kind == "capabilities" {
+            value.as_object_mut().unwrap().remove("scan_id");
+        }
+        assert_eq!(
+            facts.apply_verified_fact(&value),
+            FactProjection::Applied,
+            "{kind}"
+        );
+        let inventory = facts.snapshot.openings.as_ref().unwrap();
+        assert_eq!(inventory.total_count, 4);
+        assert_eq!(inventory.verified_aperture_count, 3);
+        assert_eq!(inventory.missing_entity_count, 2);
+        assert_eq!(inventory.complete_entity_count, 1);
+        assert_eq!(inventory.unverified_count, 2);
+        assert!(!inventory.complete());
+        assert_eq!(inventory.scan_id.as_deref(), value["scan_id"].as_str());
+        assert_eq!(
+            inventory.scene_sha256,
+            value["scene_sha256"].as_str().unwrap()
+        );
+    }
+    facts.clear_project_scope();
+    assert!(facts.snapshot.openings.is_none());
+}
+
+#[test]
+fn invalid_opening_inventory_cannot_poison_counts_or_sequence_watermarks() {
+    let mut facts = sequenced_facts();
+    let current = opening_inventory_view(linework_source_view(grouped_source_view(4), 'a'));
+    facts.apply_verified_fact(&current);
+    let previous = facts.snapshot.openings.clone();
+    for (field, value) in [
+        ("contract", json!("unknown")),
+        ("inventory_status", json!("unknown")),
+        ("total_count", json!(-1)),
+        ("total_count", json!(2)),
+        ("verified_aperture_count", json!(5)),
+        ("missing_entity_count", json!(4)),
+        ("complete_entity_count", json!(3)),
+        ("unverified_count", json!(5)),
+        ("unverified_count", Value::Null),
+    ] {
+        let mut bad = opening_inventory_view(linework_source_view(instance_source_view(100), 'b'));
+        bad["opening_summary"][field] = value;
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{field}"
+        );
+        assert_eq!(facts.snapshot.openings, previous);
+    }
+    let mut missing_binding = current.clone();
+    missing_binding["kind"] = json!("capabilities");
+    missing_binding
+        .as_object_mut()
+        .unwrap()
+        .remove("scene_sha256");
+    assert_eq!(
+        facts.apply_verified_fact(&missing_binding),
+        FactProjection::Invalid
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&opening_inventory_view(linework_source_view(
+            instance_source_view(5),
+            'b'
+        ))),
+        FactProjection::Applied
+    );
+}
+
+#[test]
+fn delayed_capabilities_or_recovered_source_shapes_cannot_restore_older_opening_inventory() {
+    let mut facts = sequenced_facts();
+    let mut latest = opening_inventory_view(linework_source_view(grouped_source_view(8), 'a'));
+    latest["opening_summary"]["missing_entity_count"] = json!(1);
+    facts.apply_verified_fact(&latest);
+    let mut stale_cap = opening_inventory_view(linework_source_view(instance_source_view(7), 'a'));
+    stale_cap["kind"] = json!("capabilities");
+    assert_eq!(
+        facts.apply_verified_fact(&stale_cap),
+        FactProjection::Superseded
+    );
+    let recovered = opening_inventory_view(linework_source_view(instance_source_view(6), 'a'));
+    assert_eq!(
+        facts.apply_verified_fact(&recovered),
+        FactProjection::Applied
+    );
+    assert_eq!(
+        facts
+            .snapshot
+            .openings
+            .as_ref()
+            .unwrap()
+            .missing_entity_count,
+        1
+    );
+    assert_eq!(facts.fact_sequences["opening_inventory"], 8);
+    let mut cap = opening_inventory_view(linework_source_view(instance_source_view(9), 'a'));
+    cap["kind"] = json!("capabilities");
+    cap["opening_summary"]["missing_entity_count"] = json!(0);
+    facts.apply_verified_fact(&cap);
+    assert_eq!(
+        facts
+            .snapshot
+            .openings
+            .as_ref()
+            .unwrap()
+            .missing_entity_count,
+        0
+    );
+    let no_inventory = linework_source_view(grouped_source_view(10), 'b');
+    assert_eq!(
+        facts.apply_verified_fact(&no_inventory),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.openings.is_none());
+    assert_eq!(facts.apply_verified_fact(&cap), FactProjection::Superseded);
+}
+
+#[test]
+fn linework_coverage_is_scope_wide_and_shared_by_all_sealed_source_shapes() {
+    let mut facts = sequenced_facts();
+    let groups = linework_source_view(grouped_source_view(4), 'a');
+    assert_eq!(facts.apply_verified_fact(&groups), FactProjection::Applied);
+    let summary = facts.snapshot.linework.clone().unwrap();
+    assert_eq!(summary.member_count, 8);
+    assert_eq!(summary.unselected_member_count, 3);
+    assert_eq!(summary.uncovered_count, 2);
+    for (sequence, kind) in [(5, "source_linework"), (6, "source_linework_selection")] {
+        let mut page = linework_source_view(instance_source_view(sequence), 'a');
+        page["kind"] = json!(kind);
+        page["members"] = json!([]);
+        page["offset"] = json!(40);
+        assert_eq!(facts.apply_verified_fact(&page), FactProjection::Applied);
+        facts.synchronization_finished(&private_receipt(&page));
+        assert_eq!(facts.snapshot.linework.as_ref(), Some(&summary));
+        assert!(facts.snapshot.groups.is_some());
+        assert_eq!(facts.snapshot.verified_fact.as_ref().unwrap().kind, kind);
+    }
+}
+
+#[test]
+fn changed_linework_selection_invalidates_groups_and_old_pages_cannot_restore_them() {
+    let mut facts = sequenced_facts();
+    let groups = linework_source_view(grouped_source_view(4), 'a');
+    facts.apply_verified_fact(&groups);
+    let mut selection = linework_source_view(instance_source_view(6), 'c');
+    selection["kind"] = json!("source_linework_selection");
+    selection["linework_summary"]["selected_member_count"] = json!(8);
+    selection["linework_summary"]["unselected_member_count"] = json!(0);
+    assert_eq!(
+        facts.apply_verified_fact(&selection),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.groups.is_none());
+    assert_eq!(
+        facts
+            .snapshot
+            .linework
+            .as_ref()
+            .unwrap()
+            .selected_member_count,
+        8
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&groups),
+        FactProjection::Superseded
+    );
+    let fresh = linework_source_view(grouped_source_view(7), 'd');
+    assert_eq!(facts.apply_verified_fact(&fresh), FactProjection::Applied);
+    assert_eq!(
+        facts.apply_verified_fact(&selection),
+        FactProjection::Superseded
+    );
+    assert_eq!(
+        facts
+            .snapshot
+            .linework
+            .as_ref()
+            .unwrap()
+            .selected_member_count,
+        5
+    );
+}
+
+#[test]
+fn invalid_linework_totals_cannot_replace_facts_or_advance_the_source_watermark() {
+    let mut facts = sequenced_facts();
+    let current = linework_source_view(grouped_source_view(4), 'a');
+    facts.apply_verified_fact(&current);
+    for (field, count) in [
+        ("selected_member_count", 9),
+        ("unselected_member_count", 4),
+        ("candidate_count", 6),
+        ("unclassified_candidate_count", 3),
+        ("diagnostic_member_count", 9),
+    ] {
+        let mut bad = linework_source_view(instance_source_view(100), 'b');
+        bad["linework_summary"][field] = json!(count);
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{field}"
+        );
+        assert!(facts.snapshot.groups.is_some());
+    }
+    let mut missing = linework_source_view(instance_source_view(100), 'b');
+    missing.as_object_mut().unwrap().remove("linework_summary");
+    assert_eq!(facts.apply_verified_fact(&missing), FactProjection::Invalid);
+    missing = linework_source_view(instance_source_view(100), 'b');
+    missing["linework_summary"]["stale_selection_count"] = json!(-1);
+    assert_eq!(facts.apply_verified_fact(&missing), FactProjection::Invalid);
+    assert_eq!(
+        facts.apply_verified_fact(&linework_source_view(instance_source_view(5), 'b')),
+        FactProjection::Applied
+    );
+}
+
+#[test]
+fn source_view_upgrade_requires_general_coverage_and_clears_legacy_shapes() {
+    let mut facts = sequenced_facts();
+    facts.apply_verified_fact(&sealed_source_view(grouped_source_view(3), 'a'));
+    let capability = json!({"contract":CONTRACT,"kind":"capabilities","run_id":"run", "context_sha256":"ctx",
+        "fact_sequence":4,"capabilities":{"source_view":{"contract_version":"source-view/2"}}});
+    assert_eq!(
+        facts.apply_verified_fact(&capability),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.groups.is_none());
+    assert_eq!(
+        facts.apply_verified_fact(&sealed_source_view(grouped_source_view(100), 'b')),
+        FactProjection::Superseded
+    );
+    assert_eq!(
+        facts.apply_verified_fact(&linework_source_view(grouped_source_view(5), 'b')),
+        FactProjection::Applied
+    );
+    facts.clear_project_scope();
+    assert!(facts.snapshot.linework.is_none());
+    assert!(facts.snapshot.groups.is_none());
+}
+
+#[test]
+fn linework_groups_accept_an_empty_block_only_with_explicit_evidence_kind() {
+    let mut value = linework_source_view(grouped_source_view(4), 'a');
+    value["groups"][0]["block"] = json!("");
+    value["groups"][0]["evidence_kind"] = json!("linework");
+    let groups = source_groups_fact(&value).unwrap();
+    assert!(groups.rows[0].contains("AI 选择的线稿对象"));
+    value["groups"][0]["evidence_kind"] = json!("insert");
+    assert!(source_groups_fact(&value).is_none());
+}
+
+#[test]
+fn source_views_preserve_ai_non_component_reasons_without_hiding_later_reinterpretation() {
+    let mut groups = grouped_source_view(4);
+    groups["assessed_groups"] = json!(1);
+    groups["groups"][0]["assessment"] = json!({
+        "category":null,"non_component":true,"basis":"assumed","reason":"图例索引，非楼层实体"
+    });
+    for instance in groups["groups"][0]["instances"].as_array_mut().unwrap() {
+        instance["non_component"] = json!(true);
+    }
+    let projection = source_groups_fact(&groups).unwrap();
+    assert!(projection.rows.iter().any(|row| {
+        row.contains("AI 判为非构件 · assumed") && row.contains("图例索引，非楼层实体")
+    }));
+    groups["groups"][0]["instances"][1]["non_component"] = json!(false);
+    let reinterpreted = source_groups_fact(&groups).unwrap();
+    assert!(reinterpreted
+        .rows
+        .iter()
+        .all(|row| !row.contains("AI 判为非构件")));
+    assert!(reinterpreted
+        .rows
+        .iter()
+        .any(|row| row.contains("图例索引")));
+
+    let mut ledger = instance_source_view(5);
+    let row = &mut ledger["objects"][0];
+    row["category"] = Value::Null;
+    row["state"] = json!("rejected");
+    row["non_component"] = json!(true);
+    row["classification_basis"] = json!("assumed");
+    row["classification_reason"] = json!("图例索引，非楼层实体");
+    let projection = source_ledger_fact(&ledger).unwrap();
+    assert!(projection
+        .rows
+        .iter()
+        .any(|row| row.contains("判为非构件 · assumed · 依据：图例索引")));
+    ledger["objects"][0]["classification_reason"] = json!("");
+    assert!(source_ledger_fact(&ledger).is_none());
+}
+
+#[test]
+fn source_ledger_keeps_aperture_validation_separate_from_missing_opening_entities() {
+    let mut value = instance_source_view(5);
+    let row = &mut value["objects"][0];
+    row["category"] = json!("door");
+    row["state"] = json!("pending_confirmation");
+    row["aperture_status"] = json!("verified");
+    row["entity_status"] = json!("missing");
+    let projection = source_ledger_fact(&value).unwrap();
+    assert!(projection
+        .rows
+        .iter()
+        .any(|row| row == "洞口 已核验 · 门窗实体 缺失"));
+    assert_eq!(projection.counts.get("pending_confirmation"), Some(&1));
+    assert!(!projection.counts.contains_key("built"));
+    value["objects"][0]["entity_status"] = json!("complete");
+    assert!(source_ledger_fact(&value)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row == "洞口 已核验 · 门窗实体 已建"));
+    value["objects"][0]["entity_status"] = json!("unknown");
+    assert!(source_ledger_fact(&value).is_none());
+}
+
+fn first_use_fixture() -> (Value, Value) {
+    let mut proposal = envelope();
+    let item = json!({"review_key":"1".repeat(64),"component_id":"chair.1","component_ids":["chair.1","chair.2"],
+        "category":"chair","template_id":"chair.template","definition_sha256":"2".repeat(64),
+        "arguments_sha256":"3".repeat(64),"source_kind":"cad","source_instance_id":"source.1",
+        "source_sha256":"4".repeat(64),"source_geometry_sha256":"5".repeat(64),
+        "source_bindings":[{"component_id":"chair.1","source_instance_id":"source.1","source_sha256":"4".repeat(64),"source_geometry_sha256":"5".repeat(64)},
+            {"component_id":"chair.2","source_instance_id":"source.2","source_sha256":"4".repeat(64),"source_geometry_sha256":"5".repeat(64)}]});
+    proposal["proposal"]["component_first_use_requirements"] =
+        json!({"contract":"component-first-use/1","required":[item.clone()],"reused":[]});
+    let mut rendered = item;
+    rendered["part_ids"] = json!(["chair.1.seat", "chair.1.base"]);
+    rendered["renderer"] = json!({"engine":"BLENDER_WORKBENCH","script_sha256":"6".repeat(64),"blender_version":[4,5,0]});
+    rendered["cad_evidence_sha256"] = json!("7".repeat(64));
+    rendered["dimensions"] = json!({"cad_xy_m":[0.6,0.5],"model_xyz_m":[0.6,0.5,0.83],"parameters":{"height":0.83},"assumed":[{"message":"height assumed 0.83m"}]});
+    rendered["images"] = json!([{"view":"comparison","image_path":std::env::temp_dir().join("first-use.png"),"image_sha256":"8".repeat(64),"dimensions_px":[2400,1800]}]);
+    let manifest = json!({"contract":"component-first-use-review/1","proposal_id":"proposal","revision":2,"prepare_token":"token","base_sha256":"base","candidate_sha256":"candidate",
+        "requirements_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap())),
+        "build_id":"first-use-build","input_sha256":"candidate","blend_sha256":"9".repeat(64),"items":[rendered]});
+    let review = json!({"component_first_use_review":{"status":"ready","current":true,"review_set_sha256":"a".repeat(64),"manifest":manifest}});
+    (proposal, review)
+}
+
+#[test]
+fn first_use_requires_exact_template_arguments_sources_revision_and_opened_review_set() {
+    let (proposal, evidence) = first_use_fixture();
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let (ready, mut images) = review::project(&evidence, &binding, &requirement).unwrap();
+    assert!(!ready.satisfied(&images));
+    images[0].file_state = ImageFileState::Available;
+    assert!(!ready.satisfied(&images));
+    images[0].externally_opened = true;
+    assert!(ready.satisfied(&images));
+    images[0].binding.review_set_sha256 = Some("b".repeat(64));
+    assert!(!ready.satisfied(&images));
+    for field in [
+        "definition_sha256",
+        "arguments_sha256",
+        "source_sha256",
+        "source_geometry_sha256",
+        "source_instance_id",
+        "template_id",
+        "component_ids",
+        "source_bindings",
+    ] {
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0][field] = json!("foreign");
+        assert!(
+            review::project(&changed, &binding, &requirement).is_none(),
+            "{field}"
+        );
+    }
+    for field in [
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+        "input_sha256",
+        "requirements_sha256",
+    ] {
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"][field] = json!("foreign");
+        assert!(
+            review::project(&changed, &binding, &requirement).is_none(),
+            "{field}"
+        );
+    }
+    let mut stale = evidence.clone();
+    stale["component_first_use_review"]["current"] = json!(false);
+    let (blocked, images) = review::project(&stale, &binding, &ready).unwrap();
+    assert!(!blocked.satisfied(&images));
+    assert!(images.is_empty());
+}
+
+#[test]
+fn missing_first_use_contract_is_unknown_and_user_request_is_explicit_without_fake_cad() {
+    let (mut proposal, mut evidence) = first_use_fixture();
+    proposal["proposal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("component_first_use_requirements");
+    let unknown = review::requirements(&proposal["proposal"]).unwrap();
+    assert_eq!(unknown.status, "unknown");
+    assert!(!unknown.satisfied(&[]));
+    let (mut proposal, _) = first_use_fixture();
+    let required = &mut proposal["proposal"]["component_first_use_requirements"]["required"][0];
+    required["source_kind"] = json!("user_request");
+    required["source_instance_id"] = Value::Null;
+    for source in required["source_bindings"].as_array_mut().unwrap() {
+        source["source_instance_id"] = Value::Null;
+    }
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let fields = proposal["proposal"]["component_first_use_requirements"]["required"][0]
+        .as_object()
+        .unwrap();
+    for (key, value) in fields {
+        evidence["component_first_use_review"]["manifest"]["items"][0][key] = value.clone();
+    }
+    evidence["component_first_use_review"]["manifest"]["items"][0]["dimensions"]["cad_xy_m"] =
+        Value::Null;
+    evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
+        )
+    ));
+    let (_, images) = review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .unwrap();
+    assert!(images[0].label.contains("用户请求（无CAD）"));
+}
+
+#[test]
+fn proposal_categories_count_actual_component_instances_and_keep_all_distinct_assumptions() {
+    let (mut proposal, _) = first_use_fixture();
+    proposal["proposal"]["draft"]["operations"] = json!([]);
+    assert_eq!(
+        proposal_category_counts(&proposal["proposal"]),
+        [("chair".into(), 2)].into()
+    );
+    proposal["proposal"]["assumed"] = json!((0..110)
+        .map(|n| json!({"message":format!("height {n}")}))
+        .collect::<Vec<_>>());
+    assert_eq!(proposal_fact(&proposal).unwrap().assumptions.len(), 110);
+}
+
+#[test]
+fn current_candidate_delivery_alone_cannot_override_a_missing_or_changed_image_file() {
+    let mut facts = sequenced_facts();
+    let proposal = proposal_fact(&envelope()).unwrap();
+    facts.snapshot.proposal = Some(proposal.clone());
+    add_reviewed_candidate(&mut facts.snapshot, &proposal.binding);
+    assert!(facts.can_authorize(&proposal.binding));
+    facts.snapshot.review_images[0].file_state = ImageFileState::Unavailable;
+    assert!(!facts.can_authorize(&proposal.binding));
+    assert!(facts.snapshot.review_images[0].verified_path().is_none());
+    facts.snapshot.review_images.clear();
+    assert!(!facts.can_authorize(&proposal.binding));
+}
+
+#[tokio::test]
+async fn png_verification_rejects_missing_changed_dimensions_and_nonlocal_files_before_opening() {
+    let (proposal, mut evidence) = first_use_fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "tui-review-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    tokio::fs::create_dir(&dir).await.unwrap();
+    let path = dir.join("image.png");
+    let bytes: Vec<u8> = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1,
+        13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let image = &mut evidence["component_first_use_review"]["manifest"]["items"][0]["images"][0];
+    image["image_path"] = json!(path);
+    image["dimensions_px"] = json!([1, 1]);
+    image["image_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
+    let requirements = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let (_, images) = review::project(&evidence, &binding, &requirements).unwrap();
+    let missing = review::open_image(images[0].binding.clone()).await;
+    assert!(!missing.file_valid);
+    assert!(missing.result.is_err());
+    tokio::fs::write(&path, &bytes).await.unwrap();
+    assert!(review::verify_image(&images[0].binding).await.is_ok());
+    tokio::fs::write(&path, [bytes.clone(), vec![0]].concat())
+        .await
+        .unwrap();
+    assert!(review::verify_image(&images[0].binding)
+        .await
+        .unwrap_err()
+        .contains("SHA256"));
+    tokio::fs::write(&path, &bytes).await.unwrap();
+    evidence["component_first_use_review"]["manifest"]["items"][0]["images"][0]["dimensions_px"] =
+        json!([2, 1]);
+    let (_, different) = review::project(&evidence, &binding, &requirements).unwrap();
+    assert!(review::verify_image(&different[0].binding)
+        .await
+        .unwrap_err()
+        .contains("尺寸"));
+    for value in [
+        "https://example.com/image.png",
+        r"\\server\image.png",
+        r"C:\image.exe",
+        "relative.png",
+    ] {
+        evidence["component_first_use_review"]["manifest"]["items"][0]["images"][0]["image_path"] =
+            json!(value);
+        assert!(review::project(&evidence, &binding, &requirements).is_none());
+    }
+    tokio::fs::remove_dir_all(&dir).await.unwrap();
+}
+
+#[test]
+fn failed_external_open_never_credits_presentation_and_new_review_sets_clear_old_openings() {
+    let (proposal, evidence) = first_use_fixture();
+    let first_use = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let (ready, mut images) = review::project(&evidence, &binding, &first_use).unwrap();
+    images[0].file_state = ImageFileState::Available;
+    images[0].finish_open(review::ImageOpenOutcome {
+        file_valid: true,
+        result: Err("viewer failed".into()),
+    });
+    assert!(!ready.satisfied(&images));
+    assert!(images[0].verified_path().is_some());
+    images[0].finish_open(review::ImageOpenOutcome {
+        file_valid: true,
+        result: Ok(()),
+    });
+    assert!(ready.satisfied(&images));
+    let mut facts = sequenced_facts();
+    facts.snapshot.first_use_review = Some(ready);
+    facts.snapshot.review_images = images;
+    let mut changed = evidence;
+    changed["component_first_use_review"]["review_set_sha256"] = json!("b".repeat(64));
+    let (new_review, new_images) = review::project(
+        &changed,
+        &binding,
+        facts.snapshot.first_use_review.as_ref().unwrap(),
+    )
+    .unwrap();
+    facts.snapshot.first_use_review = Some(new_review);
+    facts.replace_review_images(new_images, true);
+    assert!(!facts.snapshot.first_use_satisfied());
+    assert!(!facts.snapshot.review_images[0].externally_opened);
+    facts.snapshot.review_images[0].finish_open(review::ImageOpenOutcome {
+        file_valid: false,
+        result: Err("图片不可用".into()),
+    });
+    assert!(facts.snapshot.review_images[0].verified_path().is_none());
+}
+
+#[test]
+fn independent_first_use_receipt_and_late_blocked_facts_keep_exact_proposal_ownership() {
+    let (mut proposal, evidence) = first_use_fixture();
+    proposal["fact_sequence"] = json!(1);
+    proposal["ok"] = json!(true);
+    let mut facts = sequenced_facts();
+    assert_eq!(
+        facts.apply_verified_fact(&proposal),
+        FactProjection::Applied
+    );
+    let mut independent = envelope();
+    independent.as_object_mut().unwrap().remove("proposal");
+    independent["kind"] = json!("component_first_use_review");
+    independent["ok"] = json!(true);
+    independent["fact_sequence"] = json!(2);
+    independent["component_first_use_review"] = evidence["component_first_use_review"].clone();
+    for field in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+    ] {
+        independent["component_first_use_review"][field] = proposal["proposal"][field].clone();
+    }
+    let setup = facts.setup.as_ref().unwrap();
+    let receipt = private_receipt(&independent);
+    let raw = serde_json::to_vec(&independent).unwrap();
+    assert_eq!(receipt::verify(setup, &receipt, &raw).unwrap(), independent);
+    for field in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+    ] {
+        let mut changed = receipt.clone();
+        changed.binding[field] = json!("foreign");
+        assert!(receipt::verify(setup, &changed, &raw).is_err(), "{field}");
+    }
+    assert_eq!(
+        facts.apply_verified_fact(&independent),
+        FactProjection::Applied
+    );
+    assert_eq!(facts.snapshot.review_set_sha256(), Some("a".repeat(64)));
+    let current_images = facts.snapshot.review_images.clone();
+    for field in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+    ] {
+        let mut late = independent.clone();
+        late["fact_sequence"] = json!(3);
+        late["component_first_use_review"]["status"] = json!("blocked");
+        late["component_first_use_review"][field] = json!("old");
+        assert_eq!(
+            facts.apply_verified_fact(&late),
+            FactProjection::Superseded,
+            "{field}"
+        );
+        assert_eq!(facts.snapshot.review_images, current_images);
+        assert_eq!(facts.snapshot.review_set_sha256(), Some("a".repeat(64)));
+    }
+    independent["component_first_use_review"]["status"] = json!("blocked");
+    independent["fact_sequence"] = json!(4);
+    assert_eq!(
+        facts.apply_verified_fact(&independent),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.review_images.is_empty());
+    assert!(!facts.snapshot.first_use_satisfied());
+}
+
+#[test]
+fn review_labels_show_chinese_basis_without_changing_evidence_identity() {
+    assert_eq!(review::category_label("armchair"), "扶手椅");
+    assert_eq!(
+        review::category_label("open_custom_category"),
+        "open_custom_category"
+    );
+    for (basis, chinese) in [
+        ("assumed", "示意"),
+        ("source", "图纸"),
+        ("user_confirmed", "用户确认"),
+    ] {
+        let original = json!({"basis":basis,"source_id":"source.原标注"});
+        let display = review::evidence_labels(&original.to_string());
+        assert!(display.contains(chinese));
+        assert!(display.contains("source.原标注"));
+        assert_eq!(original["basis"], basis);
+    }
+    let (proposal, evidence) = first_use_fixture();
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let (ready, images) = review::project(&evidence, &binding, &requirement).unwrap();
+    assert!(images[0]
+        .label
+        .contains("椅子 · 图纸原线稿 · 三维与原图对照"));
+    assert!(ready.dimensions[0].contains("参数说明未提供，详见封存清单"));
+    assert!(!images[0].label.contains("comparison"));
+}
+
+#[test]
+fn first_use_details_use_all_chinese_display_parameters_and_never_dump_raw_templates() {
+    let (proposal, mut evidence) = first_use_fixture();
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let dimensions =
+        &mut evidence["component_first_use_review"]["manifest"]["items"][0]["dimensions"];
+    dimensions["parameters"] =
+        json!({"parameter_basis":{"height":"assumed"},"template":"do_not_display_raw_template"});
+    dimensions["assumed"] = json!([{"basis":"assumed","message":"do_not_display_raw_assumptions"}]);
+    dimensions["category_label"] = json!("示意楼梯");
+    let mut parameters = (0..110).map(|index| json!({"name":format!("part.{index}.height"),"label":"高度","value":index,"basis":"assumed","basis_label":"示意","unit_label":"米"})).collect::<Vec<_>>();
+    parameters.push(
+        json!({"name":"steps","label":"级数","value":16,"basis_label":"图纸","unit_label":"级"}),
+    );
+    parameters.push(json!({"name":"segments","label":"分段数","value":20,"basis_label":"用户确认","unit_label":"段"}));
+    parameters.push(json!({"name":"custom","label":"其他参数","value":7,"basis_label":"示意"}));
+    parameters.push(parameters[0].clone());
+    dimensions["display_parameters"] = json!(parameters);
+    dimensions["interpretation"] = json!([
+        "侧面连接采用示意，固定件未模拟",
+        "排水与安装五金未核实",
+        "侧面连接采用示意，固定件未模拟"
+    ]);
+    let (ready, images) = review::project(&evidence, &binding, &requirement).unwrap();
+    let detail = images[0].detail.as_ref().unwrap();
+    assert_eq!(detail, &ready.dimensions[0]);
+    for expected in [
+        "示意楼梯",
+        "图纸尺寸（米）[0.6,0.5]",
+        "三维尺寸（米）[0.6,0.5,0.83]",
+        "高度：109米（示意）",
+        "级数：16级（图纸）",
+        "分段数：20段（用户确认）",
+        "其他参数：7（示意）",
+        "侧面连接采用示意，固定件未模拟",
+        "排水与安装五金未核实",
+    ] {
+        assert!(detail.contains(expected), "{expected} absent from {detail}");
+    }
+    assert_eq!(detail.matches("高度：").count(), 110);
+    assert_eq!(detail.matches("侧面连接采用示意").count(), 1);
+    for raw in [
+        "parameter_basis",
+        "assumed",
+        "do_not_display",
+        "display_parameters",
+        "basis_label",
+        "unit_label",
+    ] {
+        assert!(!detail.contains(raw), "leaked {raw}");
+    }
+    assert!(!detail.contains("其他参数：7米"));
+    assert_eq!(review::category_label("hospital_bed"), "移动病床");
+    assert_eq!(review::category_label("stair"), "示意楼梯");
+    evidence["component_first_use_review"]["manifest"]["items"][0]["dimensions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("display_parameters");
+    let (_, images) = review::project(&evidence, &binding, &requirement).unwrap();
+    let fallback = images[0].detail.as_ref().unwrap();
+    assert!(fallback.contains("参数说明未提供，详见封存清单"));
+    assert!(!fallback.contains("parameter_basis"));
+    assert!(!fallback.contains("assumed"));
 }

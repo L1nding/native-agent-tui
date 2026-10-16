@@ -25,8 +25,23 @@ impl ExtensionSnapshot {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct ModelingConfirmation {
+    pub proposal: crate::domain::ProposalBinding,
+    pub review_set_sha256: Option<String>,
+}
+
+impl From<crate::domain::ProposalBinding> for ModelingConfirmation {
+    fn from(proposal: crate::domain::ProposalBinding) -> Self {
+        Self {
+            proposal,
+            review_set_sha256: None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum ExtensionConfirmation {
-    Modeling(crate::domain::ProposalBinding),
+    Modeling(ModelingConfirmation),
 }
 
 impl ExtensionConfirmation {
@@ -42,8 +57,8 @@ impl std::fmt::Debug for ExtensionConfirmation {
         match self {
             Self::Modeling(binding) => f
                 .debug_struct("ModelingConfirmation")
-                .field("proposal_id", &binding.proposal_id)
-                .field("revision", &binding.revision)
+                .field("proposal_id", &binding.proposal.proposal_id)
+                .field("revision", &binding.proposal.revision)
                 .finish_non_exhaustive(),
         }
     }

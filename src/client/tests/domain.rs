@@ -342,7 +342,7 @@ async fn domain_proposals_survive_display_clipping_but_reject_foreign_or_incompl
         .commands
         .send(Command::ConfirmExtension {
             confirmation: crate::extensions::ExtensionConfirmation::Modeling(
-                proposal.binding.clone(),
+                proposal.binding.clone().into(),
             ),
         })
         .await
@@ -625,7 +625,8 @@ async fn project_discovery_facts_flow_through_the_normal_client_and_cannot_be_ap
                     prepare_token: "none".into(),
                     base_sha256: "none".into(),
                     candidate_sha256: "none".into(),
-                },
+                }
+                .into(),
             ),
         })
         .await
@@ -640,6 +641,143 @@ async fn project_discovery_facts_flow_through_the_normal_client_and_cannot_be_ap
             .modeling()
             .unwrap()
             .authorizing
+    );
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
+async fn old_image_callbacks_do_not_release_current_check_and_missing_file_open_is_not_credited() {
+    use sha2::{Digest, Sha256};
+    let path = std::env::temp_dir().join(format!(
+        "tui-owned-image-{}-{}.png",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut bytes = vec![0u8; 16 * 1024 * 1024];
+    bytes[..24].copy_from_slice(&[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+    ]);
+    std::fs::write(&path, &bytes).unwrap();
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+    let config = Config {
+        permission: Some("read-only".into()),
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: "context.json".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "hash".into(),
+            floor_id: "floor".into(),
+        }),
+        ..Default::default()
+    };
+    let (mut client, mut server) = harness_with_config(config).await;
+    initialized(&mut server).await;
+    let set = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":set["id"],"result":{"current":"read-only","presets":[]}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Ready).await;
+    skip_skills(&mut server).await;
+    client
+        .commands
+        .send(Command::SubmitRootInput {
+            text: "prepare chair".into(),
+        })
+        .await
+        .unwrap();
+    let start = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Running).await;
+    let proposal = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"hash","kind":"proposal","fact_sequence":1,"current":true,"diagnostics":[],"proposal":{
+        "proposal_id":"p","revision":1,"prepare_token":"token","base_sha256":"base","candidate_sha256":"candidate","state":"prepared","summary":"chair","draft":{"operations":[]},"assumed":[],"issues":[],"pending":[],
+        "component_first_use_requirements":{"contract":"component-first-use/1","required":[],"reused":[]}}});
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal}}}})).await;
+    let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"hash","kind":"artifact_validation","fact_sequence":2,
+        "artifact":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","candidate":true,"authority_sha256":"base","input_sha256":"candidate","state":"built","output":"model.glb","valid":true,"current":true,
+        "review_image":{"delivery":"attached_png","image_sha256":sha,"image_path":path,"dimensions_px":[1,1],"request":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","input_sha256":"candidate","blend_sha256":"a".repeat(64),"focus_m":null}}}});
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
+    let image = client.snapshots.borrow().extensions[0]
+        .modeling()
+        .unwrap()
+        .review_images[0]
+        .binding
+        .clone();
+    client
+        .commands
+        .send(Command::DomainImagesChecked {
+            attempt_id: 0,
+            generation: 1,
+            results: vec![(image.clone(), Err("stale check must not apply".into()))],
+        })
+        .await
+        .unwrap();
+    client
+        .commands
+        .send(Command::DomainImageOpened {
+            attempt_id: 0,
+            generation: 1,
+            binding: image.clone(),
+            outcome: crate::domain::review::ImageOpenOutcome {
+                file_valid: true,
+                result: Ok(()),
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = client.snapshots.borrow().extensions[0]
+                .modeling()
+                .unwrap()
+                .review_images[0]
+                .clone();
+            assert!(!current.externally_opened);
+            assert!(!current
+                .notice
+                .as_deref()
+                .is_some_and(|text| text.contains("stale check")));
+            if current.file_state == crate::domain::ImageFileState::Available {
+                break;
+            }
+            client.snapshots.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    client
+        .commands
+        .send(Command::OpenDomainImage { binding: image })
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.snapshots.wait_for(|snapshot| {
+            snapshot.extensions[0].modeling().unwrap().review_images[0].file_state
+                == crate::domain::ImageFileState::Unavailable
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .review_images[0]
+            .externally_opened
     );
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();

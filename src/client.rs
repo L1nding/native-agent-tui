@@ -54,11 +54,26 @@ pub enum Command {
     ConfirmExtension {
         confirmation: crate::extensions::ExtensionConfirmation,
     },
+    OpenDomainImage {
+        binding: crate::domain::ReviewImageBinding,
+    },
+    DomainImagesChecked {
+        attempt_id: u64,
+        generation: u64,
+        results: Vec<(crate::domain::ReviewImageBinding, Result<(), String>)>,
+    },
+    DomainImageOpened {
+        attempt_id: u64,
+        generation: u64,
+        binding: crate::domain::ReviewImageBinding,
+        outcome: crate::domain::review::ImageOpenOutcome,
+    },
     DomainAuthorizationFinished {
         attempt_id: u64,
         generation: u64,
         root_turn_count: u64,
         binding: crate::domain::ProposalBinding,
+        review_set_sha256: Option<String>,
         outcome: Result<String, String>,
     },
     DomainFactReadFinished {
@@ -318,6 +333,9 @@ impl ClientHandle {
                 root_observed: None,
                 domain: crate::domain::DomainFacts::new(config.domain_setup.clone()),
                 domain_authorization_task: None,
+                domain_image_check_task: None,
+                domain_image_open_task: None,
+                domain_image_attempt: 0,
                 domain_generation: 0,
                 domain_fact_attempt: 0,
                 domain_fact_task: None,
@@ -328,6 +346,7 @@ impl ClientHandle {
                 backend_command_count: 0,
                 preview_bridge: None,
                 preview_epoch: 0,
+                preview_restarts: 0,
                 preview_target: None,
                 config,
                 server,
@@ -340,6 +359,7 @@ impl ClientHandle {
                     usage_facts: Default::default(),
                     tool_lines: Default::default(),
                     turn_timing: None,
+                    tool_started: Default::default(),
                 },
                 pending: HashMap::new(),
                 next_id: 1,
@@ -501,6 +521,9 @@ struct Core {
     tool_details: ToolDetails,
     domain: crate::domain::DomainFacts,
     domain_authorization_task: Option<JoinHandle<()>>,
+    domain_image_check_task: Option<(u64, JoinHandle<()>)>,
+    domain_image_open_task: Option<(u64, JoinHandle<()>)>,
+    domain_image_attempt: u64,
     domain_generation: u64,
     domain_fact_attempt: u64,
     domain_fact_task: Option<PendingDomainFact>,
@@ -513,6 +536,9 @@ struct Core {
     backend_command_count: u64,
     preview_bridge: Option<crate::preview::Bridge>,
     preview_epoch: u64,
+    /// Unexpected preview exits restarted in this session; bounded so a broken
+    /// service cannot respawn forever.
+    preview_restarts: u8,
     preview_target: Option<crate::preview::WorkTarget>,
     collab_starts: HashMap<String, u64>,
     completed_collab: VecDeque<String>,
@@ -911,6 +937,12 @@ impl Core {
         }
 
         self.preview_bridge.take();
+        if let Some((_, task)) = self.domain_image_check_task.take() {
+            task.abort();
+        }
+        if let Some((_, task)) = self.domain_image_open_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.domain_authorization_task.take() {
             task.abort();
             let _ = task.await;
@@ -983,6 +1015,7 @@ impl Core {
     }
 
     fn publish(&mut self) {
+        self.check_domain_images();
         if self.wait.is_some() {
             let targets = self.gate.targets();
             if let Some(gate) = &mut self.state.view.gate {
@@ -1494,8 +1527,17 @@ impl Core {
                         self.domain.snapshot.preview_connection = None;
                         self.domain.snapshot.preview_selection = None;
                         self.preview_target = None;
-                        self.domain.snapshot.notice =
-                            Some("Blender 预览已断开；场景与产物保持原状态".into());
+                        // The preview is display only: restart it so Blender reconnects
+                        // through session discovery, a few times at most.
+                        if self.preview_restarts < 3 {
+                            self.preview_restarts += 1;
+                            self.start_preview();
+                            self.domain.snapshot.notice =
+                                Some("Blender 预览服务已重新启动；Blender 会自动重新连接".into());
+                        } else {
+                            self.domain.snapshot.notice =
+                                Some("Blender 预览已断开；场景与产物保持原状态".into());
+                        }
                     }
                     crate::preview::Event::Feedback(feedback) => {
                         let outcome = if !self.idle_for_backend_change()
@@ -1574,11 +1616,74 @@ impl Core {
                     self.approve_domain_change(binding)
                 }
             },
+            Command::OpenDomainImage { binding } => self.open_domain_image(binding),
+            Command::DomainImagesChecked {
+                attempt_id,
+                generation,
+                results,
+            } => {
+                if self
+                    .domain_image_check_task
+                    .as_ref()
+                    .is_none_or(|(owner, _)| *owner != attempt_id)
+                {
+                    return;
+                }
+                self.domain_image_check_task.take();
+                if generation == self.generation {
+                    for (binding, result) in results {
+                        if let Some(image) = self
+                            .domain
+                            .snapshot
+                            .review_images
+                            .iter_mut()
+                            .find(|image| image.binding == binding)
+                        {
+                            image.file_state = if result.is_ok() {
+                                crate::domain::ImageFileState::Available
+                            } else {
+                                crate::domain::ImageFileState::Unavailable
+                            };
+                            image.notice = result.err();
+                            if image.file_state == crate::domain::ImageFileState::Unavailable {
+                                image.externally_opened = false;
+                            }
+                        }
+                    }
+                }
+            }
+            Command::DomainImageOpened {
+                attempt_id,
+                generation,
+                binding,
+                outcome,
+            } => {
+                if self
+                    .domain_image_open_task
+                    .as_ref()
+                    .is_none_or(|(owner, _)| *owner != attempt_id)
+                {
+                    return;
+                }
+                self.domain_image_open_task.take();
+                if generation == self.generation {
+                    if let Some(image) = self
+                        .domain
+                        .snapshot
+                        .review_images
+                        .iter_mut()
+                        .find(|image| image.binding == binding)
+                    {
+                        image.finish_open(outcome);
+                    }
+                }
+            }
             Command::DomainAuthorizationFinished {
                 attempt_id,
                 generation,
                 root_turn_count,
                 binding,
+                review_set_sha256,
                 outcome,
             } => {
                 if attempt_id != self.domain_generation || !self.domain.snapshot.authorizing {
@@ -1590,6 +1695,7 @@ impl Core {
                     || root_turn_count != self.state.view.root_turn_count
                     || !self.idle_for_backend_change()
                     || !self.domain.can_authorize(&binding)
+                    || self.domain.snapshot.review_set_sha256() != review_set_sha256
                 {
                     self.domain.snapshot.notice = Some("批准结果已过期；请核对当前方案".into());
                     return;
@@ -1601,7 +1707,15 @@ impl Core {
                             Some("具体版本已批准，交给平台 Agent 应用和构建".into());
                         self.command(Command::SubmitRootInput { text });
                     }
-                    Err(reason) => self.domain.snapshot.notice = Some(reason),
+                    Err(reason) => {
+                        if reason.starts_with("图片不可用") {
+                            for image in &mut self.domain.snapshot.review_images {
+                                image.file_state = crate::domain::ImageFileState::Pending;
+                                image.externally_opened = false;
+                            }
+                        }
+                        self.domain.snapshot.notice = Some(reason);
+                    }
                 }
             }
             Command::SubmitRootInput { text } => {
@@ -1920,6 +2034,12 @@ impl Core {
     /// A confirmed session is the readiness fact; the sandbox is dsh's own and
     /// is first exercised when the agent runs a command.
     fn reset_domain_session(&mut self) {
+        if let Some((_, task)) = self.domain_image_check_task.take() {
+            task.abort();
+        }
+        if let Some((_, task)) = self.domain_image_open_task.take() {
+            task.abort();
+        }
         if self.config.domain_setup.is_none() {
             return;
         }
@@ -2287,9 +2407,102 @@ impl Core {
         self.start_domain_fact_read();
     }
 
-    fn approve_domain_change(&mut self, binding: crate::domain::ProposalBinding) {
+    fn check_domain_images(&mut self) {
+        if self.domain_image_check_task.is_some() {
+            return;
+        }
+        let bindings: Vec<_> = self
+            .domain
+            .snapshot
+            .review_images
+            .iter_mut()
+            .filter(|image| image.file_state == crate::domain::ImageFileState::Pending)
+            .map(|image| {
+                image.file_state = crate::domain::ImageFileState::Checking;
+                image.binding.clone()
+            })
+            .collect();
+        if bindings.is_empty() {
+            return;
+        }
+        let generation = self.generation;
+        let commands = self.command_tx.clone();
+        self.domain_image_attempt = self.domain_image_attempt.wrapping_add(1);
+        let attempt_id = self.domain_image_attempt;
+        self.domain_image_check_task = Some((
+            attempt_id,
+            tokio::spawn(async move {
+                let mut results = Vec::new();
+                for binding in bindings {
+                    let result = crate::domain::review::verify_image(&binding).await;
+                    results.push((binding, result));
+                }
+                if let Some(commands) = commands.upgrade() {
+                    let _ = commands
+                        .send(Command::DomainImagesChecked {
+                            attempt_id,
+                            generation,
+                            results,
+                        })
+                        .await;
+                }
+            }),
+        ));
+    }
+
+    fn open_domain_image(&mut self, binding: crate::domain::ReviewImageBinding) {
+        if self.domain_image_open_task.is_some() || self.domain.snapshot.authorizing {
+            return;
+        }
+        if !self
+            .domain
+            .snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.binding == binding.proposal)
+            || !self.domain.snapshot.review_images.iter().any(|image| {
+                image.binding == binding
+                    && image.file_state == crate::domain::ImageFileState::Available
+            })
+        {
+            self.domain.snapshot.notice =
+                Some("图片不可用或已属于旧版本；请核对当前图片列表".into());
+            return;
+        }
+        let generation = self.generation;
+        let commands = self.command_tx.clone();
+        self.domain_image_attempt = self.domain_image_attempt.wrapping_add(1);
+        let attempt_id = self.domain_image_attempt;
+        for image in &mut self.domain.snapshot.review_images {
+            if image.binding == binding {
+                image.externally_opened = false;
+                image.notice = Some("正在外部打开".into());
+            }
+        }
+        self.domain_image_open_task = Some((
+            attempt_id,
+            tokio::spawn(async move {
+                let outcome = crate::domain::review::open_image(binding.clone()).await;
+                if let Some(commands) = commands.upgrade() {
+                    let _ = commands
+                        .send(Command::DomainImageOpened {
+                            attempt_id,
+                            generation,
+                            binding,
+                            outcome,
+                        })
+                        .await;
+                }
+            }),
+        ));
+    }
+
+    fn approve_domain_change(&mut self, confirmation: crate::extensions::ModelingConfirmation) {
+        let binding = confirmation.proposal;
+        let review_set_sha256 = confirmation.review_set_sha256;
         if !self.idle_for_backend_change()
             || !self.domain.can_authorize(&binding)
+            || self.domain.snapshot.review_set_sha256() != review_set_sha256
             || self
                 .state
                 .view
@@ -2308,10 +2521,20 @@ impl Core {
         let attempt_id = self.domain_generation;
         let generation = self.generation;
         let root_turn_count = self.state.view.root_turn_count;
+        let images = self
+            .domain
+            .snapshot
+            .review_images
+            .iter()
+            .filter(|image| image.file_state == crate::domain::ImageFileState::Available)
+            .map(|image| image.binding.clone())
+            .collect();
         self.domain.snapshot.authorizing = true;
         let commands = self.command_tx.clone();
         self.domain_authorization_task = Some(tokio::spawn(async move {
-            let outcome = crate::domain::authorize(setup, binding.clone()).await;
+            let outcome =
+                crate::domain::authorize(setup, binding.clone(), review_set_sha256.clone(), images)
+                    .await;
             if let Some(commands) = commands.upgrade() {
                 let _ = commands
                     .send(Command::DomainAuthorizationFinished {
@@ -2319,6 +2542,7 @@ impl Core {
                         generation,
                         root_turn_count,
                         binding,
+                        review_set_sha256,
                         outcome,
                     })
                     .await;
@@ -4442,6 +4666,12 @@ impl Core {
                         (params["id"].as_str(), params["state"].as_str())
                     {
                         self.state.compaction_notice(turn, id, state);
+                    }
+                }
+                Some("goal") => {
+                    if let (Some(turn), Some(round)) = (turn, params["round"].as_u64()) {
+                        self.state
+                            .goal_round_notice(turn, round, params["maxRounds"].as_u64());
                     }
                 }
                 _ => {}
@@ -9502,7 +9732,10 @@ mod tests {
                 .unwrap()
                 .text
                 .starts_with(&format!("Step {step} · ")));
-            assert_eq!(snapshot.messages[snapshot.messages.len() - 2].text, item);
+            assert_eq!(snapshot.messages[snapshot.messages.len() - 3].text, item);
+            let summary = snapshot.messages.last().unwrap();
+            assert_eq!(summary.role, "TimingSummary");
+            assert!(summary.text.starts_with(&format!("{step} steps · ")));
         }
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
@@ -9662,9 +9895,11 @@ mod tests {
         phase(&mut client, SessionPhase::Completed).await;
         {
             let snapshot = client.snapshots.borrow();
-            let [.., answer, timing] = snapshot.messages.as_slice() else {
+            let [.., answer, timing, summary] = snapshot.messages.as_slice() else {
                 panic!("the answer and its timing row are missing");
             };
+            assert_eq!(summary.role, "TimingSummary");
+            assert!(summary.text.contains(" · Completed "), "{}", summary.text);
             assert_eq!(answer.text, "中文");
             // 耗时行排在这一步的最末尾，服务端确认完成后固定并带完成时刻。
             assert_eq!((timing.role.as_str(), timing.complete), ("Timing", true));
@@ -9690,10 +9925,11 @@ mod tests {
             Duration::from_secs(3),
             client.snapshots.wait_for(|s| {
                 // 运行中的耗时行跟在回答之后，还没有固定。
-                matches!(s.messages.as_slice(), [.., answer, timing]
+                matches!(s.messages.as_slice(), [.., answer, timing, summary]
                     if answer.text == "second" && answer.role == "Agent"
                         && timing.role == "Timing" && !timing.complete
-                        && timing.turn_id == "two")
+                        && timing.turn_id == "two"
+                        && summary.role == "TimingSummary" && summary.turn_id == "two")
             }),
         )
         .await

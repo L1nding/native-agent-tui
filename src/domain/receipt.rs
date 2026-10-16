@@ -112,9 +112,12 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "project_location"
                 | "project_scope"
                 | "project_building"
+                | "project_floor_discarded"
                 | "drawing_audit"
                 | "source_ledger"
                 | "source_groups"
+                | "source_linework"
+                | "source_linework_selection"
                 | "source_interpretation"
                 | "source_disposition"
                 | "proposal"
@@ -122,6 +125,7 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "application"
                 | "artifact"
                 | "artifact_validation"
+                | "component_first_use_review"
                 | "authorization"
                 | "diagnostic"
         )
@@ -148,9 +152,15 @@ pub fn verify(setup: &DomainSetup, receipt: &FactReceipt, raw: &[u8]) -> Result<
         return Err("完整领域事实的大小或 SHA256 与回执不一致".into());
     }
     let value: Value = serde_json::from_slice(raw).map_err(|_| "完整领域事实不是有效 JSON")?;
-    let owner = ["proposal", "receipt", "artifact", "grant"]
-        .into_iter()
-        .find_map(|key| value[key].as_object());
+    let owner = [
+        "proposal",
+        "receipt",
+        "artifact",
+        "grant",
+        "component_first_use_review",
+    ]
+    .into_iter()
+    .find_map(|key| value[key].as_object());
     let binding: serde_json::Map<String, Value> = BINDING_KEYS
         .iter()
         .filter_map(|key| {
