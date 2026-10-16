@@ -53,10 +53,59 @@ impl From<bool> for ToolDisplay {
 }
 
 /// Hidden tool groups stay out of the layout unless the search focus is in one.
+/// Per-step timing is detail: only expanded tools show it; the turn summary stays.
 fn shown(message: &ConversationItem, display: ToolDisplay, focus: Option<&Focus>) -> bool {
-    display != ToolDisplay::Hidden
-        || message.role != "Tool"
-        || focus.is_some_and(|focus| focus.matches(message))
+    let focused = focus.is_some_and(|focus| focus.matches(message));
+    match message.role.as_str() {
+        "Tool" => display != ToolDisplay::Hidden || focused,
+        "Timing" => display == ToolDisplay::Expanded || focused,
+        _ => true,
+    }
+}
+
+/// A goal round dsh started without user input, as the Chinese UI reads it.
+fn localized_notice(text: &str) -> String {
+    match text.strip_prefix("Continuing toward the goal on its own (round ") {
+        Some(rest) if lang::zh() => {
+            format!(
+                "自动续跑 · 目标第 {} 轮（无新输入，Agent 继续推进）",
+                rest.trim_end_matches(')')
+            )
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// Core writes timing rows in English; the Chinese UI reads them in Chinese.
+fn localized_timing(text: &str) -> String {
+    if !lang::zh() {
+        return text.to_owned();
+    }
+    text.split(" · ")
+        .map(|part| {
+            if let Some(count) = part.strip_suffix(" steps") {
+                return format!("共 {count} 步");
+            }
+            if let Some(step) = part.strip_prefix("Step ") {
+                return format!("第 {step} 步");
+            }
+            if let Some(at) = part.strip_prefix("Completed ") {
+                return format!("完成于 {at}");
+            }
+            for (label, zh) in [
+                ("Model wait ", "模型等待 "),
+                ("Thinking ", "思考 "),
+                ("Response ", "输出 "),
+                ("Tools ", "工具 "),
+            ] {
+                if let Some(value) = part.strip_prefix(label) {
+                    return format!("{zh}{value}");
+                }
+            }
+            part.to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Which messages continue the answer above them and so carry no title.
@@ -576,10 +625,12 @@ fn tool_detail_rows(
         ToolCategory::File => "diff",
         _ => "tool",
     };
-    if tool.name.is_some()
-        || tool.command.is_some()
-        || tool.target.is_some()
-        || tool.output.is_some()
+    // The summary row already names the tool; the card title is expanded detail.
+    if display == ToolDisplay::Expanded
+        && (tool.name.is_some()
+            || tool.command.is_some()
+            || tool.target.is_some()
+            || tool.output.is_some())
     {
         rows.push((
             format!(
@@ -602,7 +653,12 @@ fn tool_detail_rows(
     if let Some(target) = &tool.target {
         rows.push((display_text(target), muted));
     }
-    if let Some(output) = &tool.output {
+    let preview = display != ToolDisplay::Expanded;
+    if let Some(summary) = super::tool_labels::result_summary(tool).filter(|_| preview) {
+        rows.push((summary, muted));
+    } else if preview && super::tool_labels::quiet(tool) {
+        // Goal and todo state is shown elsewhere; Ctrl+E still shows the raw output.
+    } else if let Some(output) = &tool.output {
         let limit = if display == ToolDisplay::Expanded {
             usize::MAX
         } else {
@@ -707,13 +763,24 @@ fn layout<'a>(
         let target = focus
             .filter(|focus| focus.matches(message))
             .map(|focus| display_text(&message.text[..focus.offset]).len());
-        let text = display_text(&message.text);
+        let timing = matches!(message.role.as_str(), "Timing" | "TimingSummary");
+        let text = if timing && target.is_none() {
+            let mut text = localized_timing(&display_text(&message.text));
+            if message.role == "TimingSummary" && display != ToolDisplay::Expanded {
+                text.push_str(tr("  · Ctrl+E per-step detail", "  · Ctrl+E 查看每步"));
+            }
+            text
+        } else if message.role == "Notice" && target.is_none() {
+            localized_notice(&display_text(&message.text))
+        } else {
+            display_text(&message.text)
+        };
         let is_tool = message.role == "Tool";
         // 耗时行和工具行一样没有标题，直接跟在这一步的内容后面。
         if !is_tool
             && !continued
             && resume.is_none()
-            && !matches!(message.role.as_str(), "Timing" | "Notice")
+            && !matches!(message.role.as_str(), "Timing" | "TimingSummary" | "Notice")
         {
             out.lines.push(header(message, theme));
         }
@@ -746,10 +813,19 @@ fn layout<'a>(
             if shown.as_ref().is_some_and(|rows| !rows.contains(&index)) {
                 continue;
             }
+            // Tool rows read in business language; offsets above stay on Core's text.
+            let localized;
+            let source =
+                if message.role == "Tool" && target.is_none() && source.starts_with(TOOL_MARKER) {
+                    localized = super::tool_labels::localized_line(source, tool);
+                    localized.as_str()
+                } else {
+                    source
+                };
             let (runs, hang, code) = match message.role.as_str() {
                 "Tool" => tool_runs(source, tool.map(|tool| tool.lifecycle), theme),
                 "You" => (vec![(source.len(), Style::default())], 0, false),
-                "Timing" | "Notice" | "Reasoning" => (
+                "Timing" | "TimingSummary" | "Notice" | "Reasoning" => (
                     vec![(source.len(), Style::default().fg(theme.muted))],
                     0,
                     false,
@@ -1195,6 +1271,7 @@ mod tests {
             second,
             other,
             item("Timing", "Model wait 1.0s"),
+            item("TimingSummary", "1 steps · Model wait 1.0s"),
         ];
 
         // 预览也保留命令、目录与终态事实。
@@ -1238,7 +1315,7 @@ mod tests {
                 "Agent",
                 "  another turn",
                 "",
-                "  Model wait 1.0s",
+                "  1 steps · Model wait 1.0s  · Ctrl+E per-step detail",
             ]
         );
 
@@ -1392,6 +1469,26 @@ mod tests {
     }
 
     #[test]
+    fn chinese_ui_reads_core_timing_rows_in_chinese() {
+        lang::set("zh");
+        assert_eq!(
+            localized_timing(
+                "9 steps · Model wait 73.1s · Response 12.6s · Tools 79.4s · Completed 16:45:24"
+            ),
+            "共 9 步 · 模型等待 73.1s · 输出 12.6s · 工具 79.4s · 完成于 16:45:24"
+        );
+        assert_eq!(
+            localized_timing("Step 3 · Thinking 2.0s"),
+            "第 3 步 · 思考 2.0s"
+        );
+        lang::set("en");
+        assert_eq!(
+            localized_timing("Step 3 · Thinking 2.0s"),
+            "Step 3 · Thinking 2.0s"
+        );
+    }
+
+    #[test]
     fn timing_row_is_a_muted_line_without_a_title_after_the_step() {
         let messages = [
             item("Agent", "answer"),
@@ -1400,7 +1497,12 @@ mod tests {
                 "Model wait 1.0s · Response 3.0s · Completed 14:32:12 UTC",
             ),
         ];
-        let view = transcript(messages.iter(), None, 80, false);
+        // Per-step timing is detail shown with expanded tools.
+        assert_eq!(
+            rows(&transcript(messages.iter(), None, 80, false)),
+            ["Agent", "  answer"]
+        );
+        let view = transcript(messages.iter(), None, 80, true);
         assert_eq!(
             rows(&view),
             [
@@ -1423,7 +1525,7 @@ mod tests {
         );
         assert_eq!(view.lines[0].spans[1].style.fg, Some(theme.muted));
         // 窄窗口按词换行，不丢阶段。
-        let narrow = rows(&transcript(messages.iter(), None, 24, false)).join(" ");
+        let narrow = rows(&transcript(messages.iter(), None, 24, true)).join(" ");
         for stage in ["Model wait 1.0s", "Response 3.0s", "14:32:12 UTC"] {
             assert!(narrow.contains(stage), "{narrow}");
         }

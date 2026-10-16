@@ -192,6 +192,10 @@ export interface HostContext {
   plugin(plugin: PluginModule, config?: unknown): unknown
   effect(callback: () => () => void, label?: string): unknown
   /** Listen to a host event until the plugin is disposed; `global` also hears other scopes. */
+  on(
+    event: 'internal/config',
+    listener: (this: { runtime?: { name?: string } }, config: unknown, next: () => unknown) => unknown,
+  ): unknown
   on(event: string, listener: (...args: unknown[]) => void, options?: { global?: boolean }): unknown
   get(name: 'appExit'): ((code: number) => void) | undefined
   get(name: 'appReady'): AppReady | undefined

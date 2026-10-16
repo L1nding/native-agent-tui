@@ -344,6 +344,8 @@ pub(crate) struct SessionState {
     pub(crate) tool_lines: VecDeque<ToolLines>,
     /// 当前 root 步骤的分阶段耗时；step/end 固定，下一步换新计时器。
     pub(crate) turn_timing: Option<TurnTiming>,
+    /// 运行中工具的开始时刻，用于在工具行显示已运行时长。只存在内存中。
+    pub(crate) tool_started: std::collections::HashMap<String, Instant>,
 }
 
 /// 一个 root 轮次的耗时阶段；由 Core 按事件到达时间切换。
@@ -371,6 +373,10 @@ pub(crate) struct TurnTiming {
     stage: TurnStage,
     since: Instant,
     totals: [Duration; 4],
+    /// 本轮之前各步的累计耗时；与 `totals` 相加就是整轮。
+    turn_totals: [Duration; 4],
+    /// 本轮已开始的主机步骤数。
+    steps: u64,
     /// 仍在运行的工具；非空时保持工具阶段，穿插的输出不打断它。
     running_tools: BTreeSet<String>,
     /// 后端报告过模型所处阶段：之后整块到达的输出不再用来划分阶段。
@@ -385,11 +391,20 @@ impl TurnTiming {
     }
 
     fn text(&self, now: Instant, active: bool) -> String {
+        self.text_with(&[Duration::ZERO; 4], now, active)
+    }
+
+    /// The whole turn: earlier steps plus this one.
+    fn turn_text(&self, now: Instant, active: bool) -> String {
+        self.text_with(&self.turn_totals, now, active)
+    }
+
+    fn text_with(&self, prior: &[Duration; 4], now: Instant, active: bool) -> String {
         TURN_STAGES
             .iter()
             .filter_map(|(stage, label)| {
                 let live = active && *stage == self.stage;
-                let mut total = self.totals[*stage as usize];
+                let mut total = self.totals[*stage as usize] + prior[*stage as usize];
                 if live {
                     total += now.saturating_duration_since(self.since);
                 }
@@ -401,15 +416,49 @@ impl TurnTiming {
     }
 }
 
-/// 轮次结束时刻的墙上时间；没有时区数据，明确标注 UTC。
+/// 轮次结束时刻的墙上时间：用系统时区；读不到时区时明确标注 UTC。
 pub(crate) fn wall_clock_label(now: SystemTime) -> Option<String> {
-    let seconds = now.duration_since(UNIX_EPOCH).ok()?.as_secs() % 86_400;
+    clock_label(now, local_offset_seconds())
+}
+
+fn clock_label(now: SystemTime, offset: Option<i64>) -> Option<String> {
+    let utc = i64::try_from(now.duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    let seconds = (utc + offset.unwrap_or(0)).rem_euclid(86_400);
     Some(format!(
-        "{:02}:{:02}:{:02} UTC",
+        "{:02}:{:02}:{:02}{}",
         seconds / 3600,
         seconds % 3600 / 60,
-        seconds % 60
+        seconds % 60,
+        if offset.is_some() { "" } else { " UTC" }
     ))
+}
+
+/// Seconds east of UTC, including daylight saving, from the Windows time zone.
+#[cfg(windows)]
+fn local_offset_seconds() -> Option<i64> {
+    use windows_sys::Win32::System::Time::{
+        GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
+    };
+    // Win32::System::SystemServices::TIME_ZONE_ID_DAYLIGHT, without that whole feature.
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    // SAFETY: the struct is plain data and the call only writes into it.
+    let mut zone: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    let id = unsafe { GetTimeZoneInformation(&mut zone) };
+    if id == TIME_ZONE_ID_INVALID {
+        return None;
+    }
+    let extra = if id == TIME_ZONE_ID_DAYLIGHT {
+        zone.DaylightBias
+    } else {
+        zone.StandardBias
+    };
+    // UTC = local + bias (minutes).
+    Some(-i64::from(zone.Bias + extra) * 60)
+}
+
+#[cfg(not(windows))]
+fn local_offset_seconds() -> Option<i64> {
+    None
 }
 
 #[derive(Debug, Default)]
@@ -509,6 +558,16 @@ impl SessionState {
                 self.tool_lines.len() - 1
             }
         };
+        if tool.lifecycle == crate::tool_details::ToolLifecycle::Running {
+            if self.tool_started.len() >= 256 && !self.tool_started.contains_key(&tool.item_id) {
+                self.tool_started.clear();
+            }
+            self.tool_started
+                .entry(tool.item_id.clone())
+                .or_insert_with(Instant::now);
+        } else {
+            self.tool_started.remove(&tool.item_id);
+        }
         let group = &mut self.tool_lines[index];
         match group
             .lines
@@ -608,7 +667,22 @@ impl SessionState {
             &group
                 .lines
                 .iter()
-                .map(|(_, line)| line.as_str())
+                .map(|(tool, line)| {
+                    // 运行满一秒后显示已运行时长，判断“还在跑”还是“卡住了”。
+                    match self.tool_started.get(&tool.item_id) {
+                        Some(started)
+                            if tool.lifecycle == crate::tool_details::ToolLifecycle::Running =>
+                        {
+                            let seconds = started.elapsed().as_secs();
+                            if seconds >= 1 {
+                                format!("{line} · {seconds}s elapsed")
+                            } else {
+                                line.clone()
+                            }
+                        }
+                        _ => line.clone(),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(
                     "
@@ -686,6 +760,8 @@ impl SessionState {
             stage: TurnStage::ModelWait,
             since: now,
             totals: [Duration::ZERO; 4],
+            turn_totals: [Duration::ZERO; 4],
+            steps: 0,
             running_tools: BTreeSet::new(),
             stream_staged: false,
         });
@@ -709,6 +785,22 @@ impl SessionState {
         if let Some(step) = current.step {
             self.end_step_timing(turn, step, now, None);
         }
+        let Some(previous) = self.turn_timing.as_ref() else {
+            return;
+        };
+        let mut turn_totals = previous.turn_totals;
+        if previous.ended.is_none() {
+            // The time before the first host step still belongs to the turn.
+            let mut closed = [Duration::ZERO; 4];
+            closed[previous.stage as usize] = now.saturating_duration_since(previous.since);
+            for (total, extra) in turn_totals.iter_mut().zip(closed) {
+                *total += extra;
+            }
+        }
+        for (total, step) in turn_totals.iter_mut().zip(previous.totals) {
+            *total += step;
+        }
+        let steps = previous.steps + 1;
         self.turn_timing = Some(TurnTiming {
             turn_id: turn.into(),
             step: Some(step),
@@ -717,6 +809,8 @@ impl SessionState {
             stage: TurnStage::ModelWait,
             since: now,
             totals: [Duration::ZERO; 4],
+            turn_totals,
+            steps,
             running_tools: BTreeSet::new(),
             stream_staged: false,
         });
@@ -815,6 +909,22 @@ impl SessionState {
         if self.turn_timing.is_some() {
             self.render_turn_timing(now, None);
         }
+        // 运行中的工具行同样只推进已运行时长。
+        let running: Vec<usize> = self
+            .tool_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                group.lines.iter().any(|(tool, _)| {
+                    tool.lifecycle == crate::tool_details::ToolLifecycle::Running
+                        && self.tool_started.contains_key(&tool.item_id)
+                })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in running {
+            self.render_tool_lines(index);
+        }
     }
 
     /// 轮次终结：固定各阶段数值。`completed_at` 只在服务端确认完成时给出。
@@ -854,12 +964,56 @@ impl SessionState {
         } else {
             format!("timing:{turn}:{}", timing.segment)
         };
-        let same_turn = |m: &ConversationItem| m.thread_id == thread && m.turn_id == turn;
+        // 整轮汇总：默认只显示这一行，逐步耗时在展开时可见。
+        let mut summary = timing.turn_text(now, finished.is_none());
+        if timing.steps > 0 {
+            let steps = format!("{} steps", timing.steps);
+            summary = if summary.is_empty() {
+                steps
+            } else {
+                format!("{steps} · {summary}")
+            };
+        }
+        if let Some(Some(completed_at)) = &finished {
+            if !summary.is_empty() {
+                summary.push_str(" · ");
+            }
+            summary.push_str("Completed ");
+            summary.push_str(completed_at);
+        }
+        let complete = finished.is_some();
+        self.place_turn_row(&thread, &turn, id, "Timing", text, complete);
+        self.place_turn_row(
+            &thread,
+            &turn,
+            format!("timing-turn:{turn}"),
+            "TimingSummary",
+            summary,
+            complete,
+        );
+    }
+
+    /// Keep a timing row last in its step (or, for the summary, last in its turn).
+    fn place_turn_row(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        id: String,
+        role: &str,
+        text: String,
+        complete: bool,
+    ) {
+        // A step row ignores the turn summary, which always stays below it.
+        let same_turn = |m: &ConversationItem| {
+            m.thread_id == thread
+                && m.turn_id == turn
+                && (role == "TimingSummary" || m.role != "TimingSummary")
+        };
         let existing = self
             .view
             .messages
             .iter()
-            .position(|m| same_turn(m) && m.id == id);
+            .position(|m| m.thread_id == thread && m.turn_id == turn && m.id == id);
         let mut item = match existing {
             // 耗时行排在这一步的最末尾；后面来了新消息就挪到它们之后。
             Some(index) if self.view.messages[index + 1..].iter().any(same_turn) => {
@@ -868,14 +1022,14 @@ impl SessionState {
             Some(index) => {
                 let item = &mut self.view.messages[index];
                 item.text = text;
-                item.complete = finished.is_some();
+                item.complete = complete;
                 return;
             }
             None => ConversationItem {
                 id,
-                thread_id: thread.clone(),
-                turn_id: turn.clone(),
-                role: "Timing".into(),
+                thread_id: thread.to_owned(),
+                turn_id: turn.to_owned(),
+                role: role.into(),
                 text: String::new(),
                 complete: false,
                 truncated: false,
@@ -883,7 +1037,7 @@ impl SessionState {
             },
         };
         item.text = text;
-        item.complete = finished.is_some();
+        item.complete = complete;
         let at = self
             .view
             .messages
@@ -979,6 +1133,18 @@ impl SessionState {
             text.push_str(&format!(": {code}"));
         }
         self.notice_item(format!("retry:{turn}:{retry}"), turn, text, true);
+    }
+
+    /// dsh 按目标自动续跑的一轮：没有用户输入，Agent 自己继续推进目标。
+    pub fn goal_round_notice(&mut self, turn: &str, round: u64, max_rounds: Option<u64>) {
+        if self.view.turn_id.as_deref() != Some(turn) {
+            return;
+        }
+        let text = match max_rounds {
+            Some(max) => format!("Continuing toward the goal on its own (round {round}/{max})"),
+            None => format!("Continuing toward the goal on its own (round {round})"),
+        };
+        self.notice_item(format!("goal:{turn}:{round}"), turn, text, true);
     }
 
     /// 上下文压缩的开始与结果；同一次压缩始终是同一行。
@@ -1523,15 +1689,19 @@ mod tests {
         state.turn_tool("turn", "shell", true, at(3));
         state.turn_tool("turn", "shell", false, at(4));
         state.end_step_timing("turn", 1, at(4), Some("12:00:04 UTC".into()));
-        let first = state.view.messages.last().unwrap().clone();
+        // The turn summary closes the turn; the step row sits just above it.
+        let summary = state.view.messages.last().unwrap().clone();
+        assert_eq!(summary.role, "TimingSummary");
+        assert_eq!(summary.text, "1 steps · Model wait 1.0s · Thinking 1.0s · Response 1.0s · Tools 1.0s · Completed 12:00:04 UTC");
+        let first = state.view.messages[state.view.messages.len() - 2].clone();
         assert_eq!(first.text, "Step 1 · Model wait 1.0s · Thinking 1.0s · Response 1.0s · Tools 1.0s · Completed 12:00:04 UTC");
         assert!(first.complete);
         assert_eq!(
-            state.view.messages[state.view.messages.len() - 2].role,
+            state.view.messages[state.view.messages.len() - 3].role,
             "Tool"
         );
         state.refresh_turn_timing(at(5));
-        assert_eq!(state.view.messages.last().unwrap(), &first);
+        assert_eq!(&state.view.messages[state.view.messages.len() - 2], &first);
         state.begin_step_timing("turn", 2, at(5));
         state.begin_step_timing("old", 9, at(5));
         state.begin_step_timing("turn", 1, at(5));
@@ -1555,8 +1725,18 @@ mod tests {
             "Step 2 · Model wait 1.0s · Response 1.0s · Completed 12:00:07 UTC"
         );
         assert_eq!(
-            state.view.messages[state.view.messages.len() - 2].text,
+            state.view.messages[state.view.messages.len() - 3].text,
             "second answer"
+        );
+        // One summary for the whole turn, accumulated across both steps.
+        let summary = state.view.messages.last().unwrap();
+        assert_eq!(summary.role, "TimingSummary");
+        assert!(
+            summary.text.starts_with(
+                "2 steps · Model wait 2.0s · Thinking 1.0s · Response 2.0s · Tools 1.0s"
+            ),
+            "{}",
+            summary.text
         );
     }
 
@@ -1709,8 +1889,10 @@ mod tests {
         state.turn_tool("turn", "tool-2", false, at(6500));
         state.message("turn", "b", "more", false);
         state.turn_stage("turn", TurnStage::Response, at(7000));
-        // 这一步后来的消息到达后，耗时行仍在最末尾。
-        assert_eq!(state.view.messages.last().unwrap().role, "Timing");
+        // 这一步后来的消息到达后，耗时行仍在这一步末尾，整轮汇总在它下面。
+        let messages = &state.view.messages;
+        assert_eq!(messages[messages.len() - 2].role, "Timing");
+        assert_eq!(messages.last().unwrap().role, "TimingSummary");
         state.begin_turn_timing(at(7200));
         state.finish_turn_timing(at(7500), Some("14:32:12 UTC".into()));
         let frozen = (
@@ -1723,8 +1905,20 @@ mod tests {
         state.turn_stage("turn", TurnStage::Thinking, at(60_000));
         assert_eq!(row(&state), frozen);
         assert_eq!(
-            wall_clock_label(UNIX_EPOCH + Duration::from_secs(86_400 + 52_332)).as_deref(),
+            clock_label(UNIX_EPOCH + Duration::from_secs(86_400 + 52_332), None).as_deref(),
             Some("14:32:12 UTC")
+        );
+        assert_eq!(
+            clock_label(
+                UNIX_EPOCH + Duration::from_secs(86_400 + 52_332),
+                Some(8 * 3600)
+            )
+            .as_deref(),
+            Some("22:32:12")
+        );
+        assert_eq!(
+            clock_label(UNIX_EPOCH + Duration::from_secs(3_600), Some(-2 * 3600)).as_deref(),
+            Some("23:00:00")
         );
 
         // 没有服务端终态的结束只固定数值，不写完成时刻。

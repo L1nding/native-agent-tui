@@ -20,6 +20,9 @@ pub enum AcpError {
     Transport(#[from] TransportError),
 }
 
+/// How long after a goal round ends a new one may still begin within the same turn.
+const GOAL_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) struct AcpProcess {
     pub core_pipe: PipeTransport,
     pub child: Child,
@@ -320,6 +323,8 @@ enum Pending {
         cwd: String,
     },
     Passthrough,
+    /// A bridge setting whose reply carries nothing for Core.
+    Ignored,
 }
 
 /// Reshapes the plugin's skill catalog into the single-workspace inventory
@@ -370,6 +375,19 @@ struct AcpBridge {
     session_id: Option<String>,
     turn_id: Option<String>,
     turn_started: bool,
+    /// dsh keeps working toward an active goal after its prompt returns. Those
+    /// rounds stay in this turn so their output is neither lost nor attached to
+    /// the user's next message.
+    goal_active: bool,
+    /// Modeling sessions advance by concrete approvals; dsh session goals would
+    /// start autonomous rounds that hide Ctrl+Y, so the bridge suppresses them.
+    no_goals: bool,
+    /// A dsh host turn (prompted or a goal round) is between its start and end.
+    host_turn_running: bool,
+    /// The prompt already returned; the turn ends when the goal rounds stop.
+    deferred_finish: Option<(RpcId, String)>,
+    /// No new goal round started by then: end the deferred turn.
+    goal_idle_deadline: Option<tokio::time::Instant>,
     pending: HashMap<RpcId, Pending>,
     permissions: HashMap<RpcId, Permission>,
     message_text: HashMap<String, String>,
@@ -421,6 +439,11 @@ impl AcpBridge {
             session_id: None,
             turn_id: None,
             turn_started: false,
+            goal_active: false,
+            no_goals: config.domain_setup.is_some(),
+            host_turn_running: false,
+            deferred_finish: None,
+            goal_idle_deadline: None,
             pending: HashMap::new(),
             permissions: HashMap::new(),
             message_text: HashMap::new(),
@@ -446,7 +469,16 @@ impl AcpBridge {
 
     async fn run(mut self) {
         loop {
+            let goal_deadline = self.goal_idle_deadline;
             tokio::select! {
+                _ = tokio::time::sleep_until(goal_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if goal_deadline.is_some() =>
+                {
+                    self.goal_idle_deadline = None;
+                    if !self.host_turn_running && self.finish_deferred().is_err() {
+                        break;
+                    }
+                }
                 message = self.core.recv() => {
                     match message {
                         Ok(message) => {
@@ -597,6 +629,7 @@ impl AcpBridge {
         result: &Value,
     ) -> Result<(), TransportError> {
         self.session_id = Some(session.clone());
+        self.suppress_goals(&session)?;
         self.message_text.clear();
         self.tool_inputs.clear();
         self.mcp_calls.clear();
@@ -731,6 +764,11 @@ impl AcpBridge {
             (Some("turn/interrupt"), Some(id)) => {
                 if let Some(session) = &self.session_id {
                     self.acp.send(acp_protocol::session_cancel(session))?;
+                }
+                // The prompt already returned while goal rounds ran: end the turn here.
+                if let Some((prompt, _)) = self.deferred_finish.take() {
+                    self.goal_idle_deadline = None;
+                    self.finish_prompt(prompt, "interrupted", None)?;
                 }
                 // ACP cancel is a notification. The synthetic acknowledgement
                 // only releases Core's pending RPC; terminal state comes from
@@ -1347,6 +1385,47 @@ impl AcpBridge {
                     ))?;
                 }
             }
+            Some("host-turn") => match event["state"].as_str() {
+                Some("start") => {
+                    self.host_turn_running = true;
+                    self.goal_idle_deadline = None;
+                }
+                Some("end") => {
+                    self.host_turn_running = false;
+                    if self.deferred_finish.is_some() {
+                        if self.goal_active {
+                            self.goal_idle_deadline = Some(tokio::time::Instant::now() + GOAL_IDLE);
+                        } else {
+                            self.finish_deferred()?;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Some("goal") => {
+                match event["operation"].as_str() {
+                    Some("create" | "resume") => self.goal_active = true,
+                    Some(
+                        "block" | "complete" | "clear" | "cancel" | "pause" | "delete"
+                        | "suppressed",
+                    ) => self.goal_active = false,
+                    _ => {}
+                }
+                if !self.goal_active && !self.host_turn_running && self.deferred_finish.is_some() {
+                    self.finish_deferred()?;
+                }
+            }
+            Some("goal-round") => {
+                let (Some(turn), Some(round)) = (self.turn_id.clone(), event["round"].as_u64())
+                else {
+                    return Ok(());
+                };
+                self.core.send(Envelope::notification(
+                    "turn/notice",
+                    Some(json!({"threadId":session,"turnId":turn,"kind":"goal",
+                        "round":round,"maxRounds":event["max"].as_u64()})),
+                ))?;
+            }
             Some("retry") => {
                 let (Some(turn), Some(retry)) = (self.turn_id.clone(), event["retry"].as_u64())
                 else {
@@ -1483,6 +1562,9 @@ impl AcpBridge {
         let Some(kind) = self.pending.remove(&id) else {
             return Ok(());
         };
+        if matches!(kind, Pending::Ignored) {
+            return Ok(());
+        }
         if let (Some(error), Pending::Prompt) = (&message.error, &kind) {
             // ACP 的 prompt 错误响应表示这一轮已确定以错误结束，不是不确定结果；
             // 映射为 failed 终态，用户可以继续提交或重试。
@@ -1650,6 +1732,7 @@ impl AcpBridge {
                     ));
                 };
                 self.session_id = Some(session.clone());
+                self.suppress_goals(&session)?;
                 self.reloaded(core_id, session, &result)?;
             }
             Pending::Initialize => {
@@ -1698,6 +1781,7 @@ impl AcpBridge {
                     return Ok(());
                 };
                 self.session_id = Some(session.clone());
+                self.suppress_goals(&session)?;
                 let models = acp_protocol::model_choices(&result);
                 self.models = models.clone();
                 self.reasoning = acp_protocol::select_option(&result, "reasoning_effort")
@@ -1782,7 +1866,15 @@ impl AcpBridge {
                     Some("cancelled" | "canceled") => "interrupted",
                     Some(_) | None => "failed",
                 };
-                self.finish_prompt(id, status, None)?;
+                if status == "completed" && self.goal_active && self.turn_id.is_some() {
+                    // dsh continues the goal on its own; keep this turn open for those rounds.
+                    self.deferred_finish = Some((id, status.into()));
+                    if !self.host_turn_running {
+                        self.goal_idle_deadline = Some(tokio::time::Instant::now() + GOAL_IDLE);
+                    }
+                } else {
+                    self.finish_prompt(id, status, None)?;
+                }
             }
             Pending::Skills { cwd } => {
                 self.core.send(Envelope::response(
@@ -1793,8 +1885,32 @@ impl AcpBridge {
             Pending::Passthrough => {
                 self.core.send(Envelope::response(id, Some(result)))?;
             }
+            Pending::Ignored => {}
         }
         Ok(())
+    }
+
+    /// Ask the bridge to keep this modeling session free of dsh session goals.
+    fn suppress_goals(&mut self, session: &str) -> Result<(), TransportError> {
+        if !self.no_goals {
+            return Ok(());
+        }
+        let id = RpcId::String(format!("acp-no-goals-{session}"));
+        self.pending.insert(id.clone(), Pending::Ignored);
+        self.acp.send(with_jsonrpc(Envelope::request(
+            id,
+            "zf/session/goals",
+            Some(json!({"sessionId": session, "allowed": false})),
+        )))
+    }
+
+    /// End a turn whose prompt returned while dsh was still continuing its goal.
+    fn finish_deferred(&mut self) -> Result<(), TransportError> {
+        self.goal_idle_deadline = None;
+        match self.deferred_finish.take() {
+            Some((id, status)) => self.finish_prompt(id, &status, None),
+            None => Ok(()),
+        }
     }
 
     fn finish_prompt(
@@ -3448,6 +3564,182 @@ mod tests {
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }
+    use serde_json::Value;
+
+    /// Start a session and one prompted turn; returns the ACP prompt request id.
+    async fn prompted_turn(
+        core_client: &mut PipeTransport,
+        acp_server: &mut PipeTransport,
+        config: &Config,
+    ) -> RpcId {
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s"})),
+            ))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        core_client
+            .send(app_server::turn_start(RpcId::Number(3), "s", "model", None))
+            .unwrap();
+        core_client.recv().await.unwrap();
+        let prompt = acp_server.recv().await.unwrap();
+        core_client.recv().await.unwrap();
+        prompt.id.unwrap()
+    }
+
+    /// Core frames until one has `method`; returns the methods seen before it.
+    async fn until(core_client: &mut PipeTransport, method: &str) -> (Vec<String>, Value) {
+        let mut seen = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), core_client.recv())
+                .await
+                .expect("frame in time")
+                .unwrap();
+            let name = frame.method.clone().unwrap_or_default();
+            if name == method {
+                return (seen, frame.params.unwrap_or(Value::Null));
+            }
+            seen.push(name);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modeling_sessions_ask_the_bridge_to_forbid_session_goals() {
+        for (modeling, expected) in [(true, true), (false, false)] {
+            let (core_client, core_bridge) = pair();
+            let (mut acp_server, acp_bridge) = pair();
+            let mut config = Config::default();
+            if modeling {
+                config.domain_setup = Some(crate::domain::DomainSetup {
+                    mode: crate::domain::DomainMode::Project,
+                    context_path: "ctx.json".into(),
+                    repository: ".".into(),
+                    python: "python".into(),
+                    run_id: "run".into(),
+                    context_sha256: "c".repeat(64),
+                    floor_id: "项目目标".into(),
+                });
+            }
+            let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+            core_client
+                .send(app_server::thread_start(RpcId::Number(2), &config))
+                .unwrap();
+            acp_server.recv().await.unwrap();
+            acp_server
+                .send(Envelope::response(
+                    RpcId::Number(2),
+                    Some(json!({"sessionId":"s"})),
+                ))
+                .unwrap();
+            let next = tokio::time::timeout(Duration::from_millis(500), acp_server.recv()).await;
+            let asked = matches!(&next, Ok(Ok(frame)) if frame.method.as_deref() == Some("zf/session/goals")
+                && frame.params.as_ref().is_some_and(|p| p["allowed"] == false && p["sessionId"] == "s"));
+            assert_eq!(asked, expected, "modeling={modeling}: {next:?}");
+            drop(core_client);
+            let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_rounds_after_the_prompt_returns_stay_in_the_same_turn() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        let prompt = prompted_turn(&mut core_client, &mut acp_server, &config).await;
+        let event = |event: Value| {
+            Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":"s","event":event})),
+            )
+        };
+        acp_server
+            .send(event(json!({"type":"host-turn","state":"start"})))
+            .unwrap();
+        acp_server
+            .send(event(json!({"type":"goal","operation":"create"})))
+            .unwrap();
+        acp_server
+            .send(event(json!({"type":"host-turn","state":"end"})))
+            .unwrap();
+        acp_server
+            .send(Envelope::response(
+                prompt,
+                Some(json!({"stopReason":"end_turn"})),
+            ))
+            .unwrap();
+        // dsh continues the goal by itself: same turn, marked as a goal round.
+        acp_server
+            .send(event(json!({"type":"host-turn","state":"start"})))
+            .unwrap();
+        acp_server
+            .send(event(json!({"type":"goal-round","round":1,"max":30})))
+            .unwrap();
+        let (before, notice) = until(&mut core_client, "turn/notice").await;
+        assert!(!before.iter().any(|m| m == "turn/completed"), "{before:?}");
+        assert_eq!(
+            (notice["kind"].as_str(), notice["round"].as_u64()),
+            (Some("goal"), Some(1))
+        );
+        let turn = notice["turnId"].as_str().unwrap().to_owned();
+        acp_server.send(Envelope::notification("session/update", Some(json!({"sessionId":"s","update":{
+            "sessionUpdate":"agent_message_chunk","messageId":"g1","content":{"type":"text","text":"round output"}}})))).unwrap();
+        let (before, delta) = until(&mut core_client, "item/agentMessage/delta").await;
+        assert!(!before.iter().any(|m| m == "turn/completed"), "{before:?}");
+        assert_eq!(
+            delta["turnId"],
+            turn.as_str(),
+            "goal output is not lost or misattributed"
+        );
+        // A blocked goal ends with its round: the turn completes once.
+        acp_server
+            .send(event(json!({"type":"goal","operation":"block"})))
+            .unwrap();
+        acp_server
+            .send(event(json!({"type":"host-turn","state":"end"})))
+            .unwrap();
+        let (_, completed) = until(&mut core_client, "turn/completed").await;
+        assert_eq!(completed["turn"]["id"], turn.as_str());
+        assert_eq!(completed["turn"]["status"], "completed");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_active_goal_without_a_next_round_still_ends_the_turn() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config::default();
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        let prompt = prompted_turn(&mut core_client, &mut acp_server, &config).await;
+        acp_server
+            .send(Envelope::notification(
+                "zf/session/event",
+                Some(json!({"sessionId":"s","event":{"type":"goal","operation":"create"}})),
+            ))
+            .unwrap();
+        acp_server
+            .send(Envelope::response(
+                prompt,
+                Some(json!({"stopReason":"end_turn"})),
+            ))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let (_, completed) = until(&mut core_client, "turn/completed").await;
+        assert_eq!(completed["turn"]["status"], "completed");
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "waited for a goal round"
+        );
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn generated_text_is_a_preview_replaced_by_the_committed_message() {
         let (mut core_client, core_bridge) = pair();

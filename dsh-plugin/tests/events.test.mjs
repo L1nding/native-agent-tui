@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { relayEvents, EVENT_METHOD } from '../lib/events.js'
+import { apply } from '../lib/index.js'
 
 /** A host context that records listeners so a test can fire host events. */
 function host() {
@@ -133,19 +134,21 @@ test('steering reaches only a running turn and reports delivery once', () => {
   claim('other', 'message-1')
   claim('s', 'message-1')
   claim('s', 'message-1')
-  assert.deepEqual(sent.map(frame => frame.params.event), [{ type: 'steer', id: 'message-1', state: 'delivered' }])
+  // Host turn boundaries are relayed too; this test is about steering receipts.
+  const steers = () => sent.map(frame => frame.params.event).filter(event => event.type === 'steer')
+  assert.deepEqual(steers(), [{ type: 'steer', id: 'message-1', state: 'delivered' }])
   // A message the turn never claimed is not reported as delivered afterwards.
   turns.steer('s', 'go right', create)
   event('s', 'turn/end', {})
   claim('s', 'message-2')
-  assert.equal(sent.length, 1)
+  assert.equal(steers().length, 1)
   assert.throws(() => turns.steer('s', 'late', create), /no turn is running/)
   // A host refusal leaves nothing pending.
   event('s', 'turn/start', {})
   agent.steer = () => { throw new Error('host refused') }
   assert.throws(() => turns.steer('s', 'again', create), /host refused/)
   claim('s', 'message-3')
-  assert.equal(sent.length, 1)
+  assert.equal(steers().length, 1)
 })
 
 test('a todo list is relayed whole, bounded, and without malformed items', () => {
@@ -171,4 +174,92 @@ test('a todo list is relayed whole, bounded, and without malformed items', () =>
   // An emptied list is a fact too: the agent cleared its todos.
   event('s', 'todo/write', { todos: [] })
   assert.deepEqual(sent[1].params.event, { type: 'todos', todos: [] })
+})
+
+test('host turns, goal changes and goal rounds are relayed without the objective', () => {
+  const { sent, event } = host()
+  event('s', 'turn/start', {})
+  event('s', 'goal/change', { kind: 'goal/change', operation: 'create', goal: { objective: 'PRIVATE objective' } })
+  event('s', 'user/message', { content: [{ type: 'text', text: '<goal_round>\nObjective: "PRIVATE"\nRound: 2/30\n' }] })
+  event('s', 'user/message', { content: [{ type: 'text', text: 'Round: 9/9 typed by a person' }] })
+  event('s', 'goal/change', { operation: 'block' })
+  event('s', 'turn/end', {})
+  assert.deepEqual(sent.map(frame => frame.params.event), [
+    { type: 'host-turn', state: 'start' },
+    { type: 'goal', operation: 'create' },
+    { type: 'goal-round', round: 2, max: 30 },
+    { type: 'goal', operation: 'block' },
+    { type: 'host-turn', state: 'end' },
+  ])
+  assert.ok(!JSON.stringify(sent).includes('PRIVATE'))
+})
+
+test('a modeling session forbids dsh goals: a created goal is cleared before any round', async () => {
+  const listeners = new Map()
+  const sent = []
+  const agent = { id: 'agent-s' }
+  let goal
+  const cleared = []
+  const goals = {
+    get: owner => (owner === agent ? goal : undefined),
+    clear: (owner, ref) => { cleared.push(ref); goal = undefined },
+  }
+  const ctx = {
+    on: (name, listener) => listeners.set(name, { listener }),
+    get: name => (name === 'agents' ? new Map([['s', agent]]) : name === 'goals' ? goals : undefined),
+    logger: { warn() {}, info() {} },
+  }
+  const turns = relayEvents(ctx, frame => sent.push(frame))
+  const event = (session, type, data) => listeners.get('session/event').listener({ header: { id: session } }, { type, data })
+  // An existing goal is cleared at once when the owner forbids goals.
+  goal = { id: 'g1', revision: 1 }
+  assert.deepEqual(turns.setGoals('s', false), { allowed: false })
+  assert.deepEqual(cleared, [{ id: 'g1', revision: 1 }])
+  // A goal the agent creates later is cleared after the host's dispatch.
+  goal = { id: 'g2', revision: 1 }
+  event('s', 'goal/change', { operation: 'create' })
+  assert.equal(cleared.length, 1, 'never re-enters the host dispatch')
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.deepEqual(cleared[1], { id: 'g2', revision: 1 })
+  assert.ok(sent.some(frame => frame.params.event.operation === 'suppressed'))
+  // Other sessions keep their goals.
+  turns.setGoals('s', true)
+  goal = { id: 'g3', revision: 1 }
+  event('s', 'goal/change', { operation: 'create' })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(cleared.length, 2)
+})
+
+test('MCP config activation extends only the modeling domain timeout for new and resumed clients', () => {
+  const listeners = new Map()
+  const disposers = []
+  const ctx = {
+    on: (name, listener) => listeners.set(name, listener),
+    get: name => name === 'appReady' ? { onReady() {} } : name === 'appExit' ? () => {} : undefined,
+    effect: callback => disposers.push(callback()),
+    plugin() {},
+    logger: { warn() {}, info() {} },
+  }
+  try {
+    apply(ctx)
+    const resolve = listeners.get('internal/config')
+    assert.equal(typeof resolve, 'function')
+    for (const lifecycle of ['new', 'resume']) {
+      const raw = { transport: 'stdio', serverName: 'modeling_domain', toolCallTimeoutMs: 60_000 }
+      let continued = false
+      const result = resolve.call({ runtime: { name: 'mcp-client' } }, raw, () => {
+        continued = true
+        return raw
+      })
+      assert.equal(continued, true, lifecycle)
+      assert.equal(result.toolCallTimeoutMs, 300_000, lifecycle)
+      assert.equal(raw.toolCallTimeoutMs, 60_000, 'the input config remains unchanged')
+    }
+    for (const [plugin, serverName] of [['mcp-client', 'other_mcp'], ['other-plugin', 'modeling_domain']]) {
+      const original = { serverName, toolCallTimeoutMs: 12_345 }
+      assert.equal(resolve.call({ runtime: { name: plugin } }, original, () => original), original)
+    }
+  } finally {
+    for (const dispose of disposers.toReversed()) dispose()
+  }
 })

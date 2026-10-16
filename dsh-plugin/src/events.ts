@@ -109,6 +109,22 @@ export function compactionOf(type: unknown, data: unknown): Record<string, unkno
   return undefined
 }
 
+/** A goal state change, by operation name only: never the objective text. */
+export function goalOf(data: unknown): Record<string, unknown> | undefined {
+  const operation = record(data)?.['operation']
+  return typeof operation === 'string' && /^[a-z_-]{1,32}$/.test(operation) ? { type: 'goal', operation } : undefined
+}
+
+/** The round number of a goal continuation dsh starts without user input. */
+export function goalRoundOf(data: unknown): Record<string, unknown> | undefined {
+  const content = record(data)?.['content']
+  const text = Array.isArray(content) ? record(content[0])?.['text'] : undefined
+  if (typeof text !== 'string' || !text.startsWith('<goal_round>')) return undefined
+  const match = /Round:\s*(\d{1,6})(?:\/(\d{1,6}))?/.exec(text.slice(0, 4096))
+  if (match === null) return undefined
+  return { type: 'goal-round', round: Number(match[1]), ...(match[2] === undefined ? {} : { max: Number(match[2]) }) }
+}
+
 /**
  * Relay stage changes, todo lists, retries and compaction of every live session.
  * @param ctx - host context; its listeners end with the plugin.
@@ -193,10 +209,42 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
     if (open.get(session)?.delete(id) === true) notify(session, { type: 'steer', id, state: 'delivered' })
   })
 
+  // Sessions whose owner forbids dsh session goals (modeling advances by approvals).
+  const noGoals = new Set<string>()
+  const clearGoal = (session: string): void => {
+    const goals = ctx.get('goals') as GoalService | undefined
+    const agent = ctx.get('agents')?.get(session)
+    const current = agent === undefined ? undefined : goals?.get(agent)
+    if (goals === undefined || agent === undefined || current === undefined) return
+    goals.clear(agent, { id: current.id, revision: current.revision })
+    notify(session, { type: 'goal', operation: 'suppressed' })
+  }
+
   ctx.on('session/event', (owner: unknown, event: unknown) => {
     const session = sessionId(owner)
     const type = record(event)?.['type']
     if (session === undefined) return
+    const goalOperation = type === 'goal/change' ? record(record(event)?.['data'])?.['operation'] : undefined
+    if (noGoals.has(session) && (goalOperation === 'create' || goalOperation === 'resume')) {
+      // Clear after the host finishes dispatching this change; never re-enter it.
+      setTimeout(() => {
+        try {
+          clearGoal(session)
+        } catch (error) {
+          ctx.logger.warn('could not clear a suppressed goal: ' + String(error))
+        }
+      }, 0)
+    }
+    // Host turns include the ones dsh starts itself to continue a goal.
+    if (type === 'turn/start') notify(session, { type: 'host-turn', state: 'start' })
+    else if (type === 'turn/end') notify(session, { type: 'host-turn', state: 'end' })
+    if (type === 'goal/change') {
+      const goal = goalOf(record(event)?.['data'])
+      if (goal !== undefined) notify(session, goal)
+    } else if (type === 'user/message') {
+      const round = goalRoundOf(record(event)?.['data'])
+      if (round !== undefined) notify(session, round)
+    }
     if (type === 'turn/start') {
       if (open.size >= 256 && !open.has(session)) {
         open.clear()
@@ -243,6 +291,15 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
   })
 
   return {
+    setGoals(session, allowed) {
+      if (allowed) noGoals.delete(session)
+      else {
+        if (noGoals.size >= 256) noGoals.clear()
+        noGoals.add(session)
+        clearGoal(session)
+      }
+      return { allowed }
+    },
     steer(session, text, createUserMessage) {
       const pending = open.get(session)
       const agent = ctx.get('agents')?.get(session)
@@ -263,8 +320,16 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
   }
 }
 
+/** The host's goal service, as far as the bridge uses it. */
+interface GoalService {
+  get(agent: unknown): { id: string; revision: number } | undefined
+  clear(agent: unknown, ref: { id: string; revision: number }): unknown
+}
+
 /** Live turns as the relay tracks them. */
 export interface LiveTurns {
+  /** Allow or forbid dsh session goals for one session; forbidding clears an existing one. */
+  setGoals(session: string, allowed: boolean): { allowed: boolean }
   /**
    * Hand a message to the running turn; it takes effect at the next step.
    * Refused when no turn is running. Delivery is reported by a `steer` event.

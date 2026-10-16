@@ -53,6 +53,15 @@ function describe(error: unknown): string {
 export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
   const logger = ctx.logger
 
+  // ACP composes MCP clients for both new and resumed sessions. Floor preparation
+  // can take several minutes, so extend only its client before plugin activation.
+  ctx.on('internal/config', function (_raw, next) {
+    const resolved = next()
+    if (this.runtime?.name !== 'mcp-client' || resolved === null || typeof resolved !== 'object') return resolved
+    const client = resolved as Record<string, unknown>
+    return client['serverName'] === 'modeling_domain' ? { ...client, toolCallTimeoutMs: 300_000 } : resolved
+  })
+
   /** Write one frame. Stdout carries protocol frames only. */
   const send = (frame: Frame): void => {
     process.stdout.write(`${JSON.stringify(frame)}\n`)
@@ -213,6 +222,15 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
       if (typeof text !== 'string') throw new Error('text is required')
       return turns.steer(sessionId, text, await loadCreateUserMessage())
+    },
+
+    /** Allow or forbid dsh session goals for one live session. */
+    'zf/session/goals': (params) => {
+      const sessionId = params['sessionId']
+      const allowed = params['allowed']
+      if (typeof sessionId !== 'string' || sessionId === '') throw new Error('sessionId is required')
+      if (typeof allowed !== 'boolean') throw new Error('allowed must be a boolean')
+      return turns.setGoals(sessionId, allowed)
     },
 
     /** dsh's slash commands for one live session. */
