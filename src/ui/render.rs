@@ -77,6 +77,25 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         );
         return;
     }
+    let conversation_card_visible = local
+        .agent_id
+        .as_ref()
+        .is_none_or(|id| !snapshot.agents.iter().any(|agent| &agent.info.id == id))
+        && !local.projects.visible
+        && !local.workflow.visible
+        && !local.evidence
+        && !local.help
+        && local.attention_editor.is_none()
+        && !local.request_panel
+        && snapshot.requests.is_empty();
+    let prioritize_modeling_approval = conversation_card_visible
+        && super::domain_workflow::domain(snapshot).is_some_and(|domain| {
+            domain.enabled
+                && domain
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|p| p.state == "prepared")
+        });
     if let Some(selection) = snapshot
         .extensions
         .iter()
@@ -105,6 +124,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     if let Some(domain) = super::domain_workflow::domain(snapshot)
         .filter(|domain| {
             area.height > 25
+                && !prioritize_modeling_approval
                 && (domain.floor_progress.is_some()
                     || domain.groups.is_some()
                     || domain.ledger.is_some()
@@ -144,7 +164,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
     }
     // Modeling sessions keep the current verified workflow stage visible.
     if let Some(line) = super::domain_workflow::domain(snapshot)
-        .filter(|_| area.height > 16 && !local.workflow.visible)
+        .filter(|_| area.height > 16 && !local.workflow.visible && !prioritize_modeling_approval)
         .and_then(|domain| super::domain_workflow::progress_line(domain, usize::from(area.width)))
     {
         frame.render_widget(
@@ -398,15 +418,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         return;
     }
 
-    let workspace_area = if selected_agent.is_none()
-        && !local.projects.visible
-        && !local.workflow.visible
-        && !local.evidence
-        && !local.help
-        && local.attention_editor.is_none()
-        && !local.request_panel
-        && snapshot.requests.is_empty()
-    {
+    let workspace_area = if conversation_card_visible {
         super::extensions::REGISTRY.draw_conversation_card(
             frame,
             chunks[1],

@@ -729,16 +729,57 @@ pub(super) fn approval_card_lines(
                 .join("、")
         )
     });
-    let mut assumptions: std::collections::BTreeSet<_> = proposal
-        .assumptions
-        .iter()
-        .map(|text| {
-            format!(
+    let mut assumptions = std::collections::BTreeSet::new();
+    let mut grouped = std::collections::BTreeMap::<(String, String), usize>::new();
+    for text in &proposal.assumptions {
+        let structured = serde_json::from_str::<serde_json::Value>(text).ok();
+        let item = structured.as_ref().and_then(|value| {
+            let object = value.as_object()?;
+            if object.len() != 3 || value["entity_id"].as_str()?.is_empty() {
+                return None;
+            }
+            Some((value["code"].as_str()?, value["message"].as_str()?))
+        });
+        if let Some((code, message)) = item {
+            *grouped.entry((code.into(), message.into())).or_default() += 1;
+        } else {
+            assumptions.insert(format!(
                 "示意假设：{}",
                 display_text(&crate::domain::review::evidence_labels(text))
-            )
-        })
-        .collect();
+            ));
+        }
+    }
+    // Only entity identity differs within a group; complete per-entity evidence stays in F6.
+    for ((code, message), count) in grouped {
+        let code = if code == "assumed_value" {
+            "示意参数"
+        } else {
+            &code
+        };
+        let message = match message.as_str() {
+            "walls: CAD-derived structure; parameter basis retained as assumptions" => {
+                "墙体：依据CAD重建；参数依据仍保留为假设"
+            }
+            "openings: CAD-derived structure; parameter basis retained as assumptions" => {
+                "门窗洞口：依据CAD重建；参数依据仍保留为假设"
+            }
+            "slabs: CAD-derived structure; parameter basis retained as assumptions" => {
+                "楼板：依据CAD重建；参数依据仍保留为假设"
+            }
+            "elements: CAD-derived structure; parameter basis retained as assumptions" => {
+                "其他结构实体：依据CAD重建；参数依据仍保留为假设"
+            }
+            "constraints: CAD-derived structure; parameter basis retained as assumptions" => {
+                "约束：依据CAD重建；参数依据仍保留为假设"
+            }
+            other => other,
+        };
+        assumptions.insert(format!(
+            "示意假设（{count}项 · {}）：{}",
+            display_text(code),
+            display_text(message)
+        ));
+    }
     if let Some(review) = &domain.first_use_review {
         assumptions.extend(review.dimensions.iter().map(|text| display_text(text)));
     }

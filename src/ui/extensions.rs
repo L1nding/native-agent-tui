@@ -212,7 +212,7 @@ impl Registry<'_> {
             })
             .collect();
         let needed = lines.len().saturating_add(2);
-        let complete = area.width >= 24 && needed <= usize::from(area.height.saturating_sub(3));
+        let complete = area.width >= 24 && needed <= usize::from(area.height.saturating_sub(1));
         let height = if complete {
             needed as u16
         } else {
@@ -623,6 +623,166 @@ mod tests {
     }
 
     #[test]
+    fn normal_terminal_shows_complete_structural_approval_with_per_entity_assumptions() {
+        let mut snapshot = snapshot();
+        let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+        let proposal = domain.proposal.as_mut().unwrap();
+        proposal.summary = format!("初始化 二层平面 结构；4130 个实体；参数假设保留; 待具体批准的墙体图层选择 [\"WALL\"]; 理由 当前楼层带的逐图层统计中，WALL 含 3789 条墙线，是已证实的主墙层；P-WALL1 不在本楼层带统计内，因此不纳入。; 定位证据 {}", "a".repeat(64));
+        proposal.assumptions = [
+            ("walls", 1274), ("openings", 295), ("slabs", 1),
+            ("elements", 2559), ("constraints", 1),
+        ].into_iter().flat_map(|(kind, count)| (0..count).map(move |n| {
+            serde_json::json!({"code":"assumed_value", "entity_id":format!("{kind}.f02.1402E2.{n}"),
+                "message":format!("{kind}: CAD-derived structure; parameter basis retained as assumptions")}).to_string()
+        })).collect();
+        domain.proposal_categories.extend([
+            ("wall".into(), 1274),
+            ("opening".into(), 295),
+            ("slab".into(), 1),
+            ("cad_reference".into(), 2559),
+        ]);
+        domain.floor_progress = Some(crate::domain::FloorProgress {
+            scan_id: "scan".into(),
+            scene_sha256: "base".into(),
+            categories: (0..10)
+                .map(|index| crate::domain::CategoryProgress {
+                    category: format!("category-{index}"),
+                    built: 0,
+                    pending: 10,
+                    blocked: 0,
+                    unidentified: 0,
+                })
+                .collect(),
+            covered: 0,
+            total: 100,
+            coverage_unit: "来源实体".into(),
+            unreviewed_regions: 10,
+        });
+        domain.groups = Some(crate::domain::SourceGroupsFact {
+            scan_id: "scan".into(),
+            scene_sha256: "base".into(),
+            total_objects: 100,
+            total_groups: 10,
+            assessed_groups: 0,
+            category_counts: Default::default(),
+            rows: Vec::new(),
+            counts: [("pending_addition".into(), 100)].into(),
+        });
+        domain.linework = Some(crate::domain::LineworkCoverageFact {
+            scan_id: "scan".into(),
+            scene_sha256: "base".into(),
+            member_count: 100,
+            selected_member_count: 0,
+            unselected_member_count: 100,
+            candidate_count: 0,
+            unclassified_candidate_count: 0,
+            region_count: 10,
+            annotation_count: 0,
+            uncovered_count: 0,
+            diagnostic_member_count: 0,
+            stale_selection_count: 0,
+        });
+        assert!(domain.current_floor_progress().is_some());
+        for build_id in ["preview-f02-structure-r1", "preview-f02-structure-r1-retry"] {
+            let mut failed = domain.artifacts[0].clone();
+            failed.binding.build_id = build_id.into();
+            failed.state = ArtifactState::Failed;
+            failed.valid = Some(false);
+            failed.reviewed = false;
+            domain.artifacts.insert(0, failed);
+        }
+        let mut local = LocalState {
+            viewport: Rect::new(0, 0, 132, 43),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(132, 43)).unwrap();
+        terminal
+            .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            local.extension.displayed.borrow().is_some(),
+            "complete 132x43 approval was not registered"
+        );
+        for expected in [
+            "修订 7",
+            "1274",
+            "295",
+            "2559",
+            "示意参数",
+            "墙体：依据CAD重建",
+            "门窗洞口：依据CAD重建",
+            "楼板：依据CAD重建",
+            "其他结构实体：依据CAD重建",
+            "约束：依据CAD重建",
+            "GLB",
+            "未纳入项",
+            "Ctrl+Y",
+        ] {
+            let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(compact.contains(&expected), "{expected} missing");
+        }
+        assert!(!text.contains("信息未完整"));
+        assert!(
+            !text.contains("category-9"),
+            "progress table took priority over the approval"
+        );
+        assert_eq!(
+            super::super::domain::approval_card_lines(
+                snapshot.extensions[0].modeling().unwrap(),
+                0
+            )
+            .iter()
+            .filter(|line| line.starts_with("示意假设"))
+            .count(),
+            5
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::client::Command::ConfirmExtension { .. })
+        ));
+    }
+
+    #[test]
+    fn approval_card_preserves_different_assumption_parameters_and_unknown_text() {
+        let mut snapshot = snapshot();
+        let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+        let original = vec![
+            serde_json::json!({"code":"assumed_value","message":"height","entity_id":"a","height":0.95}).to_string(),
+            serde_json::json!({"code":"assumed_value","message":"height","entity_id":"b","height":1.05}).to_string(),
+            serde_json::json!({"code":"assumed_value","message":"unknown height 0.95","entity_id":"c"}).to_string(),
+            serde_json::json!({"code":"assumed_value","message":"unknown height 1.05","entity_id":"d"}).to_string(),
+            "unstructured assumption with complete dimensions 0.5 x 0.7 x 1.05".into(),
+        ];
+        domain.proposal.as_mut().unwrap().assumptions = original.clone();
+        let lines = super::super::domain::approval_card_lines(domain, 0);
+        for text in [&original[0], &original[1], &original[4]] {
+            assert!(
+                lines.iter().any(|line| line.contains(text)),
+                "assumption omitted: {text}"
+            );
+        }
+        for message in ["unknown height 0.95", "unknown height 1.05"] {
+            assert!(lines.iter().any(|line| line.contains(message)));
+        }
+        assert_eq!(domain.proposal.as_ref().unwrap().assumptions, original);
+    }
+
+    #[test]
     fn conversation_card_directly_confirms_the_displayed_version_without_opening_details() {
         let mut snapshot = snapshot();
         let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
@@ -747,7 +907,7 @@ mod tests {
 
     #[test]
     fn conversation_card_never_confirms_clipped_assumptions_small_windows_or_running_tasks() {
-        for condition in ["small", "assumptions", "running", "task"] {
+        for condition in ["small", "assumptions", "running", "task", "review"] {
             let mut snapshot = snapshot();
             let mut local = LocalState {
                 viewport: Rect::new(0, 0, 120, 44),
@@ -761,6 +921,10 @@ mod tests {
                         (0..100).map(|n| format!("height {n} assumed")).collect();
                 }
                 "running" => snapshot.phase = SessionPhase::Running,
+                "review" => {
+                    let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+                    domain.artifacts[0].reviewed = false;
+                }
                 "task" => {
                     let mut scheduler = crate::scheduler::Scheduler::default();
                     scheduler
