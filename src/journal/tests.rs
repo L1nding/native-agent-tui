@@ -467,13 +467,17 @@ fn disk_budget_compacts_live_history_instead_of_terminating_the_session() {
     let record = Record::snapshot(0, snapshot("new"));
     let mut new = Store::create(settings, Path::new(env!("CARGO_MANIFEST_DIR")), &record).unwrap();
     assert!(new.persist(&record, &record.encode().unwrap()).is_ok());
+    let mut next = snapshot("new");
+    next.observation.snapshot_version = 7;
+    let next = Record::snapshot(7, next);
+    assert!(new.persist(&next, &next.encode().unwrap()).is_ok());
     assert!(Replay::open(
         &new.settings,
         Path::new(env!("CARGO_MANIFEST_DIR")),
         "new",
         0,
     )
-    .is_ok());
+    .is_ok_and(|replay| replay.info.committed_seq == 7));
     assert!(replay(&fixture, "active", 0).unwrap().info.needs_recovery);
 }
 
