@@ -857,14 +857,16 @@ impl DomainFacts {
             Some(scope)
         } else {
             if setup.mode == DomainMode::Floor
-                && matches!(
+                && (matches!(
                     kind,
                     "project_catalog"
                         | "project_selection"
                         | "project_location"
                         | "project_scope"
                         | "project_building"
-                )
+                ) || value["project_scope"]
+                    .get("opening_completion_binding")
+                    .is_some())
             {
                 return FactProjection::Invalid;
             }
@@ -2606,11 +2608,23 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     return None;
                 }
                 let source = text(spec, "source_instance_id").ok()?;
-                let evidence = p["hosted_sources"].get(&source)?;
+                // Completion reuses an approved opening; it has no newly discovered
+                // hosted source position. Keep that identity visible without inventing one.
+                let location = if let Some(evidence) = p["hosted_sources"].get(&source) {
+                    format!("来源位置 {}", evidence["origin_m"])
+                } else if project::scope_fact(value)
+                    .and_then(|scope| scope.opening_completion_binding)
+                    .is_some_and(|binding| {
+                        source == target && binding.opening_ids.contains(&target)
+                    })
+                {
+                    format!("既有洞口 {source}")
+                } else {
+                    return None;
+                };
                 objects.push(format!(
-                    "{target} · {kind} 实体补全 · 宿主 {} · 来源位置 {}",
+                    "{target} · {kind} 实体补全 · 宿主 {} · {location}",
                     text(spec, "host_wall_id").ok()?,
-                    evidence["origin_m"]
                 ));
                 objects.push(format!(
                     "保留既有洞口尺寸与位置 · 高 {} · 窗台 {} · 实体参数 assumed：{assets}",

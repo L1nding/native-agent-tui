@@ -224,49 +224,59 @@ pub(super) fn baseline(setup: &DomainSetup, mut apply: impl FnMut(Value)) {
         let index: Value =
             serde_json::from_slice(&read(&directory.join("fact-sequences.json"), 256 * 1024)?)
                 .ok()?;
+        // The index is keyed by the semantic result digest, while fact files are named
+        // by the digest of their sealed bytes, so the two never share a key. Use the
+        // index only as a membership bound on sequence numbers.
         let next = index["next"].as_u64()?;
-        let mut ordered: Vec<(u64, &str)> = index["facts"]
+        let known: std::collections::BTreeSet<u64> = index["facts"]
             .as_object()?
-            .iter()
-            .filter_map(|(sha, sequence)| Some((sequence.as_u64()?, sha.as_str())))
-            .filter(|(sequence, sha)| {
-                *sequence > 0
-                    && *sequence < next
-                    && sha.len() == 64
-                    && sha
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
+            .values()
+            .filter_map(Value::as_u64)
+            .filter(|sequence| *sequence > 0 && *sequence < next)
             .collect();
-        ordered.sort_unstable();
         let facts = directory.join("facts").canonicalize().ok()?;
         if !facts.starts_with(&directory) {
             return None;
         }
-        for (sequence, sha) in ordered {
-            let path = facts.join(format!("{sha}.json"));
-            if !path
-                .canonicalize()
-                .is_ok_and(|resolved| resolved.starts_with(&facts))
+        // Load, verify and check one sealed fact; nothing is retained by the caller
+        // beyond what it chooses to keep.
+        let open = |path: &Path| -> Option<(u64, Value)> {
+            let sha = path.file_stem()?.to_str()?;
+            if path.extension().and_then(|s| s.to_str()) != Some("json")
+                || sha.len() != 64
+                || !sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || !path.canonicalize().ok()?.starts_with(&facts)
             {
-                continue;
+                return None;
             }
-            let Some(raw) = read(&path, FACT_LIMIT) else {
-                continue;
-            };
+            let raw = read(path, FACT_LIMIT)?;
             if format!("{:x}", Sha256::digest(&raw)) != sha {
-                continue;
+                return None;
             }
-            let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
-                continue;
-            };
-            drop(raw);
-            if value["contract"] == CONTRACT
+            let value = serde_json::from_slice::<Value>(&raw).ok()?;
+            let sequence = value["fact_sequence"].as_u64()?;
+            (value["contract"] == CONTRACT
                 && value["run_id"] == setup.run_id
                 && value["context_sha256"] == setup.context_sha256
-                && value["fact_sequence"].as_u64() == Some(sequence)
-            {
-                apply(value);
+                && known.contains(&sequence))
+            .then_some((sequence, value))
+        };
+        // First pass records only (sequence, path); the second replays in order.
+        let mut ordered: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&facts)
+            .ok()?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                open(&path).map(|(sequence, _)| (sequence, path))
+            })
+            .collect();
+        ordered.sort_unstable();
+        for (sequence, path) in ordered {
+            if let Some((reread, value)) = open(&path) {
+                if reread == sequence {
+                    apply(value);
+                }
             }
         }
         Some(())

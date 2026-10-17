@@ -1080,7 +1080,11 @@ fn resumed_domain_replays_baseline_when_history_exceeds_former_byte_cap() {
         total += raw.len();
         let sha = format!("{:x}", Sha256::digest(&raw));
         std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
-        index.insert(sha, value["fact_sequence"].clone());
+        // The modeler keys its index by the semantic result digest, not the file name.
+        index.insert(
+            format!("{:x}", Sha256::digest(format!("semantic-{sha}"))),
+            value["fact_sequence"].clone(),
+        );
     }
     assert!(
         total > 32 * 1024 * 1024,
@@ -1662,13 +1666,7 @@ fn component_discovery_mode_is_bound_to_the_registered_floor_scope() {
     );
 }
 
-#[test]
-fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval() {
-    let mut setup = sequenced_facts().setup.unwrap();
-    setup.mode = DomainMode::Project;
-    let mut facts = DomainFacts::new(Some(setup));
-    facts.apply_verified_fact(&project_catalog(1));
-    facts.apply_verified_fact(&project_selection(2, true));
+fn opening_completion_scope() -> Value {
     let mut scope = project_scope(3, "f08", &"d".repeat(64));
     scope["project_structure"] = json!(false);
     scope["project_scope"]["activation_revision"] = json!(1);
@@ -1689,12 +1687,33 @@ fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval
         "source_instance_id":"door.1","kind":"door","host_wall_id":"wall.host",
         "height":2.1,"sill_height":0.0,"assets":assets
     }]});
-    scope["proposal"]["hosted_sources"] = json!({"door.1":{"origin_m":[2,2]}});
+    scope["proposal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("hosted_sources");
     scope["proposal"]["draft"]["operations"] = json!([{
         "op":"set","target_id":"door.1","collection":"openings","field":"assets",
         "basis":"assumed","source_ids":["cad.door"],"value_json":assets.to_string()
     }]);
+    scope
+}
+
+#[test]
+fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let scope = opening_completion_scope();
+    let mut floor_proposal = scope.clone();
+    floor_proposal["kind"] = json!("proposal");
+    assert_eq!(
+        sequenced_facts().apply_verified_fact(&floor_proposal),
+        FactProjection::Invalid
+    );
     assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+    assert!(facts.snapshot.proposal.as_ref().unwrap().objects[0].contains("既有洞口 door.1"));
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
     assert!(!facts.can_authorize(&binding));
     add_reviewed_candidate(&mut facts.snapshot, &binding);
@@ -1707,6 +1726,7 @@ fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval
         "proof",
         "structure",
         "duplicate",
+        "source_instance",
     ] {
         let mut bad = scope.clone();
         bad["fact_sequence"] = json!(100);
@@ -1726,6 +1746,10 @@ fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval
                 bad["project_scope"]["opening_completion_binding"]["opening_ids"] =
                     json!(["door.1", "door.1"])
             }
+            "source_instance" => {
+                bad["proposal"]["component_plan"]["openings"][0]["source_instance_id"] =
+                    json!("foreign")
+            }
             _ => unreachable!(),
         }
         assert_eq!(
@@ -1740,6 +1764,181 @@ fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval
     changed["fact_sequence"] = json!(4);
     changed["project_scope"]["opening_completion_binding"]["opening_ids"] = json!(["door.other"]);
     assert_eq!(facts.apply_verified_fact(&changed), FactProjection::Invalid);
+    let mut unbound = scope.clone();
+    unbound.as_object_mut().unwrap().remove("project_scope");
+    assert!(proposal_fact(&unbound).is_none());
+    for style in ["window", "curtain_wall"] {
+        let mut window = scope.clone();
+        window["proposal"]["component_plan"]["openings"][0]["kind"] = json!("window");
+        window["proposal"]["component_plan"]["openings"][0]["assets"]["style"] = json!(style);
+        window["proposal"]["draft"]["operations"][0]["value_json"] =
+            json!(window["proposal"]["component_plan"]["openings"][0]["assets"].to_string());
+        assert!(proposal_fact(&window).unwrap().objects[0].contains("window 实体补全"));
+    }
+}
+
+#[test]
+fn floor_and_opening_completion_switches_project_bound_reviews_live_and_after_resume() {
+    let root = std::env::temp_dir().join(format!(
+        "domain-opening-switch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let directory = root.join("outputs/domain/run/project");
+    std::fs::create_dir_all(directory.join("facts")).unwrap();
+    std::fs::write(root.join("context.json"), b"{}").unwrap();
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.repository = root.clone();
+    setup.context_path = root.join("context.json");
+    setup.context_sha256 = format!("{:x}", Sha256::digest(b"{}"));
+    let mut facts = DomainFacts::new(Some(setup.clone()));
+    let (mut requirements, evidence) = first_use_fixture();
+    let item = &mut requirements["proposal"]["component_first_use_requirements"]["required"][0];
+    item["component_id"] = json!("door.1");
+    item["component_ids"] = json!(["door.1"]);
+    item["category"] = json!("door");
+    item["template_id"] = json!("typed.door");
+    item["source_bindings"].as_array_mut().unwrap().truncate(1);
+    item["source_bindings"][0]["component_id"] = json!("door.1");
+    let requirement = requirements["proposal"]["component_first_use_requirements"].clone();
+    let mut history = Vec::new();
+    let mut index = serde_json::Map::new();
+    for activation in 1..=4 {
+        let sequence = activation * 10;
+        let mut scope = if activation % 2 == 0 {
+            opening_completion_scope()
+        } else {
+            project_scope(sequence, "f08", &"e".repeat(64))
+        };
+        scope["project_scope"]["activation_revision"] = json!(activation);
+        scope["fact_sequence"] = json!(sequence);
+        scope["proposal"]["component_first_use_requirements"] = requirement.clone();
+        let mut proposal = scope.clone();
+        proposal["kind"] = json!("proposal");
+        proposal["fact_sequence"] = json!(sequence + 1);
+        let mut artifact = artifact_envelope("preview", sequence + 2, "built", None);
+        for key in ["proposal_id", "revision", "prepare_token"] {
+            artifact["artifact"][key] = proposal["proposal"][key].clone();
+        }
+        artifact["artifact"]["authority_sha256"] = proposal["proposal"]["base_sha256"].clone();
+        artifact["artifact"]["input_sha256"] = proposal["proposal"]["candidate_sha256"].clone();
+        let mut validation = artifact.clone();
+        validation["kind"] = json!("artifact_validation");
+        validation["fact_sequence"] = json!(sequence + 3);
+        validation["artifact"]["valid"] = json!(true);
+        validation["artifact"]["review_image"] = json!({"delivery":"attached_png","image_sha256":"a".repeat(64),"visual_analysis":"not_run"});
+        validation["artifact"]["review_image"]["image_path"] = json!(root.join("candidate.png"));
+        validation["artifact"]["review_image"]["dimensions_px"] = json!([1, 1]);
+        validation["artifact"]["review_image"]["request"] = json!({
+            "build_id":"preview","proposal_id":proposal["proposal"]["proposal_id"],
+            "revision":proposal["proposal"]["revision"],"prepare_token":proposal["proposal"]["prepare_token"],
+            "input_sha256":proposal["proposal"]["candidate_sha256"],"blend_sha256":"b".repeat(64),"focus_m":null});
+        let mut review = evidence.clone();
+        review["kind"] = json!("component_first_use_review");
+        review["contract"] = json!(CONTRACT);
+        review["fact_sequence"] = json!(sequence + 4);
+        let owner = &mut review["component_first_use_review"];
+        for key in [
+            "proposal_id",
+            "revision",
+            "prepare_token",
+            "base_sha256",
+            "candidate_sha256",
+        ] {
+            owner[key] = proposal["proposal"][key].clone();
+            owner["manifest"][key] = proposal["proposal"][key].clone();
+        }
+        owner["manifest"]["input_sha256"] = proposal["proposal"]["candidate_sha256"].clone();
+        owner["manifest"]["requirements_sha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&requirement).unwrap())
+        ));
+        for (key, value) in requirement["required"][0].as_object().unwrap() {
+            owner["manifest"]["items"][0][key] = value.clone();
+        }
+        let mut values = if activation == 1 {
+            vec![project_catalog(1), project_selection(2, true)]
+        } else {
+            Vec::new()
+        };
+        values.extend([
+            scope.clone(),
+            proposal.clone(),
+            artifact,
+            validation,
+            review,
+        ]);
+        for value in &mut values {
+            value["run_id"] = json!("run");
+            value["context_sha256"] = json!(setup.context_sha256);
+            value["ok"] = json!(true);
+            if value["fact_sequence"].as_u64().unwrap() > sequence {
+                value["project_scope"] = scope["project_scope"].clone();
+                value["project_structure"] = scope["project_structure"].clone();
+            }
+            assert_eq!(
+                facts.apply_verified_fact(value),
+                FactProjection::Applied,
+                "activation {activation}, kind {}",
+                value["kind"]
+            );
+            let raw = serde_json::to_vec(value).unwrap();
+            let sha = format!("{:x}", Sha256::digest(&raw));
+            std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
+            index.insert(sha, value["fact_sequence"].clone());
+        }
+        std::fs::write(
+            directory.join("fact-sequences.json"),
+            json!({"next":sequence+5,"facts":index}).to_string(),
+        )
+        .unwrap();
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        assert!(
+            !facts.can_authorize(&binding),
+            "first-use images need local verification"
+        );
+        for image in &mut facts.snapshot.review_images {
+            image.file_state = ImageFileState::Available;
+        }
+        assert!(facts.can_authorize(&binding));
+        for old in &history {
+            assert_eq!(facts.apply_verified_fact(old), FactProjection::Superseded);
+        }
+        let mut resumed = DomainFacts::new(Some(setup.clone()));
+        assert_eq!(resumed.snapshot.project_scope, facts.snapshot.project_scope);
+        assert_eq!(resumed.snapshot.proposal.as_ref().unwrap().binding, binding);
+        assert_eq!(resumed.snapshot.artifacts[0].valid, Some(true));
+        assert_eq!(
+            resumed.snapshot.first_use_review.as_ref().unwrap().status,
+            "ready"
+        );
+        assert!(!resumed.can_authorize(&binding));
+        // Fresh proposal/review reads and locally verified images restore eligibility.
+        assert_eq!(
+            resumed.apply_verified_fact(&values[values.len() - 4]),
+            FactProjection::Applied
+        );
+        assert_eq!(
+            resumed.apply_verified_fact(values.last().unwrap()),
+            FactProjection::Applied
+        );
+        for image in &mut resumed.snapshot.review_images {
+            image.file_state = ImageFileState::Available;
+        }
+        assert!(resumed.can_authorize(&binding));
+        for old in &history {
+            assert_eq!(resumed.apply_verified_fact(old), FactProjection::Superseded);
+        }
+        history = values
+            .into_iter()
+            .filter(|value| value.get("project_scope").is_some())
+            .collect();
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
