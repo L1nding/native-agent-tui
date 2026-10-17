@@ -285,11 +285,27 @@ fn business_lines(
             match review.status.as_str() {
                 "ready" => "可复核",
                 "blocked" => "尚未满足",
+                "running" => "生成中",
+                "stalled" => "生成停滞",
                 "not_required" => "无需首用对照",
                 _ => "未知",
             },
             review.required_count
         )));
+        if let (Some(completed), Some(total)) = (review.completed, review.total) {
+            let label = match review.status.as_str() {
+                "running" => "对比图生成中",
+                "stalled" => "对比图生成停滞",
+                _ => "对比图生成进度",
+            };
+            lines.push(Line::from(format!("{label} {completed}/{total}")));
+        }
+        if review.blocked_count > 0 {
+            lines.push(Line::from(format!(
+                "有 {} 处缺图纸证据，需剔除后再确认",
+                review.blocked_count
+            )));
+        }
         if !domain.first_use_satisfied() {
             lines.push(Line::from(
                 "批准前需本版真实Blender对照图；审批卡已交付任一张即可复核，Ctrl+O 可打开当前图。",
@@ -965,7 +981,13 @@ pub(super) fn approval_card_lines(
     let candidate_review = domain.candidate_review_delivered(binding);
     let first_use = domain.first_use_satisfied();
     lines.push(
-        if !first_use {
+        if domain
+            .first_use_review
+            .as_ref()
+            .is_some_and(|r| r.blocked_count > 0)
+        {
+            "… 有缺图纸证据的对象，需剔除后再确认"
+        } else if !first_use {
             "… 图纸对比图尚未准备好"
         } else if domain
             .first_use_review
@@ -1000,6 +1022,12 @@ pub(super) fn approval_card_lines(
         } else {
             "模型尚未建好或检查尚未完成"
         })
+    } else if domain
+        .first_use_review
+        .as_ref()
+        .is_some_and(|r| r.blocked_count > 0)
+    {
+        Some("有缺图纸证据的对象，需剔除后再确认")
     } else if !candidate_review || !first_use {
         Some("复核图片尚未准备好，请在 F6 查看进度")
     } else {

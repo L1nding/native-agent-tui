@@ -77,6 +77,10 @@ pub struct FirstUseReviewFact {
     pub status: String,
     pub review_set_sha256: Option<String>,
     pub required_count: usize,
+    pub blocked_count: usize,
+    pub completed: Option<usize>,
+    pub total: Option<usize>,
+    pub job_id: Option<String>,
     pub dimensions: Vec<String>,
     requirements: Value,
 }
@@ -88,6 +92,7 @@ impl FirstUseReviewFact {
         }
         let required: Vec<_> = images.iter().filter(|image| image.required).collect();
         self.status == "ready"
+            && self.blocked_count == 0
             && self.required_count > 0
             && self.review_set_sha256.is_some()
             && required.len() >= self.required_count
@@ -166,13 +171,19 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
             status: "unknown".into(),
             review_set_sha256: None,
             required_count: 0,
+            blocked_count: 0,
+            completed: None,
+            total: None,
+            job_id: None,
             dimensions: Vec::new(),
             requirements: Value::Null,
         });
     }
     let required = value["required"].as_array()?;
-    if value["contract"] != "component-first-use/1"
-        || required.len() > MAX_IMAGES
+    if !matches!(
+        value["contract"].as_str(),
+        Some("component-first-use/1" | "component-first-use/2" | "component-first-use/3")
+    ) || required.len() > MAX_IMAGES
         || value["reused"].as_array()?.len() > 500
     {
         return None;
@@ -242,6 +253,10 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
         .into(),
         review_set_sha256: None,
         required_count: required.len(),
+        blocked_count: 0,
+        completed: None,
+        total: None,
+        job_id: None,
         dimensions: Vec::new(),
         requirements: value.clone(),
     })
@@ -318,10 +333,29 @@ pub(super) fn project(
         }
         return Some((result, Vec::new()));
     }
+    result.completed = review["completed"].as_u64().map(|value| value as usize);
+    result.total = review["total"].as_u64().map(|value| value as usize);
+    result.job_id = review["job_id"].as_str().map(str::to_owned);
+    if result
+        .completed
+        .zip(result.total)
+        .is_some_and(|(completed, total)| total == 0 || completed > total)
+    {
+        return None;
+    }
+    if review["current"] == true && matches!(review["status"].as_str(), Some("running" | "stalled"))
+    {
+        result.status = review["status"].as_str()?.to_owned();
+        result.review_set_sha256 = None;
+        result.blocked_count = 0;
+        result.dimensions.clear();
+        return Some((result, Vec::new()));
+    }
     result.review_set_sha256 = None;
     result.dimensions.clear();
     if review["status"] == "blocked" || review["current"] == false {
         result.status = "blocked".into();
+        result.blocked_count = review["manifest"]["blocked"].as_array().map_or(1, Vec::len);
         return Some((result, Vec::new()));
     }
     if review["status"] != "ready" || review["current"] != true {
@@ -344,6 +378,7 @@ pub(super) fn project(
     {
         return None;
     }
+    result.blocked_count = manifest["blocked"].as_array().map_or(0, Vec::len);
     text(manifest, "build_id").ok()?;
     hash(&manifest["blend_sha256"])?;
     let required = previous.requirements["required"].as_array()?;

@@ -4104,6 +4104,58 @@ fn first_use_requires_exact_template_arguments_sources_revision_and_opened_revie
 }
 
 #[test]
+fn first_use_v3_accepts_group_ranges_and_blocked_manifest_entries() {
+    let (mut proposal, mut evidence) = first_use_fixture();
+    proposal["proposal"]["component_first_use_requirements"]["contract"] =
+        json!("component-first-use/3");
+    proposal["proposal"]["component_first_use_requirements"]["required"][0]
+        ["source_dimension_ranges_m"] = json!({"cad_x":[0.6,0.6],"cad_y":[0.5,0.5]});
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    evidence["component_first_use_review"]["manifest"]["items"][0]["source_dimension_ranges_m"] =
+        proposal["proposal"]["component_first_use_requirements"]["required"][0]
+            ["source_dimension_ranges_m"]
+            .clone();
+    evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
+        )
+    ));
+    evidence["component_first_use_review"]["manifest"]["blocked"] =
+        json!([{"review_key":"missing"}]);
+    let (ready, images) = review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(ready.blocked_count, 1);
+    assert!(!ready.satisfied(&images));
+}
+
+#[test]
+fn first_use_async_progress_is_projected_without_images() {
+    let (proposal, mut evidence) = first_use_fixture();
+    evidence["component_first_use_review"] = json!({
+        "status":"running", "current":true, "job_id":"job-1", "completed":12, "total":40,
+        "proposal_id":"proposal", "revision":2, "prepare_token":"token",
+        "base_sha256":"base", "candidate_sha256":"candidate"
+    });
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let (running, images) = review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(running.status, "running");
+    assert_eq!(running.completed, Some(12));
+    assert_eq!(running.total, Some(40));
+    assert!(images.is_empty());
+    assert!(!running.satisfied(&images));
+}
+
+#[test]
 fn missing_first_use_contract_is_unknown_and_user_request_is_explicit_without_fake_cad() {
     let (mut proposal, mut evidence) = first_use_fixture();
     proposal["proposal"]
