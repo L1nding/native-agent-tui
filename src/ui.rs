@@ -770,7 +770,16 @@ fn handle_key_inner(
                 local.notice = Some("图片不可用：请等待本版文件校验或重新生成图片".into());
             }
             extensions::ExtensionAction::NoDisplayedConfirmation => {
-                local.notice = Some("当前尚无已展示的可批准方案".into())
+                let syncing = snapshot.extensions.iter().any(|extension| {
+                    extension.modeling().is_some_and(|domain| {
+                        domain.fact_sync_notice.is_some() || domain.authorizing
+                    })
+                });
+                local.notice = Some(if syncing {
+                    "正在同步，请稍后".into()
+                } else {
+                    "当前尚无已展示的可批准方案".into()
+                })
             }
             extensions::ExtensionAction::Handled => {}
         }

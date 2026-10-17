@@ -3642,7 +3642,7 @@ fn first_use_requires_exact_template_arguments_sources_revision_and_opened_revie
     let (ready, mut images) = review::project(&evidence, &binding, &requirement).unwrap();
     assert!(!ready.satisfied(&images));
     images[0].file_state = ImageFileState::Available;
-    assert!(!ready.satisfied(&images));
+    assert!(ready.satisfied(&images));
     images[0].externally_opened = true;
     assert!(ready.satisfied(&images));
     images[0].binding.review_set_sha256 = Some("b".repeat(64));
@@ -3814,7 +3814,7 @@ async fn png_verification_rejects_missing_changed_dimensions_and_nonlocal_files_
 }
 
 #[test]
-fn failed_external_open_never_credits_presentation_and_new_review_sets_clear_old_openings() {
+fn failed_external_open_keeps_card_delivery_and_new_review_sets_clear_old_openings() {
     let (proposal, evidence) = first_use_fixture();
     let first_use = review::requirements(&proposal["proposal"]).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
@@ -3824,7 +3824,7 @@ fn failed_external_open_never_credits_presentation_and_new_review_sets_clear_old
         file_valid: true,
         result: Err("viewer failed".into()),
     });
-    assert!(!ready.satisfied(&images));
+    assert!(ready.satisfied(&images));
     assert!(images[0].verified_path().is_some());
     images[0].finish_open(review::ImageOpenOutcome {
         file_valid: true,

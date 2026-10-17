@@ -91,10 +91,13 @@ impl FirstUseReviewFact {
             && self.required_count > 0
             && self.review_set_sha256.is_some()
             && required.len() >= self.required_count
-            && required.iter().all(|image| {
+            // A delivered, hash-verified review card is sufficient evidence for
+            // the current version. Opening one image remains available for users
+            // who want the external viewer, but approval must not require opening
+            // every comparison/detail image one by one.
+            && required.iter().any(|image| {
                 image.binding.review_set_sha256 == self.review_set_sha256
                     && image.file_state == ImageFileState::Available
-                    && image.externally_opened
             })
     }
 }

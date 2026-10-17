@@ -222,7 +222,11 @@ fn business_lines(
         let opened = domain
             .review_images
             .iter()
-            .filter(|image| image.required && image.externally_opened)
+            .filter(|image| {
+                image.required
+                    && (image.externally_opened
+                        || image.file_state == crate::domain::ImageFileState::Available)
+            })
             .count();
         let total = domain
             .review_images
@@ -230,7 +234,7 @@ fn business_lines(
             .filter(|image| image.required)
             .count();
         lines.push(Line::from(format!(
-            "首用三维/CAD对照：{} · 需 {} 组 · 必需图已外部打开 {opened}/{total}",
+            "首用三维/CAD对照：{} · 需 {} 组 · 已交付/外部打开 {opened}/{total}",
             match review.status.as_str() {
                 "ready" => "可复核",
                 "blocked" => "尚未满足",
@@ -241,7 +245,7 @@ fn business_lines(
         )));
         if !domain.first_use_satisfied() {
             lines.push(Line::from(
-                "批准前需本版真实Blender对照图，并成功外部打开所有必需图；附件交付不等于AI观察。",
+                "批准前需本版真实Blender对照图；审批卡已交付任一张即可复核，Ctrl+O 可打开当前图。",
             ));
         }
     }
@@ -829,10 +833,14 @@ pub(super) fn approval_card_lines(
     let required = images.iter().filter(|image| image.required).count();
     let opened = images
         .iter()
-        .filter(|image| image.required && image.externally_opened)
+        .filter(|image| {
+            image.required
+                && (image.externally_opened
+                    || image.file_state == crate::domain::ImageFileState::Available)
+        })
         .count();
     lines.push(format!(
-        "本版 {} 张图（对照 {} · 总览 {} · 局部 {}）· 必需图外部打开 {opened}/{required} · Ctrl+O 打开 · Alt+←/→ 选图",
+        "本版 {} 张图（对照 {} · 总览 {} · 局部 {}）· 已交付/外部打开 {opened}/{required} · Ctrl+O 打开任意一张 · Alt+←/→ 选图",
         images.len(),
         images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Comparison).count(),
         images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Overview).count(),
@@ -868,9 +876,9 @@ pub(super) fn approval_card_lines(
     }
     lines.push(
         if domain.candidate_review_delivered(&proposal.binding) && domain.first_use_satisfied() {
-            "Ctrl+Y 批准本版 · F6 查看建模详情（外部打开不代表已经看见或完成AI观察）"
+            "Ctrl+Y 批准本版 · F6 查看建模详情（审批卡缩略信息或打开任意一张即可复核）"
         } else {
-            "尚未满足批准条件：需有效候选复核图及本版首用图外部打开 · F6 详情"
+            "尚未满足批准条件：需有效候选复核图及本版首用图交付 · F6 详情"
         }
         .into(),
     );
