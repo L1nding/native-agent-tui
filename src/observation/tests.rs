@@ -536,10 +536,19 @@ fn approval_remains_actionable_despite_output_and_resolves_exactly_once() {
     ] {
         assert!(!encoded.contains(private));
     }
+    let restored = serde_json::from_str::<ObservationSnapshot>(&encoded).unwrap();
+    assert_eq!(restored.snapshot_version, snapshot.snapshot_version);
     assert_eq!(
-        serde_json::from_str::<ObservationSnapshot>(&encoded).unwrap(),
-        snapshot
+        restored.accepted_evidence_count,
+        snapshot.accepted_evidence_count
     );
+    assert_eq!(restored.activities.len(), snapshot.activities.len());
+    assert!(restored.activities.iter().all(|activity| {
+        activity.elapsed_ms.is_none()
+            && activity.silence_ms.is_none()
+            && activity.freshness == Freshness::Unknown
+            && activity.attention == Attention::default()
+    }));
 }
 
 #[test]
