@@ -185,6 +185,95 @@ pub fn verify(setup: &DomainSetup, receipt: &FactReceipt, raw: &[u8]) -> Result<
     Ok(value)
 }
 
+/// Replay sealed facts belonging to this context, in semantic sequence order.
+/// The sequence index names each fact file and bounds membership; it is never proof
+/// that a fact is valid, so every file is re-hashed and checked before `apply` sees it.
+/// Facts are read one at a time, so memory and time do not depend on keeping the
+/// whole history resident.
+pub(super) fn baseline(setup: &DomainSetup, mut apply: impl FnMut(Value)) {
+    use std::io::Read;
+    let mut load = || -> Option<()> {
+        let context = std::fs::read(&setup.context_path).ok()?;
+        if context.len() > 16 * 1024
+            || format!("{:x}", Sha256::digest(&context)) != setup.context_sha256
+        {
+            return None;
+        }
+        let root = setup.repository.canonicalize().ok()?;
+        let directory = root
+            .join("outputs/domain")
+            .join(&setup.run_id)
+            .join(match setup.mode {
+                DomainMode::Floor => "changes",
+                DomainMode::Project => "project",
+            })
+            .canonicalize()
+            .ok()?;
+        if !directory.starts_with(&root) {
+            return None;
+        }
+        let read = |path: &Path, limit: usize| -> Option<Vec<u8>> {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .ok()?
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() <= limit).then_some(bytes)
+        };
+        let index: Value =
+            serde_json::from_slice(&read(&directory.join("fact-sequences.json"), 256 * 1024)?)
+                .ok()?;
+        let next = index["next"].as_u64()?;
+        let mut ordered: Vec<(u64, &str)> = index["facts"]
+            .as_object()?
+            .iter()
+            .filter_map(|(sha, sequence)| Some((sequence.as_u64()?, sha.as_str())))
+            .filter(|(sequence, sha)| {
+                *sequence > 0
+                    && *sequence < next
+                    && sha.len() == 64
+                    && sha
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .collect();
+        ordered.sort_unstable();
+        let facts = directory.join("facts").canonicalize().ok()?;
+        if !facts.starts_with(&directory) {
+            return None;
+        }
+        for (sequence, sha) in ordered {
+            let path = facts.join(format!("{sha}.json"));
+            if !path
+                .canonicalize()
+                .is_ok_and(|resolved| resolved.starts_with(&facts))
+            {
+                continue;
+            }
+            let Some(raw) = read(&path, FACT_LIMIT) else {
+                continue;
+            };
+            if format!("{:x}", Sha256::digest(&raw)) != sha {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+                continue;
+            };
+            drop(raw);
+            if value["contract"] == CONTRACT
+                && value["run_id"] == setup.run_id
+                && value["context_sha256"] == setup.context_sha256
+                && value["fact_sequence"].as_u64() == Some(sequence)
+            {
+                apply(value);
+            }
+        }
+        Some(())
+    };
+    let _ = load();
+}
+
 pub async fn read(setup: DomainSetup, receipt: FactReceipt) -> Result<Vec<u8>, String> {
     read_with_deadline(setup, receipt, std::time::Duration::from_secs(10)).await
 }

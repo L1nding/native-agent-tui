@@ -1,6 +1,196 @@
 use super::*;
 
 #[tokio::test]
+async fn resumed_domain_verifies_old_and_out_of_order_receipts_and_rejects_bad_files() {
+    use sha2::{Digest, Sha256};
+    let directory = std::env::temp_dir().join(format!(
+        "domain-resume-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = directory.join("outputs/domain/run/changes");
+    std::fs::create_dir_all(store.join("facts")).unwrap();
+    std::fs::create_dir_all(directory.join("blender_agent/cli")).unwrap();
+    for file in ["blender_agent/__init__.py", "blender_agent/cli/__init__.py"] {
+        std::fs::write(directory.join(file), "").unwrap();
+    }
+    std::fs::write(directory.join("context.json"), b"{}").unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"{}"));
+    std::fs::write(directory.join("blender_agent/cli/main.py"),
+        "import sys\nfrom pathlib import Path\na=sys.argv\nsha=a[a.index('--fact-sha256')+1]\nsys.stdout.buffer.write(Path('outputs/domain/run/changes/facts',sha+'.json').read_bytes())\n").unwrap();
+    let proposal = json!({"kind":"proposal","fact_sequence":150,"current":true,"diagnostics":[],
+        "proposal":{"proposal_id":"p","revision":1,"prepare_token":"token","base_sha256":"base",
+        "candidate_sha256":"candidate","state":"prepared","summary":"chair","draft":{"operations":[]},
+        "issues":[],"pending":[],"assumed":[],"component_first_use_requirements":{"contract":"component-first-use/1","required":[],"reused":[]}}});
+    let groups = json!({"kind":"source_groups","fact_sequence":159,"scan_id":"scan","scene_sha256":"scene",
+        "total_groups":0,"total_objects":0,"state_counts":{},"groups":[]});
+    let artifact = json!({"kind":"artifact","fact_sequence":172,"artifact":{"build_id":"b","proposal_id":"p",
+        "revision":1,"prepare_token":"token","candidate":true,"authority_sha256":"base","input_sha256":"candidate",
+        "state":"built","output":"b.glb","current":true}});
+    let mut validation = artifact.clone();
+    validation["kind"] = json!("artifact_validation");
+    validation["fact_sequence"] = json!(178);
+    validation["artifact"]["valid"] = json!(true);
+    let mut values = vec![proposal, groups, artifact, validation];
+    let mut receipts = Vec::new();
+    let mut sequences = serde_json::Map::new();
+    for value in &mut values {
+        value["contract"] = json!("modeling-domain/v2");
+        value["run_id"] = json!("run");
+        value["context_sha256"] = json!(hash);
+        value["ok"] = json!(true);
+        let raw = serde_json::to_vec(value).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(store.join("facts").join(format!("{sha}.json")), &raw).unwrap();
+        sequences.insert(sha.clone(), value["fact_sequence"].clone());
+        let owner = value.get("proposal").or_else(|| value.get("artifact"));
+        let mut binding = serde_json::Map::new();
+        for key in [
+            "proposal_id",
+            "revision",
+            "prepare_token",
+            "base_sha256",
+            "candidate_sha256",
+            "build_id",
+            "authority_sha256",
+        ] {
+            if let Some(field) = owner.and_then(|owner| owner.get(key)) {
+                binding.insert(key.into(), field.clone());
+            }
+        }
+        receipts.push(
+            json!({"contract":"modeling-fact-receipt/v1","run_id":"run","context_sha256":hash,
+            "kind":value["kind"],"ok":true,"fact_sequence":value["fact_sequence"],"fact_sha256":sha,
+            "fact_bytes":raw.len(),"binding":binding}),
+        );
+    }
+    std::fs::write(
+        store.join("fact-sequences.json"),
+        json!({"next":183,"facts":sequences}).to_string(),
+    )
+    .unwrap();
+    let config = Config {
+        permission: Some("read-only".into()),
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: directory.join("context.json"),
+            repository: directory.clone(),
+            python: crate::domain::receipt::tests::python(),
+            run_id: "run".into(),
+            context_sha256: hash,
+            floor_id: "floor".into(),
+        }),
+        ..Default::default()
+    };
+    let (mut client, mut server) = harness_with_config(config).await;
+    initialized(&mut server).await;
+    let set = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":set["id"],"result":{"current":"read-only","presets":[]}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Ready).await;
+    skip_skills(&mut server).await;
+    client
+        .commands
+        .send(Command::SubmitRootInput {
+            text: "continue".into(),
+        })
+        .await
+        .unwrap();
+    let start = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Running).await;
+    assert!(client.snapshots.borrow().extensions[0]
+        .modeling()
+        .unwrap()
+        .groups
+        .is_some());
+    for (attempt, index) in [3, 2, 1, 0, 2, 3, 1].into_iter().enumerate() {
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+            "item":{"id":format!("receipt-{attempt}"),"type":"mcpToolCall","server":"modeling_domain","tool":"inspect_change","status":"completed",
+            "result":{"structuredContent":receipts[index]}}}})).await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.snapshots.wait_for(|snapshot| {
+            let domain = snapshot.extensions[0].modeling().unwrap();
+            domain.verified_fact.is_some() && domain.fact_sync_notice.is_none()
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let snapshot = client.snapshots.borrow().clone();
+    let domain = snapshot.extensions[0].modeling().unwrap();
+    assert_eq!(domain.artifacts[0].valid, Some(true));
+    assert!(domain.groups.is_some());
+    assert_eq!(domain.proposal.as_ref().unwrap().binding.revision, 1);
+    // Even a fact recovered at startup must be read and hashed again on a new receipt.
+    let artifact_path = store.join("facts").join(format!(
+        "{}.json",
+        receipts[2]["fact_sha256"].as_str().unwrap()
+    ));
+    for (attempt, corrupt) in [false, true].into_iter().enumerate() {
+        if corrupt {
+            std::fs::write(&artifact_path, b"{}").unwrap();
+        } else {
+            std::fs::remove_file(&artifact_path).unwrap();
+        }
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+            "item":{"id":format!("bad-{attempt}"),"type":"mcpToolCall","server":"modeling_domain","tool":"inspect_artifact","status":"completed",
+            "result":{"structuredContent":receipts[2]}}}})).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .fact_sync_notice
+                    .as_ref()
+                    .is_some_and(|n| n.contains("尚未核验 artifact"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .fact_sync_notice
+            .is_some());
+    }
+    std::fs::write(&artifact_path, serde_json::to_vec(&values[2]).unwrap()).unwrap();
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"recovered-old-receipt","type":"mcpToolCall","server":"modeling_domain","tool":"inspect_artifact","status":"completed",
+        "result":{"structuredContent":receipts[2]}}}})).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.snapshots.wait_for(|snapshot| {
+            snapshot.extensions[0]
+                .modeling()
+                .unwrap()
+                .fact_sync_notice
+                .is_none()
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn reviewed_template_policy_waits_for_turn_end_and_uses_the_private_authorization_chain() {
     use crate::config::DomainApprovalPolicy;
     use sha2::{Digest, Sha256};

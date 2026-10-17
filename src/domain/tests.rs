@@ -931,6 +931,176 @@ fn private_receipt(value: &Value) -> receipt::FactReceipt {
 }
 
 #[test]
+fn resumed_domain_replays_sealed_sequence_baseline_before_old_receipts() {
+    let root = std::env::temp_dir().join(format!(
+        "domain-baseline-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let directory = root.join("outputs/domain/run/project");
+    std::fs::create_dir_all(directory.join("facts")).unwrap();
+    std::fs::write(root.join("context.json"), b"{}").unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"{}"));
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.repository = root.clone();
+    setup.context_path = root.join("context.json");
+    setup.context_sha256 = hash.clone();
+    let scope = project_scope(150, "f08", &"d".repeat(64));
+    let mut groups = grouped_source_view(159);
+    groups["project_scope"] = scope["project_scope"].clone();
+    let mut artifact = artifact_envelope("job", 172, "built", None);
+    artifact["artifact"]["proposal_id"] = scope["proposal"]["proposal_id"].clone();
+    artifact["project_scope"] = scope["project_scope"].clone();
+    let mut validation = artifact.clone();
+    validation["kind"] = json!("artifact_validation");
+    validation["fact_sequence"] = json!(178);
+    validation["artifact"]["valid"] = json!(true);
+    let mut newer_artifact = artifact.clone();
+    newer_artifact["fact_sequence"] = json!(181);
+    let mut values = vec![
+        project_catalog(140),
+        project_selection(145, true),
+        scope,
+        groups,
+        artifact,
+        validation,
+        newer_artifact,
+    ];
+    let mut index = serde_json::Map::new();
+    for value in &mut values {
+        value["context_sha256"] = json!(hash);
+        value["ok"] = json!(true);
+        let raw = serde_json::to_vec(value).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
+        index.insert(sha, value["fact_sequence"].clone());
+    }
+    std::fs::write(
+        directory.join("fact-sequences.json"),
+        json!({"next":182,"facts":index}).to_string(),
+    )
+    .unwrap();
+    let mut facts = DomainFacts::new(Some(setup));
+    assert!(
+        facts.snapshot.project_scope.is_some(),
+        "persisted scope was not restored"
+    );
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    // Delayed stable receipts refer to the previous session's numbers.
+    for index in [5, 4, 3, 5, 3] {
+        assert_ne!(
+            facts.apply_verified_fact(&values[index]),
+            FactProjection::Invalid
+        );
+        let mut receipt = private_receipt(&values[index]);
+        receipt.context_sha256 = hash.clone();
+        facts.synchronization_finished(&receipt);
+    }
+    facts.synchronization_queue_drained();
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+    assert!(facts.snapshot.groups.is_some());
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(
+        !facts.can_authorize(&binding),
+        "restoring facts must not invent a delivered review image"
+    );
+    let mut next_scope = project_scope(190, "f09.b", &"e".repeat(64));
+    next_scope["context_sha256"] = json!(hash);
+    assert_eq!(
+        facts.apply_verified_fact(&next_scope),
+        FactProjection::Applied
+    );
+    for index in [3, 4, 5] {
+        assert_eq!(
+            facts.apply_verified_fact(&values[index]),
+            FactProjection::Superseded
+        );
+    }
+    assert_eq!(
+        facts.snapshot.project_scope.as_ref().unwrap().floor_key,
+        "f09.b"
+    );
+    assert!(facts.snapshot.artifacts.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resumed_domain_replays_baseline_when_history_exceeds_former_byte_cap() {
+    // A real floor scope held 187 facts totalling ~109 MB; resume must not give up.
+    let root = std::env::temp_dir().join(format!(
+        "domain-baseline-large-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let directory = root.join("outputs/domain/run/project");
+    std::fs::create_dir_all(directory.join("facts")).unwrap();
+    std::fs::write(root.join("context.json"), b"{}").unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"{}"));
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.repository = root.clone();
+    setup.context_path = root.join("context.json");
+    setup.context_sha256 = hash.clone();
+    let scope = project_scope(150, "f08", &"d".repeat(64));
+    let mut artifact = artifact_envelope("job", 172, "built", None);
+    artifact["artifact"]["proposal_id"] = scope["proposal"]["proposal_id"].clone();
+    artifact["project_scope"] = scope["project_scope"].clone();
+    let mut validation = artifact.clone();
+    validation["kind"] = json!("artifact_validation");
+    validation["fact_sequence"] = json!(178);
+    validation["artifact"]["valid"] = json!(true);
+    let padding = "x".repeat(260 * 1024);
+    let mut values: Vec<Value> = (1..140)
+        .map(|sequence| {
+            json!({"contract":"modeling-fact-receipt/v1","run_id":"run","kind":"padding",
+                "fact_sequence":sequence,"padding":padding})
+        })
+        .collect();
+    values.extend([
+        project_catalog(140),
+        project_selection(145, true),
+        scope,
+        artifact,
+        validation,
+    ]);
+    let mut index = serde_json::Map::new();
+    let mut total = 0;
+    for value in &mut values {
+        value["context_sha256"] = json!(hash);
+        value["ok"] = json!(true);
+        let raw = serde_json::to_vec(value).unwrap();
+        total += raw.len();
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
+        index.insert(sha, value["fact_sequence"].clone());
+    }
+    assert!(
+        total > 32 * 1024 * 1024,
+        "fixture must exceed the former cap"
+    );
+    std::fs::write(
+        directory.join("fact-sequences.json"),
+        json!({"next":179,"facts":index}).to_string(),
+    )
+    .unwrap();
+    let facts = DomainFacts::new(Some(setup));
+    assert!(
+        facts.snapshot.project_scope.is_some(),
+        "persisted scope was not restored from a large history"
+    );
+    assert_eq!(facts.snapshot.artifacts[0].valid, Some(true));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn private_fact_verification_checks_all_receipt_bindings_above_model_budget() {
     let mut value = envelope();
     value["fact_sequence"] = json!(7);

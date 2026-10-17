@@ -674,7 +674,8 @@ impl DomainFacts {
                 .unwrap_or_default(),
             ..Default::default()
         };
-        Self {
+        let recovered = setup.clone();
+        let mut facts = Self {
             setup,
             snapshot,
             control_messages: BTreeMap::new(),
@@ -687,7 +688,19 @@ impl DomainFacts {
             auto_approval_binding: None,
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
+        };
+        if let Some(setup) = &recovered {
+            // Replay one sealed fact at a time so memory stays bounded by a single fact.
+            receipt::baseline(setup, |value| {
+                facts.apply_verified_fact(&value);
+            });
         }
+        // Persisted eligibility is display evidence; policy approval needs a fresh read.
+        facts.auto_approval_binding = None;
+        if let Some(proposal) = &mut facts.snapshot.proposal {
+            proposal.ready = false;
+        }
+        facts
     }
 
     pub(crate) fn observe(&mut self, notice: &ObservedTool, item: &Value) {
@@ -723,6 +736,22 @@ impl DomainFacts {
         let Some(kind) = value["kind"].as_str() else {
             return FactProjection::Invalid;
         };
+        // Scope identity is a dependency, not corruption in a delayed sealed read.
+        // Only an already projected newer activation can make this historical.
+        if setup.mode == DomainMode::Project
+            && project::scope_fact(value).is_some_and(|scope| {
+                self.snapshot.project_scope.as_ref().is_some_and(|current| {
+                    scope != *current
+                        && value["fact_sequence"].as_u64().is_some_and(|sequence| {
+                            self.fact_sequences
+                                .get("project_scope")
+                                .is_some_and(|last| sequence < *last)
+                        })
+                })
+            })
+        {
+            return FactProjection::Superseded;
+        }
         let incoming_scope = if setup.mode == DomainMode::Project
             && !matches!(
                 kind,
