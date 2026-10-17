@@ -329,6 +329,8 @@ impl ClientHandle {
                 journal,
                 outbox,
                 journal_error: None,
+                journal_checkpoint: None,
+                journal_fingerprint: None,
                 outbox_error: None,
                 root_attempt: None,
                 root_observed: None,
@@ -490,6 +492,8 @@ struct Core {
     journal: Option<Journal>,
     outbox: Option<Outbox>,
     journal_error: Option<JournalError>,
+    journal_checkpoint: Option<JournalCheckpoint>,
+    journal_fingerprint: Option<Vec<u8>>,
     outbox_error: Option<OutboxError>,
     root_attempt: Option<TaskAttempt>,
     root_observed: Option<TaskSnapshot>,
@@ -558,6 +562,55 @@ struct Core {
     saving_provider: Option<(String, bool)>,
     /// The dsh session a pending resume switches to, until its messages are shown.
     resuming: Option<crate::conversations::ConversationSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalCheckpoint {
+    phase: SessionPhase,
+    root_turn_count: u64,
+    root_start_requests: u64,
+    request_count: usize,
+    gate_pending: bool,
+    active_tasks: usize,
+    task_count: usize,
+    queued_roots: usize,
+    domain_synchronizing: bool,
+    domain_authorizing: bool,
+}
+
+impl JournalCheckpoint {
+    fn capture(core: &Core) -> Self {
+        Self {
+            phase: core.state.view.phase,
+            root_turn_count: core.state.view.root_turn_count,
+            root_start_requests: core.state.view.root_start_requests,
+            request_count: core.state.view.requests.len(),
+            gate_pending: core
+                .state
+                .view
+                .gate
+                .as_ref()
+                .is_some_and(|gate| gate.pending),
+            active_tasks: core
+                .state
+                .view
+                .scheduler
+                .tasks
+                .iter()
+                .filter(|task| task.state.active())
+                .count(),
+            task_count: core.state.view.scheduler.tasks.len(),
+            queued_roots: core.state.view.scheduler.queued_roots,
+            domain_synchronizing: core.domain.synchronizing,
+            domain_authorizing: core.domain.snapshot.authorizing,
+        }
+    }
+}
+
+fn journal_fingerprint(snapshot: &StoredSnapshot) -> Vec<u8> {
+    let mut snapshot = snapshot.clone();
+    snapshot.observation.snapshot_version = 0;
+    serde_json::to_vec(&snapshot).unwrap_or_default()
 }
 
 struct PendingTool {
@@ -793,6 +846,20 @@ impl Core {
                     continue;
                 }
                 command = self.command_rx.recv() => {
+                    if command.as_ref().is_some_and(|command| {
+                        matches!(
+                            command,
+                            Command::SubmitRootInput { .. }
+                                | Command::ConfirmExtension { .. }
+                                | Command::QueueRootTasks { .. }
+                                | Command::Schedule(_)
+                                | Command::ScheduleTask { .. }
+                        )
+                    }) {
+                        // A user submission or scheduler mutation is a durable
+                        // boundary even when it is rejected before task counts move.
+                        self.journal_checkpoint = None;
+                    }
                     match command {
                         Some(Command::Quit) | None => break,
                         Some(Command::OutputUnavailable) => {
@@ -1043,16 +1110,30 @@ impl Core {
             .observer
             .snapshot_at(self.state.view.version + 1, Instant::now());
         if self.journal_error.is_none() {
-            if let Some(journal) = &mut self.journal {
-                if let Err(error) = journal.append(StoredSnapshot::capture(&self.state.view)) {
-                    self.journal_error = Some(error.clone());
-                    self.state.error(SessionPhase::Unknown, error.to_string());
-                    self.scheduler.disconnected();
-                    self.state.view.scheduler = self.scheduler.snapshot();
-                    self.observer.execution_unavailable(Instant::now());
-                    self.state.view.observation = self
-                        .observer
-                        .snapshot_at(self.state.view.version + 1, Instant::now());
+            let checkpoint = JournalCheckpoint::capture(self);
+            let snapshot = StoredSnapshot::capture(&self.state.view);
+            let fingerprint = journal_fingerprint(&snapshot);
+            let changed = self.journal_checkpoint.as_ref() != Some(&checkpoint)
+                || self.journal_fingerprint.as_ref() != Some(&fingerprint);
+            // Full snapshots are expensive and mostly repeat while a tool streams.
+            // Persist phase/approval/task transitions immediately; periodic snapshots
+            // keep long-running turns recoverable without exhausting the store.
+            let periodic = self.state.view.version % 256 == 0;
+            if changed || periodic {
+                self.journal_checkpoint = Some(checkpoint);
+                if let Some(journal) = &mut self.journal {
+                    if let Err(error) = journal.append(snapshot) {
+                        self.journal_error = Some(error.clone());
+                        self.state.error(SessionPhase::Unknown, error.to_string());
+                        self.scheduler.disconnected();
+                        self.state.view.scheduler = self.scheduler.snapshot();
+                        self.observer.execution_unavailable(Instant::now());
+                        self.state.view.observation = self
+                            .observer
+                            .snapshot_at(self.state.view.version + 1, Instant::now());
+                    } else {
+                        self.journal_fingerprint = Some(fingerprint);
+                    }
                 }
             }
         }

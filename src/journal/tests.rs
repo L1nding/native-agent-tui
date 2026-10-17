@@ -388,7 +388,12 @@ fn serialization_excludes_task_titles_messages_configuration_and_private_request
         .unwrap()
         .write_jsonl(&mut bytes)
         .unwrap();
-    assert!(!String::from_utf8(bytes).unwrap().contains("PRIVATE_"));
+    let encoded = String::from_utf8(bytes).unwrap();
+    assert!(!encoded.contains("PRIVATE_"));
+    assert!(!encoded.contains("elapsed_ms"));
+    assert!(!encoded.contains("silence_ms"));
+    assert!(!encoded.contains("freshness"));
+    assert!(!encoded.contains("\"attention\":"));
     assert_eq!(
         replay(&fixture, "privacy", 0).unwrap().latest_state().issue,
         Some(PersistenceIssue::ExecutionFailed)
@@ -453,7 +458,7 @@ fn retention_protects_leased_and_uncertain_sessions_and_records_removed_history(
 }
 
 #[test]
-fn disk_budget_fails_instead_of_removing_active_control_records() {
+fn disk_budget_compacts_live_history_instead_of_terminating_the_session() {
     let fixture = Fixture::new();
     let active = store(&fixture, snapshot("active"));
     drop(active);
@@ -461,10 +466,14 @@ fn disk_budget_fails_instead_of_removing_active_control_records() {
     settings.max_bytes = 8192;
     let record = Record::snapshot(0, snapshot("new"));
     let mut new = Store::create(settings, Path::new(env!("CARGO_MANIFEST_DIR")), &record).unwrap();
-    assert_eq!(
-        new.persist(&record, &record.encode().unwrap()),
-        Err(JournalError::Budget)
-    );
+    assert!(new.persist(&record, &record.encode().unwrap()).is_ok());
+    assert!(Replay::open(
+        &new.settings,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        "new",
+        0,
+    )
+    .is_ok());
     assert!(replay(&fixture, "active", 0).unwrap().info.needs_recovery);
 }
 

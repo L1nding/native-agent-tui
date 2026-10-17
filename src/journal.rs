@@ -738,6 +738,9 @@ impl Record {
     pub(crate) fn into_history(mut self) -> Self {
         self.historical = Some(true);
         if let Payload::Snapshot(snapshot) = &mut self.payload {
+            snapshot
+                .observation
+                .derive_timing(self.recorded_at.unwrap_or_default());
             for activity in &mut snapshot.observation.activities {
                 if activity.freshness == crate::observation::Freshness::Current {
                     activity.freshness = crate::observation::Freshness::Unknown;
@@ -1039,16 +1042,30 @@ impl Store {
                 Err(std::fs::TryLockError::Error(_)) => return Err(JournalError::Io),
             }
         }
-        reclaim(
-            &self.root,
-            &self.settings,
-            bytes.len() as u64 + (CURSOR_BYTES * 2) as u64,
-        )?;
-        self.log.write_all(bytes)?;
+        let required = bytes.len() as u64 + (CURSOR_BYTES * 2) as u64;
+        let mut write_bytes = bytes.to_vec();
+        if let Err(error @ JournalError::Budget) = reclaim(&self.root, &self.settings, required) {
+            // A live session cannot be discarded just because its append-only history
+            // reached the global budget. Keep the newest durable state as the replay
+            // baseline and continue writing; closed/uncertain sessions remain protected.
+            if commit.session_closed {
+                return Err(error);
+            }
+            self.log.set_len(0)?;
+            self.log.seek(SeekFrom::Start(0))?;
+            self.cursor.committed_bytes = 0;
+            let mut baseline: Record =
+                serde_json::from_slice(bytes).map_err(|_| JournalError::Corrupt)?;
+            baseline.kind = RecordKind::Snapshot;
+            write_bytes = baseline.encode()?;
+        }
+        self.log.write_all(&write_bytes)?;
         self.log.sync_all()?;
         let mut cursor = self.cursor.clone();
         cursor.committed_seq = commit.sequence;
-        cursor.committed_bytes += bytes.len() as u64;
+        cursor.committed_bytes = cursor
+            .committed_bytes
+            .saturating_add(write_bytes.len() as u64);
         cursor.snapshot_version = commit.version;
         cursor.recorded_at = commit.recorded_at;
         cursor.session_closed = commit.session_closed;
@@ -1432,7 +1449,7 @@ impl Replay {
             return Err(JournalError::Corrupt);
         }
         let mut reader = BufReader::new(file.take(info.committed_bytes));
-        let mut sequence = 0u64;
+        let mut sequence = None;
         let mut previous_version = 0u64;
         let mut baseline = None;
         let mut latest = None;
@@ -1443,16 +1460,23 @@ impl Replay {
             let Some(record) = read_record(&mut reader)? else {
                 break;
             };
-            validate_record(&record, &info, sequence)?;
-            if sequence > 0 && record.snapshot_version < previous_version {
+            let first = sequence.is_none();
+            let expected = sequence.unwrap_or(record.event_seq);
+            validate_record(&record, &info, expected, first)?;
+            if sequence.is_some() && record.snapshot_version < previous_version {
                 return Err(JournalError::Corrupt);
             }
             previous_version = record.snapshot_version;
-            if record.event_seq == since {
+            if baseline.is_none() && since <= record.event_seq {
                 baseline = Some(record.clone());
             }
             latest = Some(record);
-            sequence = sequence.checked_add(1).ok_or(JournalError::Corrupt)?;
+            sequence = Some(
+                latest
+                    .as_ref()
+                    .and_then(|record| record.event_seq.checked_add(1))
+                    .ok_or(JournalError::Corrupt)?,
+            );
         }
         let latest = latest.ok_or(JournalError::Corrupt)?;
         if latest.event_seq != info.committed_seq
@@ -1464,6 +1488,7 @@ impl Replay {
             return Err(JournalError::Corrupt);
         }
         let baseline = baseline.ok_or(JournalError::Corrupt)?;
+        let first_sequence = baseline.event_seq;
         reader.get_mut().get_mut().seek(SeekFrom::Start(0))?;
         let file = reader.into_inner().into_inner();
         Ok(Self {
@@ -1472,7 +1497,7 @@ impl Replay {
             info,
             baseline,
             latest,
-            since,
+            since: since.max(first_sequence),
         })
     }
 
@@ -1503,7 +1528,7 @@ impl Replay {
         baseline.kind = RecordKind::Snapshot;
         baseline = baseline.into_history();
         visit(baseline)?;
-        let mut sequence = 0;
+        let mut sequence = None;
         let mut previous_version = 0;
         loop {
             if cancelled() {
@@ -1512,7 +1537,9 @@ impl Replay {
             let Some(mut record) = read_record(&mut self.reader)? else {
                 break;
             };
-            validate_record(&record, &self.info, sequence)?;
+            let first = sequence.is_none();
+            let expected = sequence.unwrap_or(record.event_seq);
+            validate_record(&record, &self.info, expected, first)?;
             if record.snapshot_version < previous_version
                 || record.event_seq == self.since && record != self.baseline
                 || record.event_seq == self.info.committed_seq && record != self.latest
@@ -1520,13 +1547,18 @@ impl Replay {
                 return Err(JournalError::Corrupt);
             }
             previous_version = record.snapshot_version;
-            sequence = sequence.checked_add(1).ok_or(JournalError::Corrupt)?;
+            sequence = Some(
+                record
+                    .event_seq
+                    .checked_add(1)
+                    .ok_or(JournalError::Corrupt)?,
+            );
             if record.event_seq > self.since {
                 record = record.into_history();
                 visit(record)?;
             }
         }
-        if sequence
+        if sequence.unwrap_or_default()
             != self
                 .info
                 .committed_seq
@@ -1576,7 +1608,12 @@ impl Replay {
     }
 }
 
-fn validate_record(record: &Record, info: &SessionInfo, sequence: u64) -> Result<(), JournalError> {
+fn validate_record(
+    record: &Record,
+    info: &SessionInfo,
+    sequence: u64,
+    first: bool,
+) -> Result<(), JournalError> {
     if !supported_schema(Some(u64::from(record.schema_version))) {
         return Err(JournalError::Schema);
     }
@@ -1588,7 +1625,7 @@ fn validate_record(record: &Record, info: &SessionInfo, sequence: u64) -> Result
         || record.snapshot_version != record.state()?.observation.snapshot_version
         || record.historical.is_some()
         || record.kind
-            != if sequence == 0 {
+            != if first || sequence == 0 {
                 RecordKind::Snapshot
             } else {
                 RecordKind::State
@@ -1687,7 +1724,10 @@ impl CommittedReader {
         }
         let mut reader = BufReader::new((&mut self.file).take(info.committed_bytes - self.offset));
         while let Some(record) = read_record(&mut reader)? {
-            validate_record(&record, &info, self.next_sequence)?;
+            if self.latest.is_none() {
+                self.next_sequence = record.event_seq;
+            }
+            validate_record(&record, &info, self.next_sequence, self.latest.is_none())?;
             if self
                 .latest
                 .as_ref()

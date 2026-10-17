@@ -291,12 +291,31 @@ pub struct Attention {
     pub config_source: Option<ConfigSource>,
 }
 
+impl Default for Attention {
+    fn default() -> Self {
+        Self {
+            level: AttentionLevel::Unknown,
+            reason: AttentionReason::ClockUncertain,
+            requires_action: false,
+            quiet_after_ms: None,
+            attention_after_ms: None,
+            config_source: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Freshness {
     Current,
     Final,
     Unknown,
+}
+
+impl Default for Freshness {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,8 +373,11 @@ pub struct ActivitySnapshot {
     pub tool_category: Option<ToolCategory>,
     pub started_at_ms: Option<u64>,
     pub last_evidence_at_ms: Option<u64>,
+    #[serde(skip_serializing, default)]
     pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing, default)]
     pub silence_ms: Option<u64>,
+    #[serde(skip_serializing, default)]
     pub freshness: Freshness,
     pub last_evidence: Option<Evidence>,
     pub recent_evidence: Vec<Evidence>,
@@ -366,6 +388,7 @@ pub struct ActivitySnapshot {
     pub wait_reason: Option<WaitReason>,
     pub resume_condition: Option<ResumeCondition>,
     pub wait_targets: Vec<WaitTargetSnapshot>,
+    #[serde(skip_serializing, default)]
     pub attention: Attention,
     /// A turn/started event does not prove a provider is currently computing.
     pub provider_state: Option<String>,
@@ -447,11 +470,81 @@ pub struct ObservationSnapshot {
     pub snapshot_version: u64,
     pub raw_message_count: u64,
     pub accepted_evidence_count: u64,
+    #[serde(skip_serializing, default)]
     pub monotonic_ms: u64,
     pub settings: AttentionSettings,
     pub activities: Vec<ActivitySnapshot>,
     #[serde(default)]
     pub compactions: Vec<CompactionFact>,
+}
+
+impl ObservationSnapshot {
+    /// Reconstruct volatile timing and attention fields from persisted evidence.
+    /// Journal records keep the stable timestamps and evidence summaries only.
+    pub(crate) fn derive_timing(&mut self, now_ms: u64) {
+        for activity in &mut self.activities {
+            activity.elapsed_ms = activity
+                .started_at_ms
+                .and_then(|started| now_ms.checked_sub(started));
+            activity.silence_ms = if activity.execution_state.active() {
+                activity
+                    .last_evidence_at_ms
+                    .and_then(|last| now_ms.checked_sub(last))
+            } else {
+                None
+            };
+            activity.freshness = if activity.execution_state == ExecutionState::Unknown {
+                Freshness::Unknown
+            } else if activity.execution_state.active() {
+                Freshness::Current
+            } else {
+                Freshness::Final
+            };
+            activity.attention = if activity.execution_state == ExecutionState::Unknown {
+                Attention {
+                    level: AttentionLevel::Unknown,
+                    reason: AttentionReason::ExecutionUnknown,
+                    ..Attention::default()
+                }
+            } else if activity.interaction_state == Some(InteractionState::Pending)
+                && activity.execution_state.active()
+            {
+                Attention {
+                    level: AttentionLevel::RequiresAction,
+                    reason: AttentionReason::UserDecision,
+                    requires_action: true,
+                    ..Attention::default()
+                }
+            } else if !activity.execution_state.active() {
+                Attention {
+                    level: AttentionLevel::Ended,
+                    reason: AttentionReason::ExecutionEnded,
+                    ..Attention::default()
+                }
+            } else if let Some(class) = activity.kind.class() {
+                let thresholds = self.settings.get(class);
+                let silence = activity.silence_ms.unwrap_or_default();
+                let (level, reason) = if silence >= thresholds.attention_ms {
+                    (
+                        AttentionLevel::AttentionNeeded,
+                        AttentionReason::NoRecentEvidence,
+                    )
+                } else if silence >= thresholds.quiet_ms {
+                    (AttentionLevel::Quiet, AttentionReason::NoRecentEvidence)
+                } else {
+                    (AttentionLevel::Active, AttentionReason::RecentEvidence)
+                };
+                Attention {
+                    level,
+                    reason,
+                    config_source: Some(thresholds.source),
+                    ..Attention::default()
+                }
+            } else {
+                Attention::default()
+            };
+        }
+    }
 }
 
 pub struct ChildFact<'a> {
