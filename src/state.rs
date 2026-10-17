@@ -520,6 +520,9 @@ impl SessionState {
         tool: crate::tool_details::ConversationTool,
         line: String,
     ) {
+        if tool.lifecycle == crate::tool_details::ToolLifecycle::Running {
+            self.clear_retry_notice(thread, turn);
+        }
         let of_turn = |group: &ToolLines| group.thread_id == thread && group.turn_id == turn;
         let known = self.tool_lines.iter().position(|group| {
             of_turn(group)
@@ -831,6 +834,8 @@ impl SessionState {
         };
         current.switch(current.stage, now);
         current.ended = Some((now, completed_at));
+        let thread = self.view.thread_id.clone().unwrap_or_default();
+        self.clear_retry_notice(&thread, turn);
         self.render_turn_timing(now, None);
     }
 
@@ -862,6 +867,10 @@ impl SessionState {
     /// 后端报告的模型阶段。dsh 的输出在提交时整块到达，只有这些事件能区分
     /// 等首字、思考和输出；收到第一条后，输出到达的时刻不再划分阶段。
     pub fn turn_stream_stage(&mut self, turn: &str, stage: TurnStage, now: Instant) {
+        if stage != TurnStage::ModelWait {
+            let thread = self.view.thread_id.clone().unwrap_or_default();
+            self.clear_retry_notice(&thread, turn);
+        }
         let Some(timing) = self
             .turn_timing
             .as_mut()
@@ -929,6 +938,10 @@ impl SessionState {
 
     /// 轮次终结：固定各阶段数值。`completed_at` 只在服务端确认完成时给出。
     pub fn finish_turn_timing(&mut self, now: Instant, completed_at: Option<String>) {
+        if let Some(turn) = self.view.turn_id.clone() {
+            let thread = self.view.thread_id.clone().unwrap_or_default();
+            self.clear_retry_notice(&thread, &turn);
+        }
         if let Some(timing) = self.turn_timing.as_mut() {
             if timing.ended.is_none() {
                 let stage = timing.stage;
@@ -1116,23 +1129,35 @@ impl SessionState {
         turn: &str,
         retry: u64,
         max_retries: Option<u64>,
-        delay_ms: Option<u64>,
+        _delay_ms: Option<u64>,
         code: Option<&str>,
     ) {
-        if self.view.turn_id.as_deref() != Some(turn) {
+        if self.view.turn_id.as_deref() != Some(turn)
+            || !matches!(
+                self.view.phase,
+                SessionPhase::Running | SessionPhase::GatePending
+            )
+        {
             return;
         }
         let mut text = match max_retries {
-            Some(max) => format!("Retrying model request ({retry}/{max})"),
-            None => format!("Retrying model request ({retry})"),
+            Some(max) => format!("正在重新连接模型（第 {retry}/{max} 次"),
+            None => format!("正在重新连接模型（第 {retry} 次"),
         };
-        if let Some(delay) = delay_ms {
-            text.push_str(&format!(" in {delay}ms"));
-        }
         if let Some(code) = code {
-            text.push_str(&format!(": {code}"));
+            text.push_str(&format!("，{code}"));
         }
-        self.notice_item(format!("retry:{turn}:{retry}"), turn, text, true);
+        text.push('）');
+        self.notice_item(format!("retry:{turn}"), turn, text, true);
+    }
+
+    fn clear_retry_notice(&mut self, thread: &str, turn: &str) {
+        self.view.messages.retain(|message| {
+            !(message.role == "Notice"
+                && message.thread_id == thread
+                && message.turn_id == turn
+                && message.id.starts_with("retry:"))
+        });
     }
 
     /// dsh 按目标自动续跑的一轮：没有用户输入，Agent 自己继续推进目标。
@@ -1165,6 +1190,9 @@ impl SessionState {
 
     /// 执行不可用时，没有等到结果的压缩和引导不能继续显示为进行中。
     pub fn finish_all_notices(&mut self) {
+        self.view
+            .messages
+            .retain(|message| !(message.role == "Notice" && message.id.starts_with("retry:")));
         for message in &mut self.view.messages {
             if message.role == "Notice" && !message.complete {
                 message.text = if message.id.starts_with("steer:") {
@@ -1386,6 +1414,9 @@ impl SessionState {
             trim_front(&mut item.text, MESSAGE_BYTES);
             item.truncated = true;
         }
+        if !text.is_empty() {
+            self.clear_retry_notice(thread, turn);
+        }
         self.bound_history();
         true
     }
@@ -1418,6 +1449,10 @@ impl SessionState {
     }
 
     pub fn error(&mut self, phase: SessionPhase, error: impl Into<String>) {
+        if let Some(turn) = self.view.turn_id.clone() {
+            let thread = self.view.thread_id.clone().unwrap_or_default();
+            self.clear_retry_notice(&thread, &turn);
+        }
         self.view.phase = phase;
         self.view.last_error = Some(error.into());
         // 进行中的提示（如“正在检查 shell”）在出错后已过期，留着会遮住错误原因。
@@ -1828,7 +1863,12 @@ mod tests {
         state.retry_notice("turn", 1, Some(2), Some(500), Some("rate_limit"));
         state.retry_notice("turn", 1, Some(2), Some(500), Some("rate_limit"));
         state.retry_notice("turn", 2, None, None, None);
+        state.retry_notice("turn", 3, Some(20), None, Some("TRANSPORT"));
         state.retry_notice("old", 3, None, None, None);
+        assert_eq!(
+            notices(&state),
+            [("正在重新连接模型（第 3/20 次，TRANSPORT）".into(), true)]
+        );
         state.compaction_notice(Some("turn"), "c1", "start");
         state.compaction_notice(Some("turn"), "c2", "start");
         state.compaction_notice(Some("turn"), "c3", "start");
@@ -1840,11 +1880,6 @@ mod tests {
         assert_eq!(
             notices(&state),
             [
-                (
-                    "Retrying model request (1/2) in 500ms: rate_limit".to_owned(),
-                    true
-                ),
-                ("Retrying model request (2)".to_owned(), true),
                 ("… earlier context was compacted …".to_owned(), true),
                 ("Context compaction did not complete.".to_owned(), true),
                 (
@@ -1853,6 +1888,71 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn retry_notice_clears_on_recovery_or_terminal_turn_and_ignores_unrelated_output() {
+        for recovery in [
+            "assistant",
+            "reasoning",
+            "tool",
+            "stage",
+            "step",
+            "failed",
+            "completed",
+        ] {
+            let mut state = SessionState::default();
+            state.view.thread_id = Some("root".into());
+            state.turn_started("turn".into());
+            let now = Instant::now();
+            state.begin_turn_timing(now);
+            state.begin_step_timing("turn", 1, now);
+            state.retry_notice("turn", 20, Some(20), None, Some("TRANSPORT"));
+            state.message("old", "a", "stale", false);
+            state.reasoning("other", "turn", "r", "foreign", false);
+            state.message("turn", "a", "", false);
+            state.turn_stream_stage("turn", TurnStage::ModelWait, now);
+            state.end_step_timing("turn", 0, now, None);
+            assert!(state.view.messages.iter().any(|m| m.id == "retry:turn"));
+            match recovery {
+                "assistant" => {
+                    state.message("turn", "a", "answer", false);
+                }
+                "reasoning" => {
+                    state.reasoning("root", "turn", "r", "thinking", false);
+                }
+                "tool" => state.tool_line(
+                    "root",
+                    "turn",
+                    tool("t", crate::tool_details::ToolLifecycle::Running),
+                    "▸ running · t".into(),
+                ),
+                "stage" => state.turn_stream_stage("turn", TurnStage::Response, now),
+                "step" => state.end_step_timing("turn", 1, now, None),
+                "failed" => state.error(SessionPhase::Failed, "Retries exhausted"),
+                "completed" => {
+                    state.view.phase = SessionPhase::Completed;
+                    state.finish_turn_timing(now, None);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !state
+                    .view
+                    .messages
+                    .iter()
+                    .any(|m| m.id.starts_with("retry:")),
+                "{recovery}"
+            );
+            if matches!(recovery, "failed" | "completed") {
+                state.retry_notice("turn", 20, Some(20), None, Some("TRANSPORT"));
+                assert!(!state
+                    .view
+                    .messages
+                    .iter()
+                    .any(|m| m.id.starts_with("retry:")));
+            }
+        }
     }
 
     #[test]

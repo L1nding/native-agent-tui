@@ -1148,6 +1148,76 @@ fn slice_runs(
 mod tests {
     use super::*;
 
+    #[test]
+    fn retry_notice_updates_one_terminal_row_and_disappears_after_recovery_or_failure() {
+        use crate::state::{SessionPhase, SessionState};
+        use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
+
+        for recovery in ["assistant", "reasoning", "tool", "step", "failed"] {
+            let mut state = SessionState::default();
+            state.view.thread_id = Some("root".into());
+            state.turn_started("turn".into());
+            let now = tokio::time::Instant::now();
+            state.begin_turn_timing(now);
+            state.begin_step_timing("turn", 1, now);
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            let mut cache = ProjectionCache::default();
+            let mut draw = |state: &SessionState| {
+                let view = cache.viewport(state.view.messages.iter(), None, 100, 20, 0, false);
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(Paragraph::new(view.transcript.lines), frame.area());
+                    })
+                    .unwrap();
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            };
+            for retry in 1..=3 {
+                state.retry_notice("turn", retry, Some(20), None, Some("TRANSPORT"));
+                let screen = draw(&state);
+                assert_eq!(screen.matches("正在重新连接模型").count(), 1, "{screen}");
+                assert!(
+                    screen.contains(&format!("第{retry}/20次，TRANSPORT")),
+                    "{screen}"
+                );
+            }
+            match recovery {
+                "assistant" => {
+                    state.message("turn", "a", "Recovered answer", false);
+                }
+                "reasoning" => {
+                    state.reasoning("root", "turn", "r", "Recovered thought", false);
+                }
+                "tool" => state.tool_line(
+                    "root",
+                    "turn",
+                    item("Tool", "▸ running · test").tools.remove(0),
+                    "▸ running · test".into(),
+                ),
+                "step" => state.end_step_timing("turn", 1, now, None),
+                "failed" => {
+                    state.retry_notice("turn", 20, Some(20), None, Some("TRANSPORT"));
+                    state.error(SessionPhase::Failed, "Retries exhausted");
+                    state.finish_turn_timing(now, None);
+                    assert_eq!(state.view.last_error.as_deref(), Some("Retries exhausted"));
+                }
+                _ => unreachable!(),
+            }
+            let screen = draw(&state);
+            assert!(!screen.contains("正在重新连接模型"), "{recovery}: {screen}");
+            assert!(!screen.contains("TRANSPORT"), "{recovery}: {screen}");
+            if recovery == "assistant" {
+                assert!(screen.contains("Recoveredanswer"), "{screen}");
+            }
+        }
+    }
+
     fn item(role: &str, text: &str) -> ConversationItem {
         ConversationItem {
             id: format!("{role}-item"),

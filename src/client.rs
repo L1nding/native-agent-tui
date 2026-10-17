@@ -9881,7 +9881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_stage_and_todo_events_update_the_current_root_turn_only() {
+    async fn backend_retry_stage_and_todo_events_update_the_current_root_turn_only() {
         let (mut client, mut server) = harness().await;
         ready(&mut server).await;
         phase(&mut client, SessionPhase::Ready).await;
@@ -9930,12 +9930,14 @@ mod tests {
             .await
             .unwrap();
 
-        send(
-            &mut server,
-            json!({"method":"turn/notice","params":{"threadId":"root","turnId":"one",
-            "kind":"retry","retry":1,"maxRetries":2,"delayMs":500,"code":"rate_limit"}}),
-        )
-        .await;
+        for retry in 1..=3 {
+            send(
+                &mut server,
+                json!({"method":"turn/notice","params":{"threadId":"root","turnId":"one",
+                "kind":"retry","retry":retry,"maxRetries":20,"delayMs":500,"code":"TRANSPORT"}}),
+            )
+            .await;
+        }
         send(
             &mut server,
             json!({"method":"turn/notice","params":{"threadId":"root","turnId":"old",
@@ -9968,7 +9970,7 @@ mod tests {
                 .map(|m| m.text.as_str())
                 .collect::<Vec<_>>(),
             [
-                "Retrying model request (1/2) in 500ms: rate_limit",
+                "正在重新连接模型（第 3/20 次，TRANSPORT）",
                 "… earlier context was compacted …"
             ]
         );
@@ -10001,6 +10003,48 @@ mod tests {
             let stored = serde_json::to_string(&StoredSnapshot::capture(&snapshot)).unwrap();
             assert!(!stored.contains("build"));
         }
+        send(
+            &mut server,
+            json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"root","turnId":"one","itemId":"a","delta":" recovered"}}),
+        )
+        .await;
+        client
+            .snapshots
+            .wait_for(|snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|m| m.text == "answer recovered")
+            })
+            .await
+            .unwrap();
+        assert!(!client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.id.starts_with("retry:")));
+        send(&mut server, json!({"method":"turn/notice","params":{
+            "threadId":"root","turnId":"one","kind":"retry","retry":20,"maxRetries":20,"code":"TRANSPORT"}})).await;
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.messages.iter().any(|m| m.text.contains("20/20")))
+            .await
+            .unwrap();
+        send(&mut server, json!({"method":"turn/completed","params":{
+            "threadId":"root","turn":{"id":"one","status":"failed","error":{"message":"Retries exhausted"}}}})).await;
+        phase(&mut client, SessionPhase::Failed).await;
+        assert!(!client
+            .snapshots
+            .borrow()
+            .messages
+            .iter()
+            .any(|m| m.id.starts_with("retry:")));
+        assert_eq!(
+            client.snapshots.borrow().last_error.as_deref(),
+            Some("Retries exhausted")
+        );
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }
