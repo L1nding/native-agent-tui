@@ -662,6 +662,7 @@ pub struct DomainFacts {
     auto_approval_binding: Option<ProposalBinding>,
     pub(crate) synchronizing: bool,
     synchronization_errors: BTreeMap<String, u64>,
+    projection_failure: Option<(String, u64, String)>,
 }
 
 impl DomainFacts {
@@ -688,6 +689,7 @@ impl DomainFacts {
             auto_approval_binding: None,
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
+            projection_failure: None,
         };
         if let Some(setup) = &recovered {
             // Replay one sealed fact at a time so memory stays bounded by a single fact.
@@ -724,6 +726,7 @@ impl DomainFacts {
 
     /// Core calls this only after validating a bounded inline envelope or a sealed fact.
     pub(crate) fn apply_verified_fact(&mut self, value: &Value) -> FactProjection {
+        self.projection_failure = None;
         let Some(setup) = self.setup.as_ref() else {
             return FactProjection::Invalid;
         };
@@ -1174,6 +1177,10 @@ impl DomainFacts {
                         let Some((projected, projected_images)) =
                             review::project(value, &proposal.binding, &first_use)
                         else {
+                            self.remember_projection_failure(
+                                value,
+                                review::project_failure_reason(value),
+                            );
                             return FactProjection::Invalid;
                         };
                         first_use = projected;
@@ -1327,6 +1334,10 @@ impl DomainFacts {
                     let Some((first_use, images)) =
                         review::project(value, &proposal.binding, first_use)
                     else {
+                        self.remember_projection_failure(
+                            value,
+                            review::project_failure_reason(value),
+                        );
                         return FactProjection::Invalid;
                     };
                     self.snapshot.first_use_review = Some(first_use);
@@ -1558,6 +1569,14 @@ impl DomainFacts {
     }
 
     pub(crate) fn synchronization_failed(&mut self, kind: &str, sequence: u64, reason: String) {
+        let reason = self
+            .projection_failure
+            .take()
+            .filter(|(failed_kind, failed_sequence, _)| {
+                failed_kind == kind && *failed_sequence == sequence
+            })
+            .map(|(_, _, reason)| reason)
+            .unwrap_or(reason);
         self.synchronization_errors
             .entry(kind.into())
             .and_modify(|last| *last = (*last).max(sequence))
@@ -1566,6 +1585,12 @@ impl DomainFacts {
         self.snapshot
             .fact_sync_notice
             .clone_from(&self.snapshot.notice);
+    }
+
+    fn remember_projection_failure(&mut self, value: &Value, reason: String) {
+        let kind = value["kind"].as_str().unwrap_or("unknown").to_owned();
+        let sequence = value["fact_sequence"].as_u64().unwrap_or(0);
+        self.projection_failure = Some((kind, sequence, reason));
     }
 
     pub(crate) fn synchronization_finished(&mut self, receipt: &receipt::FactReceipt) {

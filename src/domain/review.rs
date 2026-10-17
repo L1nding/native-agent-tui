@@ -361,7 +361,10 @@ pub(super) fn project(
     if review["status"] != "ready" || review["current"] != true {
         return None;
     }
-    let set = hash(&review["review_set_sha256"])?.to_owned();
+    let top_level_set = hash(&review["review_set_sha256"]);
+    let set = top_level_set
+        .or_else(|| hash(&review["delivery"]["review_set_sha256"]))?
+        .to_owned();
     let manifest = &review["manifest"];
     if manifest["contract"] != "component-first-use-review/1"
         || manifest["proposal_id"] != proposal.proposal_id
@@ -385,6 +388,23 @@ pub(super) fn project(
     let items = manifest["items"].as_array()?;
     if items.len() != required.len() {
         return None;
+    }
+    if top_level_set.is_none() {
+        let delivery = &review["delivery"];
+        let delivery_key = hash(&delivery["review_key"])?;
+        let delivery_image = hash(&delivery["image_sha256"])?;
+        if delivery["delivery"] != "attached_png"
+            || !items.iter().any(|item| {
+                item["review_key"] == delivery_key
+                    && item["images"].as_array().is_some_and(|images| {
+                        images
+                            .iter()
+                            .any(|image| image["image_sha256"] == delivery_image)
+                    })
+            })
+        {
+            return None;
+        }
     }
     let mut seen = BTreeSet::new();
     let mut images = Vec::new();
@@ -522,6 +542,31 @@ pub(super) fn project(
     result.status = "ready".into();
     result.review_set_sha256 = Some(set);
     Some((result, images))
+}
+
+pub(super) fn project_failure_reason(value: &Value) -> String {
+    let review = &value["component_first_use_review"];
+    if hash(&review["review_set_sha256"]).is_none()
+        && hash(&review["delivery"]["review_set_sha256"]).is_none()
+    {
+        return "字段 component_first_use_review.review_set_sha256（或 delivery.review_set_sha256）缺失或无效".into();
+    }
+    if review["manifest"].is_null() {
+        return "字段 component_first_use_review.manifest 缺失".into();
+    }
+    if let (Some(items), Some(required)) = (
+        review["manifest"]["items"].as_array(),
+        value["proposal"]["component_first_use_requirements"]["required"].as_array(),
+    ) {
+        if items.len() != required.len() {
+            return format!(
+                "字段 manifest.items 数量为 {}，required 数量为 {}",
+                items.len(),
+                required.len()
+            );
+        }
+    }
+    "component_first_use_review manifest 字段校验失败（详见事实结构）".into()
 }
 
 pub(super) fn artifact_image(value: &Value, binding: &ProposalBinding) -> Option<ReviewImageFact> {

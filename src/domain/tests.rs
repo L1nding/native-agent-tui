@@ -4104,6 +4104,91 @@ fn first_use_requires_exact_template_arguments_sources_revision_and_opened_revie
 }
 
 #[test]
+fn first_use_accepts_review_set_from_attached_delivery_record() {
+    let (proposal, mut evidence) = first_use_fixture();
+    let set = "a".repeat(64);
+    evidence["component_first_use_review"]["review_set_sha256"] = Value::Null;
+    evidence["component_first_use_review"]["delivery"] = json!({
+        "delivery": "attached_png",
+        "review_key": "1".repeat(64),
+        "image_sha256": "8".repeat(64),
+        "review_set_sha256": set,
+        "request_id": "first-use-0"
+    });
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let (ready, images) = review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(ready.review_set_sha256, Some("a".repeat(64)));
+    assert_eq!(images.len(), 1);
+}
+
+#[test]
+fn first_use_accepts_six_item_batch_after_cumulative_progress_fact() {
+    let (mut proposal, mut evidence) = first_use_fixture();
+    let template = proposal["proposal"]["component_first_use_requirements"]["required"][0].clone();
+    let rendered_template = evidence["component_first_use_review"]["manifest"]["items"][0].clone();
+    let mut required = Vec::new();
+    let mut items = Vec::new();
+    for index in 0..6 {
+        let id = format!("opening.batch.{index}");
+        let source = format!("source.batch.{index}");
+        let key = format!("{index:064x}");
+        let image_sha = format!("{:064x}", index + 8);
+        let mut requirement = template.clone();
+        requirement["review_key"] = json!(key);
+        requirement["component_id"] = json!(id);
+        requirement["component_ids"] = json!([id]);
+        requirement["source_instance_id"] = json!(source);
+        requirement["source_bindings"] = json!([requirement["source_bindings"][0].clone()]);
+        requirement["source_bindings"][0]["component_id"] = json!(id);
+        requirement["source_bindings"][0]["source_instance_id"] = json!(source);
+        let mut item = rendered_template.clone();
+        item["review_key"] = json!(key);
+        item["component_id"] = json!(id);
+        item["component_ids"] = json!([id]);
+        item["source_instance_id"] = json!(source);
+        item["source_bindings"] = json!([item["source_bindings"][0].clone()]);
+        item["source_bindings"][0]["component_id"] = json!(id);
+        item["source_bindings"][0]["source_instance_id"] = json!(source);
+        item["images"][0]["image_sha256"] = json!(image_sha);
+        required.push(requirement);
+        items.push(item);
+    }
+    proposal["proposal"]["component_first_use_requirements"]["required"] = json!(required);
+    evidence["component_first_use_review"]["completed"] = json!(6);
+    evidence["component_first_use_review"]["total"] = json!(6);
+    evidence["component_first_use_review"]["manifest"]["items"] = json!(items);
+    evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
+        )
+    ));
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let (ready, images) = review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(ready.completed, Some(6));
+    assert_eq!(ready.total, Some(6));
+    assert_eq!(images.len(), 6);
+}
+
+#[test]
+fn first_use_projection_failure_names_the_missing_review_set_field() {
+    let (_, mut evidence) = first_use_fixture();
+    evidence["component_first_use_review"]["review_set_sha256"] = Value::Null;
+    let reason = review::project_failure_reason(&evidence);
+    assert!(reason.contains("delivery.review_set_sha256"), "{reason}");
+}
+
+#[test]
 fn first_use_v3_accepts_group_ranges_and_blocked_manifest_entries() {
     let (mut proposal, mut evidence) = first_use_fixture();
     proposal["proposal"]["component_first_use_requirements"]["contract"] =
