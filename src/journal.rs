@@ -909,6 +909,14 @@ impl Journal {
     }
 
     pub fn append(&mut self, snapshot: StoredSnapshot) -> Result<(), JournalError> {
+        let status = self.status.borrow();
+        if let Some(error) = &status.error {
+            return Err(error.clone());
+        }
+        if status.closed {
+            return Err(JournalError::Closed);
+        }
+        drop(status);
         let fingerprint = snapshot_fingerprint(&snapshot)?;
         if fingerprint == self.last_snapshot_fingerprint {
             return Ok(());

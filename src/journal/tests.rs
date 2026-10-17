@@ -504,13 +504,16 @@ async fn writer_failure_is_visible_and_normal_finish_waits_for_durable_close() {
         workspace_id(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap()
     );
     fs::create_dir(fixture.root.join(format!("{stem}.cursor.new"))).unwrap();
-    journal.append(snapshot("error")).unwrap();
+    let mut changed = snapshot("error");
+    changed.observation.snapshot_version = 1;
+    journal.append(changed).unwrap();
     journal
         .status
         .wait_for(|status| status.closed)
         .await
         .unwrap();
     assert_eq!(journal.status.borrow().error, Some(JournalError::Io));
+    assert_eq!(journal.append(snapshot("error")), Err(JournalError::Io));
     assert_eq!(
         journal.finish(completed("error")).await.unwrap_err(),
         JournalError::Io
