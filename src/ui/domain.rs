@@ -15,6 +15,7 @@ pub(super) fn floor_progress_lines(domain: &crate::domain::DomainSnapshot) -> Ve
             "整层尚未完成：全层进度尚未对账 · 已建 / 待建 / 卡住 / 未识别 · 图纸覆盖率未知",
         )];
     };
+    let v2 = domain.floor_progress_v2.as_ref();
     let mut lines = vec![Line::from(
         "类别               已建    待建    卡住  未识别",
     )];
@@ -49,20 +50,66 @@ pub(super) fn floor_progress_lines(domain: &crate::domain::DomainSnapshot) -> Ve
         display_text(&progress.coverage_unit),
         progress.unreviewed_regions
     )));
-    lines.push(Line::from(
-        if progress
+    let mut legacy_summary = None;
+    if let Some(v2) = v2 {
+        let count = |key| v2.disposition_counts.get(key).copied().unwrap_or(0);
+        let summaries = [
+            (
+                "已建（含示意）",
+                count("built").saturating_add(count("schematic_built")),
+            ),
+            ("跨层未核验", v2.cross_floor_unverified),
+            ("二维参考", count("2d_reference")),
+            ("暂缓（碰撞）", count("deferred_collision")),
+            ("跳过（用途不明）", count("skipped_unknown")),
+            ("跳过（无法提取）", count("skipped_unextractable")),
+        ];
+        let summary = summaries
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(label, count)| format!("{label} {count}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if !summary.is_empty() {
+            legacy_summary = Some(format!("遗留汇总：{summary}"));
+        }
+    }
+    let complete = v2.map(|v2| v2.completion).unwrap_or_else(|| {
+        !progress
             .categories
             .iter()
             .any(|row| row.pending > 0 || row.blocked > 0 || row.unidentified > 0)
-            || progress.total == 0
-            || progress.covered < progress.total
-            || progress.unreviewed_regions > 0
-        {
-            "整层尚未完成：仍有待建、卡住、未识别或未完成图纸覆盖的范围。"
-        } else {
-            "本表来源状态已对账；整层完成仍需结构、门窗及连接验收。"
-        },
-    ));
+            && progress.total > 0
+            && progress.covered == progress.total
+            && progress.unreviewed_regions == 0
+    });
+    let mut status = match (v2, complete) {
+        (Some(_), true) => "整层已完成：模型器完成口径已满足。",
+        (Some(_), false) => "整层尚未完成。",
+        (None, true) => "本表来源状态已对账；整层完成仍需结构、门窗及连接验收。",
+        (None, false) => "整层尚未完成：仍有待建、卡住、未识别或未完成图纸覆盖的范围。",
+    }
+    .to_owned();
+    if let Some(v2) = v2.filter(|v2| !v2.completion && !v2.completion_blockers.is_empty()) {
+        let blockers = v2
+            .completion_blockers
+            .iter()
+            .map(|blocker| match blocker.as_str() {
+                "unreviewed_regions" => "未判读散线区域",
+                "uncertain_regions" => "待确认区域",
+                "stale_regions" => "失效判读",
+                "pending_sources" => "待处理来源",
+                "unidentified_sources" => "未识别来源",
+                other => other,
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        status.push_str(&format!(" 阻塞原因：{blockers}"));
+    }
+    lines.push(Line::from(status));
+    if let Some(summary) = legacy_summary {
+        lines.push(Line::from(summary));
+    }
     lines
 }
 
@@ -1053,6 +1100,67 @@ mod tests {
             .join("\n");
         assert!(text.contains("图纸覆盖率 100.0%"));
         assert!(text.contains("整层完成仍需结构、门窗及连接验收"));
+    }
+
+    #[test]
+    fn floor_progress_v2_uses_completion_and_only_nonzero_legacy_counts() {
+        let mut domain = floor_progress_domain();
+        domain.floor_progress_v2 = Some(crate::domain::FloorProgressV2 {
+            completion: true,
+            completion_blockers: vec![],
+            disposition_counts: [
+                ("built".into(), 10),
+                ("schematic_built".into(), 13),
+                ("2d_reference".into(), 5),
+                ("skipped_unknown".into(), 0),
+            ]
+            .into(),
+            cross_floor_unverified: 13,
+            deferrals: 1,
+            skips: 0,
+            legacy_items: 5,
+        });
+        let text = floor_progress_lines(&domain)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("整层已完成"));
+        assert!(text.contains("已建（含示意） 23 · 跨层未核验 13 · 二维参考 5"));
+        assert!(!text.contains("跳过"));
+
+        let v2 = domain.floor_progress_v2.as_mut().unwrap();
+        v2.completion = false;
+        v2.completion_blockers = vec!["unreviewed_regions".into(), "future_blocker".into()];
+        let snapshot = CoreSnapshot {
+            extensions: vec![ExtensionSnapshot::Modeling(domain)],
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 75)).unwrap();
+        let local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            ..Default::default()
+        };
+        terminal
+            .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..75)
+            .map(|y| {
+                (0..160)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("整层尚未完成"), "{screen}");
+        assert!(
+            compact.contains("未判读散线区域·future_blocker"),
+            "{screen}"
+        );
+        assert!(compact.contains("已建（含示意）23"), "{screen}");
     }
 
     #[test]

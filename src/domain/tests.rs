@@ -2950,6 +2950,7 @@ fn floor_progress_uses_sealed_complete_counts_and_invalidates_with_the_source_vi
     assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
     let progress = facts.snapshot.current_floor_progress().unwrap().clone();
     assert_eq!(progress.categories[0].built, 322);
+    assert!(facts.snapshot.floor_progress_v2.is_none());
     let mut bad = value.clone();
     bad["fact_sequence"] = json!(99);
     bad["floor_progress"]["scene_sha256"] = json!("other");
@@ -2968,6 +2969,53 @@ fn floor_progress_uses_sealed_complete_counts_and_invalidates_with_the_source_vi
         FactProjection::Superseded
     );
     assert!(facts.snapshot.current_floor_progress().is_none());
+}
+
+#[test]
+fn floor_progress_v2_projects_completion_and_rejects_malformed_fields() {
+    let mut facts = sequenced_facts();
+    let mut value = source_region_review_view(existing_structure_view(linework_source_view(
+        instance_source_view(4),
+        'a',
+    )));
+    value["floor_progress"] = json!({
+        "contract":"floor-progress/2", "scan_id":value["scan_id"],
+        "scene_sha256":value["scene_sha256"],
+        "categories":[{"category":"chair","built":10,"pending":331,"blocked":7,"unidentified":3455}],
+        "drawing_coverage":{"covered":50,"total":100,"unit":"来源成员"},
+        "unreviewed_regions":2,
+        "completion":false,
+        "completion_blockers":["unreviewed_regions","pending_sources","unidentified_sources"],
+        "disposition_counts":{"built":10,"schematic_built":13,"skipped_unextractable":385,"future_disposition":2},
+        "cross_floor_unverified":13,
+        "deferrals":[{"source_id":"a","kind":"collision"}],
+        "skips":[{"source_id":"b","kind":"unextractable"}],
+        "legacy_items":[{"source_id":"c","kind":"2d_reference"}]
+    });
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let v2 = facts.snapshot.floor_progress_v2.as_ref().unwrap();
+    assert!(!v2.completion);
+    assert_eq!(v2.completion_blockers.len(), 3);
+    assert_eq!(v2.disposition_counts["future_disposition"], 2);
+    assert_eq!(v2.cross_floor_unverified, 13);
+    assert_eq!((v2.deferrals, v2.skips, v2.legacy_items), (1, 1, 1));
+    for (key, bad_value) in [
+        ("completion", json!("false")),
+        ("completion_blockers", json!([7])),
+        ("disposition_counts", json!({"built":-1})),
+        ("cross_floor_unverified", json!(-1)),
+        ("deferrals", json!({})),
+        ("skips", json!(["bad"])),
+        ("legacy_items", json!(null)),
+    ] {
+        let mut bad = value.clone();
+        bad["floor_progress"][key] = bad_value;
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{key}"
+        );
+    }
 }
 
 #[test]

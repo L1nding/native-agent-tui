@@ -226,6 +226,17 @@ pub struct FloorProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorProgressV2 {
+    pub completion: bool,
+    pub completion_blockers: Vec<String>,
+    pub disposition_counts: BTreeMap<String, usize>,
+    pub cross_floor_unverified: usize,
+    pub deferrals: usize,
+    pub skips: usize,
+    pub legacy_items: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceGroupsFact {
     pub scan_id: String,
     pub scene_sha256: String,
@@ -392,6 +403,7 @@ pub struct DomainSnapshot {
     pub drawing_audit: Option<DrawingAuditFact>,
     pub ledger: Option<SourceLedgerFact>,
     pub floor_progress: Option<FloorProgress>,
+    pub floor_progress_v2: Option<FloorProgressV2>,
     pub groups: Option<SourceGroupsFact>,
     pub linework: Option<LineworkCoverageFact>,
     pub existing_structure: Option<ExistingStructureCoverageFact>,
@@ -1421,7 +1433,9 @@ impl DomainFacts {
                     .insert("opening_inventory".into(), sequence.unwrap());
             }
             if source_kind {
-                self.snapshot.floor_progress = floor_progress;
+                self.snapshot.floor_progress_v2 =
+                    floor_progress.as_ref().and_then(|(_, v2)| v2.clone());
+                self.snapshot.floor_progress = floor_progress.map(|(progress, _)| progress);
                 self.snapshot.linework = linework;
                 self.snapshot.existing_structure = existing_structure;
                 self.snapshot.source_regions = source_regions;
@@ -1453,6 +1467,7 @@ impl DomainFacts {
         self.snapshot.proposal_categories.clear();
         self.snapshot.ledger = None;
         self.snapshot.floor_progress = None;
+        self.snapshot.floor_progress_v2 = None;
         self.snapshot.groups = None;
         self.snapshot.linework = None;
         self.snapshot.existing_structure = None;
@@ -1468,6 +1483,7 @@ impl DomainFacts {
 
     fn clear_source_view(&mut self) {
         self.snapshot.floor_progress = None;
+        self.snapshot.floor_progress_v2 = None;
         self.snapshot.groups = None;
         self.snapshot.ledger = None;
         self.snapshot.linework = None;
@@ -2135,14 +2151,17 @@ fn source_groups_fact(value: &Value) -> Option<SourceGroupsFact> {
     })
 }
 
-fn floor_progress_fact(value: &Value) -> Result<Option<FloorProgress>, ()> {
+fn floor_progress_fact(
+    value: &Value,
+) -> Result<Option<(FloorProgress, Option<FloorProgressV2>)>, ()> {
     let Some(progress) = value.get("floor_progress") else {
         return Ok(None);
     };
     let parse = || {
         let count = |row: &Value, key: &str| usize::try_from(row[key].as_u64()?).ok();
         let entries = progress["categories"].as_array()?;
-        if progress["contract"] != "floor-progress/1"
+        let version_two = progress["contract"] == "floor-progress/2";
+        if progress["contract"] != "floor-progress/1" && !version_two
             || progress["scan_id"] != value["scan_id"]
             || progress["scene_sha256"] != value["scene_sha256"]
             || entries.len() > 256
@@ -2176,15 +2195,61 @@ fn floor_progress_fact(value: &Value) -> Result<Option<FloorProgress>, ()> {
         {
             return None;
         }
-        Some(FloorProgress {
-            scan_id: text(value, "scan_id").ok()?,
-            scene_sha256: text(value, "scene_sha256").ok()?,
-            categories,
-            covered,
-            total,
-            coverage_unit: bounded_text(coverage, "unit", 240)?,
-            unreviewed_regions,
-        })
+        let v2 = if version_two {
+            let blockers = progress["completion_blockers"].as_array()?;
+            let counts = progress["disposition_counts"].as_object()?;
+            let deferrals = progress["deferrals"].as_array()?;
+            let skips = progress["skips"].as_array()?;
+            let legacy_items = progress["legacy_items"].as_array()?;
+            if blockers.len() > 256
+                || counts.len() > 256
+                || [deferrals, skips, legacy_items]
+                    .iter()
+                    .any(|items| items.len() > 10_000 || items.iter().any(|item| !item.is_object()))
+            {
+                return None;
+            }
+            let blockers = blockers
+                .iter()
+                .map(|item| {
+                    let blocker = item.as_str()?;
+                    (!blocker.is_empty() && blocker.chars().count() <= 80)
+                        .then(|| crate::state::display_text(blocker))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let counts = counts
+                .iter()
+                .map(|(key, value)| {
+                    (!key.is_empty() && key.chars().count() <= 80).then_some((
+                        crate::state::display_text(key),
+                        usize::try_from(value.as_u64()?).ok()?,
+                    ))
+                })
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            Some(FloorProgressV2 {
+                completion: progress["completion"].as_bool()?,
+                completion_blockers: blockers,
+                disposition_counts: counts,
+                cross_floor_unverified: count(progress, "cross_floor_unverified")?,
+                deferrals: deferrals.len(),
+                skips: skips.len(),
+                legacy_items: legacy_items.len(),
+            })
+        } else {
+            None
+        };
+        Some((
+            FloorProgress {
+                scan_id: text(value, "scan_id").ok()?,
+                scene_sha256: text(value, "scene_sha256").ok()?,
+                categories,
+                covered,
+                total,
+                coverage_unit: bounded_text(coverage, "unit", 240)?,
+                unreviewed_regions,
+            },
+            v2,
+        ))
     };
     parse().map(Some).ok_or(())
 }
