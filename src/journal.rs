@@ -118,6 +118,7 @@ pub struct JournalView {
     pub committed_seq: u64,
     pub committed_version: u64,
     pub error: Option<JournalError>,
+    pub budget_warning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +773,7 @@ pub struct JournalStatus {
     pub committed_version: u64,
     pub error: Option<JournalError>,
     pub closed: bool,
+    pub budget_warning: bool,
 }
 
 // Queue only encoded payloads and small commit metadata, not a second parsed snapshot.
@@ -828,6 +830,7 @@ impl Journal {
             committed_version: record.snapshot_version,
             error: None,
             closed: false,
+            budget_warning: false,
         });
         let session_id = record.session_id.clone();
         let worker = thread::Builder::new()
@@ -839,6 +842,7 @@ impl Journal {
                         status.error = Some(error);
                         break;
                     }
+                    status.budget_warning |= store.budget_warning;
                     status.committed_seq = record.commit.sequence;
                     status.committed_version = record.commit.version;
                     updates.send_replace(status.clone());
@@ -866,6 +870,7 @@ impl Journal {
             committed_seq: status.committed_seq,
             committed_version: status.committed_version,
             error: status.error.clone(),
+            budget_warning: status.budget_warning,
         }
     }
 
@@ -975,6 +980,7 @@ struct Store {
     log: File,
     _lease: File,
     cursor: SessionInfo,
+    budget_warning: bool,
 }
 
 impl Store {
@@ -1021,6 +1027,7 @@ impl Store {
                 needs_recovery: true,
                 execution_result: None,
             },
+            budget_warning: false,
         })
     }
 
@@ -1054,6 +1061,7 @@ impl Store {
             self.log.set_len(0)?;
             self.log.seek(SeekFrom::Start(0))?;
             self.cursor.committed_bytes = 0;
+            self.budget_warning = true;
             let mut baseline: Record =
                 serde_json::from_slice(bytes).map_err(|_| JournalError::Corrupt)?;
             baseline.kind = RecordKind::Snapshot;

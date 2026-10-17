@@ -473,6 +473,13 @@ pub(super) fn draw_evidence(
             tr("persistence", "持久化"),
             snapshot.persistence
         ));
+        if journal.budget_warning {
+            rows.push(if zh {
+                "日志已轮转：已保留最近快照并继续记录".into()
+            } else {
+                "Journal rotated: the latest snapshot was retained and recording continued".into()
+            });
+        }
     }
     let compactions = snapshot
         .observation

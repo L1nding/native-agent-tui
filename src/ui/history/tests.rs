@@ -355,6 +355,7 @@ fn session_list_marks_the_running_session_as_live_not_review_required() {
             committed_seq: 7,
             committed_version: 1,
             error: None,
+            budget_warning: false,
         }),
         ..CoreSnapshot::default()
     };
@@ -476,6 +477,7 @@ fn chinese_session_list_marks_live_and_review_required_sessions() {
             committed_seq: 7,
             committed_version: 1,
             error: None,
+            budget_warning: false,
         }),
         ..CoreSnapshot::default()
     };

@@ -2916,6 +2916,7 @@ mod tests {
             committed_seq: 1,
             committed_version: 1,
             error: None,
+            budget_warning: false,
         });
         snapshot.persistence = crate::state::PersistenceState::Submitted;
         for (width, height) in [(40, 12), (80, 24), (160, 45)] {

@@ -5091,6 +5091,7 @@ mod tests {
             committed_seq: 1,
             committed_version: 1,
             error: None,
+            budget_warning: false,
         };
         assert_eq!(
             persistence_state(Some(&view), None),
