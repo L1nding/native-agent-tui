@@ -519,6 +519,38 @@ async fn writer_failure_is_visible_and_normal_finish_waits_for_durable_close() {
 }
 
 #[tokio::test]
+async fn idle_observation_timing_does_not_grow_the_journal() {
+    let fixture = Fixture::new();
+    let initial = snapshot("idle");
+    let mut journal = Journal::open(
+        &fixture.settings(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        initial.clone(),
+    )
+    .unwrap();
+    let path = fixture.root.join(format!(
+        "{}_idle.jsonl",
+        workspace_id(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap()
+    ));
+    let before = fs::metadata(&path).unwrap().len();
+
+    for tick in 0..600 {
+        let mut heartbeat = initial.clone();
+        heartbeat.observation.monotonic_ms = tick;
+        for activity in &mut heartbeat.observation.activities {
+            activity.elapsed_ms = Some(tick);
+            activity.silence_ms = Some(tick);
+            activity.freshness = Freshness::Current;
+            activity.attention.level = AttentionLevel::Quiet;
+        }
+        journal.append(heartbeat).unwrap();
+    }
+    assert_eq!(journal.view().submitted_seq, 0);
+    assert_eq!(fs::metadata(&path).unwrap().len(), before);
+    journal.finish(completed("idle")).await.unwrap();
+}
+
+#[tokio::test]
 async fn queue_saturation_is_explicit_and_does_not_block_the_execution_owner() {
     let fixture = Fixture::new();
     let mut journal = Journal::open(
@@ -530,8 +562,10 @@ async fn queue_saturation_is_explicit_and_does_not_block_the_execution_owner() {
     let lock = catalog_lock(&fixture.root).unwrap();
     lock.lock().unwrap();
     let mut failure = None;
-    for _ in 0..QUEUE_RECORDS + 2 {
-        if let Err(error) = journal.append(snapshot("queue")) {
+    for sequence in 0..QUEUE_RECORDS + 2 {
+        let mut state = snapshot("queue");
+        state.observation.snapshot_version = sequence as u64 + 1;
+        if let Err(error) = journal.append(state) {
             failure = Some(error);
             break;
         }
@@ -539,7 +573,9 @@ async fn queue_saturation_is_explicit_and_does_not_block_the_execution_owner() {
     assert_eq!(failure, Some(JournalError::Overloaded));
     assert_eq!(journal.status.borrow().committed_seq, 0);
     drop(lock);
-    let view = journal.finish(completed("queue")).await.unwrap();
+    let mut terminal = completed("queue");
+    terminal.observation.snapshot_version = (QUEUE_RECORDS + 3) as u64;
+    let view = journal.finish(terminal).await.unwrap();
     assert!(view.committed_seq >= QUEUE_RECORDS as u64);
     assert!(replay(&fixture, "queue", 0).unwrap().info.session_closed);
 }

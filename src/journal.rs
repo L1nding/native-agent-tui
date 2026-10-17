@@ -809,6 +809,7 @@ struct Queued {
 pub struct Journal {
     session_id: String,
     next_seq: u64,
+    last_snapshot_fingerprint: Vec<u8>,
     sender: Option<mpsc::Sender<Queued>>,
     budget: Arc<Semaphore>,
     pub status: watch::Receiver<JournalStatus>,
@@ -833,6 +834,7 @@ impl Journal {
             budget_warning: false,
         });
         let session_id = record.session_id.clone();
+        let last_snapshot_fingerprint = snapshot_fingerprint(record.state()?)?;
         let worker = thread::Builder::new()
             .name("journal-writer".into())
             .spawn(move || {
@@ -855,6 +857,7 @@ impl Journal {
         Ok(Self {
             session_id,
             next_seq: 1,
+            last_snapshot_fingerprint,
             sender: Some(sender),
             budget: Arc::new(Semaphore::new(QUEUE_BYTES)),
             status,
@@ -906,6 +909,10 @@ impl Journal {
     }
 
     pub fn append(&mut self, snapshot: StoredSnapshot) -> Result<(), JournalError> {
+        let fingerprint = snapshot_fingerprint(&snapshot)?;
+        if fingerprint == self.last_snapshot_fingerprint {
+            return Ok(());
+        }
         let queued = self.queued(snapshot)?;
         self.sender
             .as_ref()
@@ -916,6 +923,7 @@ impl Journal {
                 _ => JournalError::Closed,
             })?;
         self.next_seq += 1;
+        self.last_snapshot_fingerprint = fingerprint;
         Ok(())
     }
 
@@ -971,6 +979,13 @@ impl Journal {
         self.sender.take();
         result
     }
+}
+
+/// Stable journal identity for a snapshot. Volatile timing and attention fields
+/// are excluded by their serde attributes, so repeated redraw/heartbeat updates
+/// do not create another durable record.
+fn snapshot_fingerprint(snapshot: &StoredSnapshot) -> Result<Vec<u8>, JournalError> {
+    serde_json::to_vec(snapshot).map_err(|_| JournalError::Corrupt)
 }
 
 struct Store {
