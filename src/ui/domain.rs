@@ -751,6 +751,144 @@ pub(super) fn draw(
 
 pub(super) struct ModelingView;
 
+pub(super) fn compact_approval_card_lines(
+    domain: &crate::domain::DomainSnapshot,
+    full: &[String],
+    width: usize,
+) -> Vec<String> {
+    let Some(proposal) = &domain.proposal else {
+        return Vec::new();
+    };
+    let binding = &proposal.binding;
+    let artifact = domain.artifacts.iter().rev().find(|artifact| {
+        let a = &artifact.binding;
+        a.candidate
+            && a.proposal_id == binding.proposal_id
+            && a.revision == binding.revision
+            && a.prepare_token == binding.prepare_token
+            && a.authority_sha256 == binding.base_sha256
+            && a.input_sha256 == binding.candidate_sha256
+    });
+    let mut lines = vec![
+        format!(
+            "版本 {} · 修订 {}",
+            super::activity::truncate_display_label(&binding.proposal_id.replace('\n', " "), 12),
+            binding.revision
+        ),
+        full[1].replace("本版选中对象：", "本批："),
+        artifact.map_or_else(
+            || "构建：尚无本版产物 · 验证未知".into(),
+            |artifact| {
+                format!(
+                    "构建 {} · 验证{} · {}",
+                    match artifact.state {
+                        crate::domain::ArtifactState::Built => "已构建",
+                        crate::domain::ArtifactState::Failed => "失败",
+                        crate::domain::ArtifactState::Building => "进行中",
+                        crate::domain::ArtifactState::Queued => "排队中",
+                        crate::domain::ArtifactState::Cancelled => "已取消",
+                        crate::domain::ArtifactState::Unknown => "未知",
+                    },
+                    match artifact.valid {
+                        Some(true) => "通过",
+                        Some(false) => "未通过",
+                        None => "未知",
+                    },
+                    match artifact.current {
+                        Some(true) => "当前",
+                        Some(false) => "过期",
+                        None => "版本未知",
+                    }
+                )
+            },
+        ),
+    ];
+    let images = &domain.review_images;
+    lines.push(format!(
+        "图{} 对照{}/总览{}/局部{} 首用{}",
+        images.len(),
+        images
+            .iter()
+            .filter(|i| i.view == crate::domain::ReviewImageView::Comparison)
+            .count(),
+        images
+            .iter()
+            .filter(|i| i.view == crate::domain::ReviewImageView::Overview)
+            .count(),
+        images
+            .iter()
+            .filter(|i| i.view == crate::domain::ReviewImageView::Detail)
+            .count(),
+        if !domain.first_use_satisfied() {
+            "未交付"
+        } else if domain
+            .first_use_review
+            .as_ref()
+            .is_some_and(|r| r.required_count > 0)
+        {
+            "已交付"
+        } else {
+            "无需"
+        }
+    ));
+    let assumptions: Vec<_> = full
+        .iter()
+        .filter(|line| {
+            line.starts_with("示意假设") && line.as_str() != "示意假设：本版未列出"
+                || line.starts_with("首用对照图参数")
+        })
+        .collect();
+    lines.push(format!("示意假设 {} 组 · F6 详情", assumptions.len()));
+    let mut blockers = Vec::new();
+    if domain.fact_sync_notice.is_some() {
+        blockers.push("事实同步异常");
+    }
+    if domain.authorizing {
+        blockers.push("正在记录批准");
+    }
+    if !proposal.ready {
+        blockers.push("提案未就绪");
+    }
+    if !domain.candidate_review_delivered(binding) {
+        blockers.push(if artifact.is_none() {
+            "尚无本版产物"
+        } else {
+            "有效候选复核图未交付"
+        });
+    }
+    if !domain.first_use_satisfied() {
+        blockers.push("首用必需图未交付");
+    }
+    let count = blockers.len() + proposal.diagnostics.len();
+    if count > 0 {
+        let first = blockers
+            .first()
+            .copied()
+            .or_else(|| proposal.diagnostics.first().map(String::as_str))
+            .unwrap();
+        let prefix = format!("阻塞/诊断 {count}：");
+        let suffix = " · F6 详情";
+        lines.push(format!(
+            "{prefix}{}{suffix}",
+            super::activity::truncate_display_label(
+                &first.replace(['\n', '\r'], " "),
+                width.saturating_sub(prefix.width() + suffix.width())
+            )
+        ));
+    }
+    lines.push(if blockers.is_empty() {
+        "Ctrl+Y 批准 · F6 详情".into()
+    } else {
+        "暂不能批准 · F6 详情".into()
+    });
+    lines
+        .into_iter()
+        .map(|line| {
+            super::activity::truncate_display_label(&line.replace(['\n', '\r'], " "), width)
+        })
+        .collect()
+}
+
 pub(super) fn approval_card_lines(
     domain: &crate::domain::DomainSnapshot,
     selected_image: usize,

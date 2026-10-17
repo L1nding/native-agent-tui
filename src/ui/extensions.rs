@@ -197,6 +197,7 @@ impl Registry<'_> {
         snapshot: &CoreSnapshot,
         panel: &ExtensionPanel,
     ) -> Rect {
+        panel.clear_displayed();
         let Some((view, projection)) = self.projection(snapshot, ExtensionId::Modeling) else {
             return area;
         };
@@ -212,11 +213,42 @@ impl Registry<'_> {
             })
             .collect();
         let needed = lines.len().saturating_add(2);
-        let complete = area.width >= 24 && needed <= usize::from(area.height.saturating_sub(1));
-        let height = if complete {
-            needed as u16
+        let full = area.width >= 40 && needed <= usize::from(area.height.saturating_sub(1));
+        let compact = !full && area.width >= 40 && area.height >= 8;
+        let mut lines = if compact {
+            super::domain::compact_approval_card_lines(
+                domain,
+                &content,
+                usize::from(area.width.saturating_sub(2)),
+            )
         } else {
-            area.height.saturating_sub(1).min(4)
+            lines
+        };
+        if compact {
+            let pending = if !snapshot.requests.is_empty() {
+                Some("等待待答请求处理 · F6 详情")
+            } else if !snapshot.phase.can_submit() {
+                Some("等待本轮结束 · F6 详情")
+            } else if snapshot
+                .scheduler
+                .tasks
+                .iter()
+                .any(|task| task.state.active())
+            {
+                Some("等待活动任务结束 · F6 详情")
+            } else {
+                None
+            };
+            if let Some(pending) = pending {
+                *lines.last_mut().expect("compact approval action") = pending.into();
+            }
+        }
+        // Compact cards omit the bottom border so seven information rows fit in eight rows.
+        let complete = full || compact && lines.len() < usize::from(area.height);
+        let height = if complete {
+            (lines.len() + if full { 2 } else { 1 }) as u16
+        } else {
+            area.height.min(4)
         };
         let card = Rect {
             y: area.y + area.height.saturating_sub(height),
@@ -226,13 +258,22 @@ impl Registry<'_> {
         let text = if complete {
             lines.join("\n")
         } else {
-            "建模审批信息未完整显示，暂不能在会话页批准。\nF6 查看详情；放大窗口后可直接 Ctrl+Y。"
-                .into()
+            super::layout::wrap_text(
+                "窗口过小，放大或 F6 查看详情",
+                usize::from(area.width.saturating_sub(2).max(1)),
+            )
+            .join("\n")
         };
         frame.render_widget(
             ratatui::widgets::Paragraph::new(text).block(
                 ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
+                    .borders(if full || !complete {
+                        ratatui::widgets::Borders::ALL
+                    } else {
+                        ratatui::widgets::Borders::TOP
+                            | ratatui::widgets::Borders::LEFT
+                            | ratatui::widgets::Borders::RIGHT
+                    })
                     .title("本版建模审批"),
             ),
             card,
@@ -246,7 +287,9 @@ impl Registry<'_> {
                 .any(|task| task.state.active())
             && snapshot.requests.is_empty()
         {
-            *panel.displayed.borrow_mut() = view.confirmation(projection);
+            *panel.displayed.borrow_mut() = view
+                .confirmation(projection)
+                .filter(|confirmation| confirmation.id() == ExtensionId::Modeling);
         }
         Rect {
             height: area.height.saturating_sub(height),
@@ -865,61 +908,212 @@ mod tests {
 
     #[test]
     fn conversation_card_rejects_a_new_version_without_redraw_and_changed_review_set() {
-        let mut snapshot = snapshot();
-        let mut local = LocalState {
-            viewport: Rect::new(0, 0, 120, 44),
-            ..Default::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(120, 44)).unwrap();
-        terminal
-            .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
-            .unwrap();
-        let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
-        domain.proposal.as_mut().unwrap().binding.revision += 1;
-        domain.artifacts[0].binding.revision += 1;
-        domain.review_images[0].binding.proposal.revision += 1;
-        assert!(super::super::domain::ModelingView
-            .confirmation(&snapshot.extensions[0])
-            .is_some());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        super::super::handle_key(
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
-            &snapshot,
-            &mut local,
-            &tx,
-        );
-        assert!(rx.try_recv().is_err());
-        let ExtensionSnapshot::Modeling(domain) = &snapshot.extensions[0];
-        local.extension.displayed(ExtensionConfirmation::Modeling(
-            crate::extensions::ModelingConfirmation {
-                proposal: domain.proposal.as_ref().unwrap().binding.clone(),
-                review_set_sha256: Some("old-set".into()),
-            },
-        ));
-        super::super::handle_key(
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
-            &snapshot,
-            &mut local,
-            &tx,
-        );
-        assert!(rx.try_recv().is_err());
+        for (width, height) in [(120, 44), (40, 16)] {
+            let mut snapshot = snapshot();
+            let mut local = LocalState {
+                viewport: Rect::new(0, 0, width, height),
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+                .unwrap();
+            let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+            domain.proposal.as_mut().unwrap().binding.revision += 1;
+            domain.artifacts[0].binding.revision += 1;
+            domain.review_images[0].binding.proposal.revision += 1;
+            assert!(super::super::domain::ModelingView
+                .confirmation(&snapshot.extensions[0])
+                .is_some());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            super::super::handle_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+            assert!(rx.try_recv().is_err());
+            let ExtensionSnapshot::Modeling(domain) = &snapshot.extensions[0];
+            local.extension.displayed(ExtensionConfirmation::Modeling(
+                crate::extensions::ModelingConfirmation {
+                    proposal: domain.proposal.as_ref().unwrap().binding.clone(),
+                    review_set_sha256: Some("old-set".into()),
+                },
+            ));
+            super::super::handle_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]
-    fn conversation_card_never_confirms_clipped_assumptions_small_windows_or_running_tasks() {
-        for condition in ["small", "assumptions", "running", "task", "review"] {
+    fn responsive_conversation_cards_confirm_the_same_version_at_all_supported_sizes() {
+        let mut snapshot = snapshot();
+        let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+        domain
+            .proposal_categories
+            .insert("examination_bed".into(), 1);
+        domain.proposal.as_mut().unwrap().assumptions =
+            (0..100).map(|n| format!("height {n} assumed")).collect();
+        let expected = super::super::domain::ModelingView
+            .confirmation(&snapshot.extensions[0])
+            .unwrap();
+        let mut panel = ExtensionPanel::default();
+        for width in [120, 80, 65, 48, 40] {
+            for height in [160, 12, 8] {
+                let area = Rect::new(0, 0, width, height);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        REGISTRY.draw_conversation_card(frame, area, &snapshot, &panel);
+                    })
+                    .unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                for label in ["修订7", "检查床", "Ctrl+Y", "F6"] {
+                    assert!(text.contains(label), "{width}x{height}: {label}: {text}");
+                }
+                assert_eq!(panel.displayed.borrow().as_ref(), Some(&expected));
+                let action = REGISTRY.handle_key(
+                    KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                    &snapshot,
+                    &mut panel,
+                    area,
+                    "",
+                    None,
+                );
+                assert!(matches!(action, Some(ExtensionAction::Confirm(ref c)) if c == &expected));
+            }
+            for height in [16, 24] {
+                let local = LocalState::default();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+                    .unwrap();
+                assert_eq!(local.extension.displayed.borrow().as_ref(), Some(&expected));
+            }
+        }
+        for (width, height) in [(30, 12), (40, 7)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+                })
+                .unwrap();
+            assert!(panel.displayed.borrow().is_none());
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(text.contains("窗口过小"));
+            assert!(text.contains("F6"));
+        }
+    }
+
+    #[test]
+    fn compact_conversation_card_keeps_long_fields_on_one_row_and_explains_blockers() {
+        use unicode_width::UnicodeWidthStr;
+        for condition in [
+            "diagnostics",
+            "review",
+            "artifact",
+            "ready",
+            "sync",
+            "authorizing",
+        ] {
+            let mut snapshot = snapshot();
+            let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+            domain
+                .proposal_categories
+                .insert(format!("长类别👨‍👩‍👧‍👦{}\n尾部", "很长".repeat(30)), 1);
+            domain.proposal.as_mut().unwrap().diagnostics = (0..20)
+                .map(|n| format!("诊断{n}\n{}", "很长".repeat(30)))
+                .collect();
+            let reason = match condition {
+                "review" => {
+                    domain.review_images.clear();
+                    "有效候选复核图未交付"
+                }
+                "artifact" => {
+                    domain.artifacts.clear();
+                    "尚无本版产物"
+                }
+                "ready" => {
+                    domain.proposal.as_mut().unwrap().ready = false;
+                    "提案未就绪"
+                }
+                "sync" => {
+                    domain.fact_sync_notice = Some("sync failed".into());
+                    "事实同步异常"
+                }
+                "authorizing" => {
+                    domain.authorizing = true;
+                    "正在记录批准"
+                }
+                _ => "诊断0",
+            };
+            let full = super::super::domain::approval_card_lines(domain, 0);
+            let lines = super::super::domain::compact_approval_card_lines(domain, &full, 38);
+            assert_eq!(lines.len(), 7);
+            assert!(lines
+                .iter()
+                .all(|line| !line.contains('\n') && line.width() <= 38));
+            assert!(lines[1].ends_with('…'));
+            assert!(lines[5].contains("F6 详情"));
+            assert!(lines[5].contains(if condition == "review" {
+                "有效候选"
+            } else {
+                reason
+            }));
+            let panel = ExtensionPanel::default();
+            let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+                })
+                .unwrap();
+            assert_eq!(
+                panel.displayed.borrow().is_some(),
+                condition == "diagnostics"
+            );
+            let buffer = terminal.backend().buffer();
+            for (row, line) in lines.iter().enumerate() {
+                let mut shown = String::new();
+                let mut x = 1;
+                while x < 39 {
+                    let symbol = buffer[(x, row as u16 + 1)].symbol();
+                    shown.push_str(symbol);
+                    x += (symbol.width() as u16).max(1);
+                }
+                assert_eq!(shown.trim_end(), line);
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_card_never_confirms_small_windows_or_running_tasks() {
+        for condition in ["small", "running", "task", "review"] {
             let mut snapshot = snapshot();
             let mut local = LocalState {
                 viewport: Rect::new(0, 0, 120, 44),
                 ..Default::default()
             };
             match condition {
-                "small" => local.viewport = Rect::new(0, 0, 40, 16),
-                "assumptions" => {
-                    let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
-                    domain.proposal.as_mut().unwrap().assumptions =
-                        (0..100).map(|n| format!("height {n} assumed")).collect();
-                }
+                "small" => local.viewport = Rect::new(0, 0, 30, 16),
                 "running" => snapshot.phase = SessionPhase::Running,
                 "review" => {
                     let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
