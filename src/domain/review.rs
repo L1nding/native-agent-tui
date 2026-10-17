@@ -152,14 +152,11 @@ pub(crate) fn category_label(category: &str) -> &str {
         "door" => "门",
         "window" => "窗",
         "opening" => "洞口",
+        "cad_reference" => "图纸参考线",
+        "wall_detail" => "墙面细部",
+        "unclassified" | "unidentified" | "未分类" => "其他结构",
         _ => category,
     }
-}
-
-pub(crate) fn evidence_labels(text: &str) -> String {
-    text.replace("\"basis\":\"assumed\"", "\"依据\":\"示意\"")
-        .replace("\"basis\":\"source\"", "\"依据\":\"图纸\"")
-        .replace("\"basis\":\"user_confirmed\"", "\"依据\":\"用户确认\"")
 }
 
 pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {

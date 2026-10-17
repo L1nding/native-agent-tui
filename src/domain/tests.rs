@@ -4147,23 +4147,15 @@ fn independent_first_use_receipt_and_late_blocked_facts_keep_exact_proposal_owne
 }
 
 #[test]
-fn review_labels_show_chinese_basis_without_changing_evidence_identity() {
+fn review_labels_show_chinese_categories_and_drawing_evidence() {
     assert_eq!(review::category_label("armchair"), "扶手椅");
+    assert_eq!(review::category_label("cad_reference"), "图纸参考线");
+    assert_eq!(review::category_label("wall_detail"), "墙面细部");
+    assert_eq!(review::category_label("未分类"), "其他结构");
     assert_eq!(
         review::category_label("open_custom_category"),
         "open_custom_category"
     );
-    for (basis, chinese) in [
-        ("assumed", "示意"),
-        ("source", "图纸"),
-        ("user_confirmed", "用户确认"),
-    ] {
-        let original = json!({"basis":basis,"source_id":"source.原标注"});
-        let display = review::evidence_labels(&original.to_string());
-        assert!(display.contains(chinese));
-        assert!(display.contains("source.原标注"));
-        assert_eq!(original["basis"], basis);
-    }
     let (proposal, evidence) = first_use_fixture();
     let requirement = review::requirements(&proposal["proposal"]).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;

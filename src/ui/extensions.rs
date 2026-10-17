@@ -202,9 +202,26 @@ impl Registry<'_> {
             return area;
         };
         let domain = projection.modeling().expect("modeling projection");
-        let content = super::domain::approval_card_lines(domain, panel.selected_image);
+        let mut content = super::domain::approval_card_lines(domain, panel.selected_image);
         if content.is_empty() {
             return area;
+        }
+        let pending = if !snapshot.requests.is_empty() {
+            Some("还不能确认：请先回答当前问题")
+        } else if !snapshot.phase.can_submit() {
+            Some("还不能确认：本轮还在处理，请稍候")
+        } else if snapshot
+            .scheduler
+            .tasks
+            .iter()
+            .any(|task| task.state.active())
+        {
+            Some("还不能确认：任务还在处理，请稍候")
+        } else {
+            None
+        };
+        if let Some(pending) = pending {
+            *content.last_mut().expect("approval action") = pending.into();
         }
         let lines: Vec<_> = content
             .iter()
@@ -213,9 +230,11 @@ impl Registry<'_> {
             })
             .collect();
         let needed = lines.len().saturating_add(2);
-        let full = area.width >= 40 && needed <= usize::from(area.height.saturating_sub(1));
+        let full = area.width >= 40
+            && lines.len() == content.len()
+            && needed <= usize::from(area.height.saturating_sub(1));
         let compact = !full && area.width >= 40 && area.height >= 8;
-        let mut lines = if compact {
+        let lines = if compact {
             super::domain::compact_approval_card_lines(
                 domain,
                 &content,
@@ -224,25 +243,6 @@ impl Registry<'_> {
         } else {
             lines
         };
-        if compact {
-            let pending = if !snapshot.requests.is_empty() {
-                Some("等待待答请求处理 · F6 详情")
-            } else if !snapshot.phase.can_submit() {
-                Some("等待本轮结束 · F6 详情")
-            } else if snapshot
-                .scheduler
-                .tasks
-                .iter()
-                .any(|task| task.state.active())
-            {
-                Some("等待活动任务结束 · F6 详情")
-            } else {
-                None
-            };
-            if let Some(pending) = pending {
-                *lines.last_mut().expect("compact approval action") = pending.into();
-            }
-        }
         // Compact cards omit the bottom border so seven information rows fit in eight rows.
         let complete = full || compact && lines.len() < usize::from(area.height);
         let height = if complete {
@@ -274,7 +274,7 @@ impl Registry<'_> {
                             | ratatui::widgets::Borders::LEFT
                             | ratatui::widgets::Borders::RIGHT
                     })
-                    .title("本版建模审批"),
+                    .title("建模确认 · F6 详情"),
             ),
             card,
         );
@@ -755,38 +755,31 @@ mod tests {
             "complete 132x43 approval was not registered"
         );
         for expected in [
-            "修订 7",
-            "1274",
-            "295",
-            "2559",
-            "示意参数",
-            "墙体：依据CAD重建",
-            "门窗洞口：依据CAD重建",
-            "楼板：依据CAD重建",
-            "其他结构实体：依据CAD重建",
-            "约束：依据CAD重建",
-            "GLB",
-            "未纳入项",
-            "Ctrl+Y",
+            "墙体 1274",
+            "洞口 295",
+            "楼板 1",
+            "图纸参考线 2559",
+            "尺寸依据：按图纸重建",
+            "已在 Blender 建好并通过检查",
+            "Ctrl+Y 确认",
         ] {
             let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
-            assert!(compact.contains(&expected), "{expected} missing");
+            assert!(compact.contains(&expected), "{expected} missing: {text}");
         }
-        assert!(!text.contains("信息未完整"));
-        assert!(
-            !text.contains("category-9"),
-            "progress table took priority over the approval"
-        );
-        assert_eq!(
-            super::super::domain::approval_card_lines(
-                snapshot.extensions[0].modeling().unwrap(),
-                0
-            )
-            .iter()
-            .filter(|line| line.starts_with("示意假设"))
-            .count(),
-            5
-        );
+        for forbidden in [
+            "proposal",
+            "PRIVATE_TOKEN",
+            "cad_reference",
+            "wall_detail",
+            "GLB：未知",
+            "SHA",
+            "投影",
+            "修订",
+            "未纳入项",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+        assert!(!text.contains("category-9"));
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         super::super::handle_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -801,28 +794,62 @@ mod tests {
     }
 
     #[test]
-    fn approval_card_preserves_different_assumption_parameters_and_unknown_text() {
+    fn approval_card_summarizes_dimensions_and_preserves_raw_evidence_in_details() {
         let mut snapshot = snapshot();
         let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
         let original = vec![
             serde_json::json!({"code":"assumed_value","message":"height","entity_id":"a","height":0.95}).to_string(),
             serde_json::json!({"code":"assumed_value","message":"height","entity_id":"b","height":1.05}).to_string(),
-            serde_json::json!({"code":"assumed_value","message":"unknown height 0.95","entity_id":"c"}).to_string(),
-            serde_json::json!({"code":"assumed_value","message":"unknown height 1.05","entity_id":"d"}).to_string(),
             "unstructured assumption with complete dimensions 0.5 x 0.7 x 1.05".into(),
         ];
         domain.proposal.as_mut().unwrap().assumptions = original.clone();
         let lines = super::super::domain::approval_card_lines(domain, 0);
-        for text in [&original[0], &original[1], &original[4]] {
+        assert!(lines[2].contains("高度 0.95 米（暂用值）"));
+        assert!(lines[2].contains("高度 1.05 米（暂用值）"));
+        assert_eq!(domain.proposal.as_ref().unwrap().assumptions, original);
+        let panel = ExtensionPanel::default();
+        let context = ViewContext::new(&snapshot, &panel, "", None);
+        let mut terminal = Terminal::new(TestBackend::new(300, 160)).unwrap();
+        terminal
+            .draw(|frame| {
+                super::super::domain::draw(frame, frame.area(), &snapshot.extensions[0], &context);
+            })
+            .unwrap();
+        let details = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(300)
+            .map(|row| {
+                let mut line = String::new();
+                let mut x = 0;
+                while x < row.len() {
+                    let symbol = row[x].symbol();
+                    line.push_str(symbol);
+                    x += unicode_width::UnicodeWidthStr::width(symbol).max(1);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in &original {
+            assert!(details.contains(text), "assumption omitted: {text}");
+        }
+        for technical in [
+            "proposal",
+            "PRIVATE_TOKEN",
+            "base_sha256",
+            "candidate_sha256",
+            "review_set_sha256",
+            "image_sha256",
+            "未纳入项",
+            "GLB：未知",
+        ] {
             assert!(
-                lines.iter().any(|line| line.contains(text)),
-                "assumption omitted: {text}"
+                details.contains(technical),
+                "{technical} missing from details"
             );
         }
-        for message in ["unknown height 0.95", "unknown height 1.05"] {
-            assert!(lines.iter().any(|line| line.contains(message)));
-        }
-        assert_eq!(domain.proposal.as_ref().unwrap().assumptions, original);
     }
 
     #[test]
@@ -853,13 +880,11 @@ mod tests {
             .filter(|character| !character.is_whitespace())
             .collect();
         for expected in [
-            "扶手椅 100",
-            "示意假设",
-            "已构建",
-            "验证：通过",
-            "版本：当前",
-            "GLB：未知",
-            "对照 0 · 总览 1 · 局部 0",
+            "待你确认：扶手椅 100 把",
+            "尺寸依据：高度 0.83 米（暂用值）",
+            "已在 Blender 建好并通过检查",
+            "图片 1 张",
+            "Ctrl+Y 确认",
         ] {
             let compact_expected: String = expected
                 .chars()
@@ -980,7 +1005,7 @@ mod tests {
                     .map(|cell| cell.symbol())
                     .collect::<String>();
                 let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-                for label in ["修订7", "检查床", "Ctrl+Y", "F6"] {
+                for label in ["待你确认", "检查床", "Ctrl+Y确认", "F6"] {
                     assert!(text.contains(label), "{width}x{height}: {label}: {text}");
                 }
                 assert_eq!(panel.displayed.borrow().as_ref(), Some(&expected));
@@ -1046,25 +1071,25 @@ mod tests {
             let reason = match condition {
                 "review" => {
                     domain.review_images.clear();
-                    "有效候选复核图未交付"
+                    "复核图片尚未准备好"
                 }
                 "artifact" => {
                     domain.artifacts.clear();
-                    "尚无本版产物"
+                    "模型尚未建好"
                 }
                 "ready" => {
                     domain.proposal.as_mut().unwrap().ready = false;
-                    "提案未就绪"
+                    "方案尚未准备好"
                 }
                 "sync" => {
                     domain.fact_sync_notice = Some("sync failed".into());
-                    "事实同步异常"
+                    "模型信息暂未同步"
                 }
                 "authorizing" => {
                     domain.authorizing = true;
-                    "正在记录批准"
+                    "正在保存你的确认"
                 }
-                _ => "诊断0",
+                _ => "Ctrl+Y 确认",
             };
             let full = super::super::domain::approval_card_lines(domain, 0);
             let lines = super::super::domain::compact_approval_card_lines(domain, &full, 38);
@@ -1072,13 +1097,9 @@ mod tests {
             assert!(lines
                 .iter()
                 .all(|line| !line.contains('\n') && line.width() <= 38));
-            assert!(lines[1].ends_with('…'));
-            assert!(lines[5].contains("F6 详情"));
-            assert!(lines[5].contains(if condition == "review" {
-                "有效候选"
-            } else {
-                reason
-            }));
+            assert!(lines[1].contains("其他"));
+            assert!(lines[6].contains(reason), "{condition}: {:?}", lines);
+            assert!(!lines.iter().any(|line| line.contains("诊断")));
             let panel = ExtensionPanel::default();
             let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
             terminal
@@ -1105,8 +1126,127 @@ mod tests {
     }
 
     #[test]
+    fn conversation_cards_use_plain_chinese_for_structure_furniture_and_blocked_batches() {
+        for batch in ["structure", "furniture", "blocked"] {
+            for (width, height) in [(160, 40), (40, 8)] {
+                let mut snapshot = snapshot();
+                let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
+                let label = if batch == "furniture" {
+                    domain
+                        .proposal_categories
+                        .insert("examination_bed".into(), 1);
+                    domain.proposal.as_mut().unwrap().assumptions = vec![
+                        r#"{"code":"assumed_value","height":0.65,"entity_id":"bed-internal-id"}"#
+                            .into(),
+                    ];
+                    "检查床"
+                } else {
+                    domain.proposal_categories.extend([
+                        ("wall".into(), 3),
+                        ("column".into(), 2),
+                        ("slab".into(), 1),
+                        ("cad_reference".into(), 5),
+                        ("wall_detail".into(), 4),
+                        ("未分类".into(), 6),
+                        ("unknown_english_category".into(), 7),
+                    ]);
+                    domain.proposal.as_mut().unwrap().assumptions = vec![
+                        r#"{"code":"assumed_value","entity_id":"wall-internal-id","message":"walls: CAD-derived structure; parameter basis retained as assumptions"}"#.into(),
+                    ];
+                    "图纸参考线"
+                };
+                domain.proposal.as_mut().unwrap().summary =
+                    format!("proposal PRIVATE_TOKEN {} cad_reference", "a".repeat(64));
+                if batch == "blocked" {
+                    domain.artifacts.clear();
+                }
+                let panel = ExtensionPanel::default();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+                    })
+                    .unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(usize::from(width))
+                    .map(|row| {
+                        let mut line = String::new();
+                        let mut x = 0;
+                        while x < row.len() {
+                            let symbol = row[x].symbol();
+                            line.push_str(symbol);
+                            x += unicode_width::UnicodeWidthStr::width(symbol).max(1);
+                        }
+                        line
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for forbidden in [
+                    "proposal",
+                    "PRIVATE_TOKEN",
+                    "cad_reference",
+                    "wall_detail",
+                    "unknown_english_category",
+                    "GLB：未知",
+                    "SHA",
+                    "投影",
+                    "修订",
+                    "preview",
+                    "未纳入项",
+                    &"a".repeat(64),
+                ] {
+                    assert!(
+                        !text.contains(forbidden),
+                        "{batch} {width}x{height}: {forbidden}: {text}"
+                    );
+                }
+                for expected in ["待你确认", "内容", "尺寸依据", "图片", label] {
+                    assert!(
+                        text.contains(expected),
+                        "{batch} {width}x{height}: {expected}: {text}"
+                    );
+                }
+                if batch == "blocked" {
+                    assert!(text.contains("还不能确认：模型尚未建好"));
+                    assert!(!text.contains("Ctrl+Y 确认"));
+                    assert!(panel.displayed.borrow().is_none());
+                } else {
+                    assert!(text.contains("Ctrl+Y 确认"), "{text}");
+                    assert!(panel.displayed.borrow().is_some());
+                }
+                if batch == "furniture" {
+                    assert!(text.contains("高度 0.65 米"));
+                }
+                if batch == "structure" && width == 160 {
+                    for expected in [
+                        "墙体 3 处",
+                        "柱 2 处",
+                        "楼板 1 处",
+                        "图纸参考线 5 处",
+                        "墙面细部 4 处",
+                        "其他结构 6 处",
+                        "其他 7 处",
+                    ] {
+                        assert!(text.contains(expected), "{expected}: {text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn conversation_card_never_confirms_small_windows_or_running_tasks() {
-        for condition in ["small", "running", "task", "review"] {
+        for condition in [
+            "small",
+            "running",
+            "narrow-running",
+            "compact-running",
+            "task",
+            "review",
+        ] {
             let mut snapshot = snapshot();
             let mut local = LocalState {
                 viewport: Rect::new(0, 0, 120, 44),
@@ -1115,6 +1255,19 @@ mod tests {
             match condition {
                 "small" => local.viewport = Rect::new(0, 0, 30, 16),
                 "running" => snapshot.phase = SessionPhase::Running,
+                "narrow-running" | "compact-running" => {
+                    snapshot.phase = SessionPhase::Running;
+                    local.viewport = Rect::new(
+                        0,
+                        0,
+                        40,
+                        if condition == "narrow-running" {
+                            160
+                        } else {
+                            16
+                        },
+                    );
+                }
                 "review" => {
                     let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
                     domain.artifacts[0].reviewed = false;
@@ -1138,6 +1291,18 @@ mod tests {
                 .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
                 .unwrap();
             assert!(local.extension.displayed.borrow().is_none(), "{condition}");
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(!text.contains("Ctrl+Y确认"), "{condition}: {text}");
+            if condition != "small" {
+                assert!(text.contains("还不能确认"), "{condition}: {text}");
+            }
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
             super::super::handle_key(
                 KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),

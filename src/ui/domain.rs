@@ -618,6 +618,50 @@ fn business_lines(
         ));
     }
     if let Some(p) = &domain.proposal {
+        lines.push(Line::from(format!(
+            "本版选中对象：{:?}",
+            domain.proposal_categories
+        )));
+        lines.push(Line::from(format!("示意假设 {} 项", p.assumptions.len())));
+        lines.push(Line::from("未纳入项：本提案仅包含上述选中对象；其他来源范围/剩余对象尚未完整核对，不能据此宣称整层完成。"));
+        lines.push(Line::from("GLB：未知（当前投影未提供独立GLB校验事实）"));
+        lines.push(Line::from(format!(
+            "图片：对照 {} · 总览 {} · 局部 {}",
+            domain
+                .review_images
+                .iter()
+                .filter(|i| i.view == crate::domain::ReviewImageView::Comparison)
+                .count(),
+            domain
+                .review_images
+                .iter()
+                .filter(|i| i.view == crate::domain::ReviewImageView::Overview)
+                .count(),
+            domain
+                .review_images
+                .iter()
+                .filter(|i| i.view == crate::domain::ReviewImageView::Detail)
+                .count()
+        )));
+        lines.push(Line::from(format!(
+            "确认绑定 · {:?} · review_set_sha256={:?}",
+            p.binding,
+            domain.review_set_sha256()
+        )));
+        for image in &domain.review_images {
+            lines.push(Line::from(format!(
+                "图片绑定 · {:?} · review_key={} · review_set_sha256={:?}",
+                image.binding, image.binding.review_key, image.binding.review_set_sha256
+            )));
+        }
+        if let Some(review) = &domain.first_use_review {
+            lines.extend(
+                review
+                    .dimensions
+                    .iter()
+                    .map(|s| Line::from(display_text(s))),
+            );
+        }
         lines.push(Line::from("构件位置与依据"));
         lines.extend(p.objects.iter().map(|s| Line::from(display_text(s))));
         lines.push(Line::from("假设：批准后仍保留假设标签"));
@@ -752,137 +796,11 @@ pub(super) fn draw(
 pub(super) struct ModelingView;
 
 pub(super) fn compact_approval_card_lines(
-    domain: &crate::domain::DomainSnapshot,
+    _domain: &crate::domain::DomainSnapshot,
     full: &[String],
     width: usize,
 ) -> Vec<String> {
-    let Some(proposal) = &domain.proposal else {
-        return Vec::new();
-    };
-    let binding = &proposal.binding;
-    let artifact = domain.artifacts.iter().rev().find(|artifact| {
-        let a = &artifact.binding;
-        a.candidate
-            && a.proposal_id == binding.proposal_id
-            && a.revision == binding.revision
-            && a.prepare_token == binding.prepare_token
-            && a.authority_sha256 == binding.base_sha256
-            && a.input_sha256 == binding.candidate_sha256
-    });
-    let mut lines = vec![
-        format!(
-            "版本 {} · 修订 {}",
-            super::activity::truncate_display_label(&binding.proposal_id.replace('\n', " "), 12),
-            binding.revision
-        ),
-        full[1].replace("本版选中对象：", "本批："),
-        artifact.map_or_else(
-            || "构建：尚无本版产物 · 验证未知".into(),
-            |artifact| {
-                format!(
-                    "构建 {} · 验证{} · {}",
-                    match artifact.state {
-                        crate::domain::ArtifactState::Built => "已构建",
-                        crate::domain::ArtifactState::Failed => "失败",
-                        crate::domain::ArtifactState::Building => "进行中",
-                        crate::domain::ArtifactState::Queued => "排队中",
-                        crate::domain::ArtifactState::Cancelled => "已取消",
-                        crate::domain::ArtifactState::Unknown => "未知",
-                    },
-                    match artifact.valid {
-                        Some(true) => "通过",
-                        Some(false) => "未通过",
-                        None => "未知",
-                    },
-                    match artifact.current {
-                        Some(true) => "当前",
-                        Some(false) => "过期",
-                        None => "版本未知",
-                    }
-                )
-            },
-        ),
-    ];
-    let images = &domain.review_images;
-    lines.push(format!(
-        "图{} 对照{}/总览{}/局部{} 首用{}",
-        images.len(),
-        images
-            .iter()
-            .filter(|i| i.view == crate::domain::ReviewImageView::Comparison)
-            .count(),
-        images
-            .iter()
-            .filter(|i| i.view == crate::domain::ReviewImageView::Overview)
-            .count(),
-        images
-            .iter()
-            .filter(|i| i.view == crate::domain::ReviewImageView::Detail)
-            .count(),
-        if !domain.first_use_satisfied() {
-            "未交付"
-        } else if domain
-            .first_use_review
-            .as_ref()
-            .is_some_and(|r| r.required_count > 0)
-        {
-            "已交付"
-        } else {
-            "无需"
-        }
-    ));
-    let assumptions: Vec<_> = full
-        .iter()
-        .filter(|line| {
-            line.starts_with("示意假设") && line.as_str() != "示意假设：本版未列出"
-                || line.starts_with("首用对照图参数")
-        })
-        .collect();
-    lines.push(format!("示意假设 {} 组 · F6 详情", assumptions.len()));
-    let mut blockers = Vec::new();
-    if domain.fact_sync_notice.is_some() {
-        blockers.push("事实同步异常");
-    }
-    if domain.authorizing {
-        blockers.push("正在记录批准");
-    }
-    if !proposal.ready {
-        blockers.push("提案未就绪");
-    }
-    if !domain.candidate_review_delivered(binding) {
-        blockers.push(if artifact.is_none() {
-            "尚无本版产物"
-        } else {
-            "有效候选复核图未交付"
-        });
-    }
-    if !domain.first_use_satisfied() {
-        blockers.push("首用必需图未交付");
-    }
-    let count = blockers.len() + proposal.diagnostics.len();
-    if count > 0 {
-        let first = blockers
-            .first()
-            .copied()
-            .or_else(|| proposal.diagnostics.first().map(String::as_str))
-            .unwrap();
-        let prefix = format!("阻塞/诊断 {count}：");
-        let suffix = " · F6 详情";
-        lines.push(format!(
-            "{prefix}{}{suffix}",
-            super::activity::truncate_display_label(
-                &first.replace(['\n', '\r'], " "),
-                width.saturating_sub(prefix.width() + suffix.width())
-            )
-        ));
-    }
-    lines.push(if blockers.is_empty() {
-        "Ctrl+Y 批准 · F6 详情".into()
-    } else {
-        "暂不能批准 · F6 详情".into()
-    });
-    lines
-        .into_iter()
+    full.iter()
         .map(|line| {
             super::activity::truncate_display_label(&line.replace(['\n', '\r'], " "), width)
         })
@@ -891,182 +809,206 @@ pub(super) fn compact_approval_card_lines(
 
 pub(super) fn approval_card_lines(
     domain: &crate::domain::DomainSnapshot,
-    selected_image: usize,
+    _selected_image: usize,
 ) -> Vec<String> {
     let Some(proposal) = &domain.proposal else {
         return Vec::new();
     };
-    let mut lines = vec![format!(
-        "建模审批 · {} · 修订 {} · {}",
-        display_text(&proposal.binding.proposal_id),
-        proposal.binding.revision,
-        display_text(&proposal.summary)
-    )];
-    lines.push(if domain.proposal_categories.is_empty() {
-        "本版类别数量未知；详见选中对象清单".into()
-    } else {
-        format!(
-            "本版选中对象：{}",
-            domain
-                .proposal_categories
-                .iter()
-                .map(|(category, count)| format!(
-                    "{} {count}",
-                    display_text(crate::domain::review::category_label(category))
-                ))
-                .collect::<Vec<_>>()
-                .join("、")
-        )
-    });
-    let mut assumptions = std::collections::BTreeSet::new();
-    let mut grouped = std::collections::BTreeMap::<(String, String), usize>::new();
-    for text in &proposal.assumptions {
-        let structured = serde_json::from_str::<serde_json::Value>(text).ok();
-        let item = structured.as_ref().and_then(|value| {
-            let object = value.as_object()?;
-            if object.len() != 3 || value["entity_id"].as_str()?.is_empty() {
-                return None;
-            }
-            Some((value["code"].as_str()?, value["message"].as_str()?))
-        });
-        if let Some((code, message)) = item {
-            *grouped.entry((code.into(), message.into())).or_default() += 1;
+    let mut categories = std::collections::BTreeMap::<&str, usize>::new();
+    for (category, count) in &domain.proposal_categories {
+        let label = crate::domain::review::category_label(category);
+        let label = if label
+            .chars()
+            .any(|c| c.is_ascii_alphabetic() || c.is_control())
+        {
+            "其他"
         } else {
-            assumptions.insert(format!(
-                "示意假设：{}",
-                display_text(&crate::domain::review::evidence_labels(text))
-            ));
-        }
+            label
+        };
+        *categories.entry(label).or_default() += count;
     }
-    // Only entity identity differs within a group; complete per-entity evidence stays in F6.
-    for ((code, message), count) in grouped {
-        let code = if code == "assumed_value" {
-            "示意参数"
-        } else {
-            &code
-        };
-        let message = match message.as_str() {
-            "walls: CAD-derived structure; parameter basis retained as assumptions" => {
-                "墙体：依据CAD重建；参数依据仍保留为假设"
+    let contents = categories
+        .iter()
+        .map(|(label, count)| {
+            let unit = match *label {
+                "检查床" | "床" | "移动病床" | "桌子" => "张",
+                "扶手椅" | "工作椅" | "椅子" => "把",
+                _ => "处",
+            };
+            format!("{label} {count} {unit}")
+        })
+        .collect::<Vec<_>>()
+        .join("、");
+    let title = if categories.len() == 1 {
+        contents.clone()
+    } else {
+        categories.keys().copied().collect::<Vec<_>>().join("、")
+    };
+    let mut lines = vec![
+        format!(
+            "待你确认：{}",
+            if title.is_empty() {
+                "本次模型"
+            } else {
+                &title
             }
-            "openings: CAD-derived structure; parameter basis retained as assumptions" => {
-                "门窗洞口：依据CAD重建；参数依据仍保留为假设"
+        ),
+        format!(
+            "内容：{}",
+            if contents.is_empty() {
+                "具体内容待补充"
+            } else {
+                &contents
             }
-            "slabs: CAD-derived structure; parameter basis retained as assumptions" => {
-                "楼板：依据CAD重建；参数依据仍保留为假设"
+        ),
+    ];
+
+    let mut dimensions = std::collections::BTreeSet::new();
+    let mut from_drawing = false;
+    for assumption in &proposal.assumptions {
+        let value = serde_json::from_str::<serde_json::Value>(assumption).ok();
+        let message = value
+            .as_ref()
+            .and_then(|v| v["message"].as_str())
+            .unwrap_or(assumption);
+        from_drawing |=
+            message.ends_with(": CAD-derived structure; parameter basis retained as assumptions");
+        if let Some(height) = value.as_ref().and_then(|v| v["height"].as_f64()) {
+            if height.is_finite() && height > 0.0 {
+                dimensions.insert(format!("高度 {height} 米（暂用值）"));
             }
-            "elements: CAD-derived structure; parameter basis retained as assumptions" => {
-                "其他结构实体：依据CAD重建；参数依据仍保留为假设"
+        }
+        // Only recognized dimension sentences are safe to show; raw evidence stays in F6.
+        let height = message
+            .strip_prefix("高度")
+            .and_then(|s| s.strip_suffix("米"))
+            .or_else(|| {
+                message
+                    .strip_prefix("height assumed ")
+                    .and_then(|s| s.strip_suffix('m'))
+            });
+        if let Some(height) = height.and_then(|s| s.trim().parse::<f64>().ok()) {
+            if height.is_finite() && height > 0.0 {
+                dimensions.insert(format!("高度 {height} 米（暂用值）"));
             }
-            "constraints: CAD-derived structure; parameter basis retained as assumptions" => {
-                "约束：依据CAD重建；参数依据仍保留为假设"
-            }
-            other => other,
-        };
-        assumptions.insert(format!(
-            "示意假设（{count}项 · {}）：{}",
-            display_text(code),
-            display_text(message)
-        ));
+        }
     }
     if let Some(review) = &domain.first_use_review {
-        if !review.dimensions.is_empty() {
-            assumptions.insert(format!(
-                "首用对照图参数：{}项（详细尺寸与判读说明见 F6）",
-                review.dimensions.len()
-            ));
+        for line in review.dimensions.iter().flat_map(|detail| detail.lines()) {
+            from_drawing |= line.contains("图纸原线稿");
+            if let Some((label, rest)) = line.split_once('：') {
+                if !matches!(label, "高度" | "床高" | "长度" | "宽度" | "厚度") {
+                    continue;
+                }
+                if let Some((number, basis)) = rest.split_once("米（") {
+                    let basis = match basis {
+                        "图纸）" => "按图纸",
+                        "用户确认）" => "你已确认",
+                        "示意）" => "暂用值",
+                        _ => continue,
+                    };
+                    if let Ok(number) = number.trim().parse::<f64>() {
+                        if number.is_finite() && number > 0.0 {
+                            dimensions.insert(format!("{label} {number} 米（{basis}）"));
+                        }
+                    }
+                }
+            }
         }
     }
-    if assumptions.is_empty() {
-        lines.push("示意假设：本版未列出".into());
-    }
-    lines.extend(assumptions);
+    let basis = if !dimensions.is_empty() && dimensions.len() <= 2 {
+        dimensions.into_iter().collect::<Vec<_>>().join("；")
+    } else if from_drawing && !proposal.assumptions.is_empty() {
+        "按图纸重建；部分尺寸为暂定值，详见 F6".into()
+    } else if from_drawing {
+        "按图纸重建；详细尺寸见 F6".into()
+    } else if !proposal.assumptions.is_empty() {
+        "部分尺寸用了暂定值，详见 F6".into()
+    } else {
+        "尺寸依据待补充，详见 F6".into()
+    };
+    lines.push(format!("尺寸依据：{basis}"));
+
+    let binding = &proposal.binding;
     let artifacts: Vec<_> = domain
         .artifacts
         .iter()
-        .filter(|artifact| artifact.binding.candidate)
-        .collect();
-    if artifacts.is_empty() {
-        lines.push("Blender构建：尚无本版产物".into());
-    }
-    for artifact in artifacts {
-        lines.push(format!(
-            "Blender构建 {} · {} · 验证：{} · 版本：{}",
-            display_text(&artifact.binding.build_id),
-            match artifact.state {
-                crate::domain::ArtifactState::Queued => "排队中",
-                crate::domain::ArtifactState::Building => "构建中",
-                crate::domain::ArtifactState::Unknown => "结果未知",
-                crate::domain::ArtifactState::Cancelled => "已取消",
-                crate::domain::ArtifactState::Failed => "构建失败",
-                crate::domain::ArtifactState::Built => "已构建",
-            },
-            match artifact.valid {
-                Some(true) => "通过",
-                Some(false) => "未通过",
-                None => "未知",
-            },
-            match artifact.current {
-                Some(true) => "当前",
-                Some(false) => "已过期",
-                None => "未知",
-            }
-        ));
-    }
-    lines.push("GLB：未知（当前投影未提供独立GLB校验事实）".into());
-    let images = &domain.review_images;
-    let required = images.iter().filter(|image| image.required).count();
-    let opened = images
-        .iter()
-        .filter(|image| {
-            image.required
-                && (image.externally_opened
-                    || image.file_state == crate::domain::ImageFileState::Available)
+        .filter(|artifact| {
+            let a = &artifact.binding;
+            a.candidate
+                && a.proposal_id == binding.proposal_id
+                && a.revision == binding.revision
+                && a.prepare_token == binding.prepare_token
+                && a.authority_sha256 == binding.base_sha256
+                && a.input_sha256 == binding.candidate_sha256
         })
-        .count();
-    lines.push(format!(
-        "本版 {} 张图（对照 {} · 总览 {} · 局部 {}）· 已交付/外部打开 {opened}/{required} · Ctrl+O 打开任意一张 · Alt+←/→ 选图",
-        images.len(),
-        images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Comparison).count(),
-        images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Overview).count(),
-        images.iter().filter(|image| image.view == crate::domain::ReviewImageView::Detail).count()
-    ));
-    if let Some(image) = images.get(selected_image.min(images.len().saturating_sub(1))) {
-        lines.push(format!(
-            "[{}/{}] {} · {} · {}",
-            selected_image.min(images.len() - 1) + 1,
-            images.len(),
-            display_text(&image.label),
-            if image.verified_path().is_some() {
-                "SHA已核对"
-            } else {
-                "图片不可用/校验中"
-            },
-            if image.externally_opened {
-                "已外部打开"
-            } else {
-                "未外部打开"
-            }
-        ));
-        if let Some(notice) = &image.notice {
-            lines.push(display_text(notice));
-        }
-    }
-    lines.push("未纳入项：本提案仅包含上述选中对象；其他来源范围/剩余对象尚未完整核对，不能据此宣称整层完成。".into());
-    for diagnostic in &proposal.diagnostics {
-        lines.push(display_text(diagnostic));
-    }
-    if let Some(notice) = &domain.fact_sync_notice {
-        lines.push(display_text(notice));
-    }
+        .collect();
+    let built = artifacts.iter().any(|a| {
+        a.state == crate::domain::ArtifactState::Built
+            && a.current == Some(true)
+            && a.valid == Some(true)
+    });
+    let failed = !built
+        && artifacts.last().is_some_and(|a| {
+            a.state == crate::domain::ArtifactState::Failed || a.valid == Some(false)
+        });
     lines.push(
-        if domain.candidate_review_delivered(&proposal.binding) && domain.first_use_satisfied() {
-            "Ctrl+Y 批准本版 · F6 查看建模详情（审批卡缩略信息或打开任意一张即可复核）"
+        if built {
+            "✓ 已在 Blender 建好并通过检查"
+        } else if failed {
+            "✗ 模型构建或检查未通过，需修正后重试"
         } else {
-            "尚未满足批准条件：需有效候选复核图及本版首用图交付 · F6 详情"
+            "… 模型尚未建好或检查尚未完成"
         }
         .into(),
     );
+    let candidate_review = domain.candidate_review_delivered(binding);
+    let first_use = domain.first_use_satisfied();
+    lines.push(
+        if !first_use {
+            "… 图纸对比图尚未准备好"
+        } else if domain
+            .first_use_review
+            .as_ref()
+            .is_some_and(|r| r.required_count > 0)
+        {
+            "✓ 图纸对比图已准备好"
+        } else if domain
+            .first_use_review
+            .as_ref()
+            .is_some_and(|r| r.status == "not_required")
+        {
+            "✓ 本次无需图纸对比图"
+        } else {
+            "… 暂无图纸对比图检查记录"
+        }
+        .into(),
+    );
+    lines.push(format!(
+        "图片 {} 张（Ctrl+O 查看，Alt+←/→ 切换）",
+        domain.review_images.len()
+    ));
+    let reason = if domain.fact_sync_notice.is_some() {
+        Some("模型信息暂未同步，请在 F6 查看问题")
+    } else if domain.authorizing {
+        Some("正在保存你的确认，请稍候")
+    } else if !proposal.ready {
+        Some("方案尚未准备好，请在下方输入意见或在 F6 查看问题")
+    } else if !built {
+        Some(if failed {
+            "模型检查未通过，需修正后重试"
+        } else {
+            "模型尚未建好或检查尚未完成"
+        })
+    } else if !candidate_review || !first_use {
+        Some("复核图片尚未准备好，请在 F6 查看进度")
+    } else {
+        None
+    };
+    lines.push(reason.map_or_else(
+        || "Ctrl+Y 确认 · 有意见直接在下方输入".into(),
+        |reason| format!("还不能确认：{reason}"),
+    ));
     lines
 }
 
@@ -2129,7 +2071,15 @@ mod tests {
                 extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
                 ..Default::default()
             };
-            local.extension.scroll = max_scroll(&snapshot, &local, Rect::new(0, 0, width, height));
+            let context = ViewContext::new(&snapshot, &local.extension, "", None);
+            local.extension.scroll = business_lines(
+                snapshot.extensions[0].modeling().unwrap(),
+                &context,
+                width - 2,
+            )
+            .iter()
+            .position(|line| line.to_string().starts_with("构建任务 build-failed"))
+            .unwrap() as u16;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|f| draw(f, f.area(), &snapshot, &local))
