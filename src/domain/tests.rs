@@ -4304,6 +4304,32 @@ fn first_use_v4_style_groups_project_with_aperture_ranges() {
 }
 
 #[test]
+fn first_use_2d_overlay_is_accepted_only_for_hosted_or_schematic_categories() {
+    for (category, accepted) in [("door", true), ("fire_hydrant", true), ("chair", false)] {
+        let (mut proposal, mut evidence) = first_use_fixture();
+        proposal["proposal"]["component_first_use_requirements"]["required"][0]["category"] =
+            json!(category);
+        let requirement = review::requirements(&proposal["proposal"]).unwrap();
+        let item = &mut evidence["component_first_use_review"]["manifest"]["items"][0];
+        item["category"] = json!(category);
+        item["renderer"] = json!({"engine":"PIL_2D_OVERLAY","version":"1","font":"PIL-default"});
+        evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"])
+                    .unwrap()
+            )
+        ));
+        let projected = review::project(
+            &evidence,
+            &proposal_fact(&proposal).unwrap().binding,
+            &requirement,
+        );
+        assert_eq!(projected.is_some(), accepted, "{category}");
+    }
+}
+
+#[test]
 fn first_use_async_progress_is_projected_without_images() {
     let (proposal, mut evidence) = first_use_fixture();
     evidence["component_first_use_review"] = json!({

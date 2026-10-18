@@ -426,12 +426,28 @@ pub(super) fn project(
         {
             return None;
         }
-        if item["renderer"]["engine"] != "BLENDER_WORKBENCH" {
-            return None;
-        }
-        hash(&item["renderer"]["script_sha256"])?;
-        if item["renderer"]["blender_version"].is_null() {
-            return None;
+        match item["renderer"]["engine"].as_str() {
+            Some("BLENDER_WORKBENCH") => {
+                hash(&item["renderer"]["script_sha256"])?;
+                if item["renderer"]["blender_version"].is_null() {
+                    return None;
+                }
+            }
+            // Hosted openings and schematic fixtures use a fast sealed 2D overlay;
+            // the modeler restricts it to those categories before sealing.
+            Some("PIL_2D_OVERLAY")
+                if matches!(
+                    item["category"].as_str(),
+                    Some(
+                        "door"
+                            | "window"
+                            | "fire_door"
+                            | "fire_window"
+                            | "fire_hydrant"
+                            | "counter"
+                    )
+                ) => {}
+            _ => return None,
         }
         hash(&item["cad_evidence_sha256"])?;
         strings(&item["part_ids"], 64)?;
