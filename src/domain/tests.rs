@@ -3354,6 +3354,27 @@ fn source_region_review_view(mut value: Value) -> Value {
 }
 
 #[test]
+fn region_review_v2_accepts_skipped_unknown_counted_as_reviewed() {
+    let base = source_region_review_view(existing_structure_view(linework_source_view(
+        instance_source_view(4),
+        'a',
+    )));
+    let mut value = base.clone();
+    value["source_region_summary"]["contract_version"] = json!("source-region-review/2");
+    value["source_region_summary"]["skipped_unknown_region_count"] = json!(1);
+    assert_eq!(
+        sequenced_facts().apply_verified_fact(&value),
+        FactProjection::Applied
+    );
+    // Uncertain plus skipped cannot exceed the reviewed regions.
+    value["source_region_summary"]["skipped_unknown_region_count"] = json!(2);
+    assert_eq!(
+        sequenced_facts().apply_verified_fact(&value),
+        FactProjection::Invalid
+    );
+}
+
+#[test]
 fn floor_progress_uses_sealed_complete_counts_and_invalidates_with_the_source_view() {
     let mut facts = sequenced_facts();
     let mut value = source_region_review_view(existing_structure_view(linework_source_view(

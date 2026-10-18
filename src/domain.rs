@@ -1983,7 +1983,11 @@ fn source_region_review_fact(
     let Some(summary) = value.get("source_region_summary") else {
         return Ok(None);
     };
-    if summary["contract_version"] != "source-region-review/1" {
+    // /2 adds the skipped_unknown decision; such regions count as reviewed.
+    if !matches!(
+        summary["contract_version"].as_str(),
+        Some("source-region-review/1" | "source-region-review/2")
+    ) {
         return Err(());
     }
     let linework = linework.ok_or(())?;
@@ -2010,6 +2014,13 @@ fn source_region_review_fact(
         != Some(fact.region_count)
         || fact.region_count != linework.region_count
         || fact.uncertain_region_count > fact.reviewed_region_count
+        || summary
+            .get("skipped_unknown_region_count")
+            .is_some_and(|skipped| {
+                skipped.as_u64().is_none_or(|skipped| {
+                    fact.uncertain_region_count as u64 + skipped > fact.reviewed_region_count as u64
+                })
+            })
         || fact.stale_review_count > fact.unreviewed_region_count
         || (fact.structure_represented_region_count > 0
             && structure.is_none_or(|coverage| {
