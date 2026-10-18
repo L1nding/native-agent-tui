@@ -81,8 +81,10 @@ pub fn from_tool(
     {
         return Ok(None);
     }
+    // A failed or aborted call produces no fact; the tool row already shows the
+    // failure, and approval stays bound to the server-checked displayed version.
     if notice.outcome != Some(ObservedToolOutcome::Completed) || item["result"]["isError"] == true {
-        return Err("领域工具未成功返回事实回执；请检查当前执行结果".into());
+        return Ok(None);
     }
     if super::unwrap_envelope(item["result"].clone(), 0).is_some() {
         return Ok(None);

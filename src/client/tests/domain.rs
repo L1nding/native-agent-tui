@@ -185,6 +185,16 @@ async fn resumed_domain_verifies_old_and_out_of_order_receipts_and_rejects_bad_f
     .await
     .unwrap()
     .unwrap();
+    // A failed or aborted read produces no fact and must not leave the card unsynchronized.
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"aborted-read","type":"mcpToolCall","server":"modeling_domain","tool":"read_component_first_use_image","status":"failed",
+        "result":{"isError":true,"content":[{"type":"text","text":"Error: [object Object]"}]}}}})).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client.snapshots.borrow().extensions[0]
+        .modeling()
+        .unwrap()
+        .fact_sync_notice
+        .is_none());
     client.commands.send(Command::Quit).await.unwrap();
     client.join.await.unwrap();
     std::fs::remove_dir_all(directory).unwrap();
