@@ -130,6 +130,11 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "component_first_use_review"
                 | "authorization"
                 | "diagnostic"
+                // Server-driven batches; projected as unrelated facts.
+                | "auto_batch"
+                | "precedent_auto_batch"
+                | "precedent_job"
+                | "linework_presort"
         )
         || receipt.fact_sequence == 0
         || receipt.fact_bytes == 0
@@ -428,6 +433,23 @@ pub(crate) mod tests {
             binding: json!({}),
         };
         (setup, receipt, root)
+    }
+
+    #[test]
+    fn server_batch_receipts_are_valid_kinds() {
+        let (setup, mut receipt, root) = fixture("");
+        for kind in [
+            "auto_batch",
+            "precedent_auto_batch",
+            "precedent_job",
+            "linework_presort",
+        ] {
+            receipt.kind = kind.into();
+            assert!(validate(&setup, &receipt).is_ok(), "{kind}");
+        }
+        receipt.kind = "invented".into();
+        assert!(validate(&setup, &receipt).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A just-terminated process can hold its working directory for a moment on Windows.

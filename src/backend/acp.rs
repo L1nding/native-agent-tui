@@ -2967,7 +2967,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requested_reasoning_effort_is_selected_after_the_model() {
-        let (mut core_client, core_bridge) = pair();
+        let (core_client, core_bridge) = pair();
         let (mut acp_server, acp_bridge) = pair();
         let config = Config {
             model: Some("hi/gpt-6-astra".into()),
