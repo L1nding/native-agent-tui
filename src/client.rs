@@ -28,6 +28,25 @@ use crate::state::{
 use crate::tool_details::{ToolDetailLocator, ToolDetails, ToolLifecycle};
 use crate::transport::{PipeTransport, TransportError};
 
+/// Continue only an idle, successful modeling turn on a known-incomplete floor,
+/// within the user's budget and never while the user owes an answer.
+fn should_auto_continue(
+    modeling: bool,
+    used: u32,
+    budget: u32,
+    phase: SessionPhase,
+    awaiting_user: bool,
+    floor_complete: Option<bool>,
+) -> bool {
+    modeling
+        && used < budget
+        && phase == SessionPhase::Completed
+        && !awaiting_user
+        && floor_complete == Some(false)
+}
+
+const AUTO_CONTINUE_PROMPT: &str = "继续：楼层尚未完成。按 building-modeling 技能的提速优先顺序推进；后台任务用 mode=inspect 轮询，不要结束本轮；需要批准时出审批卡后继续做其他可推进的工作。";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     PreviewEvent {
@@ -372,6 +391,8 @@ impl ClientHandle {
                 scheduler,
                 child_interrupts: VecDeque::new(),
                 interrupt_requested: false,
+                auto_continues: 0,
+                auto_submission: false,
                 interrupt_sent: false,
                 token_budget_stop_started: false,
                 agent_budget_interrupts: BTreeMap::new(),
@@ -512,6 +533,9 @@ struct Core {
     scheduler: Scheduler,
     child_interrupts: VecDeque<InterruptEffect>,
     interrupt_requested: bool,
+    /// Consecutive turns continued automatically since the user last typed.
+    auto_continues: u32,
+    auto_submission: bool,
     interrupt_sent: bool,
     token_budget_stop_started: bool,
     /// 已触发的 agent/turn 预算键；同一代只允许一次中断。
@@ -1812,6 +1836,9 @@ impl Core {
                 }
             }
             Command::SubmitRootInput { text } => {
+                if !std::mem::take(&mut self.auto_submission) {
+                    self.auto_continues = 0;
+                }
                 if self.domain.snapshot.authorizing {
                     self.state.view.notice = Some("正在记录具体版本批准，请等待结果或取消".into());
                     return;
@@ -2414,6 +2441,34 @@ impl Core {
         self.domain.synchronizing = true;
         self.domain.snapshot.fact_sync_notice = Some("正在同步完整领域事实".into());
         self.start_domain_fact_read();
+    }
+
+    /// The modeling agent tends to end a turn while background builds run; keep it
+    /// going while the floor is incomplete, bounded, and never over a pending question.
+    fn maybe_auto_continue(&mut self) {
+        if !should_auto_continue(
+            self.config.domain_setup.is_some(),
+            self.auto_continues,
+            self.config.auto_continue,
+            self.state.view.phase,
+            !self.state.view.requests.is_empty() || self.domain.snapshot.authorizing,
+            self.domain
+                .snapshot
+                .floor_progress_v2
+                .as_ref()
+                .map(|progress| progress.completion),
+        ) {
+            return;
+        }
+        self.auto_continues += 1;
+        self.auto_submission = true;
+        self.state.view.notice = Some(format!(
+            "楼层尚未完成，自动续接（{}/{}）",
+            self.auto_continues, self.config.auto_continue
+        ));
+        self.command(Command::SubmitRootInput {
+            text: AUTO_CONTINUE_PROMPT.into(),
+        });
     }
 
     fn start_domain_fact_read(&mut self) {
@@ -4718,6 +4773,7 @@ impl Core {
                         self.state.view.notice = Some("Dependent tasks remain blocked; retry the failed task or cancel queued work in F4.".into());
                     }
                 }
+                self.maybe_auto_continue();
             }
             "turn/step" => {
                 if let (Some(turn), Some(step)) = (
@@ -4967,6 +5023,76 @@ mod tests {
     mod tool_details;
 
     use super::*;
+
+    #[test]
+    fn auto_continue_runs_only_on_an_idle_incomplete_floor_within_budget() {
+        use SessionPhase::*;
+        assert!(should_auto_continue(
+            true,
+            0,
+            3,
+            Completed,
+            false,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            false,
+            0,
+            3,
+            Completed,
+            false,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            true,
+            3,
+            3,
+            Completed,
+            false,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            true,
+            0,
+            0,
+            Completed,
+            false,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            true,
+            0,
+            3,
+            Failed,
+            false,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            true,
+            0,
+            3,
+            Interrupted,
+            false,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            true,
+            0,
+            3,
+            Completed,
+            true,
+            Some(false)
+        ));
+        assert!(!should_auto_continue(
+            true,
+            0,
+            3,
+            Completed,
+            false,
+            Some(true)
+        ));
+        assert!(!should_auto_continue(true, 0, 3, Completed, false, None));
+    }
     use crate::journal::{tests::Fixture as JournalFixture, JournalView, Payload, Replay};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

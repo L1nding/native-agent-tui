@@ -43,6 +43,7 @@ Options:
   --profile NAME   dsh profile carrying the zf-tui-bridge plugin (default: zf-tui)
   --model NAME     Requested model as provider/model; the last /model choice when omitted
   --reasoning LEVEL  Reasoning effort (for example low/medium/high) when the model offers it
+  --auto-continue N  Modeling: continue up to N idle turns while the floor is incomplete
   --permission PRESET  dsh permission preset for this session, e.g. read-only |
                    workspace-write | danger-full-access (default: dsh's own default)
   --domain-context FILE  Attach pure modeling tools and the F6 modeling view to this dsh session
