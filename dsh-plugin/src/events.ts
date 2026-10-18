@@ -242,7 +242,22 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
       const goal = goalOf(record(event)?.['data'])
       if (goal !== undefined) notify(session, goal)
     } else if (type === 'user/message') {
-      const round = goalRoundOf(record(event)?.['data'])
+      const data = record(record(event)?.['data'])
+      const source = record(data?.['source'])
+      const sender = source?.['senderSessionId']
+      const kind = source?.['kind']
+      if ((kind === 'subagent-settled' || kind === 'agent-message') && typeof sender === 'string' && sender.length > 0 && sender.length <= 1024) {
+        const content = data?.['content']
+        const texts = Array.isArray(content) ? content.slice(0, 8).flatMap(block => {
+          const text = record(block)?.['text']
+          return typeof text === 'string' ? [text.slice(0, 512)] : []
+        }) : []
+        const summary = (kind === 'subagent-settled' && texts.length > 2 ? texts.slice(2) : texts).join('\n').slice(0, 1024)
+        // The source is runtime-owned; an assistant quoting this text is not a notice.
+        const completed = Array.isArray(content) && record(content[0])?.['text'] === `Background subagent ${sender} finished and will do no further work unless you send it more.`
+        notify(session, { type: 'subagent', id: sender, state: kind === 'agent-message' ? 'message' : completed ? 'completed' : 'failed', summary })
+      }
+      const round = goalRoundOf(data)
       if (round !== undefined) notify(session, round)
     }
     if (type === 'turn/start') {

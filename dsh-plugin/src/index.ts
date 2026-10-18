@@ -59,7 +59,7 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
     const resolved = next()
     if (this.runtime?.name !== 'mcp-client' || resolved === null || typeof resolved !== 'object') return resolved
     const client = resolved as Record<string, unknown>
-    return client['serverName'] === 'modeling_domain' ? { ...client, toolCallTimeoutMs: 300_000 } : resolved
+    return client['serverName'] === 'modeling_domain' ? { ...client, toolCallTimeoutMs: 600_000 } : resolved
   })
 
   /** Write one frame. Stdout carries protocol frames only. */

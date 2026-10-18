@@ -51,6 +51,7 @@ pub(super) struct ViewContext<'a> {
     pub activity: Option<&'static str>,
     pub activity_marker: &'static str,
     pub panel: &'a ExtensionPanel,
+    pub subagents: &'a [crate::state::DshSubagent],
 }
 
 impl<'a> ViewContext<'a> {
@@ -65,6 +66,7 @@ impl<'a> ViewContext<'a> {
             model: snapshot.model.as_deref(),
             reply: current_reply(snapshot),
             panel,
+            subagents: &snapshot.dsh_subagents,
             draft,
             notice,
             activity: super::busy::label(snapshot),

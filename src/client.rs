@@ -45,7 +45,7 @@ fn should_auto_continue(
         && floor_complete == Some(false)
 }
 
-const AUTO_CONTINUE_PROMPT: &str = "继续：楼层尚未完成。按 building-modeling 技能的提速优先顺序推进；后台任务用 mode=inspect 轮询，不要结束本轮；需要批准时出审批卡后继续做其他可推进的工作。";
+const AUTO_CONTINUE_PROMPT: &str = "继续";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -845,9 +845,39 @@ impl Core {
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut observation_clock = tokio::time::interval(Duration::from_secs(1));
         observation_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut domain_clock = tokio::time::interval(Duration::from_secs(5));
+        domain_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut checked = crate::domain::receipt::FactFiles::new();
+        let mut poll_generation = self.domain_generation;
+        let (poll_tx, mut poll_rx) = mpsc::channel(1);
+        let mut poll_task: Option<JoinHandle<crate::domain::receipt::FactFiles>> = None;
         let mut journal_status = self.journal.as_ref().map(|journal| journal.status.clone());
         loop {
             tokio::select! {
+                _ = domain_clock.tick(), if self.config.domain_setup.is_some() && poll_task.is_none() => {
+                    if poll_generation != self.domain_generation {
+                        checked.clear();
+                        poll_generation = self.domain_generation;
+                    }
+                    let setup = self.config.domain_setup.clone().unwrap();
+                    let after = self.domain.highest_sequence;
+                    let mut files = std::mem::take(&mut checked);
+                    let sender = poll_tx.clone();
+                    let generation = poll_generation;
+                    poll_task = Some(tokio::task::spawn_blocking(move || {
+                        crate::domain::receipt::scan(&setup, after, &mut files, |value| sender.blocking_send((generation, value)).is_ok());
+                        files
+                    }));
+                }
+                result = async { poll_task.as_mut().unwrap().await }, if poll_task.is_some() => {
+                    checked = result.unwrap_or_default();
+                    poll_task = None;
+                }
+                Some((generation, value)) = poll_rx.recv() => {
+                    if generation == self.domain_generation && value["fact_sequence"].as_u64().is_some_and(|sequence| sequence > self.domain.highest_sequence) {
+                        self.domain.apply_verified_fact(&value);
+                    }
+                }
                 changed = async {
                     match &mut journal_status { Some(status) => Some(status.changed().await), None => std::future::pending().await }
                 } => {
@@ -1031,6 +1061,10 @@ impl Core {
         }
 
         self.preview_bridge.take();
+        drop(poll_rx);
+        if let Some(task) = poll_task {
+            let _ = task.await;
+        }
         if let Some((_, task)) = self.domain_image_check_task.take() {
             task.abort();
         }
@@ -2154,6 +2188,7 @@ impl Core {
     /// A confirmed session is the readiness fact; the sandbox is dsh's own and
     /// is first exercised when the agent runs a command.
     fn reset_domain_session(&mut self) {
+        self.state.view.dsh_subagents.clear();
         if let Some((_, task)) = self.domain_image_check_task.take() {
             task.abort();
         }
@@ -4054,6 +4089,9 @@ impl Core {
             }
         }
         let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
+        if self.state.view.thread_id.as_deref() == Some(notice.thread_id.as_str()) {
+            self.state.view.observe_dsh_tool(&params["item"]);
+        }
         if notice.outcome.is_none() {
             self.tool_details
                 .observe_started(locator.clone(), notice.category, fields);
@@ -4337,6 +4375,12 @@ impl Core {
     }
 
     fn notification(&mut self, method: &str, params: Value) {
+        if method == "subagent/notice" {
+            if params["threadId"].as_str() == self.state.view.thread_id.as_deref() {
+                self.state.view.observe_dsh_notice(&params);
+            }
+            return;
+        }
         if method == "model/listChanged" {
             // dsh 的可选模型变了；已经看过清单的界面跟着刷新。
             if self.state.view.models.availability != crate::models::ModelsAvailability::NotQueried
@@ -5023,6 +5067,11 @@ mod tests {
     mod tool_details;
 
     use super::*;
+
+    #[test]
+    fn auto_continue_prompt_is_continue_only() {
+        assert_eq!(AUTO_CONTINUE_PROMPT, "继续");
+    }
 
     #[test]
     fn auto_continue_runs_only_on_an_idle_incomplete_floor_within_budget() {

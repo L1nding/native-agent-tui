@@ -203,6 +203,23 @@ pub fn verify(setup: &DomainSetup, receipt: &FactReceipt, raw: &[u8]) -> Result<
 /// Facts are read one at a time, so memory and time do not depend on keeping the
 /// whole history resident.
 pub(super) fn baseline(setup: &DomainSetup, mut apply: impl FnMut(Value)) {
+    scan(setup, 0, &mut std::collections::HashMap::new(), |value| {
+        apply(value);
+        true
+    });
+}
+
+// A fact may be published before the sequence index. Retry only that file when
+// the index changes; unchanged malformed files need no repeated large reads.
+pub(crate) type FactFiles =
+    std::collections::HashMap<PathBuf, (std::time::SystemTime, Option<String>)>;
+
+pub(crate) fn scan(
+    setup: &DomainSetup,
+    after: u64,
+    checked: &mut FactFiles,
+    mut apply: impl FnMut(Value) -> bool,
+) {
     use std::io::Read;
     let mut load = || -> Option<()> {
         let context = std::fs::read(&setup.context_path).ok()?;
@@ -233,9 +250,9 @@ pub(super) fn baseline(setup: &DomainSetup, mut apply: impl FnMut(Value)) {
                 .ok()?;
             (bytes.len() <= limit).then_some(bytes)
         };
-        let index: Value =
-            serde_json::from_slice(&read(&directory.join("fact-sequences.json"), 256 * 1024)?)
-                .ok()?;
+        let index_raw = read(&directory.join("fact-sequences.json"), 256 * 1024)?;
+        let index_sha = format!("{:x}", Sha256::digest(&index_raw));
+        let index: Value = serde_json::from_slice(&index_raw).ok()?;
         // The index is keyed by the semantic result digest, while fact files are named
         // by the digest of their sealed bytes, so the two never share a key. Use the
         // index only as a membership bound on sequence numbers.
@@ -271,23 +288,51 @@ pub(super) fn baseline(setup: &DomainSetup, mut apply: impl FnMut(Value)) {
             let sequence = value["fact_sequence"].as_u64()?;
             (value["contract"] == CONTRACT
                 && value["run_id"] == setup.run_id
-                && value["context_sha256"] == setup.context_sha256
-                && known.contains(&sequence))
-            .then_some((sequence, value))
+                && value["context_sha256"] == setup.context_sha256)
+                .then_some((sequence, value))
         };
         // First pass records only (sequence, path); the second replays in order.
         let mut ordered: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&facts)
             .ok()?
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
-                open(&path).map(|(sequence, _)| (sequence, path))
+                let modified = path.metadata().ok()?.modified().ok()?;
+                if checked.get(&path).is_some_and(|(previous, pending)| {
+                    *previous == modified && pending.as_ref().is_none_or(|hash| *hash == index_sha)
+                }) {
+                    return None;
+                }
+                if checked.len() >= 65536 {
+                    checked.clear();
+                }
+                let Some((sequence, _)) = open(&path) else {
+                    checked.insert(path, (modified, None));
+                    return None;
+                };
+                if !known.contains(&sequence) {
+                    checked.insert(path, (modified, Some(index_sha.clone())));
+                    return None;
+                }
+                if sequence <= after {
+                    checked.insert(path, (modified, None));
+                    return None;
+                }
+                Some((sequence, path))
             })
             .collect();
         ordered.sort_unstable();
         for (sequence, path) in ordered {
             if let Some((reread, value)) = open(&path) {
-                if reread == sequence {
-                    apply(value);
+                if reread == sequence && known.contains(&sequence) {
+                    if !apply(value) {
+                        break;
+                    }
+                    if let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) {
+                        if checked.len() >= 65536 {
+                            checked.clear();
+                        }
+                        checked.insert(path, (modified, None));
+                    }
                 }
             }
         }

@@ -1,5 +1,143 @@
 use super::*;
 
+#[tokio::test]
+async fn domain_http_patch_file_has_global_server_and_long_timeout() {
+    let path = write_http_mcp_patch(12345).await.unwrap();
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "- insert:\n    - id: mcp-modeling-domain\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: modeling_domain\n        transport: streamable-http\n        url: http://127.0.0.1:12345/mcp\n        toolCallTimeoutMs: 600000\n        failOnStartupError: true\n");
+    tokio::fs::remove_file(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn domain_port_probe_reports_timeout_and_accepts_ready_listener() {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    wait_domain_port(port, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    drop(listener);
+    assert_eq!(
+        wait_domain_port(port, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn domain_poll_projects_new_sealed_facts_and_ignores_tampering_foreign_and_old_sequences() {
+    for mode in [DomainMode::Floor, DomainMode::Project] {
+        let root = std::env::temp_dir().join(format!(
+            "domain-poll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let directory = root
+            .join("outputs/domain/run")
+            .join(if mode == DomainMode::Project {
+                "project"
+            } else {
+                "changes"
+            });
+        std::fs::create_dir_all(directory.join("facts")).unwrap();
+        std::fs::write(root.join("context.json"), b"{}").unwrap();
+        let mut setup = sequenced_facts().setup.unwrap();
+        setup.mode = mode;
+        setup.repository = root.clone();
+        setup.context_path = root.join("context.json");
+        setup.context_sha256 = format!("{:x}", Sha256::digest(b"{}"));
+        let mut facts = DomainFacts::new(Some(setup.clone()));
+        let mut checked = receipt::FactFiles::new();
+        let mut index = serde_json::Map::new();
+        for sequence in [2, 4] {
+            let mut value = if mode == DomainMode::Project {
+                project_catalog(sequence)
+            } else {
+                envelope()
+            };
+            value["context_sha256"] = json!(setup.context_sha256);
+            value["fact_sequence"] = json!(sequence);
+            value["proposal"]["summary"] = json!(format!("sequence-{sequence}"));
+            let raw = serde_json::to_vec(&value).unwrap();
+            let sha = format!("{:x}", Sha256::digest(&raw));
+            std::fs::write(directory.join("facts").join(format!("{sha}.json")), &raw).unwrap();
+            index.insert(sha, json!(sequence));
+            if sequence == 4 {
+                for key in ["run_id", "context_sha256", "contract", "hash", "unindexed"] {
+                    let mut invalid = value.clone();
+                    invalid["fact_sequence"] = json!(if key == "unindexed" { 12 } else { 10 });
+                    if !matches!(key, "hash" | "unindexed") {
+                        invalid[key] = json!("foreign");
+                    }
+                    let raw = serde_json::to_vec(&invalid).unwrap();
+                    let sha = if key == "hash" {
+                        "0".repeat(64)
+                    } else {
+                        format!("{:x}", Sha256::digest(&raw))
+                    };
+                    std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw)
+                        .unwrap();
+                }
+                index.insert("invalid-sequence".into(), json!(10));
+            }
+            std::fs::write(
+                directory.join("fact-sequences.json"),
+                json!({"next":11,"facts":index}).to_string(),
+            )
+            .unwrap();
+            let after = facts.highest_sequence;
+            let mut applied = Vec::new();
+            receipt::scan(&setup, after, &mut checked, |value| {
+                applied.push(value["fact_sequence"].as_u64().unwrap());
+                assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+                true
+            });
+            assert_eq!(applied, vec![sequence]);
+            assert_eq!(facts.highest_sequence, sequence);
+        }
+        let snapshot = facts.snapshot.clone();
+        receipt::scan(&setup, facts.highest_sequence, &mut checked, |_| {
+            panic!("unchanged or old fact replayed")
+        });
+        assert!(facts.snapshot == snapshot);
+        let mut old = if mode == DomainMode::Project {
+            project_catalog(3)
+        } else {
+            envelope()
+        };
+        old["context_sha256"] = json!(setup.context_sha256);
+        old["fact_sequence"] = json!(3);
+        old["proposal"]["revision"] = json!(100);
+        let raw = serde_json::to_vec(&old).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
+        index.insert(sha, json!(3));
+        index.insert("late-index".into(), json!(12));
+        std::fs::write(
+            directory.join("fact-sequences.json"),
+            json!({"next":13,"facts":index}).to_string(),
+        )
+        .unwrap();
+        let mut applied = Vec::new();
+        receipt::scan(&setup, facts.highest_sequence, &mut checked, |value| {
+            applied.push(value["fact_sequence"].as_u64().unwrap());
+            assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+            true
+        });
+        assert_eq!(applied, [12]);
+        if mode == DomainMode::Floor {
+            assert_eq!(
+                facts.snapshot.proposal.as_ref().unwrap().binding.revision,
+                2
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 #[ignore = "read-only replay; set DOMAIN_FACT_REPLAY to a sealed facts directory"]
 fn replay_sealed_facts_projects_first_use_review() {
@@ -1596,8 +1734,10 @@ fn ordinary_project_launch_creates_a_bound_context_and_registers_pure_tools() {
     let value: Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(value["contract"], "modeling-project/v1");
     assert_eq!(setup.context_sha256, format!("{:x}", Sha256::digest(raw)));
-    assert!(
-        matches!(&config.mcp_servers[0], McpServerConfig::Stdio {args,..} if args.iter().any(|arg| arg == "blender_agent.integrations.project_mcp"))
+    assert!(config.mcp_servers.is_empty());
+    assert_eq!(
+        crate::backend::acp_protocol::encode_mcp_servers(&config.mcp_servers),
+        json!([])
     );
     for path in [root.clone(), root.join("..")] {
         assert!(configure(Config {

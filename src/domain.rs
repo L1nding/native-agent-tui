@@ -133,21 +133,23 @@ pub fn configure(mut config: Config) -> Result<Config, String> {
     if config.mcp_servers.iter().any(|s| matches!(s, McpServerConfig::Stdio { name, .. } | McpServerConfig::Http { name, .. } if name == SERVER)) {
         return Err("建模领域 MCP 已被配置".into());
     }
-    config.mcp_servers.push(McpServerConfig::Stdio {
-        name: SERVER.into(),
-        command: python.to_string_lossy().into_owned(),
-        args: vec![
-            "-m".into(),
-            match mode {
-                DomainMode::Floor => "blender_agent.integrations.domain_mcp",
-                DomainMode::Project => "blender_agent.integrations.project_mcp",
-            }
-            .into(),
-            "--context".into(),
-            context_path.to_string_lossy().into_owned(),
-        ],
-        env: Vec::new(),
-    });
+    if mode == DomainMode::Floor {
+        config.mcp_servers.push(McpServerConfig::Stdio {
+            name: SERVER.into(),
+            command: python.to_string_lossy().into_owned(),
+            args: vec![
+                "-m".into(),
+                match mode {
+                    DomainMode::Floor => "blender_agent.integrations.domain_mcp",
+                    DomainMode::Project => "blender_agent.integrations.project_mcp",
+                }
+                .into(),
+                "--context".into(),
+                context_path.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+        });
+    }
     config.domain_setup = Some(DomainSetup {
         mode,
         context_path,
@@ -158,6 +160,131 @@ pub fn configure(mut config: Config) -> Result<Config, String> {
         floor_id,
     });
     Ok(config)
+}
+
+pub(crate) struct HttpMcp {
+    child: crate::owned_process::Child,
+    drains: Vec<tokio::task::JoinHandle<()>>,
+    patch: PathBuf,
+}
+
+pub(crate) fn http_mcp_patch(port: u16) -> String {
+    format!("- insert:\n    - id: mcp-modeling-domain\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: modeling_domain\n        transport: streamable-http\n        url: http://127.0.0.1:{port}/mcp\n        toolCallTimeoutMs: 600000\n        failOnStartupError: true\n")
+}
+
+pub(crate) async fn write_http_mcp_patch(port: u16) -> std::io::Result<PathBuf> {
+    let patch = std::env::temp_dir().join(format!(
+        "native-agent-domain-{}-{port}-{}.yml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    tokio::fs::write(&patch, http_mcp_patch(port)).await?;
+    Ok(patch)
+}
+
+pub(crate) async fn wait_domain_port(
+    port: u16,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + timeout;
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "领域 MCP 端口就绪超时",
+                ));
+            }
+            if std::net::TcpStream::connect_timeout(
+                &address,
+                remaining.min(std::time::Duration::from_millis(100)),
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+impl HttpMcp {
+    pub(crate) async fn start(config: &mut Config) -> std::io::Result<Option<Self>> {
+        let Some(setup) = config
+            .domain_setup
+            .as_ref()
+            .filter(|setup| setup.mode == DomainMode::Project)
+        else {
+            return Ok(None);
+        };
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let mut command = crate::owned_process::Command::new(&setup.python);
+        command
+            .current_dir(&setup.repository)
+            .args(["-m", "blender_agent.integrations.project_mcp", "--context"])
+            .args([setup.context_path.as_os_str()])
+            .args([
+                "--transport",
+                "streamable-http",
+                "--port",
+                &port.to_string(),
+            ]);
+        let child = crate::owned_process::spawn(command, crate::owned_process::Input::Null)?;
+        let mut server = Self {
+            child,
+            drains: Vec::new(),
+            patch: PathBuf::new(),
+        };
+        use tokio::io::AsyncReadExt;
+        if let Some(mut stdout) = server.child.stdout.take() {
+            server.drains.push(tokio::spawn(async move {
+                let mut buffer = [0; 8192];
+                while matches!(stdout.read(&mut buffer).await, Ok(n) if n > 0) {}
+            }));
+        }
+        if let Some(mut stderr) = server.child.stderr.take() {
+            server.drains.push(tokio::spawn(async move {
+                let mut buffer = [0; 8192];
+                while matches!(stderr.read(&mut buffer).await, Ok(n) if n > 0) {}
+            }));
+        }
+        if let Err(error) = wait_domain_port(port, std::time::Duration::from_secs(30)).await {
+            let _ = server.stop().await;
+            return Err(error);
+        }
+        server.patch = write_http_mcp_patch(port).await?;
+        config.domain_mcp_patch = Some(server.patch.clone());
+        Ok(Some(server))
+    }
+
+    pub(crate) async fn stop(&mut self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        self.child.shutdown_tree().await?;
+        self.child.kill().await?;
+        for drain in &self.drains {
+            drain.abort();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HttpMcp {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        for drain in &self.drains {
+            drain.abort();
+        }
+        let _ = std::fs::remove_file(&self.patch);
+    }
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf, String> {
@@ -654,6 +781,7 @@ pub struct DomainFacts {
     pub snapshot: DomainSnapshot,
     control_messages: BTreeMap<String, String>,
     fact_sequences: BTreeMap<String, u64>,
+    pub(crate) highest_sequence: u64,
     source_view: Option<SourceViewIdentity>,
     source_policy: Option<String>,
     source_view_policy: Option<String>,
@@ -681,6 +809,7 @@ impl DomainFacts {
             snapshot,
             control_messages: BTreeMap::new(),
             fact_sequences: BTreeMap::new(),
+            highest_sequence: 0,
             source_view: None,
             source_policy: None,
             source_view_policy: None,
@@ -1484,6 +1613,7 @@ impl DomainFacts {
                 self.source_view = incoming_source_view;
             }
             if let Some(sequence) = sequence {
+                self.highest_sequence = self.highest_sequence.max(sequence);
                 if source_kind {
                     self.source_view_sequence = Some(sequence);
                 }

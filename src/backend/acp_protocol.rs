@@ -541,9 +541,17 @@ pub fn tool_input(tool: &Value) -> ToolInput {
     };
     ToolInput {
         command: field(&["command", "cmd"]),
-        reason: field(&["justification", "description", "reason"]),
+        reason: field(&["justification", "description", "label", "reason"]),
         cwd: field(&["workdir", "cwd"]),
-        target: field(&["file_path", "path", "pattern", "url", "query"]),
+        target: field(&[
+            "file_path",
+            "path",
+            "pattern",
+            "url",
+            "query",
+            "agent_id",
+            "target",
+        ]),
         sandbox: field(&["sandbox_permissions"]),
     }
 }

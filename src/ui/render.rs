@@ -1,5 +1,6 @@
 //! Read-only terminal rendering composed from a Core snapshot and local UI state.
 
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
@@ -600,7 +601,34 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &CoreSnapshot, loca
         if let Some(domain) =
             super::domain_workflow::domain(snapshot).filter(|_| !local.workflow.show_tasks)
         {
-            super::domain_workflow::draw(frame, chunks[1], domain, local.workflow.modeling_node);
+            let mut area = chunks[1];
+            if !snapshot.dsh_subagents.is_empty() {
+                let rows = Layout::vertical([
+                    Constraint::Length((snapshot.dsh_subagents.len().min(3) * 2 + 1) as u16),
+                    Constraint::Min(4),
+                ])
+                .split(area);
+                let lines = snapshot
+                    .dsh_subagents
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .flat_map(|agent| {
+                        [
+                            agent.line(std::time::SystemTime::now()),
+                            format!("  {}", agent.latest_message),
+                        ]
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().title("子 Agent · Tab 查看完整列表与消息")),
+                    rows[0],
+                );
+                area = rows[1];
+            }
+            super::domain_workflow::draw(frame, area, domain, local.workflow.modeling_node);
         } else {
             workflow_view::draw_workflow(
                 frame,
@@ -946,6 +974,24 @@ pub(super) fn editor_view(
 
 /// Status panel text shared by rendering and scroll geometry; empty hides the panel.
 pub(super) fn status_text(snapshot: &CoreSnapshot, local: &LocalState) -> String {
+    let body = status_body(snapshot, local);
+    if !snapshot.requests.is_empty() {
+        return body;
+    }
+    let agent = snapshot
+        .dsh_subagents
+        .iter()
+        .rev()
+        .find(|agent| agent.status == crate::state::DshSubagentStatus::Running)
+        .or_else(|| snapshot.dsh_subagents.last());
+    match agent {
+        Some(agent) if body.is_empty() => agent.line(std::time::SystemTime::now()),
+        Some(agent) => format!("{}\n{body}", agent.line(std::time::SystemTime::now())),
+        None => body,
+    }
+}
+
+fn status_body(snapshot: &CoreSnapshot, local: &LocalState) -> String {
     let request = selected_request(snapshot, local);
     let waiting = snapshot.gate.as_ref().filter(|gate| gate.pending);
     // 错误原因始终保留在提示前面，后续提示不能把它遮住。
@@ -1066,6 +1112,7 @@ pub(super) fn status_rows(snapshot: &CoreSnapshot, local: &LocalState, text: &st
     if text.is_empty() {
         StatusRows::Hidden
     } else if selected_request(snapshot, local).is_some()
+        || text.contains('\n')
         || snapshot.last_error.is_some()
         || snapshot.gate.as_ref().is_some_and(|gate| gate.pending)
     {
@@ -1163,6 +1210,86 @@ mod tests {
             &serde_json::json!({"threadId":"root","turnId":"turn","command":"cargo check"}),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn domain_subagent_call_started_and_settled_render_status_and_latest_message() {
+        use crate::state::DshSubagentStatus;
+        use serde_json::json;
+        let (mut snapshot, mut local) = running(vec![]);
+        snapshot.observe_dsh_tool(&json!({"id":"call","tool":"subagent","description":"二层散线区域判读","status":"inProgress"}));
+        snapshot.observe_dsh_tool(&json!({"id":"call","tool":"subagent","status":"completed","aggregatedOutput":"started subagent child-X"}));
+        assert_eq!(snapshot.dsh_subagents[0].id, "child-X");
+        assert_eq!(snapshot.dsh_subagents[0].status, DshSubagentStatus::Running);
+        snapshot.dsh_subagents[0].started =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(720);
+        let text = rows(&snapshot, &local, 120, 32).join("\n");
+        assert!(
+            text.contains("子 Agent：二层散线区域判读 · 运行中 12 分钟"),
+            "{text}"
+        );
+        snapshot.extensions = vec![crate::extensions::ExtensionSnapshot::Modeling(
+            crate::domain::DomainSnapshot {
+                enabled: true,
+                ..Default::default()
+            },
+        )];
+        local.extension.visible = Some(crate::extensions::ExtensionId::Modeling);
+        let text = rows(&snapshot, &local, 120, 40).join("\n");
+        assert!(
+            text.contains("子 Agent：二层散线区域判读 · 运行中 12 分钟"),
+            "{text}"
+        );
+        local.extension.visible = None;
+        snapshot.observe_dsh_notice(
+            &json!({"id":"child-X","state":"message","summary":"已完成三个区域"}),
+        );
+        assert_eq!(snapshot.dsh_subagents[0].status, DshSubagentStatus::Running);
+        snapshot.observe_dsh_notice(
+            &json!({"id":"child-X","state":"completed","summary":"所有散线区域判读结束"}),
+        );
+        assert_eq!(
+            snapshot.dsh_subagents[0].status,
+            DshSubagentStatus::Completed
+        );
+        let text = rows(&snapshot, &local, 120, 32).join("\n");
+        assert!(
+            text.contains("子 Agent：二层散线区域判读 · 已结束"),
+            "{text}"
+        );
+        local.workflow.visible = true;
+        local.workflow.show_tasks = true;
+        let text = rows(&snapshot, &local, 120, 40).join("\n");
+        assert!(text.contains("所有散线区域判读结束"), "{text}");
+        snapshot.observe_dsh_tool(
+            &json!({"id":"send","tool":"send_message","target":"child-X","status":"completed"}),
+        );
+        assert_eq!(snapshot.dsh_subagents[0].status, DshSubagentStatus::Running);
+        snapshot.observe_dsh_notice(&json!({"id":"child-X","state":"failed","summary":"执行失败"}));
+        assert_eq!(snapshot.dsh_subagents[0].status, DshSubagentStatus::Failed);
+    }
+
+    #[test]
+    fn domain_subagent_early_settlement_merges_with_the_started_receipt() {
+        use serde_json::json;
+        let mut snapshot = CoreSnapshot::default();
+        snapshot.observe_dsh_tool(
+            &json!({"id":"call","tool":"subagent","description":"区域判读","status":"inProgress"}),
+        );
+        snapshot.observe_dsh_notice(&json!({"id":"child","state":"completed","summary":"已判读"}));
+        snapshot.observe_dsh_tool(&json!({"id":"call","tool":"subagent","status":"completed","aggregatedOutput":"started subagent child"}));
+        assert_eq!(snapshot.dsh_subagents.len(), 1);
+        assert_eq!(snapshot.dsh_subagents[0].name, "区域判读");
+        assert_eq!(snapshot.dsh_subagents[0].latest_message, "已判读");
+        assert_eq!(
+            snapshot.dsh_subagents[0].status,
+            crate::state::DshSubagentStatus::Completed
+        );
+        snapshot.observe_dsh_tool(&json!({"id":"list","tool":"list_agents","status":"completed","aggregatedOutput":"[{\"target\":\"child\",\"status\":\"inactive\"}]"}));
+        assert_eq!(
+            snapshot.dsh_subagents[0].status,
+            crate::state::DshSubagentStatus::Completed
+        );
     }
 
     #[test]

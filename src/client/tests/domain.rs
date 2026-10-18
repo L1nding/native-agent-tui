@@ -1,6 +1,61 @@
 use super::*;
 
 #[tokio::test]
+async fn domain_poll_refreshes_snapshot_without_any_parent_tool_receipt() {
+    use sha2::{Digest, Sha256};
+    let root = std::env::temp_dir().join(format!(
+        "domain-client-poll-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = root.join("outputs/domain/run/changes");
+    std::fs::create_dir_all(store.join("facts")).unwrap();
+    std::fs::write(root.join("context.json"), b"{}").unwrap();
+    let context_sha256 = format!("{:x}", Sha256::digest(b"{}"));
+    let (mut client, mut server) = harness_with_config(Config {
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: root.join("context.json"),
+            repository: root.clone(),
+            python: "unused-python".into(),
+            run_id: "run".into(),
+            context_sha256: context_sha256.clone(),
+            floor_id: "floor".into(),
+        }),
+        ..Default::default()
+    })
+    .await;
+    ready(&mut server).await;
+    phase(&mut client, SessionPhase::Ready).await;
+    let value = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_sha256,"ok":true,"kind":"source_groups","fact_sequence":7,"scan_id":"scan","scene_sha256":"scene","total_groups":0,"total_objects":0,"state_counts":{},"groups":[]});
+    let raw = serde_json::to_vec(&value).unwrap();
+    let sha = format!("{:x}", Sha256::digest(&raw));
+    std::fs::write(store.join("facts").join(format!("{sha}.json")), &raw).unwrap();
+    std::fs::write(
+        store.join("fact-sequences.json"),
+        json!({"next":8,"facts":{sha:7}}).to_string(),
+    )
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        client
+            .snapshots
+            .wait_for(|snapshot| snapshot.extensions[0].modeling().unwrap().groups.is_some()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(client.snapshots.borrow().phase, SessionPhase::Ready);
+    assert_eq!(client.snapshots.borrow().root_start_requests, 0);
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn resumed_domain_verifies_old_and_out_of_order_receipts_and_rejects_bad_files() {
     use sha2::{Digest, Sha256};
     let directory = std::env::temp_dir().join(format!(

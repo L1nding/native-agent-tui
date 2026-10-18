@@ -42,6 +42,8 @@ pub struct Config {
     /// The dsh profile to boot; it must carry the `zf-tui-bridge` plugin.
     pub acp_profile: String,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Runtime-owned global modeling MCP patch, retained across dsh reloads.
+    pub domain_mcp_patch: Option<PathBuf>,
     pub domain_context: Option<PathBuf>,
     pub domain_project: Option<PathBuf>,
     pub domain_setup: Option<crate::domain::DomainSetup>,
@@ -82,6 +84,7 @@ impl Default for Config {
                 .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "dsh.cmd" } else { "dsh" })),
             acp_profile: DEFAULT_PROFILE.into(),
             mcp_servers: Vec::new(),
+            domain_mcp_patch: None,
             domain_context: None,
             domain_project: None,
             domain_setup: None,

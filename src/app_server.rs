@@ -39,17 +39,21 @@ pub(crate) struct AppServer {
     child: Child,
     stderr: JoinHandle<()>,
     bridge: Option<JoinHandle<()>>,
+    domain_mcp: Option<crate::domain::HttpMcp>,
 }
 
 impl AppServer {
     /// Boot the dsh profile; its bridge plugin answers on the child's stdio.
     pub(crate) async fn spawn(config: &Config) -> Result<Self, AppServerError> {
-        let process = acp::spawn(config)?;
+        let mut config = config.clone();
+        let domain_mcp = crate::domain::HttpMcp::start(&mut config).await?;
+        let process = acp::spawn(&config)?;
         Ok(Self {
             pipe: Some(process.core_pipe),
             child: process.child,
             stderr: process.stderr,
             bridge: Some(process.bridge),
+            domain_mcp,
         })
     }
 
@@ -78,6 +82,7 @@ impl AppServer {
             child,
             stderr,
             bridge: None,
+            domain_mcp: None,
         })
     }
 
@@ -107,6 +112,9 @@ impl AppServer {
         }
         self.stderr.abort();
         let _ = (&mut self.stderr).await;
+        if let Some(mut server) = self.domain_mcp.take() {
+            server.stop().await?;
+        }
         Ok(())
     }
 }

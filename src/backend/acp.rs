@@ -64,14 +64,20 @@ fn launch(config: &Config) -> std::io::Result<(PipeTransport, Child, JoinHandle<
     launch_with_tail(config, None)
 }
 
+fn dsh_arguments(config: &Config) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["--profile".into(), config.acp_profile.clone().into()];
+    if let Some(patch) = &config.domain_mcp_patch {
+        args.extend(["--patch".into(), patch.as_os_str().to_owned()]);
+    }
+    args
+}
+
 fn launch_with_tail(
     config: &Config,
     tail: Option<StderrTail>,
 ) -> std::io::Result<(PipeTransport, Child, JoinHandle<()>)> {
     let mut command = Command::new(&config.dsh_executable);
-    command
-        .args(["--profile", config.acp_profile.as_str()])
-        .current_dir(&config.cwd);
+    command.args(dsh_arguments(config)).current_dir(&config.cwd);
     let mut child = owned_process::spawn(command, Input::Pipe)?;
     let stdout = child
         .stdout
@@ -1249,6 +1255,23 @@ impl AcpBridge {
         };
         let event = &params["event"];
         match event["type"].as_str() {
+            Some("subagent") => {
+                let (Some(id), Some(state), Some(summary)) = (
+                    event["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 1024),
+                    event["state"]
+                        .as_str()
+                        .filter(|state| matches!(*state, "completed" | "failed" | "message")),
+                    event["summary"].as_str().filter(|text| text.len() <= 4096),
+                ) else {
+                    return Ok(());
+                };
+                self.core.send(Envelope::notification(
+                    "subagent/notice",
+                    Some(json!({"threadId":session,"id":id,"state":state,"summary":summary})),
+                ))?;
+            }
             Some("step") => {
                 let (Some(turn), Some(step), Some(state)) = (
                     self.turn_id.clone(),
@@ -1535,6 +1558,7 @@ impl AcpBridge {
                     .join("\n")
             });
             let mut item = json!({"id":item_id,"status":status,"tool":name,
+                "description":input.and_then(|input| input.reason.as_deref()),
                 "cwd":input.and_then(|input| input.cwd.as_deref()),
                 "target":input.and_then(|input| input.target.as_deref()).or_else(|| diffs.first().map(|diff| diff.path.as_str())),
                 "exitCode":exit_code,"durationMs":duration_ms,"aggregatedOutput":patch.or(output)});
@@ -2220,6 +2244,75 @@ mod tests {
     use crate::transport::PipeTransport;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn domain_dsh_arguments_include_global_patch() {
+        let config = Config {
+            domain_mcp_patch: Some("domain patch.yml".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::dsh_arguments(&config),
+            ["--profile", "zf-tui", "--patch", "domain patch.yml"].map(std::ffi::OsString::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_subagent_notices_arrive_between_turns_and_reject_foreign_sessions() {
+        let (mut core, core_bridge) = pair();
+        let (_, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        for session in ["foreign", "s"] {
+            bridge.plugin_event(json!({"sessionId":session,"event":{"type":"subagent","id":"child","state":"completed","summary":"区域判读结束"}})).unwrap();
+        }
+        let event = core.recv().await.unwrap();
+        assert_eq!(event.method.as_deref(), Some("subagent/notice"));
+        assert_eq!(
+            event.params.unwrap(),
+            json!({"threadId":"s","id":"child","state":"completed","summary":"区域判读结束"})
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_global_mcp_content_update_is_still_a_verified_receipt() {
+        let (mut core, core_bridge) = pair();
+        let (_, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge.turn_id = Some("t".into());
+        bridge.turn_started = true;
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"c","title":"mcp__modeling_domain__inspect_change","rawInput":{}}})).await.unwrap();
+        core.recv().await.unwrap();
+        let receipt = json!({"contract":"modeling-fact-receipt/v1","run_id":"run","context_sha256":"ctx","kind":"capabilities","ok":true,"fact_sequence":1,"fact_sha256":"a".repeat(64),"fact_bytes":2,"binding":{}});
+        bridge.update(json!({"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"c","status":"completed","content":[{"type":"content","content":{"type":"text","text":receipt.to_string()}}]}})).await.unwrap();
+        let item = core.recv().await.unwrap().params.unwrap()["item"].clone();
+        let setup = crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Project,
+            context_path: "context".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor".into(),
+        };
+        let notice = crate::protocol::ObservedTool {
+            thread_id: "s".into(),
+            turn_id: "t".into(),
+            item_id: "c".into(),
+            outcome: Some(crate::protocol::ObservedToolOutcome::Completed),
+            category: crate::protocol::ToolCategory::Mcp,
+            compaction: None,
+        };
+        assert_eq!(item["server"], "modeling_domain");
+        assert_eq!(
+            crate::domain::receipt::from_tool(&setup, &notice, &item)
+                .unwrap()
+                .unwrap()
+                .fact_sequence,
+            1
+        );
+    }
 
     fn pair() -> (PipeTransport, PipeTransport) {
         let (a, b) = tokio::io::duplex(64 * 1024);

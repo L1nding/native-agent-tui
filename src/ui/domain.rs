@@ -723,17 +723,30 @@ pub(super) fn draw(
     let reply = context.reply;
     let chunks = sections(area, reply);
     let reply_height = chunks[2].height;
+    let subagent = context
+        .subagents
+        .iter()
+        .rev()
+        .find(|agent| agent.status == crate::state::DshSubagentStatus::Running)
+        .or_else(|| context.subagents.last());
+    let status = subagent
+        .map(|agent| agent.line(std::time::SystemTime::now()))
+        .into_iter()
+        .chain(
+            domain
+                .fact_sync_notice
+                .as_ref()
+                .map(|notice| display_text(notice)),
+        )
+        .collect::<Vec<_>>()
+        .join(" · ");
     frame.render_widget(
         Paragraph::new(format!(
             "建模 · {} · {} · 平台模型 {}\n{}",
             domain.floor_title(),
             super::lang::phase(context.phase),
             context.model.unwrap_or("default"),
-            domain
-                .fact_sync_notice
-                .as_ref()
-                .map(|notice| display_text(notice))
-                .unwrap_or_default()
+            status
         )),
         chunks[0],
     );

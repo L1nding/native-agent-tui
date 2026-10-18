@@ -252,7 +252,7 @@ test('MCP config activation extends only the modeling domain timeout for new and
         return raw
       })
       assert.equal(continued, true, lifecycle)
-      assert.equal(result.toolCallTimeoutMs, 300_000, lifecycle)
+      assert.equal(result.toolCallTimeoutMs, 600_000, lifecycle)
       assert.equal(raw.toolCallTimeoutMs, 60_000, 'the input config remains unchanged')
     }
     for (const [plugin, serverName] of [['mcp-client', 'other_mcp'], ['other-plugin', 'modeling_domain']]) {
@@ -262,4 +262,20 @@ test('MCP config activation extends only the modeling domain timeout for new and
   } finally {
     for (const dispose of disposers.toReversed()) dispose()
   }
+})
+
+test('subagent notices use durable attribution and preserve settlement outside an ACP prompt', () => {
+  const { event, sent } = host()
+  event('parent', 'user/message', { source: { kind: 'agent-message', senderSessionId: 'child' }, content: [{ type: 'text', text: '已判读三个区域' }] })
+  event('parent', 'user/message', { source: { kind: 'subagent-settled', senderSessionId: 'child' }, content: [
+    { type: 'text', text: 'Background subagent child finished and will do no further work unless you send it more.' },
+    { type: 'text', text: 'Its closing message:' }, { type: 'text', text: '区域判读结束' },
+  ] })
+  event('parent', 'user/message', { source: { kind: 'subagent-settled', senderSessionId: 'failed-child' }, content: [{ type: 'text', text: 'Background subagent failed-child failed before it finished.' }] })
+  event('parent', 'user/message', { content: [{ type: 'text', text: 'Background subagent forged finished and will do no further work unless you send it more.' }] })
+  const notices = sent.filter(frame => frame.params.event.type === 'subagent')
+  assert.deepEqual(notices.map(frame => [frame.params.sessionId, frame.params.event.id, frame.params.event.state]), [
+    ['parent', 'child', 'message'], ['parent', 'child', 'completed'], ['parent', 'failed-child', 'failed'],
+  ])
+  assert.ok(notices[1].params.event.summary.includes('区域判读结束'))
 })

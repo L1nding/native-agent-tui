@@ -414,6 +414,12 @@ pub(super) fn draw_workflow(
     } else {
         format!("Workflow: {dispatch}{stopping}{disconnected} | ready roots: {ready}")
     }];
+    for agent in &snapshot.dsh_subagents {
+        raw.push(agent.line(std::time::SystemTime::now()));
+        if !agent.latest_message.is_empty() {
+            raw.push(format!("  {}：{}", agent.id, agent.latest_message));
+        }
+    }
     let native_reserved = scheduler
         .native_slot_capacity
         .map(|capacity| format!("{}/{}", scheduler.native_slots_reserved, capacity))

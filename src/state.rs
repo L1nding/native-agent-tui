@@ -183,6 +183,7 @@ pub struct CoreSnapshot {
     pub journal: Option<crate::journal::JournalView>,
     pub persistence: PersistenceState,
     pub agents: Vec<AgentSnapshot>,
+    pub dsh_subagents: Vec<DshSubagent>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub model: Option<String>,
@@ -232,6 +233,200 @@ pub struct MessageReplacement {
     pub current: String,
     /// Earlier preview blocks folded into the same committed block.
     pub prefix_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DshSubagentStatus {
+    Running,
+    Inactive,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DshSubagent {
+    pub id: String,
+    pub call_id: String,
+    pub name: String,
+    pub status: DshSubagentStatus,
+    pub started: SystemTime,
+    pub latest_message: String,
+}
+
+impl DshSubagent {
+    pub fn line(&self, now: SystemTime) -> String {
+        let status = match self.status {
+            DshSubagentStatus::Running => "运行中",
+            DshSubagentStatus::Inactive => "空闲（结果未知）",
+            DshSubagentStatus::Completed => "已结束",
+            DshSubagentStatus::Failed => "失败",
+        };
+        let minutes = now
+            .duration_since(self.started)
+            .unwrap_or_default()
+            .as_secs()
+            / 60;
+        if self.status == DshSubagentStatus::Running {
+            format!("子 Agent：{} · {status} {minutes} 分钟", self.name)
+        } else {
+            format!("子 Agent：{} · {status}", self.name)
+        }
+    }
+}
+
+impl CoreSnapshot {
+    pub(crate) fn observe_dsh_tool(&mut self, item: &serde_json::Value) {
+        let bounded = |text: &str| display_text(&text.chars().take(240).collect::<String>());
+        let call = item["id"].as_str().unwrap_or_default();
+        if call.is_empty() || call.len() > 1024 {
+            return;
+        }
+        match item["tool"].as_str() {
+            Some("subagent") => {
+                let index = self
+                    .dsh_subagents
+                    .iter()
+                    .position(|agent| agent.call_id == call);
+                let index = index.unwrap_or_else(|| {
+                    if self.dsh_subagents.len() >= 64 {
+                        let oldest = self
+                            .dsh_subagents
+                            .iter()
+                            .position(|agent| agent.status != DshSubagentStatus::Running)
+                            .unwrap_or(0);
+                        self.dsh_subagents.remove(oldest);
+                    }
+                    self.dsh_subagents.push(DshSubagent {
+                        id: call.into(),
+                        call_id: call.into(),
+                        name: bounded(item["description"].as_str().unwrap_or("子任务")),
+                        status: DshSubagentStatus::Running,
+                        started: SystemTime::now(),
+                        latest_message: String::new(),
+                    });
+                    self.dsh_subagents.len() - 1
+                });
+                let output = item["aggregatedOutput"].as_str().unwrap_or_default();
+                if let Some(id) = output
+                    .trim()
+                    .strip_prefix("started subagent ")
+                    .and_then(|text| text.split_whitespace().next())
+                    .filter(|id| id.len() <= 1024)
+                {
+                    let mut index = index;
+                    if let Some(other) = self
+                        .dsh_subagents
+                        .iter()
+                        .position(|agent| agent.id == id && agent.call_id != call)
+                    {
+                        let notice = self.dsh_subagents.remove(other);
+                        if other < index {
+                            index -= 1;
+                        }
+                        self.dsh_subagents[index].status = notice.status;
+                        self.dsh_subagents[index].latest_message = notice.latest_message;
+                    }
+                    self.dsh_subagents[index].id = id.into();
+                } else if item["status"] == "completed" {
+                    let agent = &mut self.dsh_subagents[index];
+                    agent.status = DshSubagentStatus::Completed;
+                    agent.latest_message = bounded(output);
+                } else if matches!(item["status"].as_str(), Some("failed" | "cancelled")) {
+                    let agent = &mut self.dsh_subagents[index];
+                    agent.status = DshSubagentStatus::Failed;
+                    agent.latest_message = bounded(output);
+                }
+            }
+            Some("send_message") if item["status"] == "completed" => {
+                if let Some(agent) = self
+                    .dsh_subagents
+                    .iter_mut()
+                    .find(|agent| item["target"] == agent.id)
+                {
+                    if agent.status != DshSubagentStatus::Running {
+                        agent.started = SystemTime::now();
+                    }
+                    agent.status = DshSubagentStatus::Running;
+                }
+            }
+            Some("list_agents") if item["status"] == "completed" => {
+                if let Some(value) = item["aggregatedOutput"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                {
+                    for entry in value
+                        .as_array()
+                        .or_else(|| value["agents"].as_array())
+                        .into_iter()
+                        .flatten()
+                        .take(64)
+                    {
+                        if let Some(agent) = self.dsh_subagents.iter_mut().find(|agent| {
+                            entry["id"] == agent.id
+                                || entry["target"] == agent.id
+                                || entry["target"] == agent.name
+                        }) {
+                            agent.status = match entry["status"].as_str() {
+                                Some("running") => DshSubagentStatus::Running,
+                                Some("inactive") if agent.status == DshSubagentStatus::Running => {
+                                    DshSubagentStatus::Inactive
+                                }
+                                Some("inactive") => continue,
+                                Some("completed") => DshSubagentStatus::Completed,
+                                Some("failed") => DshSubagentStatus::Failed,
+                                _ => continue,
+                            };
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn observe_dsh_notice(&mut self, notice: &serde_json::Value) {
+        let Some(id) = notice["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 1024)
+        else {
+            return;
+        };
+        if !matches!(
+            notice["state"].as_str(),
+            Some("completed" | "failed" | "message")
+        ) {
+            return;
+        }
+        if !self.dsh_subagents.iter().any(|agent| agent.id == id) {
+            if self.dsh_subagents.len() >= 64 {
+                self.dsh_subagents.remove(0);
+            }
+            self.dsh_subagents.push(DshSubagent {
+                id: id.into(),
+                call_id: String::new(),
+                name: display_text(id),
+                status: DshSubagentStatus::Running,
+                started: SystemTime::now(),
+                latest_message: String::new(),
+            });
+        }
+        let Some(agent) = self
+            .dsh_subagents
+            .iter_mut()
+            .find(|agent| notice["id"] == agent.id)
+        else {
+            return;
+        };
+        match notice["state"].as_str() {
+            Some("completed") => agent.status = DshSubagentStatus::Completed,
+            Some("failed") => agent.status = DshSubagentStatus::Failed,
+            Some("message") => {}
+            _ => return,
+        }
+        if let Some(text) = notice["summary"].as_str() {
+            agent.latest_message = display_text(&text.chars().take(240).collect::<String>());
+        }
+    }
 }
 
 /// dsh 的一条斜杠命令，例如 `compact`；名称不带斜杠。
