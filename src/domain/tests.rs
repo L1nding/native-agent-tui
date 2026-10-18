@@ -4270,6 +4270,40 @@ fn first_use_v3_accepts_group_ranges_and_blocked_manifest_entries() {
 }
 
 #[test]
+fn first_use_v4_style_groups_project_with_aperture_ranges() {
+    let (mut proposal, mut evidence) = first_use_fixture();
+    let requirements = &mut proposal["proposal"]["component_first_use_requirements"];
+    requirements["contract"] = json!("component-first-use/4");
+    requirements["required"][0]["style_signature_sha256"] = json!("c".repeat(64));
+    requirements["required"][0]["source_dimension_ranges_m"] = json!({
+        "cad_x":[0.9,1.5],"cad_y":[0.2,0.2],"width":[0.9,1.5],"height":[2.1,2.1],"sill_height":[0,0]
+    });
+    requirements["reused"] = json!([{"review_key":"a".repeat(64),"approved_review":{
+        "proposal_id":"approved","review_set_sha256":"b".repeat(64),
+        "domain_directory":"D:/runs/f02-opening-1/changes"}}]);
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    for field in ["style_signature_sha256", "source_dimension_ranges_m"] {
+        evidence["component_first_use_review"]["manifest"]["items"][0][field] =
+            proposal["proposal"]["component_first_use_requirements"]["required"][0][field].clone();
+    }
+    evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
+        )
+    ));
+    let (ready, images) = review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .unwrap();
+    assert_eq!(ready.status, "ready");
+    assert_eq!(ready.blocked_count, 0);
+    assert!(!images.is_empty());
+}
+
+#[test]
 fn first_use_async_progress_is_projected_without_images() {
     let (proposal, mut evidence) = first_use_fixture();
     evidence["component_first_use_review"] = json!({

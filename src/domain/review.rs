@@ -182,7 +182,12 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
     let required = value["required"].as_array()?;
     if !matches!(
         value["contract"].as_str(),
-        Some("component-first-use/1" | "component-first-use/2" | "component-first-use/3")
+        Some(
+            "component-first-use/1"
+                | "component-first-use/2"
+                | "component-first-use/3"
+                | "component-first-use/4"
+        )
     ) || required.len() > MAX_IMAGES
         || value["reused"].as_array()?.len() > 500
     {
