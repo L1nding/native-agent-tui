@@ -1,5 +1,56 @@
 use super::*;
 
+#[test]
+#[ignore = "read-only replay; set DOMAIN_FACT_REPLAY to a sealed facts directory"]
+fn replay_sealed_facts_projects_first_use_review() {
+    let root = std::env::var_os("DOMAIN_FACT_REPLAY").expect("DOMAIN_FACT_REPLAY");
+    let mut values: Vec<Value> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap()
+        })
+        .collect();
+    values.sort_by_key(|value| value["fact_sequence"].as_u64().unwrap());
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.run_id = values.last().unwrap()["run_id"].as_str().unwrap().into();
+    setup.context_sha256 = values.last().unwrap()["context_sha256"]
+        .as_str()
+        .unwrap()
+        .into();
+    let mut facts = DomainFacts::new(Some(setup));
+    for value in &values {
+        let result = facts.apply_verified_fact(value);
+        eprintln!(
+            "{} {}: {result:?}, projection_failure={:?}",
+            value["fact_sequence"], value["kind"], facts.projection_failure
+        );
+        if result == FactProjection::Invalid {
+            facts.synchronization_failed(
+                value["kind"].as_str().unwrap(),
+                value["fact_sequence"].as_u64().unwrap(),
+                "projection rejected".into(),
+            );
+        } else if result == FactProjection::Applied {
+            facts.synchronization_finished(&private_receipt(value));
+        }
+    }
+    eprintln!(
+        "review={:?}, sync={:?}",
+        facts
+            .snapshot
+            .first_use_review
+            .as_ref()
+            .map(|r| (&r.status, r.required_count)),
+        facts.snapshot.fact_sync_notice
+    );
+    assert_eq!(
+        facts.snapshot.first_use_review.as_ref().unwrap().status,
+        "ready"
+    );
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+}
+
 fn envelope() -> Value {
     json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx", "kind":"proposal", "current":true,
         "diagnostics":[],"proposal":{"proposal_id":"proposal", "revision":2,"prepare_token":"token",
@@ -4567,4 +4618,13 @@ fn first_use_details_use_all_chinese_display_parameters_and_never_dump_raw_templ
     assert!(fallback.contains("参数说明未提供，详见封存清单"));
     assert!(!fallback.contains("parameter_basis"));
     assert!(!fallback.contains("assumed"));
+}
+
+#[test]
+fn first_use_requirements_digest_survives_python_float_text() {
+    // Python writes the shortest round-trip float; re-encoding must reproduce it
+    // byte for byte or the sealed requirements digest no longer matches.
+    let text = r#"{"cad_x":[0.19999999999999574,2.099999999999998]}"#;
+    let value: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(serde_json::to_string(&value).unwrap(), text);
 }
