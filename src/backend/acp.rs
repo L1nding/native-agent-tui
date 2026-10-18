@@ -455,7 +455,7 @@ impl AcpBridge {
             model: config.model.clone(),
             model_is_preference: config.model_is_preference,
             models: Vec::new(),
-            reasoning: None,
+            reasoning: config.reasoning.clone(),
             current: None,
             respawn: None,
             replacement: None,
@@ -1784,9 +1784,12 @@ impl AcpBridge {
                 self.suppress_goals(&session)?;
                 let models = acp_protocol::model_choices(&result);
                 self.models = models.clone();
-                self.reasoning = acp_protocol::select_option(&result, "reasoning_effort")
+                // An explicit `--reasoning` wins over the agent's default and is applied
+                // through the same post-model restore path.
+                let current = acp_protocol::select_option(&result, "reasoning_effort")
                     .map(|(current, _)| current)
                     .filter(|current| !current.is_empty());
+                self.reasoning = self.reasoning.take().or(current);
                 let Some(requested) = self.model.clone() else {
                     let current = acp_protocol::current_model(&result);
                     return self.confirm(id, &session, current);
@@ -2958,6 +2961,46 @@ mod tests {
         let result = started.result.unwrap();
         assert_eq!(result["thread"]["id"], "s");
         assert_eq!(result["model"], "hi/gpt-6-astra");
+        drop(core_client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requested_reasoning_effort_is_selected_after_the_model() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let config = Config {
+            model: Some("hi/gpt-6-astra".into()),
+            reasoning: Some("low".into()),
+            ..Config::default()
+        };
+        let bridge = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+        core_client
+            .send(app_server::thread_start(RpcId::Number(2), &config))
+            .unwrap();
+        acp_server.recv().await.unwrap();
+        acp_server
+            .send(Envelope::response(
+                RpcId::Number(2),
+                Some(json!({"sessionId":"s","configOptions":[
+                    {"id":"model","currentValue":"[\"deepseek-official\",\"flash\"]","options":[
+                        {"group":"hi","options":[{"value":"[\"hi\",\"gpt-6-astra\"]","name":"GPT-6 Astra"}]}]},
+                    {"id":"reasoning_effort","currentValue":"high","options":[{"value":"low"},{"value":"high"}]}]})),
+            ))
+            .unwrap();
+        let select = acp_server.recv().await.unwrap();
+        assert_eq!(select.params.unwrap()["configId"], "model");
+        acp_server
+            .send(Envelope::response(
+                select.id.unwrap(),
+                Some(json!({"configOptions":[
+                    {"id":"reasoning_effort","currentValue":"high","options":[{"value":"low"},{"value":"high"}]}]})),
+            ))
+            .unwrap();
+        let effort = acp_server.recv().await.unwrap();
+        let params = effort.params.unwrap();
+        assert_eq!(params["configId"], "reasoning_effort");
+        assert_eq!(params["value"], "low");
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
     }

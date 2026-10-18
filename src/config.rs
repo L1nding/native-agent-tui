@@ -50,6 +50,8 @@ pub struct Config {
     pub no_domain_preview: bool,
     pub domain_approval_policy: DomainApprovalPolicy,
     pub model: Option<String>,
+    /// `--reasoning`: reasoning effort to select after the model, when the backend offers it.
+    pub reasoning: Option<String>,
     /// `model` came from saved preferences, not `--model`: a backend that no
     /// longer offers it keeps its own default instead of failing startup.
     pub model_is_preference: bool,
@@ -84,6 +86,7 @@ impl Default for Config {
             no_domain_preview: false,
             domain_approval_policy: DomainApprovalPolicy::Manual,
             model: None,
+            reasoning: None,
             model_is_preference: false,
             strict_outcome: false,
             permission: None,
@@ -241,6 +244,7 @@ where
             "--dsh" => config.dsh_executable = value(&args, &mut index, option)?.into(),
             "--profile" => config.acp_profile = value(&args, &mut index, option)?,
             "--model" => config.model = Some(value(&args, &mut index, option)?),
+            "--reasoning" => config.reasoning = Some(value(&args, &mut index, option)?),
             "--journal-dir" => config.journal.root = Some(value(&args, &mut index, option)?.into()),
             "--max-native-children" => {
                 config.max_native_children = bounded_usize(&args, &mut index, option, 1, 64)?;

@@ -42,6 +42,7 @@ Options:
   --dsh PATH       dsh launcher (or DSH_BIN)
   --profile NAME   dsh profile carrying the zf-tui-bridge plugin (default: zf-tui)
   --model NAME     Requested model as provider/model; the last /model choice when omitted
+  --reasoning LEVEL  Reasoning effort (for example low/medium/high) when the model offers it
   --permission PRESET  dsh permission preset for this session, e.g. read-only |
                    workspace-write | danger-full-access (default: dsh's own default)
   --domain-context FILE  Attach pure modeling tools and the F6 modeling view to this dsh session
