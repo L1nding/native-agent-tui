@@ -135,6 +135,11 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "precedent_auto_batch"
                 | "precedent_job"
                 | "linework_presort"
+                | "group_contact_sheet"
+                | "group_contact_sheet_image"
+                | "group_interpretation_batch"
+                | "schematic_templates"
+                | "unknown_box_presort"
         )
         || receipt.fact_sequence == 0
         || receipt.fact_bytes == 0
@@ -442,6 +447,9 @@ pub(crate) mod tests {
             "auto_batch",
             "precedent_auto_batch",
             "precedent_job",
+            "group_contact_sheet",
+            "group_interpretation_batch",
+            "schematic_templates",
             "linework_presort",
         ] {
             receipt.kind = kind.into();
