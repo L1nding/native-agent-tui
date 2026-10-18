@@ -4,7 +4,7 @@ use super::*;
 use tokio::io::AsyncReadExt;
 
 pub const FACT_LIMIT: usize = 8 * 1024 * 1024;
-const RECEIPT_LIMIT: usize = 16 * 1024;
+const RECEIPT_LIMIT: usize = 64 * 1024;
 const RECEIPT_CONTRACT: &str = "modeling-fact-receipt/v1";
 const BINDING_KEYS: &[&str] = &[
     "proposal_id",
