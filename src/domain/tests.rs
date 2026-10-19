@@ -4994,3 +4994,31 @@ fn polled_late_scope_activation_is_applied_and_reprojects_later_facts() {
     // Facts that are neither newer nor a late activation are ignored by the poller.
     assert_eq!(facts.apply_polled_fact(&first), None);
 }
+
+#[test]
+fn sealed_manual_grant_survives_busy_sync_but_not_a_changed_or_applied_version() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["project_scope"]["activation_revision"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    // The agent keeps tools running: facts are syncing when the grant comes back.
+    facts.synchronizing = true;
+    assert!(!facts.can_authorize(&binding));
+    assert!(facts.shows_binding(&binding));
+    let mut other = binding.clone();
+    other.revision += 1;
+    assert!(!facts.shows_binding(&other));
+    facts.snapshot.operation = Some(crate::domain::OperationFact {
+        operation_id: "op".into(),
+        state: "applied".into(),
+        recovery: "not_required".into(),
+        current_sha256: String::new(),
+    });
+    assert!(!facts.shows_binding(&binding));
+}

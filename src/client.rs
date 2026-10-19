@@ -1845,7 +1845,11 @@ impl Core {
                         || root_turn_count != self.state.view.root_turn_count
                         || !self.idle_for_backend_change()))
                     || (manual && !self.ready_for_human_approval())
-                    || !self.domain.can_authorize(&binding)
+                    // The grant is already sealed for this exact version. A busy agent keeps
+                    // facts syncing, so a manual grant only needs the same version and review
+                    // set to still be shown; policy approval keeps the full readiness check.
+                    || (manual && !self.domain.shows_binding(&binding))
+                    || (!manual && !self.domain.can_authorize(&binding))
                     || self.domain.snapshot.review_set_sha256() != review_set_sha256
                     || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
                         && !self.domain.can_auto_authorize(&binding))

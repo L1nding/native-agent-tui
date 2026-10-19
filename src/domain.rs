@@ -1958,6 +1958,15 @@ impl DomainFacts {
             && self.can_authorize(binding)
     }
 
+    /// The displayed proposal is still exactly this version and nothing applied it yet.
+    pub fn shows_binding(&self, binding: &ProposalBinding) -> bool {
+        self.snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| &proposal.binding == binding)
+            && self.snapshot.operation.is_none()
+    }
+
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
         self.setup.as_ref().is_some_and(|setup| {
             setup.run_id == binding.run_id
