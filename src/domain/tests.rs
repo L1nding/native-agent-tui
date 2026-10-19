@@ -4926,3 +4926,25 @@ fn replay_real_one_fact() {
         manifest["items"][0]["renderer"]
     );
 }
+
+#[test]
+fn project_activation_clears_sync_errors_from_the_previous_scope() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let mut first = project_scope(3, "f08", &"d".repeat(64));
+    first["project_scope"]["activation_revision"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&first), FactProjection::Applied);
+    // A one-off fact sealed while the scope was switching failed to project.
+    facts.synchronization_failed("opening_type_representatives", 4, "scope changed".into());
+    assert!(facts.snapshot.fact_sync_notice.is_some());
+    let mut second = project_scope(6, "f09.b", &"e".repeat(64));
+    second["project_scope"]["activation_revision"] = json!(2);
+    assert_eq!(facts.apply_verified_fact(&second), FactProjection::Applied);
+    assert!(facts.synchronization_errors.is_empty());
+    // A failure after the activation still blocks until re-verified.
+    facts.synchronization_failed("artifact", 9, "corrupt".into());
+    assert_eq!(facts.synchronization_errors.get("artifact"), Some(&9));
+}

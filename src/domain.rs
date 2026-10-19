@@ -1203,6 +1203,13 @@ impl DomainFacts {
                 };
                 if self.snapshot.project_scope.as_ref() != Some(&scope) {
                     self.clear_project_scope();
+                    // Facts that failed before this activation describe the previous
+                    // scope; the new activation re-establishes current state, so their
+                    // errors must not block approval cards forever.
+                    if let Some(sequence) = value["fact_sequence"].as_u64() {
+                        self.synchronization_errors
+                            .retain(|_, failed| *failed > sequence);
+                    }
                 }
                 self.snapshot.floor_id = scope.floor_id.clone();
                 self.snapshot.project_scope = Some(scope);
