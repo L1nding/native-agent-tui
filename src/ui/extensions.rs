@@ -1029,6 +1029,7 @@ mod tests {
             "ready",
             "sync",
             "authorizing",
+            "approved",
         ] {
             let mut snapshot = snapshot();
             let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
@@ -1058,6 +1059,16 @@ mod tests {
                 "authorizing" => {
                     domain.authorizing = true;
                     "正在保存你的确认"
+                }
+                "approved" => {
+                    domain.proposal.as_mut().unwrap().ready = false;
+                    domain.operation = Some(crate::domain::OperationFact {
+                        operation_id: "op".into(),
+                        state: "applying".into(),
+                        recovery: "not_required".into(),
+                        current_sha256: String::new(),
+                    });
+                    "你已批准"
                 }
                 _ => "Ctrl+Y 确认",
             };

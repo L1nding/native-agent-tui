@@ -1027,6 +1027,13 @@ pub(super) fn approval_card_lines(
         Some("模型信息暂未同步，请在 F6 查看问题")
     } else if domain.authorizing {
         Some("正在保存你的确认，请稍候")
+    } else if let Some(operation) = &domain.operation {
+        // Approved already: the proposal leaves `prepared`, which is not "not ready".
+        Some(if matches!(operation.state.as_str(), "applied" | "built") {
+            "✓ 你已批准，已应用到模型"
+        } else {
+            "✓ 你已批准，正在应用到模型"
+        })
     } else if !proposal.ready {
         Some("方案尚未准备好，请在下方输入意见或在 F6 查看问题")
     } else if !built {
@@ -1048,7 +1055,13 @@ pub(super) fn approval_card_lines(
     };
     lines.push(reason.map_or_else(
         || "Ctrl+Y 确认 · 有意见直接在下方输入".into(),
-        |reason| format!("还不能确认：{reason}"),
+        |reason| {
+            if reason.starts_with('✓') {
+                reason.into()
+            } else {
+                format!("还不能确认：{reason}")
+            }
+        },
     ));
     lines
 }
