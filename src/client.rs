@@ -864,7 +864,7 @@ impl Core {
                         poll_generation = self.domain_generation;
                     }
                     let setup = self.config.domain_setup.clone().unwrap();
-                    let after = self.domain.highest_sequence;
+                    let after = self.domain.poll_floor();
                     let mut files = std::mem::take(&mut checked);
                     let sender = poll_tx.clone();
                     let generation = poll_generation;
@@ -878,8 +878,8 @@ impl Core {
                     poll_task = None;
                 }
                 Some((generation, value)) = poll_rx.recv() => {
-                    if generation == self.domain_generation && value["fact_sequence"].as_u64().is_some_and(|sequence| sequence > self.domain.highest_sequence) {
-                        self.domain.apply_verified_fact(&value);
+                    if generation == self.domain_generation {
+                        self.domain.apply_polled_fact(&value);
                     }
                 }
                 changed = async {

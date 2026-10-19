@@ -4948,3 +4948,49 @@ fn project_activation_clears_sync_errors_from_the_previous_scope() {
     facts.synchronization_failed("artifact", 9, "corrupt".into());
     assert_eq!(facts.synchronization_errors.get("artifact"), Some(&9));
 }
+
+#[test]
+fn polled_late_scope_activation_is_applied_and_reprojects_later_facts() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let mut first = project_scope(3, "f08", &"d".repeat(64));
+    first["project_scope"]["activation_revision"] = json!(1);
+    assert_eq!(
+        facts.apply_polled_fact(&first),
+        Some(FactProjection::Applied)
+    );
+    // A background job activates scope 2 (seq 6) but a later tool receipt for that
+    // scope (seq 9) is projected first and fails against the old scope.
+    let mut second = project_scope(6, "f09.b", &"e".repeat(64));
+    second["project_scope"]["activation_revision"] = json!(2);
+    let mut later = second.clone();
+    later["fact_sequence"] = json!(9);
+    facts.highest_sequence = 9;
+    facts.synchronization_failed("project_scope", 9, "scope not current".into());
+    assert!(facts.poll_floor() <= 3);
+    assert_eq!(
+        facts.apply_polled_fact(&second),
+        Some(FactProjection::Applied)
+    );
+    assert_eq!(
+        facts
+            .snapshot
+            .project_scope
+            .as_ref()
+            .unwrap()
+            .activation_revision,
+        Some(2)
+    );
+    assert!(facts.synchronization_errors.is_empty());
+    assert_eq!(facts.highest_sequence, 6);
+    // The rescanned later fact now projects under the right scope.
+    assert_eq!(
+        facts.apply_polled_fact(&later),
+        Some(FactProjection::Applied)
+    );
+    // Facts that are neither newer nor a late activation are ignored by the poller.
+    assert_eq!(facts.apply_polled_fact(&first), None);
+}

@@ -1744,6 +1744,56 @@ impl DomainFacts {
         self.projection_failure = Some((kind, sequence, reason));
     }
 
+    /// Sequence the poller must scan from: a scope activation sealed by a background
+    /// job can arrive after a higher-numbered tool receipt, so project mode also
+    /// rescans everything after the last applied activation.
+    pub(crate) fn poll_floor(&self) -> u64 {
+        let scope = self
+            .fact_sequences
+            .get("project_scope")
+            .copied()
+            .unwrap_or(0);
+        if self
+            .setup
+            .as_ref()
+            .is_some_and(|setup| setup.mode == DomainMode::Project)
+        {
+            self.highest_sequence.min(scope)
+        } else {
+            self.highest_sequence
+        }
+    }
+
+    /// Apply one polled fact. Newer facts project as before; a scope activation that
+    /// arrived late is applied too, and the facts sealed after it are re-projected
+    /// under that scope instead of staying unverified forever.
+    pub(crate) fn apply_polled_fact(&mut self, value: &Value) -> Option<FactProjection> {
+        let sequence = value["fact_sequence"].as_u64()?;
+        if sequence > self.highest_sequence {
+            return Some(self.apply_verified_fact(value));
+        }
+        let late_scope = value["kind"] == "project_scope"
+            && self
+                .fact_sequences
+                .get("project_scope")
+                .is_none_or(|last| sequence > *last);
+        if !late_scope {
+            return None;
+        }
+        let projection = self.apply_verified_fact(value);
+        if projection == FactProjection::Applied {
+            self.highest_sequence = sequence;
+            self.synchronization_errors
+                .retain(|_, failed| *failed < sequence);
+            if self.synchronization_errors.is_empty() {
+                self.snapshot.fact_sync_notice = None;
+            } else {
+                self.show_remaining_synchronization_errors();
+            }
+        }
+        Some(projection)
+    }
+
     pub(crate) fn synchronization_finished(&mut self, receipt: &receipt::FactReceipt) {
         for key in [receipt.kind.as_str(), "transport"] {
             if self
