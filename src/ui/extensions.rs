@@ -181,12 +181,11 @@ impl Registry<'_> {
         *context.panel.displayed.borrow_mut() = view
             .confirmation(projection)
             .filter(|_| {
-                snapshot.phase.can_submit()
-                    && !snapshot
-                        .scheduler
-                        .tasks
-                        .iter()
-                        .any(|task| task.state.active())
+                !snapshot
+                    .scheduler
+                    .tasks
+                    .iter()
+                    .any(|task| task.state.active())
             })
             .filter(|confirmation| confirmation.id() == id);
         true
@@ -210,8 +209,6 @@ impl Registry<'_> {
         }
         let pending = if !snapshot.requests.is_empty() {
             Some("还不能确认：请先回答当前问题")
-        } else if !snapshot.phase.can_submit() {
-            Some("还不能确认：本轮还在处理，请稍候")
         } else if snapshot
             .scheduler
             .tasks
@@ -281,7 +278,6 @@ impl Registry<'_> {
             card,
         );
         if complete
-            && snapshot.phase.can_submit()
             && !snapshot
                 .scheduler
                 .tasks
@@ -381,7 +377,6 @@ impl Registry<'_> {
                         .filter(|confirmation| confirmation.id() == id)
                         .filter(|confirmation| {
                             view.confirmation(projection).as_ref() == Some(confirmation)
-                                && snapshot.phase.can_submit()
                                 && !snapshot
                                     .scheduler
                                     .tasks
@@ -490,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn running_model_turn_cannot_present_an_actionable_modeling_approval() {
+    fn running_model_turn_still_presents_the_modeling_approval() {
         let mut snapshot = snapshot();
         snapshot.phase = SessionPhase::Running;
         let local = LocalState {
@@ -501,10 +496,8 @@ mod tests {
         terminal
             .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
             .unwrap();
-        assert!(
-            local.extension.displayed.borrow().is_none(),
-            "running turn offered approval that Core will reject"
-        );
+        // Human approval binds the displayed version; the agent may keep working.
+        assert!(local.extension.displayed.borrow().is_some());
     }
 
     #[test]
@@ -578,7 +571,7 @@ mod tests {
 
     #[test]
     fn ctrl_y_rechecks_invalidated_evidence_and_the_current_proposal_before_confirming() {
-        for change in ["invalid", "different-build", "binding", "running"] {
+        for change in ["invalid", "different-build", "binding"] {
             let mut snapshot = snapshot();
             let mut panel = ExtensionPanel::new(Some(ExtensionId::Modeling));
             panel.displayed(
@@ -603,7 +596,6 @@ mod tests {
                     domain.proposal.as_mut().unwrap().binding.prepare_token = "new-token".into();
                     domain.artifacts[0].binding.prepare_token = "new-token".into();
                 }
-                "running" => snapshot.phase = SessionPhase::Running,
                 _ => unreachable!(),
             }
             let action = REGISTRY.handle_key(
@@ -1240,15 +1232,8 @@ mod tests {
     }
 
     #[test]
-    fn conversation_card_never_confirms_small_windows_or_running_tasks() {
-        for condition in [
-            "small",
-            "running",
-            "narrow-running",
-            "compact-running",
-            "task",
-            "review",
-        ] {
+    fn conversation_card_never_confirms_small_windows_running_tasks_or_unreviewed_builds() {
+        for condition in ["small", "task", "review"] {
             let mut snapshot = snapshot();
             let mut local = LocalState {
                 viewport: Rect::new(0, 0, 120, 44),
@@ -1256,20 +1241,6 @@ mod tests {
             };
             match condition {
                 "small" => local.viewport = Rect::new(0, 0, 30, 16),
-                "running" => snapshot.phase = SessionPhase::Running,
-                "narrow-running" | "compact-running" => {
-                    snapshot.phase = SessionPhase::Running;
-                    local.viewport = Rect::new(
-                        0,
-                        0,
-                        40,
-                        if condition == "narrow-running" {
-                            160
-                        } else {
-                            16
-                        },
-                    );
-                }
                 "review" => {
                     let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
                     domain.artifacts[0].reviewed = false;

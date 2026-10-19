@@ -1835,9 +1835,12 @@ impl Core {
                 }
                 self.domain_authorization_task.take();
                 self.domain.snapshot.authorizing = false;
-                if generation != self.generation
-                    || root_turn_count != self.state.view.root_turn_count
-                    || !self.idle_for_backend_change()
+                let manual = policy == crate::config::DomainApprovalPolicy::Manual;
+                if (!manual
+                    && (generation != self.generation
+                        || root_turn_count != self.state.view.root_turn_count
+                        || !self.idle_for_backend_change()))
+                    || (manual && !self.ready_for_human_approval())
                     || !self.domain.can_authorize(&binding)
                     || self.domain.snapshot.review_set_sha256() != review_set_sha256
                     || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
@@ -1856,7 +1859,13 @@ impl Core {
                                 "具体版本已批准，交给平台 Agent 应用和构建".into()
                             },
                         );
-                        self.command(Command::SubmitRootInput { text });
+                        if self.state.view.phase.can_submit() {
+                            self.command(Command::SubmitRootInput { text });
+                        } else if let Err(error) = self.steer_root(text) {
+                            // The grant is recorded; the agent finds it on its next inspect.
+                            self.domain.snapshot.notice =
+                                Some(format!("具体版本已批准；通知 Agent 失败：{error}"));
+                        }
                     }
                     Err(reason) => {
                         if reason.starts_with("图片不可用") {
@@ -2716,7 +2725,16 @@ impl Core {
     ) {
         let binding = confirmation.proposal;
         let review_set_sha256 = confirmation.review_set_sha256;
-        if !self.idle_for_backend_change()
+        // A human approval binds the exact displayed version and is re-verified by the
+        // private authorizer, so it may be given while the agent is still working; with
+        // subagents and auto-continue the session is rarely idle. Policy approval stays
+        // at turn boundaries.
+        let ready = if policy == crate::config::DomainApprovalPolicy::Manual {
+            self.ready_for_human_approval()
+        } else {
+            self.idle_for_backend_change()
+        };
+        if !ready
             || !self.domain.can_authorize(&binding)
             || self.domain.snapshot.review_set_sha256() != review_set_sha256
             || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
@@ -2776,6 +2794,16 @@ impl Core {
                     .await;
             }
         }));
+    }
+
+    /// The session is up and not switching; a turn may be running.
+    fn ready_for_human_approval(&self) -> bool {
+        self.session_ready
+            && self.state.view.thread_id.is_some()
+            && self.state.view.models.switching.is_none()
+            && !self.state.view.models.reloading
+            && self.state.view.resuming.is_none()
+            && !self.state.view.creating_conversation
     }
 
     /// No turn, gate or task is active, so the model or backend can change.
