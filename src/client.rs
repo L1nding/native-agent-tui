@@ -393,6 +393,7 @@ impl ClientHandle {
                 interrupt_requested: false,
                 auto_continues: 0,
                 auto_submission: false,
+                undelivered_grant: None,
                 interrupt_sent: false,
                 token_budget_stop_started: false,
                 agent_budget_interrupts: BTreeMap::new(),
@@ -536,6 +537,9 @@ struct Core {
     /// Consecutive turns continued automatically since the user last typed.
     auto_continues: u32,
     auto_submission: bool,
+    /// A grant steered into a running turn may be lost when that turn ends first;
+    /// it is resubmitted when the turn ends while the change is still unapplied.
+    undelivered_grant: Option<(crate::domain::ProposalBinding, String)>,
     interrupt_sent: bool,
     token_budget_stop_started: bool,
     /// 已触发的 agent/turn 预算键；同一代只允许一次中断。
@@ -1861,7 +1865,10 @@ impl Core {
                         );
                         if self.state.view.phase.can_submit() {
                             self.command(Command::SubmitRootInput { text });
-                        } else if let Err(error) = self.steer_root(text) {
+                        } else if let Err(error) = {
+                            self.undelivered_grant = Some((binding.clone(), text.clone()));
+                            self.steer_root(text)
+                        } {
                             // The grant is recorded; the agent finds it on its next inspect.
                             self.domain.snapshot.notice =
                                 Some(format!("具体版本已批准；通知 Agent 失败：{error}"));
@@ -2490,6 +2497,24 @@ impl Core {
     /// The modeling agent tends to end a turn while background builds run; keep it
     /// going while the floor is incomplete, bounded, and never over a pending question.
     fn maybe_auto_continue(&mut self) {
+        if let Some((binding, text)) = self.undelivered_grant.take() {
+            let unapplied = self.domain.snapshot.operation.is_none()
+                && self
+                    .domain
+                    .snapshot
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|proposal| proposal.binding == binding);
+            if unapplied
+                && self.state.view.phase.can_submit()
+                && self.state.view.requests.is_empty()
+                && !self.domain.snapshot.authorizing
+            {
+                self.auto_submission = true;
+                self.command(Command::SubmitRootInput { text });
+                return;
+            }
+        }
         if !should_auto_continue(
             self.config.domain_setup.is_some(),
             self.auto_continues,
