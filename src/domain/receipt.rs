@@ -139,6 +139,8 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "group_contact_sheet_image"
                 | "group_interpretation_batch"
                 | "schematic_templates"
+                | "schematic_circulation"
+                | "opening_type_representatives"
                 | "unknown_box_presort"
         )
         || receipt.fact_sequence == 0
@@ -495,6 +497,8 @@ pub(crate) mod tests {
             "group_contact_sheet",
             "group_interpretation_batch",
             "schematic_templates",
+            "schematic_circulation",
+            "opening_type_representatives",
             "linework_presort",
         ] {
             receipt.kind = kind.into();
