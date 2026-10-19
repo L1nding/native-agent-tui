@@ -4465,8 +4465,12 @@ fn first_use_v4_style_groups_project_with_aperture_ranges() {
 }
 
 #[test]
-fn first_use_2d_overlay_is_accepted_only_for_hosted_or_schematic_categories() {
-    for (category, accepted) in [("door", true), ("fire_hydrant", true), ("chair", false)] {
+fn first_use_2d_overlay_is_accepted_for_any_sealed_category() {
+    for (category, accepted) in [
+        ("door", true),
+        ("fire_hydrant", true),
+        ("office_chair", true),
+    ] {
         let (mut proposal, mut evidence) = first_use_fixture();
         proposal["proposal"]["component_first_use_requirements"]["required"][0]["category"] =
             json!(category);
@@ -4848,4 +4852,66 @@ fn first_use_requirements_digest_survives_python_float_text() {
     let text = r#"{"cad_x":[0.19999999999999574,2.099999999999998]}"#;
     let value: Value = serde_json::from_str(text).unwrap();
     assert_eq!(serde_json::to_string(&value).unwrap(), text);
+}
+
+#[test]
+#[ignore = "read-only diagnosis; set DOMAIN_REAL_CONTEXT and DOMAIN_REAL_CWD"]
+fn replay_real_context_like_resume() {
+    let context = std::env::var("DOMAIN_REAL_CONTEXT").expect("DOMAIN_REAL_CONTEXT");
+    let cwd = std::env::var("DOMAIN_REAL_CWD").expect("DOMAIN_REAL_CWD");
+    let config = configure(Config {
+        cwd: cwd.into(),
+        domain_context: Some(context.into()),
+        ..Config::default()
+    })
+    .unwrap();
+    let facts = DomainFacts::new(config.domain_setup.clone());
+    let s = &facts.snapshot;
+    eprintln!(
+        "proposal={:?}",
+        s.proposal
+            .as_ref()
+            .map(|p| (p.binding.proposal_id.clone(), p.binding.revision, p.ready))
+    );
+    eprintln!(
+        "first_use={:?}",
+        s.first_use_review.as_ref().map(|r| (
+            &r.status,
+            r.required_count,
+            r.blocked_count,
+            &r.review_set_sha256
+        ))
+    );
+    eprintln!(
+        "images={} required={}",
+        s.review_images.len(),
+        s.review_images.iter().filter(|i| i.required).count()
+    );
+    eprintln!("sync={:?}", s.fact_sync_notice);
+}
+
+#[test]
+#[ignore = "read-only diagnosis"]
+fn replay_real_one_fact() {
+    let context = std::env::var("DOMAIN_REAL_CONTEXT").unwrap();
+    let cwd = std::env::var("DOMAIN_REAL_CWD").unwrap();
+    let path = std::env::var("DOMAIN_REAL_FACT").unwrap();
+    let config = configure(Config {
+        cwd: cwd.into(),
+        domain_context: Some(context.into()),
+        ..Config::default()
+    })
+    .unwrap();
+    let mut facts = DomainFacts::new(config.domain_setup.clone());
+    let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let result = facts.apply_verified_fact(&value);
+    eprintln!("result={result:?} failure={:?}", facts.projection_failure);
+    eprintln!("reason={}", review::project_failure_reason(&value));
+    let manifest = &value["component_first_use_review"]["manifest"];
+    eprintln!(
+        "manifest contract={} items={} renderer0={}",
+        manifest["contract"],
+        manifest["items"].as_array().map_or(0, Vec::len),
+        manifest["items"][0]["renderer"]
+    );
 }

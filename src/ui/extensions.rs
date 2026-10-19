@@ -180,13 +180,6 @@ impl Registry<'_> {
         view.draw(frame, area, projection, context);
         *context.panel.displayed.borrow_mut() = view
             .confirmation(projection)
-            .filter(|_| {
-                !snapshot
-                    .scheduler
-                    .tasks
-                    .iter()
-                    .any(|task| task.state.active())
-            })
             .filter(|confirmation| confirmation.id() == id);
         true
     }
@@ -207,15 +200,10 @@ impl Registry<'_> {
         if content.is_empty() {
             return area;
         }
+        // Human approval binds the exact displayed version; running turns and tasks
+        // (the root "继续" task, subagents) do not block it. Only a pending question does.
         let pending = if !snapshot.requests.is_empty() {
             Some("还不能确认：请先回答当前问题")
-        } else if snapshot
-            .scheduler
-            .tasks
-            .iter()
-            .any(|task| task.state.active())
-        {
-            Some("还不能确认：任务还在处理，请稍候")
         } else {
             None
         };
@@ -277,14 +265,7 @@ impl Registry<'_> {
             ),
             card,
         );
-        if complete
-            && !snapshot
-                .scheduler
-                .tasks
-                .iter()
-                .any(|task| task.state.active())
-            && snapshot.requests.is_empty()
-        {
+        if complete && snapshot.requests.is_empty() {
             *panel.displayed.borrow_mut() = view
                 .confirmation(projection)
                 .filter(|confirmation| confirmation.id() == ExtensionId::Modeling);
@@ -377,11 +358,6 @@ impl Registry<'_> {
                         .filter(|confirmation| confirmation.id() == id)
                         .filter(|confirmation| {
                             view.confirmation(projection).as_ref() == Some(confirmation)
-                                && !snapshot
-                                    .scheduler
-                                    .tasks
-                                    .iter()
-                                    .any(|task| task.state.active())
                                 && area.width >= 24
                                 && area.height >= 8
                         })
@@ -1232,8 +1208,8 @@ mod tests {
     }
 
     #[test]
-    fn conversation_card_never_confirms_small_windows_running_tasks_or_unreviewed_builds() {
-        for condition in ["small", "task", "review"] {
+    fn conversation_card_never_confirms_small_windows_or_unreviewed_builds() {
+        for condition in ["small", "review"] {
             let mut snapshot = snapshot();
             let mut local = LocalState {
                 viewport: Rect::new(0, 0, 120, 44),
@@ -1244,14 +1220,6 @@ mod tests {
                 "review" => {
                     let ExtensionSnapshot::Modeling(domain) = &mut snapshot.extensions[0];
                     domain.artifacts[0].reviewed = false;
-                }
-                "task" => {
-                    let mut scheduler = crate::scheduler::Scheduler::default();
-                    scheduler
-                        .enqueue(vec![crate::scheduler::RootTaskSpec::input("work".into())])
-                        .unwrap();
-                    scheduler.dispatch().unwrap();
-                    snapshot.scheduler = scheduler.snapshot();
                 }
                 _ => unreachable!(),
             }

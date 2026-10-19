@@ -433,20 +433,10 @@ pub(super) fn project(
                     return None;
                 }
             }
-            // Hosted openings and schematic fixtures use a fast sealed 2D overlay;
-            // the modeler restricts it to those categories before sealing.
-            Some("PIL_2D_OVERLAY")
-                if matches!(
-                    item["category"].as_str(),
-                    Some(
-                        "door"
-                            | "window"
-                            | "fire_door"
-                            | "fire_window"
-                            | "fire_hydrant"
-                            | "counter"
-                    )
-                ) => {}
+            // Openings, schematic fixtures and server schematic extrusions use a fast
+            // sealed 2-D overlay; the modeler decides eligibility before sealing, so Core
+            // does not keep its own (inevitably stale) category list.
+            Some("PIL_2D_OVERLAY") => {}
             _ => return None,
         }
         hash(&item["cad_evidence_sha256"])?;
