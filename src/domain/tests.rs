@@ -2867,10 +2867,21 @@ fn project_activation_rejects_previous_floor_incarnation_even_with_newer_sequenc
         facts.apply_verified_fact(&restored),
         FactProjection::Applied
     );
+    // A job still sealing facts for an earlier activation is stale, not corrupt: it is
+    // skipped (no sync error) and never becomes current state.
     let mut late = first.clone();
     late["kind"] = json!("proposal");
     late["fact_sequence"] = json!(100);
-    assert_eq!(facts.apply_verified_fact(&late), FactProjection::Invalid);
+    assert_eq!(facts.apply_verified_fact(&late), FactProjection::Superseded);
+    assert_eq!(
+        facts
+            .snapshot
+            .project_scope
+            .as_ref()
+            .unwrap()
+            .activation_revision,
+        Some(3)
+    );
     late["kind"] = json!("project_scope");
     assert_eq!(facts.apply_verified_fact(&late), FactProjection::Invalid);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();

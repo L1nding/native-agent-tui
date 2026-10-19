@@ -896,6 +896,20 @@ impl DomainFacts {
             let Some(scope) = project::scope_fact(value) else {
                 return FactProjection::Invalid;
             };
+            // A background job keeps sealing facts for the scope it started in after the
+            // agent re-activates another one; those belong to an older activation and are
+            // not current state, so they are skipped without a synchronization error.
+            if kind != "project_scope"
+                && self.snapshot.project_scope.as_ref().is_some_and(|current| {
+                    current.activation_revision.is_some_and(|revision| {
+                        scope
+                            .activation_revision
+                            .is_some_and(|incoming| incoming < revision)
+                    })
+                })
+            {
+                return FactProjection::Superseded;
+            }
             if self.snapshot.selection.as_ref().is_none_or(|selection| {
                 selection.state != SelectionState::Selected
                     || selection.selection_id != scope.selection_id
