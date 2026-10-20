@@ -213,7 +213,9 @@ pub(super) fn scope_fact(value: &Value) -> Option<ProjectScopeFact> {
                 return None;
             }
             let ids = binding["opening_ids"].as_array()?;
-            if ids.is_empty() || ids.len() > 100 {
+            // Sealed facts are byte-bounded; validate every bound opening rather
+            // than imposing a display-sized limit on a complete floor batch.
+            if ids.is_empty() {
                 return None;
             }
             let mut seen = std::collections::BTreeSet::new();

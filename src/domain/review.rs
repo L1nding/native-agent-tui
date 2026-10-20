@@ -226,6 +226,13 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
         if bindings.len() != ids.len() {
             return None;
         }
+        // V4 opening style groups retain each aperture's geometry hash. The
+        // representative must still match, and project() binds every member to
+        // the frozen requirements and the exact rendered review manifest.
+        let opening_style_group = value["contract"] == "component-first-use/4"
+            && kind == "cad"
+            && matches!(item["category"].as_str(), Some("door" | "window"))
+            && hash(&item["style_signature_sha256"]).is_some();
         let mut bound = BTreeSet::new();
         for binding in bindings {
             let id = text(binding, "component_id").ok()?;
@@ -233,7 +240,12 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 return None;
             }
             for key in ["source_sha256", "source_geometry_sha256"] {
-                if binding[key] != item[key] {
+                hash(&binding[key])?;
+                if binding[key] != item[key]
+                    && !(opening_style_group
+                        && key == "source_geometry_sha256"
+                        && binding["component_id"] != item["component_id"])
+                {
                     return None;
                 }
             }
@@ -557,6 +569,12 @@ pub(super) fn project(
 
 pub(super) fn project_failure_reason(value: &Value) -> String {
     let review = &value["component_first_use_review"];
+    if !matches!(
+        review["status"].as_str(),
+        Some("ready" | "blocked" | "running" | "stalled" | "not_required")
+    ) {
+        return "字段 component_first_use_review.status 不是可投影的复核状态".into();
+    }
     if hash(&review["review_set_sha256"]).is_none()
         && hash(&review["delivery"]["review_set_sha256"]).is_none()
     {

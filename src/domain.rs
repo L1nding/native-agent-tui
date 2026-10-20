@@ -855,18 +855,32 @@ impl DomainFacts {
 
     /// Core calls this only after validating a bounded inline envelope or a sealed fact.
     pub(crate) fn apply_verified_fact(&mut self, value: &Value) -> FactProjection {
+        macro_rules! invalid {
+            () => {
+                invalid!("fact projection validation")
+            };
+            ($reason:expr) => {{
+                if self.projection_failure.is_none() {
+                    self.remember_projection_failure(
+                        value,
+                        format!("{} rejected at {}:{}", $reason, file!(), line!()),
+                    );
+                }
+                FactProjection::Invalid
+            }};
+        }
         self.projection_failure = None;
         let Some(setup) = self.setup.as_ref() else {
-            return FactProjection::Invalid;
+            return invalid!();
         };
         if value["contract"] != CONTRACT {
-            return FactProjection::Invalid;
+            return invalid!();
         }
         if value["run_id"] != setup.run_id || value["context_sha256"] != setup.context_sha256 {
-            return FactProjection::Invalid;
+            return invalid!();
         }
         let Some(kind) = value["kind"].as_str() else {
-            return FactProjection::Invalid;
+            return invalid!();
         };
         // Scope identity is a dependency, not corruption in a delayed sealed read.
         // Only an already projected newer activation can make this historical.
@@ -894,7 +908,15 @@ impl DomainFacts {
                     | "diagnostic"
             ) {
             let Some(scope) = project::scope_fact(value) else {
-                return FactProjection::Invalid;
+                return invalid!(if value["project_scope"]
+                    .get("opening_completion_binding")
+                    .is_some()
+                    && value["project_scope"].get("activation_revision").is_none()
+                {
+                    "project::scope_fact: opening completion requires activation_revision"
+                } else {
+                    "project::scope_fact"
+                });
             };
             // A background job keeps sealing facts for the scope it started in after the
             // agent re-activates another one; those belong to an older activation and are
@@ -918,11 +940,11 @@ impl DomainFacts {
             }) || (kind != "project_scope"
                 && self.snapshot.project_scope.as_ref() != Some(&scope))
             {
-                return FactProjection::Invalid;
+                return invalid!("selection identity or current project scope mismatch");
             }
             if let Some(binding) = &scope.opening_completion_binding {
                 if value["project_structure"] != false {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 }
                 if matches!(kind, "project_scope" | "proposal") {
                     let proposal = &value["proposal"];
@@ -950,7 +972,7 @@ impl DomainFacts {
                                 })
                         })
                     {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     }
                 }
             }
@@ -972,7 +994,7 @@ impl DomainFacts {
                                     .any(|layer| !location.layers.contains(layer))
                         })
                     {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     }
                 }
                 if let Some(binding) = &scope.assembly_binding {
@@ -987,7 +1009,7 @@ impl DomainFacts {
                             && building.valid == Some(true)
                     }) || value["project_structure"] != false
                     {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     }
                 }
                 if let Some(current) = self.snapshot.project_scope.as_ref() {
@@ -995,7 +1017,7 @@ impl DomainFacts {
                         if scope.activation_revision.is_none_or(|incoming| {
                             incoming < revision || (incoming == revision && scope != *current)
                         }) {
-                            return FactProjection::Invalid;
+                            return invalid!();
                         }
                     }
                 }
@@ -1014,7 +1036,7 @@ impl DomainFacts {
                     .get("opening_completion_binding")
                     .is_some())
             {
-                return FactProjection::Invalid;
+                return invalid!();
             }
             None
         };
@@ -1025,7 +1047,7 @@ impl DomainFacts {
         let incoming_source_view = if source_kind {
             match SourceViewIdentity::read(value) {
                 Ok(view) => view,
-                Err(()) => return FactProjection::Invalid,
+                Err(()) => return invalid!(),
             }
         } else {
             None
@@ -1043,12 +1065,12 @@ impl DomainFacts {
         let artifact_kind = matches!(kind, "artifact" | "artifact_validation");
         let fact_key = if kind == "project_building" {
             let Some(id) = value["project_building"]["build_id"].as_str() else {
-                return FactProjection::Invalid;
+                return invalid!();
             };
             format!("building:{id}")
         } else if artifact_kind {
             let Some(id) = value["artifact"]["build_id"].as_str() else {
-                return FactProjection::Invalid;
+                return invalid!();
             };
             format!("artifact:{id}")
         } else if source_kind {
@@ -1092,7 +1114,7 @@ impl DomainFacts {
         let linework = if source_kind {
             match linework_coverage_fact(value) {
                 Ok(summary) => summary,
-                Err(()) => return FactProjection::Invalid,
+                Err(()) => return invalid!(),
             }
         } else {
             None
@@ -1101,7 +1123,7 @@ impl DomainFacts {
         let existing_structure = if source_kind {
             match existing_structure_coverage_fact(value, linework.as_ref()) {
                 Ok(summary) if summary.is_none() || incoming_source_view.is_some() => summary,
-                _ => return FactProjection::Invalid,
+                _ => return invalid!(),
             }
         } else {
             None
@@ -1109,7 +1131,7 @@ impl DomainFacts {
         let source_regions = if source_kind {
             match source_region_review_fact(value, linework.as_ref(), existing_structure.as_ref()) {
                 Ok(summary) if summary.is_none() || incoming_source_view.is_some() => summary,
-                _ => return FactProjection::Invalid,
+                _ => return invalid!(),
             }
         } else {
             None
@@ -1117,18 +1139,18 @@ impl DomainFacts {
         let openings = if inventory_kind {
             match opening_inventory_fact(value) {
                 Ok(summary) => summary,
-                Err(()) => return FactProjection::Invalid,
+                Err(()) => return invalid!(),
             }
         } else {
             None
         };
         if openings.is_some() && sequence.is_none() {
-            return FactProjection::Invalid;
+            return invalid!();
         }
         let floor_progress = if source_kind {
             match floor_progress_fact(value) {
                 Ok(progress) => progress,
-                Err(()) => return FactProjection::Invalid,
+                Err(()) => return invalid!(),
             }
         } else {
             None
@@ -1142,7 +1164,7 @@ impl DomainFacts {
                     .as_ref()
                     .and_then(|selection| project::building_fact(value, selection))
                 else {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 };
                 if let Some(old) = self
                     .snapshot
@@ -1154,7 +1176,7 @@ impl DomainFacts {
                         || old.input_binding != fact.input_binding
                         || old.input_sha256 != fact.input_sha256
                     {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     }
                     if fact.valid.is_none() && old.state == fact.state {
                         fact.valid = old.valid;
@@ -1181,7 +1203,7 @@ impl DomainFacts {
             }
             Some("drawing_audit") => {
                 let Some(fact) = project::drawing_audit_fact(value) else {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 };
                 if self.snapshot.operation.as_ref().is_some_and(|operation| {
                     operation.state == "applied" && operation.current_sha256 != fact.scene_sha256
@@ -1193,13 +1215,13 @@ impl DomainFacts {
             }
             Some("project_scope") => {
                 let Some(scope) = incoming_scope else {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 };
                 let Some(proposal) = proposal_fact(value) else {
-                    return FactProjection::Invalid;
+                    return invalid!("proposal_fact");
                 };
                 let Some(first_use) = review::requirements(&value["proposal"]) else {
-                    return FactProjection::Invalid;
+                    return invalid!("review::requirements");
                 };
                 if self.snapshot.project_scope.as_ref() != Some(&scope) {
                     self.clear_project_scope();
@@ -1230,7 +1252,7 @@ impl DomainFacts {
             }
             Some("project_location") => {
                 let Some(location) = project::location_fact(value) else {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 };
                 if self.snapshot.selection.as_ref().is_none_or(|selection| {
                     selection.state != SelectionState::Selected
@@ -1239,14 +1261,14 @@ impl DomainFacts {
                         || selection.source_sha256 != location.source_sha256
                         || !selection.selected_keys.contains(&location.floor_key)
                 }) {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 }
                 self.snapshot.project_location = Some(location);
                 accepted = true;
             }
             Some("project_catalog") => {
                 let Some(project) = project::catalog_fact(value) else {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 };
                 // A read-only catalog includes the original persisted target. Restore
                 // this selection before accepting floor facts; it grants no write access.
@@ -1254,7 +1276,7 @@ impl DomainFacts {
                     let Some(selection) = project::selection_fact(&json!({
                         "ok":true,"selection":value["recovery_index"]["selection"]
                     })) else {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     };
                     if selection.catalog_id != project.catalog_id
                         || selection.source_sha256 != project.source_sha256
@@ -1263,7 +1285,7 @@ impl DomainFacts {
                             .iter()
                             .any(|key| !project.floor_keys.contains(key))
                     {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     }
                     Some(selection)
                 } else {
@@ -1290,7 +1312,7 @@ impl DomainFacts {
             }
             Some("project_selection") => {
                 let Some(selection) = project::selection_fact(value) else {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 };
                 if self.snapshot.project.as_ref().is_none_or(|project| {
                     project.catalog_id != selection.catalog_id
@@ -1300,7 +1322,7 @@ impl DomainFacts {
                             .iter()
                             .any(|key| !project.floor_keys.contains(key))
                 }) {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 }
                 if self
                     .snapshot
@@ -1320,7 +1342,7 @@ impl DomainFacts {
             Some("proposal") => {
                 if let Some(proposal) = proposal_fact(value) {
                     let Some(mut first_use) = review::requirements(&value["proposal"]) else {
-                        return FactProjection::Invalid;
+                        return invalid!("review::requirements");
                     };
                     let mut images = Vec::new();
                     if value.get("component_first_use_review").is_some() {
@@ -1331,7 +1353,7 @@ impl DomainFacts {
                                 value,
                                 review::project_failure_reason(value),
                             );
-                            return FactProjection::Invalid;
+                            return invalid!();
                         };
                         first_use = projected;
                         images = projected_images;
@@ -1488,7 +1510,7 @@ impl DomainFacts {
                             value,
                             review::project_failure_reason(value),
                         );
-                        return FactProjection::Invalid;
+                        return invalid!();
                     };
                     self.snapshot.first_use_review = Some(first_use);
                     self.replace_review_images(images, true);
@@ -1561,7 +1583,7 @@ impl DomainFacts {
                         .as_str()
                         .filter(|v| !v.is_empty() && v.len() <= 80)
                     else {
-                        return FactProjection::Invalid;
+                        return invalid!();
                     };
                     Some(policy)
                 } else {
@@ -1574,10 +1596,10 @@ impl DomainFacts {
                         Some("source-view/1" | "source-view/2")
                     )
                 }) {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 }
                 if (policy.is_some() || view_declaration.is_some()) && sequence.is_none() {
-                    return FactProjection::Invalid;
+                    return invalid!();
                 }
                 if let Some(policy) = policy {
                     if self.source_policy.as_deref() != Some(policy) {
@@ -1645,7 +1667,7 @@ impl DomainFacts {
             }
             FactProjection::Applied
         } else if kind == "proposal" || source_kind {
-            FactProjection::Invalid
+            invalid!()
         } else {
             FactProjection::Unrelated
         }

@@ -1890,6 +1890,136 @@ fn opening_completion_scope() -> Value {
 }
 
 #[test]
+fn opening_completion_activation_projects_all_160_openings_and_preserves_validation() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let mut previous = project_scope(2198, "f08", &"e".repeat(64));
+    previous["project_scope"]["activation_revision"] = json!(88);
+    assert_eq!(
+        facts.apply_verified_fact(&previous),
+        FactProjection::Applied
+    );
+
+    // Minimal shape from real seq 2200: revision 89, 160 bound openings, one
+    // assets-only operation and complete-entity specification for each opening.
+    let mut scope = opening_completion_scope();
+    scope["fact_sequence"] = json!(2200);
+    scope["project_scope"]["activation_revision"] = json!(89);
+    let assets = json!({"style":"door","leaf_count":1,"leaf_span":null,
+        "leaf_thickness":0.04,"glass_thickness":0.008,"mullion_width":0.04,
+        "panel_max_width":1.2,"clearance":0.008});
+    let mut ids = Vec::new();
+    let mut operations = Vec::new();
+    let mut specs = Vec::new();
+    for index in 0..160 {
+        let id = format!("opening.{index}");
+        let mut op = scope["proposal"]["draft"]["operations"][0].clone();
+        op["target_id"] = json!(id);
+        op["value_json"] = json!(assets.to_string());
+        let mut spec = scope["proposal"]["component_plan"]["openings"][0].clone();
+        for key in ["component_id", "target_opening_id", "source_instance_id"] {
+            spec[key] = json!(id);
+        }
+        spec["assets"] = assets.clone();
+        ids.push(id);
+        operations.push(op);
+        specs.push(spec);
+    }
+    scope["project_scope"]["opening_completion_binding"]["opening_ids"] = json!(ids);
+    scope["proposal"]["draft"]["operations"] = json!(operations);
+    scope["proposal"]["component_plan"]["openings"] = json!(specs);
+    let (review_proposal, _) = first_use_fixture();
+    let mut requirement =
+        review_proposal["proposal"]["component_first_use_requirements"]["required"][0].clone();
+    requirement["category"] = json!("door");
+    requirement["template_id"] = json!("typed.door");
+    requirement["component_id"] = json!("opening.0");
+    requirement["source_instance_id"] = json!("opening.0");
+    requirement["component_ids"] = json!(["opening.0", "opening.159"]);
+    requirement["style_signature_sha256"] = json!("c".repeat(64));
+    requirement["source_dimension_ranges_m"] = json!({"width":[0.85,1.04],"height":[2.1,2.1]});
+    for (index, id) in ["opening.0", "opening.159"].into_iter().enumerate() {
+        requirement["source_bindings"][index]["component_id"] = json!(id);
+        requirement["source_bindings"][index]["source_instance_id"] = json!(id);
+    }
+    requirement["source_bindings"][1]["source_geometry_sha256"] = json!("6".repeat(64));
+    scope["proposal"]["component_first_use_requirements"] = json!({
+        "contract":"component-first-use/4","required":[requirement],"reused":[]});
+    // Activation freezes requirements; a proposal read without ready evidence stays blocked.
+    scope["component_first_use_review"] = json!({"status":"blocked","current":true});
+    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert_eq!(facts.snapshot.proposal.as_ref().unwrap().objects.len(), 320);
+    assert!(facts.snapshot.proposal.as_ref().unwrap().objects[318].contains("opening.159"));
+    assert!(!facts.can_authorize(&binding));
+    let mut proposal = scope.clone();
+    proposal["kind"] = json!("proposal");
+    proposal["fact_sequence"] = json!(2202);
+    assert_eq!(
+        facts.apply_verified_fact(&proposal),
+        FactProjection::Applied
+    );
+    let mut artifact = artifact_envelope("completion", 2203, "built", Some(true));
+    artifact["project_scope"] = scope["project_scope"].clone();
+    artifact["project_structure"] = json!(false);
+    artifact["artifact"]["proposal_id"] = json!(binding.proposal_id);
+    artifact["artifact"]["revision"] = json!(binding.revision);
+    artifact["artifact"]["prepare_token"] = json!(binding.prepare_token);
+    artifact["artifact"]["authority_sha256"] = json!(binding.base_sha256);
+    artifact["artifact"]["input_sha256"] = json!(binding.candidate_sha256);
+    assert_eq!(
+        facts.apply_verified_fact(&artifact),
+        FactProjection::Applied
+    );
+    assert!(!facts.can_authorize(&binding));
+    for fault in [
+        "revision",
+        "selection",
+        "scope",
+        "duplicate",
+        "target",
+        "assets",
+        "field",
+        "proof",
+    ] {
+        let mut bad = proposal.clone();
+        bad["fact_sequence"] = json!(2300);
+        match fault {
+            "revision" => {
+                bad["project_scope"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("activation_revision");
+            }
+            "selection" => bad["project_scope"]["selection_id"] = json!("9".repeat(64)),
+            "scope" => bad["project_scope"]["scope_id"] = json!("9".repeat(64)),
+            "duplicate" => {
+                bad["project_scope"]["opening_completion_binding"]["opening_ids"][159] =
+                    json!("opening.0")
+            }
+            "target" => bad["proposal"]["draft"]["operations"][159]["target_id"] = json!("foreign"),
+            "assets" => {
+                bad["proposal"]["component_plan"]["openings"][159]["assets"]["leaf_count"] =
+                    json!(2)
+            }
+            "field" => bad["proposal"]["draft"]["operations"][159]["field"] = json!("width"),
+            "proof" => bad["proposal"]["opening_completion_source"]["sha256"] = Value::Null,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{fault}"
+        );
+        assert_eq!(facts.snapshot.proposal.as_ref().unwrap().binding, binding);
+        assert!(!facts.can_authorize(&binding));
+    }
+}
+
+#[test]
 fn opening_completion_scope_preserves_exact_assets_only_binding_and_new_approval() {
     let mut setup = sequenced_facts().setup.unwrap();
     setup.mode = DomainMode::Project;
@@ -4409,6 +4539,12 @@ fn first_use_projection_failure_names_the_missing_review_set_field() {
     evidence["component_first_use_review"]["review_set_sha256"] = Value::Null;
     let reason = review::project_failure_reason(&evidence);
     assert!(reason.contains("delivery.review_set_sha256"), "{reason}");
+    evidence["component_first_use_review"]["status"] = json!("unknown");
+    let reason = review::project_failure_reason(&evidence);
+    assert!(
+        reason.contains("component_first_use_review.status"),
+        "{reason}"
+    );
 }
 
 #[test]
@@ -4453,10 +4589,15 @@ fn first_use_v4_style_groups_project_with_aperture_ranges() {
     requirements["reused"] = json!([{"review_key":"a".repeat(64),"approved_review":{
         "proposal_id":"approved","review_set_sha256":"b".repeat(64),
         "domain_directory":"D:/runs/f02-opening-1/changes"}}]);
+    requirements["required"][0]["category"] = json!("door");
+    requirements["required"][0]["source_bindings"][1]["source_geometry_sha256"] =
+        json!("6".repeat(64));
     let requirement = review::requirements(&proposal["proposal"]).unwrap();
-    for field in ["style_signature_sha256", "source_dimension_ranges_m"] {
-        evidence["component_first_use_review"]["manifest"]["items"][0][field] =
-            proposal["proposal"]["component_first_use_requirements"]["required"][0][field].clone();
+    for (field, value) in proposal["proposal"]["component_first_use_requirements"]["required"][0]
+        .as_object()
+        .unwrap()
+    {
+        evidence["component_first_use_review"]["manifest"]["items"][0][field] = value.clone();
     }
     evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
         "{:x}",
@@ -4473,6 +4614,58 @@ fn first_use_v4_style_groups_project_with_aperture_ranges() {
     assert_eq!(ready.status, "ready");
     assert_eq!(ready.blocked_count, 0);
     assert!(!images.is_empty());
+    for fault in [
+        "hash",
+        "representative",
+        "source",
+        "style",
+        "contract",
+        "category",
+    ] {
+        let mut bad = proposal.clone();
+        let required = &mut bad["proposal"]["component_first_use_requirements"]["required"][0];
+        match fault {
+            "hash" => required["source_bindings"][1]["source_geometry_sha256"] = json!("invalid"),
+            "representative" => {
+                required["source_bindings"][0]["source_geometry_sha256"] = json!("6".repeat(64))
+            }
+            "source" => required["source_bindings"][1]["source_sha256"] = json!("6".repeat(64)),
+            "style" => required["style_signature_sha256"] = Value::Null,
+            "category" => required["category"] = json!("chair"),
+            "contract" => {
+                bad["proposal"]["component_first_use_requirements"]["contract"] =
+                    json!("component-first-use/3")
+            }
+            _ => unreachable!(),
+        }
+        assert!(review::requirements(&bad["proposal"]).is_none(), "{fault}");
+    }
+    for field in [
+        "source_bindings",
+        "style_signature_sha256",
+        "source_dimension_ranges_m",
+    ] {
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0][field] = Value::Null;
+        assert!(
+            review::project(
+                &changed,
+                &proposal_fact(&proposal).unwrap().binding,
+                &requirement
+            )
+            .is_none(),
+            "{field}"
+        );
+    }
+    let mut changed = evidence.clone();
+    changed["component_first_use_review"]["manifest"]["items"][0]["source_bindings"][1]
+        ["source_geometry_sha256"] = json!("7".repeat(64));
+    assert!(review::project(
+        &changed,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement
+    )
+    .is_none());
 }
 
 #[test]
@@ -5039,29 +5232,48 @@ fn replay_real_facts_in_sequence() {
         ..Config::default()
     })
     .unwrap();
-    let mut facts = DomainFacts::new(config.domain_setup.clone());
+    // Replay the captured sequence from empty state, without a second baseline scan.
+    let mut facts = DomainFacts::new(None);
+    facts.setup = config.domain_setup;
     let mut values: Vec<Value> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
         .filter_map(|b| serde_json::from_slice(&b).ok())
         .collect();
     values.sort_by_key(|v| v["fact_sequence"].as_u64().unwrap_or(0));
+    let last_sequence = values.last().and_then(|v| v["fact_sequence"].as_u64());
+    let mut invalid_sequences = Vec::new();
     for value in values {
         let seq = value["fact_sequence"].as_u64().unwrap_or(0);
         let kind = value["kind"].as_str().unwrap_or("").to_owned();
         let result = facts.apply_verified_fact(&value);
+        if seq >= from && kind == "project_scope" {
+            eprintln!("ACTIVATION seq={seq} result={result:?}");
+        }
         if seq >= from && result == FactProjection::Invalid {
+            invalid_sequences.push(seq);
             let scope = facts
                 .snapshot
                 .project_scope
                 .as_ref()
                 .map(|s| (s.scope_id[..12].to_owned(), s.activation_revision));
             eprintln!(
-                "INVALID seq={seq} kind={kind} current_scope={scope:?} incoming={:?}",
+                "INVALID seq={seq} kind={kind} current_scope={scope:?} failure={:?} incoming={:?}",
+                facts.projection_failure,
                 value["project_scope"]["scope_id"]
                     .as_str()
                     .map(|s| &s[..12])
             );
         }
     }
+    eprintln!("REPLAY last_sequence={last_sequence:?} invalid_sequences={invalid_sequences:?}");
+    eprintln!(
+        "FINAL scope={:?} proposal_objects={:?}",
+        facts
+            .snapshot
+            .project_scope
+            .as_ref()
+            .map(|s| (&s.scope_id, s.activation_revision)),
+        facts.snapshot.proposal.as_ref().map(|p| p.objects.len())
+    );
 }
