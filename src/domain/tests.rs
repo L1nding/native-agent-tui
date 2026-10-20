@@ -5022,3 +5022,46 @@ fn sealed_manual_grant_survives_busy_sync_but_not_a_changed_or_applied_version()
     });
     assert!(!facts.shows_binding(&binding));
 }
+
+#[test]
+#[ignore = "read-only diagnosis; set DOMAIN_REAL_CONTEXT, DOMAIN_REAL_CWD, DOMAIN_REAL_FACTS"]
+fn replay_real_facts_in_sequence() {
+    let context = std::env::var("DOMAIN_REAL_CONTEXT").unwrap();
+    let cwd = std::env::var("DOMAIN_REAL_CWD").unwrap();
+    let dir = std::env::var("DOMAIN_REAL_FACTS").unwrap();
+    let from: u64 = std::env::var("DOMAIN_REAL_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let config = configure(Config {
+        cwd: cwd.into(),
+        domain_context: Some(context.into()),
+        ..Config::default()
+    })
+    .unwrap();
+    let mut facts = DomainFacts::new(config.domain_setup.clone());
+    let mut values: Vec<Value> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| std::fs::read(e.ok()?.path()).ok())
+        .filter_map(|b| serde_json::from_slice(&b).ok())
+        .collect();
+    values.sort_by_key(|v| v["fact_sequence"].as_u64().unwrap_or(0));
+    for value in values {
+        let seq = value["fact_sequence"].as_u64().unwrap_or(0);
+        let kind = value["kind"].as_str().unwrap_or("").to_owned();
+        let result = facts.apply_verified_fact(&value);
+        if seq >= from && result == FactProjection::Invalid {
+            let scope = facts
+                .snapshot
+                .project_scope
+                .as_ref()
+                .map(|s| (s.scope_id[..12].to_owned(), s.activation_revision));
+            eprintln!(
+                "INVALID seq={seq} kind={kind} current_scope={scope:?} incoming={:?}",
+                value["project_scope"]["scope_id"]
+                    .as_str()
+                    .map(|s| &s[..12])
+            );
+        }
+    }
+}
