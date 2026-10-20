@@ -4600,94 +4600,176 @@ fn first_use_v3_accepts_group_ranges_and_blocked_manifest_entries() {
 }
 
 #[test]
-fn first_use_v4_style_groups_project_with_aperture_ranges() {
+fn first_use_v5_separates_source_directions_and_binds_the_manifest() {
     let (mut proposal, mut evidence) = first_use_fixture();
+    // Minimal seq 2387 structure: schematic template, source-bound placement,
+    // and a normalized CAD direction (295.714285714... -> 295.714286).
+    proposal["proposal"]["component_plan"] = json!({
+    "templates":[{"id":"chair.template","metadata":{"template_kind":"schematic_extrusion"}}],
+    "components":[
+        {"component_id":"chair.1","template_id":"chair.template","source_instance_id":"source.1",
+         "placement_basis":"source","scale":[1.0,1.0,1.0],"rotation_z_deg":-64.28571428571428},
+        {"component_id":"chair.2","template_id":"chair.template","source_instance_id":"source.2",
+         "placement_basis":"source","scale":[1.0,1.0,1.0],"rotation_z_deg":295.7142857142857}
+    ]});
     let requirements = &mut proposal["proposal"]["component_first_use_requirements"];
-    requirements["contract"] = json!("component-first-use/4");
+    requirements["contract"] = json!("component-first-use/5");
+    requirements["required"][0]["source_direction"] = json!([false, false, 295.714286]);
     requirements["required"][0]["style_signature_sha256"] = json!("c".repeat(64));
-    requirements["required"][0]["source_dimension_ranges_m"] = json!({
-        "cad_x":[0.9,1.5],"cad_y":[0.2,0.2],"width":[0.9,1.5],"height":[2.1,2.1],"sill_height":[0,0]
-    });
-    requirements["reused"] = json!([{"review_key":"a".repeat(64),"approved_review":{
-        "proposal_id":"approved","review_set_sha256":"b".repeat(64),
-        "domain_directory":"D:/runs/f02-opening-1/changes"}}]);
-    requirements["required"][0]["category"] = json!("door");
-    requirements["required"][0]["source_bindings"][1]["source_geometry_sha256"] =
-        json!("6".repeat(64));
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
-    for (field, value) in proposal["proposal"]["component_first_use_requirements"]["required"][0]
-        .as_object()
-        .unwrap()
-    {
+    for (field, value) in requirements["required"][0].as_object().unwrap() {
         evidence["component_first_use_review"]["manifest"]["items"][0][field] = value.clone();
     }
     evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
         "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
-        )
+        Sha256::digest(serde_json::to_vec(requirements).unwrap())
     ));
-    let (ready, images) = review::project(
-        &evidence,
-        &proposal_fact(&proposal).unwrap().binding,
-        &requirement,
-    )
-    .unwrap();
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let (ready, images) = review::project(&evidence, &binding, &requirement).unwrap();
     assert_eq!(ready.status, "ready");
-    assert_eq!(ready.blocked_count, 0);
-    assert!(!images.is_empty());
-    for fault in [
-        "hash",
-        "representative",
-        "source",
-        "style",
-        "contract",
-        "category",
+    assert_eq!(images.len(), 1);
+    for direction in [
+        Value::Null,
+        json!([]),
+        json!([false, false]),
+        json!([0, false, 295.714286]),
+        json!([false, false, "295.714286"]),
+        json!([false, false, -1]),
+        json!([false, false, 360]),
+        json!([true, false, 295.714286]),
+        json!([false, false, 90.0]),
     ] {
         let mut bad = proposal.clone();
-        let required = &mut bad["proposal"]["component_first_use_requirements"]["required"][0];
-        match fault {
-            "hash" => required["source_bindings"][1]["source_geometry_sha256"] = json!("invalid"),
-            "representative" => {
-                required["source_bindings"][0]["source_geometry_sha256"] = json!("6".repeat(64))
-            }
-            "source" => required["source_bindings"][1]["source_sha256"] = json!("6".repeat(64)),
-            "style" => required["style_signature_sha256"] = Value::Null,
-            "category" => required["category"] = json!("chair"),
-            "contract" => {
-                bad["proposal"]["component_first_use_requirements"]["contract"] =
-                    json!("component-first-use/3")
-            }
-            _ => unreachable!(),
-        }
-        assert!(review::requirements(&bad["proposal"]).is_none(), "{fault}");
-    }
-    for field in [
-        "source_bindings",
-        "style_signature_sha256",
-        "source_dimension_ranges_m",
-    ] {
-        let mut changed = evidence.clone();
-        changed["component_first_use_review"]["manifest"]["items"][0][field] = Value::Null;
+        bad["proposal"]["component_first_use_requirements"]["required"][0]["source_direction"] =
+            direction.clone();
         assert!(
-            review::project(
-                &changed,
-                &proposal_fact(&proposal).unwrap().binding,
-                &requirement
-            )
-            .is_none(),
-            "{field}"
+            review::requirements(&bad["proposal"]).is_none(),
+            "{direction}"
         );
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0]["source_direction"] =
+            direction;
+        assert!(review::project(&changed, &binding, &requirement).is_none());
     }
+    let mut missing = proposal.clone();
+    missing["proposal"]["component_first_use_requirements"]["required"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_direction");
+    assert!(review::requirements(&missing["proposal"]).is_none());
+    for (field, value) in [
+        ("rotation_z_deg", json!(90.0)),
+        ("scale", json!([-1.0, 1.0, 1.0])),
+    ] {
+        let mut bad = proposal.clone();
+        bad["proposal"]["component_plan"]["components"][1][field] = value;
+        assert!(review::requirements(&bad["proposal"]).is_none(), "{field}");
+    }
+    let mut bad = proposal.clone();
+    bad["proposal"]["component_first_use_requirements"]["required"][0]["source_bindings"][1]
+        ["source_geometry_sha256"] = json!("f".repeat(64));
+    assert!(review::requirements(&bad["proposal"]).is_none());
     let mut changed = evidence.clone();
     changed["component_first_use_review"]["manifest"]["items"][0]["source_bindings"][1]
-        ["source_geometry_sha256"] = json!("7".repeat(64));
-    assert!(review::project(
-        &changed,
-        &proposal_fact(&proposal).unwrap().binding,
-        &requirement
-    )
-    .is_none());
+        ["source_geometry_sha256"] = json!("f".repeat(64));
+    assert!(review::project(&changed, &binding, &requirement).is_none());
+}
+
+#[test]
+fn first_use_v4_style_groups_project_with_aperture_ranges() {
+    for contract in ["component-first-use/4", "component-first-use/5"] {
+        let (mut proposal, mut evidence) = first_use_fixture();
+        let requirements = &mut proposal["proposal"]["component_first_use_requirements"];
+        requirements["contract"] = json!(contract);
+        requirements["required"][0]["style_signature_sha256"] = json!("c".repeat(64));
+        requirements["required"][0]["source_dimension_ranges_m"] = json!({
+            "cad_x":[0.9,1.5],"cad_y":[0.2,0.2],"width":[0.9,1.5],"height":[2.1,2.1],"sill_height":[0,0]
+        });
+        requirements["reused"] = json!([{"review_key":"a".repeat(64),"approved_review":{
+        "proposal_id":"approved","review_set_sha256":"b".repeat(64),
+        "domain_directory":"D:/runs/f02-opening-1/changes"}}]);
+        requirements["required"][0]["category"] = json!("door");
+        requirements["required"][0]["source_bindings"][1]["source_geometry_sha256"] =
+            json!("6".repeat(64));
+        let requirement = review::requirements(&proposal["proposal"]).unwrap();
+        for (field, value) in proposal["proposal"]["component_first_use_requirements"]["required"]
+            [0]
+        .as_object()
+        .unwrap()
+        {
+            evidence["component_first_use_review"]["manifest"]["items"][0][field] = value.clone();
+        }
+        evidence["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"])
+                    .unwrap()
+            )
+        ));
+        let (ready, images) = review::project(
+            &evidence,
+            &proposal_fact(&proposal).unwrap().binding,
+            &requirement,
+        )
+        .unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.blocked_count, 0);
+        assert!(!images.is_empty());
+        for fault in [
+            "hash",
+            "representative",
+            "source",
+            "style",
+            "contract",
+            "category",
+        ] {
+            let mut bad = proposal.clone();
+            let required = &mut bad["proposal"]["component_first_use_requirements"]["required"][0];
+            match fault {
+                "hash" => {
+                    required["source_bindings"][1]["source_geometry_sha256"] = json!("invalid")
+                }
+                "representative" => {
+                    required["source_bindings"][0]["source_geometry_sha256"] = json!("6".repeat(64))
+                }
+                "source" => required["source_bindings"][1]["source_sha256"] = json!("6".repeat(64)),
+                "style" => required["style_signature_sha256"] = Value::Null,
+                "category" => required["category"] = json!("chair"),
+                "contract" => {
+                    bad["proposal"]["component_first_use_requirements"]["contract"] =
+                        json!("component-first-use/3")
+                }
+                _ => unreachable!(),
+            }
+            assert!(review::requirements(&bad["proposal"]).is_none(), "{fault}");
+        }
+        for field in [
+            "source_bindings",
+            "style_signature_sha256",
+            "source_dimension_ranges_m",
+        ] {
+            let mut changed = evidence.clone();
+            changed["component_first_use_review"]["manifest"]["items"][0][field] = Value::Null;
+            assert!(
+                review::project(
+                    &changed,
+                    &proposal_fact(&proposal).unwrap().binding,
+                    &requirement
+                )
+                .is_none(),
+                "{field}"
+            );
+        }
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0]["source_bindings"][1]
+            ["source_geometry_sha256"] = json!("7".repeat(64));
+        assert!(review::project(
+            &changed,
+            &proposal_fact(&proposal).unwrap().binding,
+            &requirement
+        )
+        .is_none());
+    }
 }
 
 #[test]
@@ -5274,6 +5356,9 @@ async fn replay_real_facts_in_sequence() {
         if seq >= from && kind == "project_scope" {
             eprintln!("ACTIVATION seq={seq} result={result:?}");
         }
+        if seq >= from && matches!(kind.as_str(), "proposal" | "fact_page") {
+            eprintln!("PROJECTION seq={seq} kind={kind} result={result:?}");
+        }
         if seq >= from && result == FactProjection::Invalid {
             invalid_sequences.push(seq);
             let scope = facts
@@ -5334,6 +5419,24 @@ async fn replay_real_facts_in_sequence() {
             .map(|s| (&s.scope_id, s.activation_revision)),
         facts.snapshot.proposal.as_ref().map(|p| p.objects.len())
     );
+}
+
+#[test]
+fn immutable_fact_pages_are_unrelated_without_project_scope() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    let mut page = project_catalog(2459);
+    page["kind"] = json!("fact_page");
+    page.as_object_mut().unwrap().remove("project_scope");
+    page["items"] = json!([{"id":"source.1"}]);
+    assert_eq!(
+        facts.apply_polled_fact(&page),
+        Some(FactProjection::Unrelated)
+    );
+    assert!(facts.snapshot.rejected_facts.is_empty());
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+    assert_eq!(facts.poll_floor(), 2459);
 }
 
 #[test]

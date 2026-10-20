@@ -187,6 +187,7 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 | "component-first-use/2"
                 | "component-first-use/3"
                 | "component-first-use/4"
+                | "component-first-use/5"
         )
     ) || required.len() > MAX_IMAGES
         || value["reused"].as_array()?.len() > 500
@@ -226,11 +227,37 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
         if bindings.len() != ids.len() {
             return None;
         }
-        // V4 opening style groups retain each aperture's geometry hash. The
+        let directional = value["contract"] == "component-first-use/5";
+        let template = proposal["component_plan"]["templates"]
+            .as_array()
+            .and_then(|templates| templates.iter().find(|t| t["id"] == item["template_id"]));
+        let direction = if directional
+            && (item.get("source_direction").is_some()
+                || (kind == "cad"
+                    && template
+                        .is_some_and(|t| t["metadata"]["template_kind"] == "schematic_extrusion")))
+        {
+            let direction = item["source_direction"].as_array()?;
+            if direction.len() != 3 {
+                return None;
+            }
+            let x = direction[0].as_bool()?;
+            let y = direction[1].as_bool()?;
+            let rotation = direction[2].as_f64()?;
+            if !rotation.is_finite() || !(0.0..360.0).contains(&rotation) || kind != "cad" {
+                return None;
+            }
+            Some((x, y, rotation))
+        } else {
+            None
+        };
+        // V4/V5 opening style groups retain each aperture's geometry hash. The
         // representative must still match, and project() binds every member to
         // the frozen requirements and the exact rendered review manifest.
-        let opening_style_group = value["contract"] == "component-first-use/4"
-            && kind == "cad"
+        let opening_style_group = matches!(
+            value["contract"].as_str(),
+            Some("component-first-use/4" | "component-first-use/5")
+        ) && kind == "cad"
             && matches!(item["category"].as_str(), Some("door" | "window"))
             && hash(&item["style_signature_sha256"]).is_some();
         let mut bound = BTreeSet::new();
@@ -238,6 +265,40 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
             let id = text(binding, "component_id").ok()?;
             if !ids.contains(&id) || !bound.insert(id) {
                 return None;
+            }
+            if let Some((mirror_x, mirror_y, rotation)) = direction {
+                // Source-bound schematic placements carry the CAD transform in
+                // the sealed proposal. Check every member, not just the image's
+                // representative, so distinct directions cannot share a group.
+                let mut placements = proposal["component_plan"]["components"]
+                    .as_array()?
+                    .iter()
+                    .filter(|c| c["component_id"] == binding["component_id"]);
+                let placement = placements.next()?;
+                if placements.next().is_some()
+                    || placement["template_id"] != item["template_id"]
+                    || placement["source_instance_id"] != binding["source_instance_id"]
+                    || placement["placement_basis"] != "source"
+                {
+                    return None;
+                }
+                let scale = placement["scale"].as_array()?;
+                if scale.len() != 3 {
+                    return None;
+                }
+                let x = scale[0].as_f64()?;
+                let y = scale[1].as_f64()?;
+                let angle = placement["rotation_z_deg"].as_f64()?;
+                let angle = (angle.rem_euclid(360.0) * 1_000_000.0).round_ties_even() / 1_000_000.0;
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || !angle.is_finite()
+                    || (x < 0.0) != mirror_x
+                    || (y < 0.0) != mirror_y
+                    || angle % 360.0 != rotation
+                {
+                    return None;
+                }
             }
             for key in ["source_sha256", "source_geometry_sha256"] {
                 hash(&binding[key])?;

@@ -1039,6 +1039,11 @@ impl DomainFacts {
         let Some(kind) = value["kind"].as_str() else {
             return invalid!();
         };
+        // Immutable capability array fragments have no project scope or state
+        // projection. Policies and opening counts remain in the parent fact.
+        if kind == "fact_page" {
+            return FactProjection::Unrelated;
+        }
         // Scope identity is a dependency, not corruption in a delayed sealed read.
         // Only an already projected newer activation can make this historical.
         if setup.mode == DomainMode::Project
