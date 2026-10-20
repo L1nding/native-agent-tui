@@ -544,6 +544,7 @@ pub struct DomainSnapshot {
     pub authorizing: bool,
     pub notice: Option<String>,
     pub fact_sync_notice: Option<String>,
+    pub rejected_facts: Vec<RejectedFact>,
     pub verified_fact: Option<VerifiedFact>,
     pub preview_connection: Option<String>,
     pub preview_selection: Option<crate::preview::Selection>,
@@ -724,12 +725,30 @@ impl std::fmt::Debug for DomainSnapshot {
     }
 }
 
+/// Safe projection diagnostics: no raw tool payloads are retained.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RejectedFact {
+    pub kind: String,
+    pub sequence: u64,
+    pub reason: String,
+    scope_id: Option<String>,
+    activation_revision: Option<u64>,
+    proposal_id: Option<String>,
+    revision: Option<u64>,
+    prepare_token: Option<String>,
+    build_id: Option<String>,
+    pub blocking: bool,
+    pub dependency_rejected: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FactProjection {
     Applied,
     Superseded,
     Unrelated,
     Invalid,
+    Deferred,
+    DependencyRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +810,10 @@ pub struct DomainFacts {
     pub(crate) synchronizing: bool,
     synchronization_errors: BTreeMap<String, u64>,
     projection_failure: Option<(String, u64, String)>,
+    polled_sequence: u64,
+    activation_sequence: u64,
+    projected_sequences: BTreeMap<String, u64>,
+    deferred_sequences: BTreeMap<u64, String>,
 }
 
 impl DomainFacts {
@@ -819,6 +842,10 @@ impl DomainFacts {
             synchronizing: false,
             synchronization_errors: BTreeMap::new(),
             projection_failure: None,
+            polled_sequence: 0,
+            activation_sequence: 0,
+            projected_sequences: BTreeMap::new(),
+            deferred_sequences: BTreeMap::new(),
         };
         if let Some(setup) = &recovered {
             // Replay one sealed fact at a time so memory stays bounded by a single fact.
@@ -855,15 +882,145 @@ impl DomainFacts {
 
     /// Core calls this only after validating a bounded inline envelope or a sealed fact.
     pub(crate) fn apply_verified_fact(&mut self, value: &Value) -> FactProjection {
+        let sequence = value["fact_sequence"].as_u64().unwrap_or(0);
+        let before = self.snapshot.clone();
+        let mut result = self.project_fact(value);
+        if result == FactProjection::Deferred {
+            if let Some(rejected) = self.snapshot.rejected_facts.iter().find(|fact| {
+                fact.kind == "project_scope"
+                    && !fact.dependency_rejected
+                    && fact
+                        .scope_id
+                        .as_deref()
+                        .is_some_and(|id| value["project_scope"]["scope_id"].as_str() == Some(id))
+                    && fact.activation_revision
+                        == value["project_scope"]["activation_revision"].as_u64()
+                    && fact.sequence < sequence
+            }) {
+                let reason = format!(
+                    "依赖的 {} (seq {}) 已被拒绝：{}",
+                    rejected.kind, rejected.sequence, rejected.reason
+                );
+                self.remember_projection_failure(value, reason);
+                result = FactProjection::DependencyRejected;
+            }
+        }
+        let kind = value["kind"].as_str().unwrap_or("unknown");
+        if self.setup.as_ref().is_none_or(|setup| {
+            value["contract"] != CONTRACT
+                || value["run_id"] != setup.run_id
+                || value["context_sha256"] != setup.context_sha256
+        }) {
+            return result;
+        }
+        if matches!(
+            result,
+            FactProjection::Invalid | FactProjection::DependencyRejected
+        ) {
+            self.snapshot = before;
+            let reason = self
+                .projection_failure
+                .as_ref()
+                .map(|(_, _, reason)| reason.clone())
+                .unwrap_or_else(|| "fact projection validation".into());
+            let owner = match kind {
+                "artifact" | "artifact_validation" => &value["artifact"],
+                "component_first_use_review" => &value["component_first_use_review"],
+                "application" | "operation" => &value["receipt"],
+                _ => &value["proposal"],
+            };
+            // Keep a bounded diagnostic history. Eviction never clears an active blocker.
+            if self.snapshot.rejected_facts.len() >= 256 {
+                if let Some(index) = self
+                    .snapshot
+                    .rejected_facts
+                    .iter()
+                    .position(|fact| !fact.blocking)
+                {
+                    self.snapshot.rejected_facts.remove(index);
+                }
+            }
+            self.snapshot
+                .rejected_facts
+                .retain(|fact| fact.sequence != sequence || fact.kind != kind);
+            self.snapshot.rejected_facts.push(RejectedFact {
+                kind: kind.into(),
+                sequence,
+                reason,
+                scope_id: value["project_scope"]["scope_id"]
+                    .as_str()
+                    .map(str::to_owned),
+                activation_revision: value["project_scope"]["activation_revision"].as_u64(),
+                proposal_id: owner["proposal_id"].as_str().map(str::to_owned),
+                revision: owner["revision"].as_u64(),
+                prepare_token: owner["prepare_token"].as_str().map(str::to_owned),
+                build_id: owner["build_id"].as_str().map(str::to_owned),
+                blocking: true,
+                dependency_rejected: result == FactProjection::DependencyRejected,
+            });
+            self.highest_sequence = self.highest_sequence.max(sequence);
+            if self.synchronization_errors.get(kind) == Some(&sequence) {
+                self.synchronization_errors.remove(kind);
+            }
+        }
+        if result == FactProjection::Deferred {
+            self.deferred_sequences.insert(sequence, kind.into());
+        } else {
+            self.deferred_sequences.remove(&sequence);
+        }
+        if result == FactProjection::Applied {
+            let key = value["artifact"]["build_id"]
+                .as_str()
+                .map_or_else(|| kind.to_owned(), |id| format!("{kind}:{id}"));
+            self.projected_sequences
+                .entry(key)
+                .and_modify(|last| *last = (*last).max(sequence))
+                .or_insert(sequence);
+            self.snapshot
+                .rejected_facts
+                .retain(|fact| fact.sequence != sequence || fact.kind != kind);
+            if self
+                .synchronization_errors
+                .get(kind)
+                .is_some_and(|failed| *failed <= sequence)
+            {
+                self.synchronization_errors.remove(kind);
+            }
+        }
+        self.refresh_rejections();
+        result
+    }
+
+    fn project_fact(&mut self, value: &Value) -> FactProjection {
         macro_rules! invalid {
             () => {
                 invalid!("fact projection validation")
             };
             ($reason:expr) => {{
                 if self.projection_failure.is_none() {
+                    let reason = $reason;
+                    let summary = match reason {
+                        "review::requirements" => "首用复核需求缺失或无效",
+                        "proposal_fact" => "方案内容或绑定不合法",
+                        "project::scope_fact: opening completion requires activation_revision" => {
+                            "开洞补全作用域缺少激活版本 activation_revision"
+                        }
+                        "project::scope_fact" => "作用域字段缺失或无效",
+                        "selection identity or current project scope mismatch" => {
+                            "事实与当前选择或作用域不一致"
+                        }
+                        _ => "事实字段或绑定不符合领域契约",
+                    };
                     self.remember_projection_failure(
                         value,
-                        format!("{} rejected at {}:{}", $reason, file!(), line!()),
+                        format!(
+                            "{} 校验失败：{}；{} ({}:{})",
+                            value["kind"].as_str().unwrap_or("unknown"),
+                            summary,
+                            reason,
+                            file!(),
+                            line!()
+                        ),
                     );
                 }
                 FactProjection::Invalid
@@ -940,6 +1097,23 @@ impl DomainFacts {
             }) || (kind != "project_scope"
                 && self.snapshot.project_scope.as_ref() != Some(&scope))
             {
+                let future_activation =
+                    self.snapshot.project_scope.as_ref().is_none_or(|current| {
+                        scope.activation_revision.is_some_and(|incoming| {
+                            current
+                                .activation_revision
+                                .is_none_or(|revision| incoming > revision)
+                        })
+                    });
+                if self.snapshot.selection.is_none()
+                    || (future_activation
+                        && self.snapshot.selection.as_ref().is_some_and(|selection| {
+                            selection.selected_keys.contains(&scope.floor_key)
+                        }))
+                {
+                    self.remember_projection_failure(value, "作用域或选择依赖尚未到达".into());
+                    return FactProjection::Deferred;
+                }
                 return invalid!("selection identity or current project scope mismatch");
             }
             if let Some(binding) = &scope.opening_completion_binding {
@@ -978,6 +1152,9 @@ impl DomainFacts {
             }
             if kind == "project_scope" {
                 if let Some(choice) = &scope.wall_layer_choice {
+                    if self.snapshot.project_location.is_none() {
+                        return FactProjection::Deferred;
+                    }
                     if self
                         .snapshot
                         .project_location
@@ -998,6 +1175,17 @@ impl DomainFacts {
                     }
                 }
                 if let Some(binding) = &scope.assembly_binding {
+                    if value["project_structure"] == false
+                        && !self.snapshot.buildings.iter().any(|building| {
+                            building.build_id == binding.build_id
+                                && building.input_binding == binding.input_binding
+                                && building.current
+                                && building.valid == Some(true)
+                                && building.state == "built"
+                        })
+                    {
+                        return FactProjection::Deferred;
+                    }
                     if self.snapshot.selection.as_ref().is_none_or(|selection| {
                         !selection.selected_keys.contains(&binding.upper_floor_key)
                     }) || !self.snapshot.buildings.iter().any(|building| {
@@ -1224,6 +1412,7 @@ impl DomainFacts {
                     return invalid!("review::requirements");
                 };
                 if self.snapshot.project_scope.as_ref() != Some(&scope) {
+                    self.activation_sequence = sequence.unwrap_or(0);
                     self.clear_project_scope();
                     // Facts that failed before this activation describe the previous
                     // scope; the new activation re-establishes current state, so their
@@ -1251,6 +1440,9 @@ impl DomainFacts {
                 accepted = true;
             }
             Some("project_location") => {
+                if self.snapshot.selection.is_none() {
+                    return FactProjection::Deferred;
+                }
                 let Some(location) = project::location_fact(value) else {
                     return invalid!();
                 };
@@ -1311,6 +1503,9 @@ impl DomainFacts {
                 accepted = true;
             }
             Some("project_selection") => {
+                if self.snapshot.project.is_none() {
+                    return FactProjection::Deferred;
+                }
                 let Some(selection) = project::selection_fact(value) else {
                     return invalid!();
                 };
@@ -1407,6 +1602,9 @@ impl DomainFacts {
             Some("source_groups") => {
                 if let Some(groups) = source_groups_fact(value) {
                     if let Err(projection) = self.accept_source_policy(value) {
+                        if projection == FactProjection::Invalid {
+                            return invalid!("source policy declaration");
+                        }
                         return projection;
                     }
                     self.snapshot.groups = Some(groups);
@@ -1419,6 +1617,9 @@ impl DomainFacts {
             Some("source_ledger") => {
                 if let Some(ledger) = source_ledger_fact(value) {
                     if let Err(projection) = self.accept_source_policy(value) {
+                        if projection == FactProjection::Invalid {
+                            return invalid!("source policy declaration");
+                        }
                         return projection;
                     }
                     self.snapshot.ledger = Some(ledger);
@@ -1431,6 +1632,9 @@ impl DomainFacts {
             Some("source_linework" | "source_linework_selection") => {
                 if linework.is_some() && incoming_source_view.is_some() {
                     if let Err(projection) = self.accept_source_policy(value) {
+                        if projection == FactProjection::Invalid {
+                            return invalid!("source policy declaration");
+                        }
                         return projection;
                     }
                     if !same_source_view {
@@ -1491,6 +1695,9 @@ impl DomainFacts {
                 accepted = true;
             }
             Some("component_first_use_review") => {
+                if self.snapshot.proposal.is_none() || self.snapshot.first_use_review.is_none() {
+                    return FactProjection::Deferred;
+                }
                 if let (Some(proposal), Some(first_use)) =
                     (&self.snapshot.proposal, &self.snapshot.first_use_review)
                 {
@@ -1518,6 +1725,18 @@ impl DomainFacts {
                 }
             }
             Some("artifact" | "artifact_validation") => {
+                if self.snapshot.proposal.is_none() {
+                    return FactProjection::Deferred;
+                }
+                let owner = &value["artifact"];
+                if let Some(proposal) = &self.snapshot.proposal {
+                    if owner["proposal_id"]
+                        .as_str()
+                        .is_some_and(|id| id != proposal.binding.proposal_id)
+                    {
+                        return FactProjection::Superseded;
+                    }
+                }
                 if let Some(mut artifact) = self
                     .snapshot
                     .proposal
@@ -1666,7 +1885,7 @@ impl DomainFacts {
                     .or_insert(sequence);
             }
             FactProjection::Applied
-        } else if kind == "proposal" || source_kind {
+        } else if matches!(kind, "proposal" | "artifact" | "artifact_validation") || source_kind {
             invalid!()
         } else {
             FactProjection::Unrelated
@@ -1742,6 +1961,15 @@ impl DomainFacts {
     }
 
     pub(crate) fn synchronization_failed(&mut self, kind: &str, sequence: u64, reason: String) {
+        if self
+            .snapshot
+            .rejected_facts
+            .iter()
+            .any(|fact| fact.kind == kind && fact.sequence == sequence)
+        {
+            self.refresh_rejections();
+            return;
+        }
         let reason = self
             .projection_failure
             .take()
@@ -1754,10 +1982,9 @@ impl DomainFacts {
             .entry(kind.into())
             .and_modify(|last| *last = (*last).max(sequence))
             .or_insert(sequence);
-        self.snapshot.notice = Some(format!("领域事实同步失败：{reason}；请重新检查当前方案"));
-        self.snapshot
-            .fact_sync_notice
-            .clone_from(&self.snapshot.notice);
+        self.snapshot.fact_sync_notice = Some(format!(
+            "领域事实同步失败：{kind} (seq {sequence})，{reason}；请重新检查当前方案"
+        ));
     }
 
     fn remember_projection_failure(&mut self, value: &Value, reason: String) {
@@ -1766,54 +1993,50 @@ impl DomainFacts {
         self.projection_failure = Some((kind, sequence, reason));
     }
 
-    /// Sequence the poller must scan from: a scope activation sealed by a background
-    /// job can arrive after a higher-numbered tool receipt, so project mode also
-    /// rescans everything after the last applied activation.
+    /// Only a completed poll advances this cursor; tool receipts cannot hide gaps.
+    /// Permanent rejections are consumed, while unresolved dependencies are retried.
     pub(crate) fn poll_floor(&self) -> u64 {
-        let scope = self
-            .fact_sequences
-            .get("project_scope")
-            .copied()
-            .unwrap_or(0);
-        if self
-            .setup
-            .as_ref()
-            .is_some_and(|setup| setup.mode == DomainMode::Project)
-        {
-            self.highest_sequence.min(scope)
+        let floor = if self.deferred_sequences.is_empty() {
+            self.polled_sequence
         } else {
-            self.highest_sequence
-        }
+            self.polled_sequence.min(
+                self.fact_sequences
+                    .get("project_scope")
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
+        self.deferred_sequences
+            .keys()
+            .chain(self.synchronization_errors.values())
+            .filter(|sequence| **sequence > 0)
+            .fold(floor, |floor, sequence| {
+                floor.min(sequence.saturating_sub(1))
+            })
     }
 
-    /// Apply one polled fact. Newer facts project as before; a scope activation that
-    /// arrived late is applied too, and the facts sealed after it are re-projected
-    /// under that scope instead of staying unverified forever.
+    /// Retry dependency failures even when a later independent fact was applied.
     pub(crate) fn apply_polled_fact(&mut self, value: &Value) -> Option<FactProjection> {
         let sequence = value["fact_sequence"].as_u64()?;
-        if sequence > self.highest_sequence {
-            return Some(self.apply_verified_fact(value));
-        }
+        let previous = self.polled_sequence;
+        self.polled_sequence = previous.max(sequence);
         let late_scope = value["kind"] == "project_scope"
             && self
                 .fact_sequences
                 .get("project_scope")
                 .is_none_or(|last| sequence > *last);
-        if !late_scope {
-            return None;
+        if sequence >= previous
+            || late_scope
+            || self.deferred_sequences.contains_key(&sequence)
+            || self
+                .synchronization_errors
+                .values()
+                .any(|failed| *failed == sequence)
+        {
+            Some(self.apply_verified_fact(value))
+        } else {
+            None
         }
-        let projection = self.apply_verified_fact(value);
-        if projection == FactProjection::Applied {
-            self.highest_sequence = sequence;
-            self.synchronization_errors
-                .retain(|_, failed| *failed < sequence);
-            if self.synchronization_errors.is_empty() {
-                self.snapshot.fact_sync_notice = None;
-            } else {
-                self.show_remaining_synchronization_errors();
-            }
-        }
-        Some(projection)
     }
 
     pub(crate) fn synchronization_finished(&mut self, receipt: &receipt::FactReceipt) {
@@ -1857,7 +2080,7 @@ impl DomainFacts {
         }
         if self.synchronization_errors.is_empty() {
             self.snapshot.notice = None;
-            self.snapshot.fact_sync_notice = None;
+            self.refresh_rejections();
         } else {
             self.show_remaining_synchronization_errors();
         }
@@ -1879,9 +2102,93 @@ impl DomainFacts {
     pub(crate) fn synchronization_queue_drained(&mut self) {
         self.synchronizing = false;
         if self.synchronization_errors.is_empty() {
-            self.snapshot.fact_sync_notice = None;
+            self.refresh_rejections();
         } else {
             self.show_remaining_synchronization_errors();
+        }
+    }
+
+    fn refresh_rejections(&mut self) {
+        let scope = self.snapshot.project_scope.as_ref();
+        let proposal = self.snapshot.proposal.as_ref().map(|p| &p.binding);
+        if let Some(activation) = self.fact_sequences.get("project_scope") {
+            self.deferred_sequences
+                .retain(|sequence, _| sequence > activation);
+        }
+        for fact in &mut self.snapshot.rejected_facts {
+            let old_activation = fact.sequence < self.activation_sequence;
+            let other_scope = scope.is_some_and(|scope| {
+                fact.scope_id
+                    .as_ref()
+                    .is_some_and(|id| id != &scope.scope_id)
+                    || scope.activation_revision.is_some_and(|current| {
+                        fact.activation_revision.is_some_and(|old| old < current)
+                    })
+            });
+            let other_proposal = matches!(
+                fact.kind.as_str(),
+                "proposal"
+                    | "artifact"
+                    | "artifact_validation"
+                    | "component_first_use_review"
+                    | "application"
+                    | "operation"
+            ) && proposal.is_some_and(|binding| {
+                let same_proposal = fact.proposal_id.as_ref() == Some(&binding.proposal_id);
+                fact.proposal_id
+                    .as_ref()
+                    .is_some_and(|id| id != &binding.proposal_id)
+                    || (same_proposal
+                        && (fact
+                            .revision
+                            .is_some_and(|revision| revision < binding.revision)
+                            || (fact.revision == Some(binding.revision)
+                                && fact
+                                    .prepare_token
+                                    .as_ref()
+                                    .is_some_and(|token| token != &binding.prepare_token))))
+            });
+            let key = fact
+                .build_id
+                .as_ref()
+                .map(|id| format!("{}:{id}", fact.kind));
+            let replaced = self
+                .projected_sequences
+                .get(key.as_deref().unwrap_or(&fact.kind))
+                .is_some_and(|seq| *seq > fact.sequence);
+            fact.blocking = !old_activation
+                && !other_scope
+                && !other_proposal
+                && !replaced
+                && matches!(
+                    fact.kind.as_str(),
+                    "project_scope"
+                        | "project_selection"
+                        | "project_catalog"
+                        | "proposal"
+                        | "artifact"
+                        | "artifact_validation"
+                        | "component_first_use_review"
+                        | "application"
+                        | "operation"
+                );
+        }
+        if self.synchronization_errors.is_empty() {
+            self.snapshot.fact_sync_notice = self
+                .snapshot
+                .rejected_facts
+                .iter()
+                .find(|fact| fact.blocking)
+                .map(|fact| {
+                    format!(
+                        "领域事实{}：{} (seq {})，{}",
+                        if fact.dependency_rejected { "依赖被拒绝" } else { "已拒绝" },
+                        fact.kind, fact.sequence, fact.reason
+                    )
+                })
+                .or_else(|| self.deferred_sequences.iter().next().map(|(sequence, kind)| {
+                    format!("领域事实依赖尚未到达：{kind} (seq {sequence})；等待对应作用域或前置事实")
+                }));
         }
     }
 
@@ -1987,6 +2294,11 @@ impl DomainFacts {
             .as_ref()
             .is_some_and(|proposal| &proposal.binding == binding)
             && self.snapshot.operation.is_none()
+            && !self
+                .snapshot
+                .rejected_facts
+                .iter()
+                .any(|fact| fact.blocking)
     }
 
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
@@ -2010,6 +2322,12 @@ impl DomainFacts {
                     }))
         }) && !self.synchronizing
             && self.synchronization_errors.is_empty()
+            && !self
+                .snapshot
+                .rejected_facts
+                .iter()
+                .any(|fact| fact.blocking)
+            && self.deferred_sequences.is_empty()
             && !self.snapshot.authorizing
             && self.snapshot.operation.is_none()
             && self.snapshot.candidate_review_delivered(binding)

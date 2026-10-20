@@ -165,6 +165,24 @@ fn business_lines(
     {
         lines.push(Line::from(display_text(notice)));
     }
+    for fact in &domain.rejected_facts {
+        lines.push(Line::from(display_text(&format!(
+            "{} {} (seq {}) · {}：{}",
+            if fact.dependency_rejected {
+                "依赖被拒绝"
+            } else {
+                "已拒绝"
+            },
+            fact.kind,
+            fact.sequence,
+            if fact.blocking {
+                "阻止当前确认"
+            } else {
+                "不影响当前确认"
+            },
+            fact.reason
+        ))));
+    }
     if let Some(p) = &domain.proposal {
         lines.push(Line::from(format!(
             "方案 · 修订 {} · {}",
@@ -729,6 +747,24 @@ pub(super) fn draw(
         .rev()
         .find(|agent| agent.status == crate::state::DshSubagentStatus::Running)
         .or_else(|| context.subagents.last());
+    let rejection_status = domain.rejected_facts.last().map(|fact| {
+        format!(
+            "{} {} (seq {})：{}{}",
+            if fact.dependency_rejected {
+                "依赖被拒绝"
+            } else {
+                "已拒绝"
+            },
+            fact.kind,
+            fact.sequence,
+            fact.reason,
+            if fact.blocking {
+                ""
+            } else {
+                "；不影响当前确认"
+            }
+        )
+    });
     let status = subagent
         .map(|agent| agent.line(std::time::SystemTime::now()))
         .into_iter()
@@ -737,6 +773,12 @@ pub(super) fn draw(
                 .fact_sync_notice
                 .as_ref()
                 .map(|notice| display_text(notice)),
+        )
+        .chain(
+            rejection_status
+                .as_deref()
+                .filter(|_| domain.fact_sync_notice.is_none())
+                .map(display_text),
         )
         .collect::<Vec<_>>()
         .join(" · ");
@@ -1023,8 +1065,8 @@ pub(super) fn approval_card_lines(
         "图片 {} 张（Ctrl+O 查看，Alt+←/→ 切换）",
         domain.review_images.len()
     ));
-    let reason = if domain.fact_sync_notice.is_some() {
-        Some("模型信息暂未同步，请在 F6 查看问题")
+    let reason = if let Some(reason) = domain.fact_sync_notice.as_deref() {
+        Some(reason)
     } else if domain.authorizing {
         Some("正在保存你的确认，请稍候")
     } else if let Some(operation) = &domain.operation {
@@ -2350,6 +2392,73 @@ mod tests {
         assert!(rows.iter().any(|line| line.contains("GROUP_ROW_199")));
         assert!(rows.iter().any(|line| line.contains("LEDGER_ROW_999")));
         assert!(rows.iter().any(|line| line.contains("bed.1.body")));
+    }
+
+    #[test]
+    fn rejected_fact_kind_sequence_and_reason_are_visible_in_details_and_status() {
+        use crate::domain::{DomainFacts, DomainMode, DomainSetup};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut facts = DomainFacts::new(Some(DomainSetup {
+            mode: DomainMode::Floor,
+            context_path: "absent-context".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor".into(),
+        }));
+        facts.apply_verified_fact(&serde_json::json!({
+            "contract":"modeling-domain/v2", "run_id":"run", "context_sha256":"ctx",
+            "kind":"proposal", "fact_sequence":2156, "proposal":{}
+        }));
+        let reason = facts.snapshot.rejected_facts[0].reason.clone();
+        let local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            ..Default::default()
+        };
+        for blocking in [true, false] {
+            facts.snapshot.rejected_facts[0].blocking = blocking;
+            if !blocking {
+                facts.snapshot.fact_sync_notice = None;
+            }
+            let snapshot = CoreSnapshot {
+                extensions: vec![ExtensionSnapshot::Modeling(facts.snapshot.clone())],
+                ..Default::default()
+            };
+            let context = ViewContext::new(&snapshot, &local.extension, "", None);
+            let details = business_lines(&facts.snapshot, &context, 160)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(details.contains("proposal (seq 2156)"));
+            assert!(details.contains(&reason));
+            assert!(details.contains(if blocking {
+                "阻止当前确认"
+            } else {
+                "不影响当前确认"
+            }));
+            let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, frame.area(), &snapshot, &local))
+                .unwrap();
+            let header = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .take(600)
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(header.contains("proposal (seq 2156)"), "{header}");
+            assert!(
+                header
+                    .split_whitespace()
+                    .collect::<String>()
+                    .contains("校验失败"),
+                "{header}"
+            );
+        }
     }
 
     #[test]

@@ -2607,18 +2607,16 @@ impl Core {
             })
         };
         match result {
-            Ok(value) => {
-                if self.domain.apply_verified_fact(&value) == crate::domain::FactProjection::Invalid
-                {
-                    self.domain.synchronization_failed(
-                        &pending.receipt.kind,
-                        pending.receipt.fact_sequence,
-                        "完整事实不能投影为当前领域状态".into(),
-                    );
-                } else {
-                    self.domain.synchronization_finished(&pending.receipt);
-                }
-            }
+            Ok(value) => match self.domain.apply_verified_fact(&value) {
+                crate::domain::FactProjection::Deferred => self.domain.synchronization_failed(
+                    &pending.receipt.kind,
+                    pending.receipt.fact_sequence,
+                    "完整事实的投影依赖尚未到达".into(),
+                ),
+                crate::domain::FactProjection::Invalid
+                | crate::domain::FactProjection::DependencyRejected => {}
+                _ => self.domain.synchronization_finished(&pending.receipt),
+            },
             Err(reason) => self.domain.synchronization_failed(
                 &pending.receipt.kind,
                 pending.receipt.fact_sequence,

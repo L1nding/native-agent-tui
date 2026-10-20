@@ -214,7 +214,7 @@ pub(super) fn baseline(setup: &DomainSetup, mut apply: impl FnMut(Value)) {
 // A fact may be published before the sequence index. Retry only that file when
 // the index changes; unchanged malformed files need no repeated large reads.
 pub(crate) type FactFiles =
-    std::collections::HashMap<PathBuf, (std::time::SystemTime, Option<String>)>;
+    std::collections::HashMap<PathBuf, (std::time::SystemTime, Option<String>, Option<u64>)>;
 
 pub(crate) fn scan(
     setup: &DomainSetup,
@@ -299,42 +299,37 @@ pub(crate) fn scan(
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 let modified = path.metadata().ok()?.modified().ok()?;
-                if checked.get(&path).is_some_and(|(previous, pending)| {
-                    *previous == modified && pending.as_ref().is_none_or(|hash| *hash == index_sha)
-                }) {
-                    return None;
+                if let Some((previous, pending, sequence)) = checked.get(&path) {
+                    if *previous == modified {
+                        if let Some(sequence) = sequence {
+                            return (*sequence > after && known.contains(sequence))
+                                .then_some((*sequence, path));
+                        }
+                        if pending.as_ref().is_none_or(|hash| *hash == index_sha) {
+                            return None;
+                        }
+                    }
                 }
                 if checked.len() >= 65536 {
                     checked.clear();
                 }
                 let Some((sequence, _)) = open(&path) else {
-                    checked.insert(path, (modified, None));
+                    checked.insert(path, (modified, None, None));
                     return None;
                 };
                 if !known.contains(&sequence) {
-                    checked.insert(path, (modified, Some(index_sha.clone())));
+                    checked.insert(path, (modified, Some(index_sha.clone()), None));
                     return None;
                 }
-                if sequence <= after {
-                    checked.insert(path, (modified, None));
-                    return None;
-                }
-                Some((sequence, path))
+                checked.insert(path.clone(), (modified, None, Some(sequence)));
+                (sequence > after).then_some((sequence, path))
             })
             .collect();
         ordered.sort_unstable();
         for (sequence, path) in ordered {
             if let Some((reread, value)) = open(&path) {
-                if reread == sequence && known.contains(&sequence) {
-                    if !apply(value) {
-                        break;
-                    }
-                    if let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) {
-                        if checked.len() >= 65536 {
-                            checked.clear();
-                        }
-                        checked.insert(path, (modified, None));
-                    }
+                if reread == sequence && known.contains(&sequence) && !apply(value) {
+                    break;
                 }
             }
         }

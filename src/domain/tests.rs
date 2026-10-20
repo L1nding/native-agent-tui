@@ -134,6 +134,12 @@ fn domain_poll_projects_new_sealed_facts_and_ignores_tampering_foreign_and_old_s
                 2
             );
         }
+        let mut rescanned = Vec::new();
+        receipt::scan(&setup, 0, &mut checked, |value| {
+            rescanned.push(value["fact_sequence"].as_u64().unwrap());
+            true
+        });
+        assert_eq!(rescanned, [2, 3, 4, 12]);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -1627,7 +1633,7 @@ fn project_catalog_and_selection_are_bound_sequenced_and_never_authorize_scene_w
     let mut facts = DomainFacts::new(Some(setup));
     assert_eq!(
         facts.apply_verified_fact(&project_selection(2, true)),
-        FactProjection::Invalid
+        FactProjection::Deferred
     );
     assert_eq!(
         facts.apply_verified_fact(&project_catalog(1)),
@@ -2276,7 +2282,7 @@ fn lost_project_scope_rejects_proposal_until_read_only_scope_and_proposal_recove
     inspected["fact_sequence"] = json!(5);
     assert_eq!(
         facts.apply_verified_fact(&inspected),
-        FactProjection::Invalid
+        FactProjection::Deferred
     );
     facts.synchronization_failed("proposal", 5, "floor scope response was lost".into());
     assert!(facts.snapshot.proposal.is_none());
@@ -2344,7 +2350,13 @@ fn selected_project_scopes_bind_structure_approval_and_reject_other_floor_or_sta
         facts.apply_verified_fact(&malformed),
         FactProjection::Invalid
     );
-    assert!(facts.can_authorize(&current));
+    assert!(!facts.can_authorize(&current));
+    assert!(facts
+        .snapshot
+        .fact_sync_notice
+        .as_deref()
+        .unwrap()
+        .contains("seq 999"));
     let mut changed = project_selection(7, true);
     changed["selection"]["selection_id"] = json!("f".repeat(64));
     assert_eq!(facts.apply_verified_fact(&changed), FactProjection::Applied);
@@ -3033,7 +3045,7 @@ fn project_activation_rejects_previous_floor_incarnation_even_with_newer_sequenc
         .unwrap()
         .remove("activation_revision");
     assert_eq!(facts.apply_verified_fact(&legacy), FactProjection::Invalid);
-    assert!(facts.can_authorize(&binding));
+    assert!(!facts.can_authorize(&binding));
 }
 
 #[test]
@@ -3050,7 +3062,7 @@ fn project_connection_scope_requires_verified_building_and_selected_adjacent_ref
         "contract":"project-connection-scope/v1", "build_id":"base",
         "input_binding":"d".repeat(64), "upper_floor_key":"f09.b"
     });
-    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Invalid);
+    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Deferred);
     facts.apply_verified_fact(&project_building(3, "base", "built", Some(true)));
     assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
@@ -3073,7 +3085,11 @@ fn project_connection_scope_requires_verified_building_and_selected_adjacent_ref
         invalid["project_scope"]["assembly_binding"][key] = value;
         assert_eq!(
             facts.apply_verified_fact(&invalid),
-            FactProjection::Invalid,
+            if key == "build_id" {
+                FactProjection::Deferred
+            } else {
+                FactProjection::Invalid
+            },
             "{key}"
         );
     }
@@ -3170,12 +3186,12 @@ fn floor_location_is_source_bound_evidence_not_scene_authorization() {
     let mut facts = DomainFacts::new(Some(setup));
     assert_eq!(
         facts.apply_verified_fact(&project_location(3)),
-        FactProjection::Invalid
+        FactProjection::Deferred
     );
     facts.apply_verified_fact(&project_catalog(1));
     facts.apply_verified_fact(&project_selection(2, true));
     let scope = project_layer_choice_scope(4);
-    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Invalid);
+    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Deferred);
     assert_eq!(
         facts.apply_verified_fact(&project_location(3)),
         FactProjection::Applied
@@ -3225,7 +3241,13 @@ fn floor_location_is_source_bound_evidence_not_scene_authorization() {
     assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
     let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
     add_reviewed_candidate(&mut facts.snapshot, &binding);
-    assert!(facts.can_authorize(&binding));
+    assert!(!facts.can_authorize(&binding));
+    assert!(facts
+        .snapshot
+        .fact_sync_notice
+        .as_deref()
+        .unwrap()
+        .contains("seq 99"));
     let mut changed = project_selection(5, true);
     changed["selection"]["selection_id"] = json!("f".repeat(64));
     assert_eq!(facts.apply_verified_fact(&changed), FactProjection::Applied);
@@ -5177,8 +5199,8 @@ fn polled_late_scope_activation_is_applied_and_reprojects_later_facts() {
             .activation_revision,
         Some(2)
     );
-    assert!(facts.synchronization_errors.is_empty());
-    assert_eq!(facts.highest_sequence, 6);
+    assert_eq!(facts.synchronization_errors.get("project_scope"), Some(&9));
+    assert_eq!(facts.highest_sequence, 9);
     // The rescanned later fact now projects under the right scope.
     assert_eq!(
         facts.apply_polled_fact(&later),
@@ -5216,9 +5238,9 @@ fn sealed_manual_grant_survives_busy_sync_but_not_a_changed_or_applied_version()
     assert!(!facts.shows_binding(&binding));
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "read-only diagnosis; set DOMAIN_REAL_CONTEXT, DOMAIN_REAL_CWD, DOMAIN_REAL_FACTS"]
-fn replay_real_facts_in_sequence() {
+async fn replay_real_facts_in_sequence() {
     let context = std::env::var("DOMAIN_REAL_CONTEXT").unwrap();
     let cwd = std::env::var("DOMAIN_REAL_CWD").unwrap();
     let dir = std::env::var("DOMAIN_REAL_FACTS").unwrap();
@@ -5246,7 +5268,9 @@ fn replay_real_facts_in_sequence() {
     for value in values {
         let seq = value["fact_sequence"].as_u64().unwrap_or(0);
         let kind = value["kind"].as_str().unwrap_or("").to_owned();
-        let result = facts.apply_verified_fact(&value);
+        let result = facts
+            .apply_polled_fact(&value)
+            .unwrap_or(FactProjection::Unrelated);
         if seq >= from && kind == "project_scope" {
             eprintln!("ACTIVATION seq={seq} result={result:?}");
         }
@@ -5266,6 +5290,40 @@ fn replay_real_facts_in_sequence() {
             );
         }
     }
+    for image in &mut facts.snapshot.review_images {
+        image.file_state = if review::verify_image(&image.binding).await.is_ok() {
+            ImageFileState::Available
+        } else {
+            ImageFileState::Unavailable
+        };
+    }
+    facts.synchronization_queue_drained();
+    eprintln!(
+        "FINAL can_authorize={} poll_floor={} sync_notice={:?}",
+        facts
+            .snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|p| facts.can_authorize(&p.binding)),
+        facts.poll_floor(),
+        facts.snapshot.fact_sync_notice
+    );
+    eprintln!("FINAL readiness={:?} operation={:?} candidate_review={} first_use={} pending_dependencies={}",
+        facts.snapshot.proposal.as_ref().map(|p| (p.binding.revision, p.ready, p.state.as_str())),
+        facts.snapshot.operation.as_ref().map(|operation| operation.state.as_str()),
+        facts.snapshot.proposal.as_ref().is_some_and(|p| facts.snapshot.candidate_review_delivered(&p.binding)),
+        facts.snapshot.first_use_satisfied(), facts.deferred_sequences.len());
+    for fact in facts
+        .snapshot
+        .rejected_facts
+        .iter()
+        .filter(|fact| fact.sequence >= from)
+    {
+        eprintln!(
+            "REJECTED kind={} seq={} blocking={} dependency_rejected={} reason={}",
+            fact.kind, fact.sequence, fact.blocking, fact.dependency_rejected, fact.reason
+        );
+    }
     eprintln!("REPLAY last_sequence={last_sequence:?} invalid_sequences={invalid_sequences:?}");
     eprintln!(
         "FINAL scope={:?} proposal_objects={:?}",
@@ -5276,4 +5334,214 @@ fn replay_real_facts_in_sequence() {
             .map(|s| (&s.scope_id, s.activation_revision)),
         facts.snapshot.proposal.as_ref().map(|p| p.objects.len())
     );
+}
+
+#[test]
+fn rejected_unrelated_fact_does_not_stop_current_proposal_or_poll_floor() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_polled_fact(&project_catalog(1));
+    facts.apply_polled_fact(&project_selection(2, true));
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["project_scope"]["activation_revision"] = json!(2);
+    assert_eq!(
+        facts.apply_polled_fact(&scope),
+        Some(FactProjection::Applied)
+    );
+    let mut rejected = scope.clone();
+    rejected["kind"] = json!("proposal");
+    rejected["fact_sequence"] = json!(4);
+    rejected["project_scope"]["scope_id"] = json!("e".repeat(64));
+    rejected["proposal"]["summary"] = json!(null);
+    assert_eq!(
+        facts.apply_polled_fact(&rejected),
+        Some(FactProjection::Invalid)
+    );
+    facts.synchronization_failed("proposal", 4, "fallback".into());
+    assert!(facts.synchronization_errors.is_empty());
+    assert_eq!(facts.poll_floor(), 4);
+    let mut proposal = scope.clone();
+    proposal["kind"] = json!("proposal");
+    proposal["fact_sequence"] = json!(5);
+    assert_eq!(
+        facts.apply_polled_fact(&proposal),
+        Some(FactProjection::Applied)
+    );
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    assert_eq!(facts.poll_floor(), 5);
+    assert!(!facts.snapshot.rejected_facts[0].blocking);
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+}
+
+#[test]
+fn rejected_current_dependencies_block_until_matching_valid_replacement_or_new_activation() {
+    for kind in [
+        "proposal",
+        "artifact",
+        "artifact_validation",
+        "component_first_use_review",
+        "project_scope",
+    ] {
+        let mut setup = sequenced_facts().setup.unwrap();
+        setup.mode = DomainMode::Project;
+        let mut facts = DomainFacts::new(Some(setup));
+        facts.apply_polled_fact(&project_catalog(1));
+        facts.apply_polled_fact(&project_selection(2, true));
+        let mut scope = project_scope(3, "f08", &"d".repeat(64));
+        scope["project_scope"]["activation_revision"] = json!(1);
+        facts.apply_polled_fact(&scope);
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        add_reviewed_candidate(&mut facts.snapshot, &binding);
+        assert!(facts.can_authorize(&binding));
+        let mut bad = scope.clone();
+        bad["kind"] = json!(kind);
+        bad["fact_sequence"] = json!(4);
+        bad["proposal"]["summary"] = json!(null);
+        if kind == "project_scope" {
+            bad["proposal"]["proposal_id"] = json!("another-family");
+        }
+        let owner = json!({"proposal_id":binding.proposal_id,"revision":binding.revision,
+            "prepare_token":binding.prepare_token,"base_sha256":binding.base_sha256,
+            "candidate_sha256":binding.candidate_sha256,"build_id":"bad-build"});
+        bad["artifact"] = owner.clone();
+        bad["component_first_use_review"] = owner;
+        assert_eq!(
+            facts.apply_polled_fact(&bad),
+            Some(FactProjection::Invalid),
+            "{kind}"
+        );
+        assert!(!facts.can_authorize(&binding), "{kind}");
+        let notice = facts.snapshot.fact_sync_notice.as_deref().unwrap();
+        assert!(
+            notice.contains(kind)
+                && notice.contains("seq 4")
+                && notice.contains(&facts.snapshot.rejected_facts[0].reason),
+            "{notice}"
+        );
+        assert_eq!(facts.poll_floor(), 4);
+        // Reading the same activation again does not repair an invalid dependency.
+        let mut reread = scope.clone();
+        reread["fact_sequence"] = json!(5);
+        if kind != "project_scope" && kind != "proposal" {
+            facts.apply_polled_fact(&reread);
+            assert!(!facts.can_authorize(&binding), "{kind}");
+        }
+        let mut next = project_scope(6, "f09.b", &"e".repeat(64));
+        next["project_scope"]["activation_revision"] = json!(2);
+        assert_eq!(
+            facts.apply_polled_fact(&next),
+            Some(FactProjection::Applied)
+        );
+        let next_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        add_reviewed_candidate(&mut facts.snapshot, &next_binding);
+        assert!(facts.can_authorize(&next_binding), "{kind}");
+        assert!(!facts.snapshot.rejected_facts[0].blocking);
+        assert!(facts.snapshot.fact_sync_notice.is_none());
+    }
+}
+
+#[test]
+fn late_activation_dependency_retries_after_independent_facts_advance() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_polled_fact(&project_catalog(1));
+    facts.apply_polled_fact(&project_selection(2, true));
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["project_scope"]["activation_revision"] = json!(1);
+    let mut proposal = scope.clone();
+    proposal["kind"] = json!("proposal");
+    proposal["fact_sequence"] = json!(4);
+    assert_eq!(
+        facts.apply_polled_fact(&proposal),
+        Some(FactProjection::Deferred)
+    );
+    assert!(facts.snapshot.rejected_facts.is_empty());
+    assert_eq!(facts.poll_floor(), 0);
+    assert_eq!(
+        facts.apply_polled_fact(&scope),
+        Some(FactProjection::Applied)
+    );
+    assert_eq!(
+        facts.apply_polled_fact(&proposal),
+        Some(FactProjection::Applied)
+    );
+    assert_eq!(facts.poll_floor(), 4);
+}
+
+#[test]
+fn malformed_old_activation_is_visible_without_blocking_current_activation() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_polled_fact(&project_catalog(1));
+    facts.apply_polled_fact(&project_selection(2, true));
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["project_scope"]["activation_revision"] = json!(2);
+    facts.apply_polled_fact(&scope);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    let mut old = scope.clone();
+    old["fact_sequence"] = json!(4);
+    old["project_scope"]["activation_revision"] = json!(1);
+    old["project_scope"]["component_discovery"] = json!("malformed");
+    assert_eq!(facts.apply_polled_fact(&old), Some(FactProjection::Invalid));
+    assert!(facts.can_authorize(&binding));
+    assert!(!facts.snapshot.rejected_facts[0].blocking);
+    assert_eq!(facts.poll_floor(), 4);
+}
+
+#[test]
+fn rejected_activation_does_not_pin_polling_through_its_dependent_facts() {
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    let mut facts = DomainFacts::new(Some(setup));
+    facts.apply_polled_fact(&project_catalog(1));
+    facts.apply_polled_fact(&project_selection(2, true));
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["project_scope"]["activation_revision"] = json!(1);
+    facts.apply_polled_fact(&scope);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    let mut rejected = project_scope(4, "f09.b", &"e".repeat(64));
+    rejected["project_scope"]["activation_revision"] = json!(2);
+    rejected["proposal"]["summary"] = json!(null);
+    assert_eq!(
+        facts.apply_polled_fact(&rejected),
+        Some(FactProjection::Invalid)
+    );
+    let mut dependent = rejected.clone();
+    dependent["kind"] = json!("proposal");
+    dependent["fact_sequence"] = json!(5);
+    assert_eq!(
+        facts.apply_polled_fact(&dependent),
+        Some(FactProjection::DependencyRejected)
+    );
+    assert_eq!(facts.poll_floor(), 5);
+    assert!(facts.deferred_sequences.is_empty());
+    assert!(facts.can_authorize(&binding));
+    let failure = &facts.snapshot.rejected_facts[1];
+    assert!(failure.dependency_rejected);
+    assert!(failure.reason.contains("project_scope (seq 4)"));
+}
+
+#[test]
+fn missing_proposal_identity_cannot_prove_a_rejected_dependency_is_historical() {
+    let mut facts = sequenced_facts();
+    facts.apply_verified_fact(&envelope());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    let mut bad = artifact_envelope("bad", 9, "built", Some(true));
+    bad["artifact"]
+        .as_object_mut()
+        .unwrap()
+        .remove("proposal_id");
+    bad["artifact"]["revision"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&bad), FactProjection::Invalid);
+    assert!(!facts.can_authorize(&binding));
+    assert!(facts.snapshot.rejected_facts[0].blocking);
 }

@@ -1053,8 +1053,8 @@ mod tests {
                     "方案尚未准备好"
                 }
                 "sync" => {
-                    domain.fact_sync_notice = Some("sync failed".into());
-                    "模型信息暂未同步"
+                    domain.fact_sync_notice = Some("proposal #4：字段无效".into());
+                    "proposal #4：字段无效"
                 }
                 "authorizing" => {
                     domain.authorizing = true;
