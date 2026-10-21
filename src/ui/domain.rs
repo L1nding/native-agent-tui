@@ -934,6 +934,30 @@ pub(super) fn approval_card_lines(
         ),
     ];
 
+    if let Some(revision) = domain
+        .structure_revision
+        .as_ref()
+        .filter(|r| r.proposal == proposal.binding)
+    {
+        lines.push(format!(
+            "结构修订 · 方案第 {} 版 · 宿主映射 {}",
+            proposal.binding.revision, revision.host_mapping_count
+        ));
+        lines.extend(revision.changes.iter().map(|s| display_text(s)));
+        lines.extend(
+            revision
+                .void_decisions
+                .iter()
+                .map(|s| format!("挑空决定 · {}", display_text(s))),
+        );
+        lines.extend(
+            revision
+                .verification_questions
+                .iter()
+                .map(|s| format!("挑空核验 · {}", display_text(s))),
+        );
+    }
+
     let mut dimensions = std::collections::BTreeSet::new();
     let mut from_drawing = false;
     for assumption in &proposal.assumptions {
@@ -2487,6 +2511,47 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.to_string().contains("STRUCTURE_ENTITY_2219")));
+    }
+
+    #[test]
+    fn structural_approval_card_shows_revision_hosts_decisions_and_review_state() {
+        let proposal = proposal(7);
+        let mut domain = DomainSnapshot {
+            enabled: true,
+            structure_revision: Some(crate::domain::StructureRevisionFact {
+                proposal: proposal.binding.clone(),
+                host_mapping_count: 12,
+                changes: vec![
+                    "移除墙 old · 合并连续墙".into(),
+                    "新增楼板 slab · 恢复外轮廓".into(),
+                ],
+                void_decisions: vec!["void.1：保留楼板 · 用户原话 保留".into()],
+                verification_questions: vec!["该来源候选是否为挑空？ · 已记录决定".into()],
+            }),
+            proposal: Some(proposal),
+            ..Default::default()
+        };
+        let text = approval_card_lines(&domain, 0).join("\n");
+        for expected in [
+            "方案第 7 版",
+            "宿主映射 12",
+            "合并连续墙",
+            "恢复外轮廓",
+            "保留楼板",
+            "已记录决定",
+            "暂无图纸对比图检查记录",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        domain
+            .structure_revision
+            .as_mut()
+            .unwrap()
+            .proposal
+            .revision = 6;
+        let text = approval_card_lines(&domain, 0).join("\n");
+        assert!(!text.contains("宿主映射"));
+        assert!(!text.contains("void.1"));
     }
 
     #[test]

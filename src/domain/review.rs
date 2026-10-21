@@ -83,6 +83,8 @@ pub struct FirstUseReviewFact {
     pub job_id: Option<String>,
     pub dimensions: Vec<String>,
     requirements: Value,
+    edit_parts: Option<Vec<Value>>,
+    structure_parts: Option<Vec<(String, Value)>>,
 }
 
 impl FirstUseReviewFact {
@@ -113,6 +115,32 @@ fn hash(value: &Value) -> Option<&str> {
             && s.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+// Python's geometry digest uses repr-style floats, including a signed,
+// two-digit exponent. serde_json's default exponent spelling is different.
+struct PythonGeometryFormatter;
+
+impl serde_json::ser::Formatter for PythonGeometryFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        let text = if value == 0.0 || (1e-4..1e16).contains(&value.abs()) {
+            let text = value.to_string();
+            if text.contains('.') {
+                text
+            } else {
+                format!("{text}.0")
+            }
+        } else {
+            let text = format!("{value:e}");
+            let (mantissa, exponent) = text.split_once('e').unwrap();
+            format!("{mantissa}e{:+03}", exponent.parse::<i32>().unwrap())
+        };
+        writer.write_all(text.as_bytes())
+    }
 }
 
 fn strings(value: &Value, limit: usize) -> Option<BTreeSet<String>> {
@@ -159,6 +187,7 @@ pub(crate) fn category_label(category: &str) -> &str {
         "opening" => "洞口",
         "cad_reference" => "图纸参考线",
         "wall_detail" => "墙面细部",
+        "structure_revision" => "结构修订",
         "unclassified" | "unidentified" | "未分类" => "其他结构",
         _ => category,
     }
@@ -166,6 +195,14 @@ pub(crate) fn category_label(category: &str) -> &str {
 
 pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
     let value = &proposal["component_first_use_requirements"];
+    if !proposal["structure_revision_source"].is_null()
+        && proposal["candidate_sha256"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        && value["contract"] != "component-first-use/structure-revision-1"
+    {
+        return None;
+    }
     if value.is_null() {
         return Some(FirstUseReviewFact {
             status: "unknown".into(),
@@ -177,6 +214,8 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
             job_id: None,
             dimensions: Vec::new(),
             requirements: Value::Null,
+            edit_parts: None,
+            structure_parts: None,
         });
     }
     let required = value["required"].as_array()?;
@@ -188,14 +227,57 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 | "component-first-use/3"
                 | "component-first-use/4"
                 | "component-first-use/5"
+                | "component-first-use/structure-revision-1"
         )
     ) || required.len() > MAX_IMAGES
         || value["reused"].as_array()?.len() > 500
     {
         return None;
     }
+    let edit = proposal
+        .get("component_edit")
+        .filter(|edit| !edit.is_null());
+    let edit_parts = if edit.is_some() {
+        component_edit::projection(proposal)?;
+        Some(
+            proposal["draft"]["operations"]
+                .as_array()?
+                .iter()
+                .filter(|op| op["op"] == "add" && op["collection"] == "solids")
+                .map(|op| serde_json::from_str(op["value_json"].as_str()?).ok())
+                .collect::<Option<Vec<Value>>>()?,
+        )
+    } else {
+        None
+    };
+    let plan = edit.map_or(&proposal["component_plan"], |edit| {
+        &edit["plan"]["replacements"]
+    });
+    let structure_parts = if value["contract"] == "component-first-use/structure-revision-1" {
+        let mut parts = Vec::new();
+        // Match structure_specs' candidate collection order, retaining operation
+        // order inside each collection as apply_patch appends the replacements.
+        for collection in ["walls", "slabs", "solids", "elements", "openings"] {
+            for op in proposal["draft"]["operations"]
+                .as_array()?
+                .iter()
+                .filter(|op| op["op"] == "add" && op["collection"] == collection)
+            {
+                parts.push((
+                    collection.to_owned(),
+                    serde_json::from_str(op["value_json"].as_str()?).ok()?,
+                ));
+            }
+        }
+        Some(parts)
+    } else {
+        None
+    };
     let mut seen = BTreeSet::new();
     let mut components = BTreeSet::new();
+    if value["contract"] == "component-first-use/structure-revision-1" && required.len() != 1 {
+        return None;
+    }
     for item in required {
         if !seen.insert(hash(&item["review_key"])?) {
             return None;
@@ -210,6 +292,61 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
         }
         for key in ["component_id", "category", "template_id"] {
             text(item, key).ok()?;
+        }
+        if value["contract"] == "component-first-use/structure-revision-1" {
+            // Structural review has one CAD binding for a set of typed entities,
+            // rather than one binding per furniture component.
+            let ids = strings(&item["entity_ids"], 50000)?;
+            let operations = proposal["draft"]["operations"].as_array()?;
+            let added: BTreeSet<_> = operations
+                .iter()
+                .filter(|op| op["op"] == "add" && op["collection"] != "constraints")
+                .map(|op| op["target_id"].as_str().map(str::to_owned))
+                .collect::<Option<_>>()?;
+            let certificate = &proposal["structure_revision_source"];
+            let path = text(certificate, "path").ok()?;
+            let sha = hash(&certificate["sha256"])?;
+            let binding = json!({"component_id":"structure.revision",
+                "source_instance_id":"structure.revision",
+                "source_sha256":item["source_sha256"],
+                "source_geometry_sha256":item["source_geometry_sha256"]});
+            let arguments = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&json!({
+                "certificate":certificate,"base":proposal["base_sha256"]}))
+                    .ok()?
+                )
+            );
+            let key = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&json!({
+                "component_id":"structure.revision", "source_instance_id":"structure.revision",
+                "source_sha256":item["source_sha256"],
+                "source_geometry_sha256":item["source_geometry_sha256"],
+                "definition":item["definition_sha256"],"arguments":arguments}))
+                    .ok()?
+                )
+            );
+            if required.len() != 1
+                || !value["reused"].as_array()?.is_empty()
+                || item["category"] != "structure_revision"
+                || item["template_id"] != "typed.structure_revision"
+                || item["component_id"] != "structure.revision"
+                || item["source_instance_id"] != "structure.revision"
+                || item["source_kind"] != "cad"
+                || strings(&item["component_ids"], 50000)? != ids
+                || ids != added
+                || item["source_bindings"] != json!([binding])
+                || certificate["contract"] != "cad-structure-revision/1"
+                || proposal["source_dependencies"][&path] != sha
+                || item["arguments_sha256"] != arguments
+                || item["review_key"] != key
+            {
+                return None;
+            }
+            continue;
         }
         let kind = item["source_kind"].as_str()?;
         if !matches!(kind, "cad" | "user_request")
@@ -228,15 +365,18 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
             return None;
         }
         let directional = value["contract"] == "component-first-use/5";
-        let template = proposal["component_plan"]["templates"]
+        let template = plan["templates"]
             .as_array()
             .and_then(|templates| templates.iter().find(|t| t["id"] == item["template_id"]));
         let direction = if directional
             && (item.get("source_direction").is_some()
                 || (kind == "cad"
-                    && template
-                        .is_some_and(|t| t["metadata"]["template_kind"] == "schematic_extrusion")))
-        {
+                    && template.is_some_and(|t| {
+                        matches!(
+                            t["metadata"]["template_kind"].as_str(),
+                            Some("schematic_extrusion" | "cad_minimal_form")
+                        )
+                    }))) {
             let direction = item["source_direction"].as_array()?;
             if direction.len() != 3 {
                 return None;
@@ -267,10 +407,9 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 return None;
             }
             if let Some((mirror_x, mirror_y, rotation)) = direction {
-                // Source-bound schematic placements carry the CAD transform in
-                // the sealed proposal. Check every member, not just the image's
-                // representative, so distinct directions cannot share a group.
-                let mut placements = proposal["component_plan"]["components"]
+                // Bind every member to its CAD direction. An explicit edit may
+                // change its pose, but cannot change the sealed source identity.
+                let mut placements = plan["components"]
                     .as_array()?
                     .iter()
                     .filter(|c| c["component_id"] == binding["component_id"]);
@@ -278,17 +417,83 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 if placements.next().is_some()
                     || placement["template_id"] != item["template_id"]
                     || placement["source_instance_id"] != binding["source_instance_id"]
-                    || placement["placement_basis"] != "source"
                 {
                     return None;
                 }
-                let scale = placement["scale"].as_array()?;
-                if scale.len() != 3 {
+                let basis = placement["placement_basis"].as_str()?;
+                if basis != "source" && !(edit.is_some() && basis == "user_request") {
+                    return None;
+                }
+                let direction_owner = if let Some(edit) = edit {
+                    let source_id = binding["source_instance_id"].as_str()?;
+                    let source = edit["sources"].get(source_id)?;
+                    if source["source_id"] != source_id
+                        || source["component_id"] != binding["component_id"]
+                        || source["source_sha256"] != binding["source_sha256"]
+                        || source["geometry_sha256"] != binding["source_geometry_sha256"]
+                    {
+                        return None;
+                    }
+                    let scale = placement["scale"].as_array()?;
+                    let origin = placement["origin"].as_array()?;
+                    if scale.len() != 3
+                        || origin.len() != 3
+                        || scale
+                            .iter()
+                            .chain(origin)
+                            .any(|v| v.as_f64().is_none_or(|n| !n.is_finite()))
+                        || placement["rotation_z_deg"]
+                            .as_f64()
+                            .is_none_or(|n| !n.is_finite())
+                    {
+                        return None;
+                    }
+                    let source_scale = source["scale"].as_array()?;
+                    if source_scale.len() < 2
+                        || (0..2).any(|i| {
+                            source_scale[i].as_f64().is_none_or(|n| {
+                                !n.is_finite()
+                                    || (scale[i].as_f64().unwrap().abs() - n.abs()).abs() > 1e-8
+                            })
+                        })
+                    {
+                        return None;
+                    }
+                    if basis == "source" {
+                        let angle = placement["rotation_z_deg"].as_f64()?;
+                        let source_angle = source["rotation_z_deg"].as_f64()?;
+                        if ((angle - source_angle + 180.0).rem_euclid(360.0) - 180.0).abs() > 1e-6
+                            || (0..2).any(|i| {
+                                (scale[i].as_f64().unwrap() - source_scale[i].as_f64().unwrap())
+                                    .abs()
+                                    > 1e-8
+                            })
+                        {
+                            return None;
+                        }
+                        let source_origin = source["origin_m"].as_array()?;
+                        if source_origin.len() != 2
+                            || (0..2).any(|i| {
+                                source_origin[i].as_f64().is_none_or(|n| {
+                                    !n.is_finite()
+                                        || (origin[i].as_f64().unwrap() - n).abs() > 0.001
+                                })
+                            })
+                        {
+                            return None;
+                        }
+                    }
+                    source
+                } else {
+                    placement
+                };
+                let scale = direction_owner["scale"].as_array()?;
+                if !(2..=3).contains(&scale.len()) || (edit.is_none() && scale.len() != 3) {
                     return None;
                 }
                 let x = scale[0].as_f64()?;
                 let y = scale[1].as_f64()?;
-                let angle = placement["rotation_z_deg"].as_f64()?;
+                let angle = direction_owner["rotation_z_deg"].as_f64()?;
                 let angle = (angle.rem_euclid(360.0) * 1_000_000.0).round_ties_even() / 1_000_000.0;
                 if !x.is_finite()
                     || !y.is_finite()
@@ -337,6 +542,8 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
         job_id: None,
         dimensions: Vec::new(),
         requirements: value.clone(),
+        edit_parts,
+        structure_parts,
     })
 }
 
@@ -513,7 +720,14 @@ pub(super) fn project(
             _ => return None,
         }
         hash(&item["cad_evidence_sha256"])?;
-        strings(&item["part_ids"], 64)?;
+        strings(
+            &item["part_ids"],
+            if item["category"] == "structure_revision" {
+                50000
+            } else {
+                64
+            },
+        )?;
         let dimensions = &item["dimensions"];
         if !dimensions.is_object()
             || dimensions.get("assumed").is_none()
@@ -522,6 +736,99 @@ pub(super) fn project(
             || (item["source_kind"] == "cad" && dimensions["cad_xy_m"].as_array()?.len() != 2)
         {
             return None;
+        }
+        if let Some(parts) = &previous.structure_parts {
+            let rendered = dimensions["parts"].as_array()?;
+            if rendered.len() != parts.len() {
+                return None;
+            }
+            let mut seen = BTreeSet::new();
+            for part in rendered {
+                if !seen.insert(part["id"].as_str()?) {
+                    return None;
+                }
+            }
+            let mut ordered = Vec::new();
+            for (_, expected) in parts {
+                let actual = rendered.iter().find(|part| part["id"] == expected["id"])?;
+                for (key, value) in expected.as_object()? {
+                    if key == "metadata" {
+                        for (key, value) in value.as_object()? {
+                            // apply_patch replaces only these provenance stamps.
+                            if !matches!(
+                                key.as_str(),
+                                "patch_id" | "patch_reason" | "value_basis" | "decision_id"
+                            ) && actual["metadata"].get(key) != Some(value)
+                            {
+                                return None;
+                            }
+                        }
+                    } else if actual.get(key) != Some(value) {
+                        return None;
+                    }
+                }
+                ordered.push(actual);
+            }
+            let mut encoded = Vec::new();
+            ordered
+                .serialize(&mut serde_json::Serializer::with_formatter(
+                    &mut encoded,
+                    PythonGeometryFormatter,
+                ))
+                .ok()?;
+            if item["definition_sha256"] != format!("{:x}", Sha256::digest(&encoded)) {
+                return None;
+            }
+            let mesh_ids = strings(&item["part_ids"], 50000)?;
+            if !seen.iter().all(|id| mesh_ids.contains(*id))
+                || mesh_ids.iter().any(|id| {
+                    !seen.contains(id.as_str())
+                        && !parts.iter().any(|(collection, part)| {
+                            collection == "openings"
+                                && !part["assets"].is_null()
+                                && part["id"]
+                                    .as_str()
+                                    .is_some_and(|owner| id.starts_with(&format!("{owner}.")))
+                        })
+                })
+            {
+                return None;
+            }
+        }
+        if let Some(parts) = &previous.edit_parts {
+            // The CAD direction describes the source. The rendered representative
+            // must separately retain the actual edited shape and pose from the draft.
+            let expected: Vec<_> = parts
+                .iter()
+                .filter(|part| part["metadata"]["component_id"] == item["component_id"])
+                .collect();
+            let rendered = dimensions["parts"].as_array()?;
+            if expected.is_empty() || rendered.len() != expected.len() {
+                return None;
+            }
+            let mut seen_parts = BTreeSet::new();
+            for part in rendered {
+                let id = part["id"].as_str()?;
+                let original = expected.iter().find(|old| old["id"] == id)?;
+                if !seen_parts.insert(id)
+                    || [
+                        "primitive_id",
+                        "arguments",
+                        "origin",
+                        "rotation_z_deg",
+                        "scale",
+                    ]
+                    .iter()
+                    .any(|key| part.get(*key) != original.get(*key))
+                {
+                    return None;
+                }
+            }
+            if strings(&item["part_ids"], 64)?
+                != seen_parts.iter().map(|id| (*id).to_owned()).collect()
+            {
+                return None;
+            }
         }
         let kind = if item["source_kind"] == "user_request" {
             "用户请求（无CAD）"
@@ -543,6 +850,31 @@ pub(super) fn project(
             cad_dimensions,
             dimensions["model_xyz_m"]
         )];
+        if let Some(direction) = item.get("source_direction") {
+            display_lines.push(format!("CAD来源方向（镜像X、镜像Y、角度）：{direction}"));
+        }
+        if let Some(metadata) = dimensions["parameters"].get("metadata") {
+            metadata.as_object()?;
+            for (key, label, limit) in [
+                ("template_kind", "构形类型", 128),
+                ("form_version", "构形版本", 128),
+                ("category_family", "类别族", 256),
+                ("geometry_basis", "几何依据", 2000),
+                ("diagnostics", "构形诊断", 4000),
+                ("reason", "构形说明", 4000),
+            ] {
+                if let Some(value) = metadata.get(key) {
+                    let value = value.as_str()?;
+                    if value.chars().count() > limit || (value.is_empty() && key != "diagnostics") {
+                        return None;
+                    }
+                    if !value.is_empty() {
+                        display_lines
+                            .push(format!("{label}：{}", crate::state::display_text(value)));
+                    }
+                }
+            }
+        }
         if let Some(parameters) = dimensions["display_parameters"].as_array() {
             let mut seen = BTreeSet::new();
             for parameter in parameters {
@@ -829,4 +1161,23 @@ fn launch_image(path: &Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn launch_image(_path: &Path) -> Result<(), String> {
     Err("外部打开尚未支持此平台".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structural_geometry_digest_preserves_python_float_spelling() {
+        let text = "[1e-06,1e-05,0.0001,1.0,1000000000000000.0,1e+16,1e+20,-0.0,0.19999999999999574,2.099999999999998,1.2345678901234567e-06]";
+        let value: Value = serde_json::from_str(text).unwrap();
+        let mut encoded = Vec::new();
+        value
+            .serialize(&mut serde_json::Serializer::with_formatter(
+                &mut encoded,
+                PythonGeometryFormatter,
+            ))
+            .unwrap();
+        assert_eq!(String::from_utf8(encoded).unwrap(), text);
+    }
 }

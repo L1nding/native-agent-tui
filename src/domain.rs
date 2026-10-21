@@ -526,6 +526,7 @@ pub struct DomainSnapshot {
     pub project_scope: Option<ProjectScopeFact>,
     /// Measured plausibility of the current floor structure, from the modeler.
     pub structure_review: Option<StructureReview>,
+    pub structure_revision: Option<StructureRevisionFact>,
     pub buildings: Vec<ProjectBuildingFact>,
     pub drawing_audit: Option<DrawingAuditFact>,
     pub ledger: Option<SourceLedgerFact>,
@@ -548,6 +549,15 @@ pub struct DomainSnapshot {
     pub verified_fact: Option<VerifiedFact>,
     pub preview_connection: Option<String>,
     pub preview_selection: Option<crate::preview::Selection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureRevisionFact {
+    pub proposal: ProposalBinding,
+    pub host_mapping_count: usize,
+    pub changes: Vec<String>,
+    pub void_decisions: Vec<String>,
+    pub verification_questions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,9 +1049,12 @@ impl DomainFacts {
         let Some(kind) = value["kind"].as_str() else {
             return invalid!();
         };
-        // Immutable capability array fragments have no project scope or state
-        // projection. Policies and opening counts remain in the parent fact.
-        if kind == "fact_page" {
+        // Immutable pages, project diagnostics and pre-activation waits have no
+        // current floor state to project. Envelope identity was checked above.
+        if matches!(
+            kind,
+            "fact_page" | "diagnostic_log" | "project_floor_preparing"
+        ) {
             return FactProjection::Unrelated;
         }
         // Scope identity is a dependency, not corruption in a delayed sealed read.
@@ -1859,6 +1872,78 @@ impl DomainFacts {
             _ => {}
         }
         if accepted {
+            if matches!(kind, "proposal" | "project_scope") {
+                self.snapshot.structure_revision =
+                    (!value["proposal"]["structure_revision_source"].is_null()
+                        || !value["proposal"]["slab_revision_source"].is_null())
+                    .then(|| {
+                        let audit = &value["structure_revision"];
+                        StructureRevisionFact {
+                            proposal: self.snapshot.proposal.as_ref().unwrap().binding.clone(),
+                            host_mapping_count: audit["host_mapping"]
+                                .as_object()
+                                .map_or(0, |m| m.len()),
+                            changes: value["proposal"]["draft"]["operations"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|op| {
+                                    let action = match op["op"].as_str() {
+                                        Some("remove") => "移除",
+                                        Some("set") => "修改",
+                                        _ => "新增",
+                                    };
+                                    let collection = match op["collection"].as_str() {
+                                        Some("walls") => "墙",
+                                        Some("slabs") => "楼板",
+                                        Some("openings") => "洞口",
+                                        Some("constraints") => "约束",
+                                        _ => "构件",
+                                    };
+                                    format!(
+                                        "{action}{collection} {} · {}",
+                                        op["target_id"].as_str().unwrap(),
+                                        op["reason"].as_str().unwrap()
+                                    )
+                                })
+                                .collect(),
+                            void_decisions: audit["slab"]["void_decisions"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|d| {
+                                    format!(
+                                        "{}：{} · {} · 用户原话 {}",
+                                        d["candidate_id"].as_str().unwrap(),
+                                        if d["choice"] == "cut_void" {
+                                            "确认挖洞"
+                                        } else {
+                                            "保留楼板"
+                                        },
+                                        d["reason"].as_str().unwrap(),
+                                        d["user_statement"].as_str().unwrap()
+                                    )
+                                })
+                                .collect(),
+                            verification_questions: audit["slab"]["verification_questions"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|q| {
+                                    format!(
+                                        "{} · {}",
+                                        q["question"].as_str().unwrap(),
+                                        if q["status"] == "unanswered" {
+                                            "待用户决定"
+                                        } else {
+                                            "已记录决定"
+                                        }
+                                    )
+                                })
+                                .collect(),
+                        }
+                    });
+            }
             if inventory_kind
                 && sequence.is_some_and(|seq| {
                     self.fact_sequences
@@ -1901,6 +1986,7 @@ impl DomainFacts {
         self.source_view = None;
         self.snapshot.project_scope = None;
         self.snapshot.structure_review = None;
+        self.snapshot.structure_revision = None;
         self.snapshot.drawing_audit = None;
         self.snapshot.proposal = None;
         self.snapshot.proposal_categories.clear();
@@ -3039,6 +3125,11 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     // must be projected and validated, including parts after a large batch boundary.
     let correction = p.get("drawing_review").filter(|v| !v.is_null());
     let edit = p.get("component_edit").filter(|v| !v.is_null());
+    let structure_revision =
+        !p["structure_revision_source"].is_null() || !p["slab_revision_source"].is_null();
+    if structure_revision {
+        objects.extend(project::structure_revision_rows(value)?);
+    }
     if edit.is_some() {
         objects.extend(component_edit::projection(p)?);
     }
@@ -3064,6 +3155,9 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         );
     }
     for op in p["draft"]["operations"].as_array()? {
+        if structure_revision {
+            continue; // Exact revision operations were projected with their certificate.
+        }
         if edit.is_some() && op["op"] == "remove" {
             continue; // Exact removals and old geometry were projected from the verified certificate.
         }

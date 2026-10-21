@@ -130,6 +130,12 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "component_first_use_review"
                 | "authorization"
                 | "diagnostic"
+                | "diagnostic_log"
+                | "project_floor_preparing"
+                | "wall_mount_inspection"
+                | "source_region_inventory"
+                | "job_index"
+                | "delivery_status"
                 // Server-driven batches; projected as unrelated facts.
                 | "auto_batch"
                 | "precedent_auto_batch"
@@ -196,7 +202,113 @@ pub fn verify(setup: &DomainSetup, receipt: &FactReceipt, raw: &[u8]) -> Result<
     {
         return Err("完整领域事实的上下文、序号或提案绑定与回执不一致".into());
     }
+    verify_revision_certificate(setup, &value)?;
     Ok(value)
+}
+
+fn revision_proof_matches(value: &Value, proof: &Value, slab_only: bool) -> bool {
+    let proposal = &value["proposal"];
+    let certificate = &proposal[if slab_only {
+        "slab_revision_source"
+    } else {
+        "structure_revision_source"
+    }];
+    let contract = if slab_only {
+        "cad-slab-revision/1"
+    } else {
+        "cad-structure-revision/1"
+    };
+    let is_sha = |value: &Value| {
+        value.as_str().is_some_and(|sha| {
+            sha.len() == 64
+                && sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    let Some(path) = certificate["path"].as_str().filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let Some(dependencies) = proposal["source_dependencies"].as_object() else {
+        return false;
+    };
+    let Some(proof_dependencies) = proof["dependencies"].as_object() else {
+        return false;
+    };
+    if certificate
+        .as_object()
+        .is_none_or(|fields| fields.len() != 3)
+        || certificate["contract"] != contract
+        || proof["contract"] != contract
+        || !is_sha(&certificate["sha256"])
+        || dependencies.get(path) != Some(&certificate["sha256"])
+        || !is_sha(&proof["base_sha256"])
+        || proof["base_sha256"] != proposal["base_sha256"]
+        || proof_dependencies.iter().any(|(path, sha)| {
+            path.is_empty() || !is_sha(sha) || dependencies.get(path) != Some(sha)
+        })
+    {
+        return false;
+    }
+    if slab_only {
+        let Some(operations) = proposal["draft"]["operations"].as_array() else {
+            return false;
+        };
+        operations.len() == 1
+            && proof["slab_id"].as_str().is_some_and(|id| !id.is_empty())
+            && proof["slab_id"] == operations[0]["target_id"]
+            && proof["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.trim().is_empty())
+            && proof["reason"] == operations[0]["reason"]
+    } else {
+        proof["audit"].is_object() && proof["audit"] == value["structure_revision"]
+    }
+}
+
+fn verify_revision_certificate(setup: &DomainSetup, value: &Value) -> Result<(), String> {
+    use std::io::Read;
+
+    let proposal = &value["proposal"];
+    let slab_only = !proposal["slab_revision_source"].is_null();
+    let structure = !proposal["structure_revision_source"].is_null();
+    if !slab_only && !structure {
+        return Ok(());
+    }
+    let checked = || -> Option<()> {
+        if slab_only && structure {
+            return None;
+        }
+        let certificate = &proposal[if slab_only {
+            "slab_revision_source"
+        } else {
+            "structure_revision_source"
+        }];
+        let root = setup.repository.canonicalize().ok()?;
+        let name = text(certificate, "path").ok()?;
+        let path = root.join(name).canonicalize().ok()?;
+        if !path.starts_with(&root) {
+            return None;
+        }
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > FACT_LIMIT as u64 {
+            return None;
+        }
+        let mut raw = Vec::new();
+        file.take(FACT_LIMIT as u64 + 1)
+            .read_to_end(&mut raw)
+            .ok()?;
+        if raw.len() > FACT_LIMIT || certificate["sha256"] != format!("{:x}", Sha256::digest(&raw))
+        {
+            return None;
+        }
+        let proof: Value = serde_json::from_slice(&raw).ok()?;
+        // CAD and historical dependencies remain sealed hash bindings here; only
+        // the bounded certificate is read on Core's private verification path.
+        revision_proof_matches(value, &proof, slab_only).then_some(())
+    };
+    checked().ok_or_else(|| "结构或楼板修订证书的路径、SHA256 或封存绑定无效".into())
 }
 
 /// Replay sealed facts belonging to this context, in semantic sequence order.
@@ -328,7 +440,11 @@ pub(crate) fn scan(
         ordered.sort_unstable();
         for (sequence, path) in ordered {
             if let Some((reread, value)) = open(&path) {
-                if reread == sequence && known.contains(&sequence) && !apply(value) {
+                if reread == sequence
+                    && known.contains(&sequence)
+                    && verify_revision_certificate(setup, &value).is_ok()
+                    && !apply(value)
+                {
                     break;
                 }
             }
@@ -495,6 +611,12 @@ pub(crate) mod tests {
             "schematic_circulation",
             "opening_type_representatives",
             "linework_presort",
+            "wall_mount_inspection",
+            "source_region_inventory",
+            "job_index",
+            "delivery_status",
+            "diagnostic_log",
+            "project_floor_preparing",
         ] {
             receipt.kind = kind.into();
             assert!(validate(&setup, &receipt).is_ok(), "{kind}");
@@ -502,6 +624,210 @@ pub(crate) mod tests {
         receipt.kind = "invented".into();
         assert!(validate(&setup, &receipt).is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn revision_fixture(slab_only: bool) -> (Value, Value) {
+        let contract = if slab_only {
+            "cad-slab-revision/1"
+        } else {
+            "cad-structure-revision/1"
+        };
+        let key = if slab_only {
+            "slab_revision_source"
+        } else {
+            "structure_revision_source"
+        };
+        let audit = json!({"host_mapping":{},"slab":{"verification_questions":[]}});
+        let mut value = json!({
+            "contract":CONTRACT,"run_id":"run","context_sha256":format!("{:x}", Sha256::digest(b"{}")),
+            "kind":"proposal","ok":true,"fact_sequence":1,"structure_revision":audit,
+            "proposal":{"base_sha256":"b".repeat(64),
+                "source_dependencies":{"certificate.json":"c".repeat(64),"unread-cad.dxf":"d".repeat(64)},
+                "draft":{"operations":[{"target_id":"slab.1","reason":"restore CAD boundary"}]}}
+        });
+        value["proposal"][key] =
+            json!({"contract":contract,"path":"certificate.json","sha256":"c".repeat(64)});
+        let mut proof = json!({"contract":contract,"base_sha256":"b".repeat(64),
+            "dependencies":{"unread-cad.dxf":"d".repeat(64)}});
+        if slab_only {
+            proof["slab_id"] = json!("slab.1");
+            proof["reason"] = json!("restore CAD boundary");
+        } else {
+            proof["audit"] = audit;
+        }
+        (value, proof)
+    }
+
+    #[test]
+    fn revision_certificates_bind_proof_audit_base_and_dependencies() {
+        let (value, proof) = revision_fixture(false);
+        assert!(revision_proof_matches(&value, &proof, false));
+        for (pointer, changed) in [
+            ("/contract", json!("cad-slab-revision/1")),
+            ("/base_sha256", json!("a".repeat(64))),
+            ("/dependencies", Value::Null),
+            ("/dependencies/unread-cad.dxf", json!("e".repeat(64))),
+            ("/dependencies/unlisted.dxf", json!("a".repeat(64))),
+            ("/audit", json!({"host_mapping":{"old":"unrelated"}})),
+        ] {
+            let mut changed_proof = proof.clone();
+            if pointer == "/dependencies/unlisted.dxf" {
+                changed_proof["dependencies"]["unlisted.dxf"] = changed;
+            } else {
+                *changed_proof.pointer_mut(pointer).unwrap() = changed;
+            }
+            assert!(
+                !revision_proof_matches(&value, &changed_proof, false),
+                "{pointer}"
+            );
+        }
+        let mut changed = value.clone();
+        changed["proposal"]["source_dependencies"]["certificate.json"] = json!("a".repeat(64));
+        assert!(!revision_proof_matches(&changed, &proof, false));
+        changed = value;
+        changed["structure_revision"]["slab"]["verification_questions"] = json!(["changed"]);
+        assert!(!revision_proof_matches(&changed, &proof, false));
+    }
+
+    #[test]
+    fn revision_certificates_bind_slab_identity_and_reason() {
+        let (value, proof) = revision_fixture(true);
+        assert!(revision_proof_matches(&value, &proof, true));
+        for key in ["slab_id", "reason", "base_sha256", "contract"] {
+            let mut changed = proof.clone();
+            changed[key] = json!("changed");
+            assert!(!revision_proof_matches(&value, &changed, true), "{key}");
+        }
+        let mut changed = value;
+        changed["proposal"]["draft"]["operations"] = json!([]);
+        assert!(!revision_proof_matches(&changed, &proof, true));
+    }
+
+    #[test]
+    fn revision_certificates_are_checked_by_receipt_and_cached_scan() {
+        let (setup, mut receipt, root) = fixture("");
+        let (mut value, proof) = revision_fixture(false);
+        let proof_raw = serde_json::to_vec(&proof).unwrap();
+        let proof_sha = format!("{:x}", Sha256::digest(&proof_raw));
+        std::fs::write(root.join("certificate.json"), &proof_raw).unwrap();
+        value["proposal"]["structure_revision_source"]["sha256"] = json!(proof_sha);
+        value["proposal"]["source_dependencies"]["certificate.json"] = json!(proof_sha);
+        let raw = serde_json::to_vec(&value).unwrap();
+        receipt.fact_bytes = raw.len();
+        receipt.fact_sha256 = format!("{:x}", Sha256::digest(&raw));
+        receipt.binding = json!({"base_sha256":"b".repeat(64)});
+        assert!(verify(&setup, &receipt, &raw).is_ok());
+        assert!(!root.join("unread-cad.dxf").exists());
+        let directory = root.join("outputs/domain/run/changes");
+        std::fs::create_dir_all(directory.join("facts")).unwrap();
+        std::fs::write(
+            directory.join("fact-sequences.json"),
+            br#"{"next":2,"facts":{"semantic":1}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory
+                .join("facts")
+                .join(format!("{}.json", receipt.fact_sha256)),
+            &raw,
+        )
+        .unwrap();
+        let mut checked = FactFiles::new();
+        let mut count = 0;
+        scan(&setup, 0, &mut checked, |_| {
+            count += 1;
+            true
+        });
+        assert_eq!(count, 1);
+        std::fs::write(root.join("certificate.json"), b"{}").unwrap();
+        assert!(verify(&setup, &receipt, &raw).is_err());
+        scan(&setup, 0, &mut checked, |_| {
+            count += 1;
+            true
+        });
+        assert_eq!(count, 1);
+        std::fs::write(root.join("certificate.json"), proof_raw).unwrap();
+        scan(&setup, 0, &mut checked, |_| {
+            count += 1;
+            true
+        });
+        assert_eq!(count, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revision_certificates_reject_outside_and_oversized_files() {
+        let (mut setup, _, root) = fixture("");
+        let (mut value, proof) = revision_fixture(false);
+        let proof_raw = serde_json::to_vec(&proof).unwrap();
+        let proof_sha = format!("{:x}", Sha256::digest(&proof_raw));
+        std::fs::write(root.join("certificate.json"), &proof_raw).unwrap();
+        value["proposal"]["structure_revision_source"] = json!({
+            "contract":"cad-structure-revision/1","path":"../certificate.json","sha256":proof_sha});
+        value["proposal"]["source_dependencies"]["../certificate.json"] = json!(proof_sha);
+        setup.repository = root.join("bound");
+        std::fs::create_dir(&setup.repository).unwrap();
+        assert!(verify_revision_certificate(&setup, &value).is_err());
+        setup.repository = root.clone();
+        value["proposal"]["structure_revision_source"]["path"] = json!("certificate.json");
+        value["proposal"]["source_dependencies"]["certificate.json"] = json!(proof_sha);
+        assert!(verify_revision_certificate(&setup, &value).is_ok());
+        std::fs::File::create(root.join("certificate.json"))
+            .unwrap()
+            .set_len(FACT_LIMIT as u64 + 1)
+            .unwrap();
+        assert!(verify_revision_certificate(&setup, &value).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revision_rows_reject_mixed_authority_and_slab_parent_feedback() {
+        let (mut value, _) = revision_fixture(true);
+        value["project_structure"] = json!(true);
+        value["proposal"]["scope"] = json!({"floor_id":"floor","structural_additions":true});
+        value["proposal"]["draft"]["operations"][0] = json!({
+            "op":"set","collection":"slabs","field":"boundary","floor_id":"floor",
+            "target_id":"slab.1","reason":"restore CAD boundary","basis":"assumed",
+            "source_ids":["cad.1"],"value_json":"[{\"x\":0,\"y\":0},{\"x\":1,\"y\":0},{\"x\":1,\"y\":1}]"});
+        value["proposal"]["hosted_sources"] = json!({});
+        value["proposal"]["vertical_sources"] = json!({});
+        value["proposal"]["decision_drafts"] = json!([]);
+        assert!(project::structure_revision_rows(&value).is_some());
+        for (key, mixed) in [
+            ("source_evidence", json!({})),
+            ("hosted_sources", json!({"source":{}})),
+            ("vertical_sources", json!({"source":{}})),
+            ("decision_drafts", json!([{}])),
+            ("parent_id", json!("parent")),
+            ("feedback", json!({})),
+        ] {
+            let mut changed = value.clone();
+            changed["proposal"][key] = mixed;
+            assert!(
+                project::structure_revision_rows(&changed).is_none(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn revision_rows_accept_full_host_mapping_and_long_ids() {
+        let (mut value, _) = revision_fixture(false);
+        value["project_structure"] = json!(true);
+        value["proposal"]["scope"] = json!({"floor_id":"floor","structural_additions":true});
+        value["proposal"]["draft"]["operations"] = json!([{
+            "op":"remove","collection":"walls","floor_id":"floor","target_id":"old",
+            "reason":"merge walls","basis":"assumed","source_ids":[]}]);
+        let mut hosts: serde_json::Map<String, Value> = (0..50001)
+            .map(|index| (format!("wall.{index}"), json!(format!("wall.{index}"))))
+            .collect();
+        hosts.insert("a".repeat(257), json!("b".repeat(257)));
+        value["structure_revision"] = json!({"host_mapping":hosts,"merged_runs":[],
+            "closed_joints":[],"cad_bridges":[],"pending":[],
+            "slab":{"verification_questions":[],"void_decisions":[]}});
+        value["verification_questions"] = json!([]);
+        assert!(serde_json::to_vec(&value).unwrap().len() < FACT_LIMIT);
+        assert!(project::structure_revision_rows(&value).is_some());
     }
 
     /// A just-terminated process can hold its working directory for a moment on Windows.

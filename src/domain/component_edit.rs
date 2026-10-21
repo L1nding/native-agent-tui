@@ -94,9 +94,28 @@ pub(super) fn projection(proposal: &Value) -> Option<Vec<String>> {
             for reference in part["source_ids"].as_array()? {
                 source_refs.insert(reference.as_str()?.to_owned());
             }
+            text(part, "primitive_id").ok()?;
+            if part["arguments"]
+                .as_object()?
+                .values()
+                .any(|v| v.as_f64().is_none_or(|n| !n.is_finite()))
+            {
+                return None;
+            }
+            for key in ["origin", "scale"] {
+                let values = part[key].as_array()?;
+                if values.len() != 3
+                    || values
+                        .iter()
+                        .any(|v| v.as_f64().is_none_or(|n| !n.is_finite()))
+                {
+                    return None;
+                }
+            }
+            part["rotation_z_deg"].as_f64().filter(|n| n.is_finite())?;
             rows.push(format!(
-                "选中 {component} · 原部件 {id} · 原位置 {}",
-                part["origin"]
+                "选中 {component} · 原部件 {id} · 原位置 {} · 原 primitive {} · 原参数 {} · 原旋转 {} · 原缩放 {}",
+                part["origin"], part["primitive_id"].as_str()?, part["arguments"], part["rotation_z_deg"], part["scale"]
             ));
         }
         refs.insert(component.clone(), source_refs);

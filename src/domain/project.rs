@@ -2,6 +2,276 @@
 use super::*;
 use std::io::Write;
 
+pub(super) fn structure_revision_rows(value: &Value) -> Option<Vec<String>> {
+    let proposal = &value["proposal"];
+    let slab_only = !proposal["slab_revision_source"].is_null();
+    let certificate = &proposal[if slab_only {
+        "slab_revision_source"
+    } else {
+        "structure_revision_source"
+    }];
+    let path = text(certificate, "path").ok()?;
+    let digest = sha(certificate, "sha256")?;
+    let audit = &value["structure_revision"];
+    if value["project_structure"] != true
+        || certificate["contract"]
+            != if slab_only {
+                "cad-slab-revision/1"
+            } else {
+                "cad-structure-revision/1"
+            }
+        || proposal["source_dependencies"][&path] != digest
+        || proposal["scope"]["structural_additions"] != true
+        || [
+            "component_plan",
+            "source_evidence",
+            "component_edit",
+            "drawing_review",
+            "structural_source",
+            "assembly_source",
+            "opening_completion_source",
+        ]
+        .iter()
+        .any(|key| !proposal[key].is_null())
+        || ["hosted_sources", "vertical_sources"].iter().any(|key| {
+            !proposal[key].is_null()
+                && proposal[key]
+                    .as_object()
+                    .is_none_or(|sources| !sources.is_empty())
+        })
+        || (!proposal["decision_drafts"].is_null()
+            && proposal["decision_drafts"]
+                .as_array()
+                .is_none_or(|drafts| !drafts.is_empty()))
+        || (slab_only && !proposal["structure_revision_source"].is_null())
+        || (slab_only && (!proposal["parent_id"].is_null() || !proposal["feedback"].is_null()))
+        || (!slab_only
+            && value["verification_questions"] != audit["slab"]["verification_questions"])
+    {
+        return None;
+    }
+    if slab_only {
+        let operations = proposal["draft"]["operations"].as_array()?;
+        if operations.len() != 1 {
+            return None;
+        }
+        let op = &operations[0];
+        if op["op"] != "set"
+            || op["collection"] != "slabs"
+            || op["field"] != "boundary"
+            || op["floor_id"] != proposal["scope"]["floor_id"]
+            || op["basis"] != "assumed"
+            || op["source_ids"].as_array()?.is_empty()
+        {
+            return None;
+        }
+        let boundary: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+        let points = boundary.as_array()?;
+        if points.len() < 3
+            || points
+                .iter()
+                .any(|p| p["x"].as_f64().is_none() || p["y"].as_f64().is_none())
+        {
+            return None;
+        }
+        return Some(vec![format!(
+            "楼板轮廓修订 · {} · 新轮廓 {boundary} · 来源 {} · assumed · {} · 证书 {digest}",
+            text(op, "target_id").ok()?,
+            op["source_ids"],
+            bounded_text(op, "reason", 4000)?
+        )]);
+    }
+    let hosts = audit["host_mapping"].as_object()?;
+    if hosts
+        .iter()
+        .any(|(old, new)| old.is_empty() || new.as_str().is_none_or(str::is_empty))
+    {
+        return None;
+    }
+    let mut rows = vec![format!(
+        "结构修订 · 宿主映射 {} · 证书 {digest}",
+        hosts.len()
+    )];
+    for key in ["merged_runs", "closed_joints", "cad_bridges", "pending"] {
+        let records = audit[key].as_array()?;
+        rows.push(format!("{key} · {}", records.len()));
+        rows.extend(records.iter().map(|record| format!("{key} · {record}")));
+    }
+    for (old, new) in hosts {
+        rows.push(format!("宿主 {old} → {}", new.as_str()?));
+    }
+    let questions = audit["slab"]["verification_questions"].as_array()?;
+    let decisions = audit["slab"]["void_decisions"].as_array()?;
+    if questions.len() > 10000 || decisions.len() > questions.len() {
+        return None;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for question in questions {
+        let binding = &question["binding"];
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(binding).ok()?));
+        let id = format!("void.{}", &hash[..24]);
+        if question["candidate_id"] != id
+            || !seen.insert(id.clone())
+            || binding["contract"] != "cad-void-candidate/1"
+            || binding["floor_id"] != proposal["scope"]["floor_id"]
+            || !matches!(
+                binding["kind"].as_str()?,
+                "closed_region" | "unbounded_marker"
+            )
+        {
+            return None;
+        }
+        for key in ["source_sha256", "config_sha256", "geometry_sha256"] {
+            sha(binding, key)?;
+        }
+        let sources = binding["source_ids"].as_array()?;
+        if sources.is_empty() || sources.iter().any(|s| s.as_str().is_none_or(str::is_empty)) {
+            return None;
+        }
+        let matching: Vec<_> = decisions
+            .iter()
+            .filter(|d| d["candidate_id"] == id)
+            .collect();
+        match question["status"].as_str()? {
+            "unanswered"
+                if matching.is_empty()
+                    && proposal["pending"]
+                        .as_array()
+                        .is_some_and(|p| !p.is_empty()) => {}
+            "keep_slab" | "cut_void" if matching.len() == 1 => {
+                let decision = matching[0];
+                if decision["contract"] != "cad-void-decision/1"
+                    || decision["binding"] != *binding
+                    || decision["choice"] != question["status"]
+                {
+                    return None;
+                }
+                for key in ["actor", "reason", "user_statement"] {
+                    bounded_text(decision, key, 4000)?;
+                }
+                rows.push(format!(
+                    "挑空决定 {id} · {} · {} · {} · 用户原话 {}",
+                    decision["choice"],
+                    decision["actor"],
+                    decision["reason"],
+                    decision["user_statement"]
+                ));
+            }
+            _ => return None,
+        }
+        rows.push(format!(
+            "挑空核验 {id} · {} · {}",
+            question["status"],
+            bounded_text(question, "question", 4000)?
+        ));
+    }
+    if decisions.iter().any(|d| {
+        d["candidate_id"]
+            .as_str()
+            .is_none_or(|id| !seen.contains(id))
+    }) {
+        return None;
+    }
+    let operations = proposal["draft"]["operations"].as_array()?;
+    if operations.is_empty() {
+        return None;
+    }
+    let mut seen_ops = std::collections::BTreeSet::new();
+    for op in operations {
+        let collection = text(op, "collection").ok()?;
+        let target = text(op, "target_id").ok()?;
+        let action = text(op, "op").ok()?;
+        if !matches!(
+            collection.as_str(),
+            "walls" | "slabs" | "elements" | "openings" | "solids" | "constraints"
+        ) || !matches!(action.as_str(), "add" | "remove")
+            || op["basis"] != "assumed"
+            || op["floor_id"] != proposal["scope"]["floor_id"]
+            || !seen_ops.insert((action.clone(), collection.clone(), target.clone()))
+            || op["source_ids"]
+                .as_array()?
+                .iter()
+                .any(|s| s.as_str().is_none_or(str::is_empty))
+        {
+            return None;
+        }
+        let reason = bounded_text(op, "reason", 4000)?;
+        if action == "add" {
+            let entity: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+            if entity["id"] != target || entity["source_ids"] != op["source_ids"] {
+                return None;
+            }
+            match collection.as_str() {
+                "walls" => {
+                    for key in ["start", "end"] {
+                        entity[key]["x"].as_f64()?;
+                        entity[key]["y"].as_f64()?;
+                    }
+                    if entity["height"].as_f64()? <= 0.0 || entity["thickness"].as_f64()? <= 0.0 {
+                        return None;
+                    }
+                }
+                "slabs" | "elements" => {
+                    for ring in std::iter::once(&entity["boundary"])
+                        .chain(entity["holes"].as_array()?.iter())
+                    {
+                        let points = ring.as_array()?;
+                        if points.len() < 3
+                            || points
+                                .iter()
+                                .any(|p| p["x"].as_f64().is_none() || p["y"].as_f64().is_none())
+                        {
+                            return None;
+                        }
+                    }
+                    let (height, base) = if collection == "slabs" {
+                        ("thickness", "elevation")
+                    } else {
+                        ("height", "base_z")
+                    };
+                    if entity[height].as_f64()? <= 0.0 {
+                        return None;
+                    }
+                    entity[base].as_f64()?;
+                }
+                "openings" => {
+                    let host = text(&entity, "wall_id").ok()?;
+                    if !hosts.values().any(|v| v == &host) {
+                        return None;
+                    }
+                    for key in ["offset", "width", "height", "sill_height"] {
+                        entity[key].as_f64()?;
+                    }
+                }
+                "solids" => {
+                    text(&entity, "primitive_id").ok()?;
+                    for key in ["origin", "scale"] {
+                        let values = entity[key].as_array()?;
+                        if values.len() != 3 || values.iter().any(|v| v.as_f64().is_none()) {
+                            return None;
+                        }
+                    }
+                }
+                "constraints" => {
+                    text(&entity, "kind").ok()?;
+                    entity["target_ids"].as_array()?;
+                }
+                _ => return None,
+            }
+            rows.push(format!(
+                "新增 {collection}/{target} · {entity} · assumed · {reason}"
+            ));
+        } else {
+            rows.push(format!(
+                "移除 {collection}/{target} · 来源 {} · assumed · {reason}",
+                op["source_ids"]
+            ));
+        }
+    }
+    rows.push(format!("楼板修订 · {}", audit["slab"]));
+    Some(rows)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCatalogFact {
     pub catalog_id: String,
