@@ -718,6 +718,33 @@ fn handle_key_inner(
     if key.code != KeyCode::F(9) {
         local.workflow.confirm_stop = false;
     }
+    if control && key.code == KeyCode::Char('o') {
+        if let Some(request) = selected_request(snapshot, local) {
+            if let RequestKind::UserInput { questions } = &request.kind {
+                if let Some(question) = questions
+                    .get(local.question_index.min(questions.len().saturating_sub(1)))
+                    .filter(|question| question.preview.is_some())
+                {
+                    if request_locked(snapshot, local, request) {
+                        local.notice = Some(
+                            lang::tr("Request is submitted or unavailable.", "问题已提交或不可用")
+                                .into(),
+                        );
+                    } else {
+                        send(
+                            Command::OpenQuestionPreview {
+                                request: request.reference(),
+                                question_id: question.id.clone(),
+                            },
+                            tx,
+                            local,
+                        );
+                    }
+                    return false;
+                }
+            }
+        }
+    }
     // These control letters remain distinct when a host drops Enter modifiers.
     let key = if control && key.code == KeyCode::Char('s') {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
@@ -764,7 +791,7 @@ fn handle_key_inner(
                 send(Command::ConfirmExtension { confirmation }, tx, local);
             }
             extensions::ExtensionAction::OpenImage(binding) => {
-                send(Command::OpenDomainImage { binding }, tx, local);
+                send(Command::OpenDomainImage { binding: *binding }, tx, local);
             }
             extensions::ExtensionAction::ImageUnavailable => {
                 local.notice = Some("图片不可用：请等待本版文件校验或重新生成图片".into());
@@ -6179,6 +6206,54 @@ mod tests {
         assert_eq!(answers["component-28"], ["move X +0.25 m"]);
         assert!(rx.try_recv().is_err());
         assert!(local.submitted.contains(&request));
+    }
+
+    #[test]
+    fn question_preview_ctrl_o_opens_current_question_and_preserves_answer_draft() {
+        let request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({
+            "threadId":"root","turnId":"one","questions":[
+                {"id":"first","header":"A","question":"First?"},
+                {"id":"second","header":"B","question":"Second?","preview":{
+                    "html_path":"review/index.html","png_path":"review/review.png","data_sha256":"a".repeat(64)}}
+            ]
+        })).unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        sync_local_requests(&mut local, &snapshot);
+        local.question_index = 1;
+        local.editor.insert("keep this answer");
+        for panel in [false, true] {
+            local.request_panel = panel;
+            handle_key(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+            assert_eq!(local.editor.text, "keep this answer");
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                Command::OpenQuestionPreview {
+                    request: snapshot.requests[0].reference(),
+                    question_id: "second".into(),
+                }
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        local.submitted.insert(snapshot.requests[0].reference());
+        handle_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local.editor.text, "keep this answer");
     }
 
     #[test]

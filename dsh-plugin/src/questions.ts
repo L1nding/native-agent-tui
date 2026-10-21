@@ -21,6 +21,7 @@ const MAX_OPTIONS = 12
 interface Pending {
   /** Option labels of each question, to tell a choice from typed text. */
   labels: Map<string, Set<string>>
+  previewHashes: Map<string, unknown>
   resolve(answer: unknown): void
   reject(error: Error): void
 }
@@ -62,6 +63,7 @@ export function answerQuestions(
       return typeof pass === 'function' ? (pass as () => unknown)() : undefined
     }
     const labels = new Map<string, Set<string>>()
+    const previewHashes = new Map<string, unknown>()
     const questions = asked.map((item) => {
       const question = record(item) ?? {}
       const options = (Array.isArray(question['options']) ? (question['options'] as unknown[]) : [])
@@ -71,12 +73,15 @@ export function answerQuestions(
       // The reply key must remain the host's exact item identity.
       const id = typeof question['id'] === 'string' ? question['id'] : ''
       labels.set(id, new Set(options.map((option) => option.label)))
+      const preview = record(question['preview'])
+      if (preview !== undefined) previewHashes.set(id, preview['data_sha256'])
       const detail = text(question['detail'])
       return {
         id,
         header: text(question['header'], 200),
         // The reviewed text, e.g. the plan, is part of what the user is asked.
         question: detail === '' ? text(question['question']) : `${text(question['question'], 400)}\n\n${detail}`,
+        ...(question['preview'] === undefined ? {} : { preview: question['preview'] }),
         ...(options.length === 0 ? {} : { options, multiSelect: question['multiSelect'] === true }),
       }
     })
@@ -90,6 +95,7 @@ export function answerQuestions(
       }
       pending.set(id, {
         labels,
+        previewHashes,
         resolve: (answer) => {
           signal?.removeEventListener('abort', withdraw)
           resolve(answer)
@@ -115,12 +121,22 @@ export function answerQuestions(
         entry.reject(dismissal('the user dismissed the question'))
         return true
       }
+      for (const [id, hash] of entry.previewHashes) {
+        if (typeof hash !== 'string' || hash === '' || record(given[id])?.['preview_data_sha256'] !== hash) {
+          entry.reject(new Error(`missing or mismatched preview_data_sha256 for question ${id}`))
+          return true
+        }
+      }
       const answers = [...entry.labels].map(([id, labels]) => {
-        const values = record(given[id])?.['answers']
+        const answer = record(given[id])
+        const values = answer?.['answers']
         const list = (Array.isArray(values) ? values : []).filter((item): item is string => typeof item === 'string')
         const selected = list.filter((item) => labels.has(item))
         const typed = list.filter((item) => !labels.has(item)).join('\n').slice(0, MAX_TEXT_CHARS)
-        return { id, selected, ...(typed === '' ? {} : { custom: typed }) }
+        return {
+          id, selected, ...(typed === '' ? {} : { custom: typed }),
+          ...(entry.previewHashes.has(id) ? { preview_data_sha256: answer?.['preview_data_sha256'] } : {}),
+        }
       })
       entry.resolve({ answers })
       return true

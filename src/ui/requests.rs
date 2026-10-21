@@ -9,7 +9,7 @@ use super::lang::{self, tr};
 use super::layout::wrap;
 use super::theme::{self, Theme};
 use super::{request_locked, selected_request, LocalState};
-use crate::interactions::{InputOption, RequestKind, RequestView};
+use crate::interactions::{InputOption, QuestionPreview, RequestKind, RequestView};
 use crate::state::{display_text, CoreSnapshot};
 
 fn locked_text() -> &'static str {
@@ -27,6 +27,22 @@ pub(super) fn option_line(index: usize, option: &InputOption) -> String {
         ":"
     };
     format!("{}. {}{colon}", index + 1, option.label)
+}
+
+pub(super) fn preview_summary(preview: &QuestionPreview) -> String {
+    let kind = preview
+        .review_type
+        .as_deref()
+        .unwrap_or(tr("pending", "待校验"));
+    let count = preview
+        .candidate_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| tr("unknown", "未知").into());
+    format!(
+        "{}: {kind} · {}: {count}",
+        tr("Preview type", "预览类型"),
+        tr("Candidates", "候选数")
+    )
 }
 
 fn unsupported_text() -> &'static str {
@@ -85,11 +101,18 @@ fn available_actions(
     if request_locked(snapshot, local, request) {
         return Actions::Locked;
     }
-    if matches!(request.kind, RequestKind::UserInput { .. }) {
-        return Actions::Hints(vec![
+    if let RequestKind::UserInput { questions } = &request.kind {
+        let mut hints = vec![
             tr("Enter answer", "Enter 回答"),
             tr("F2 next request", "F2 下一个请求"),
-        ]);
+        ];
+        if questions
+            .get(local.question_index)
+            .is_some_and(|q| q.preview.is_some())
+        {
+            hints.push(tr("Ctrl+O open web page", "Ctrl+O 打开网页"));
+        }
+        return Actions::Hints(hints);
     }
     let mut hints = Vec::new();
     if request.allow_accept {
@@ -288,6 +311,35 @@ fn details(request: &RequestView, snapshot: &CoreSnapshot, local: &LocalState) -
                     Row::new(RowKind::Decision, question.question.clone())
                         .lead(INDENT, RowKind::Decision),
                 );
+                if let Some(preview) = &question.preview {
+                    rows.push(
+                        Row::new(RowKind::Meta, preview_summary(preview))
+                            .lead(INDENT, RowKind::Meta),
+                    );
+                    rows.push(
+                        Row::new(
+                            RowKind::Meta,
+                            format!(
+                                "PNG: {} · HTML: {}",
+                                preview.png_path.display(),
+                                preview.html_path.display()
+                            ),
+                        )
+                        .lead(INDENT, RowKind::Meta),
+                    );
+                    rows.push(
+                        Row::new(
+                            RowKind::Meta,
+                            format!("Ctrl+O {}", tr("open web page", "打开网页")),
+                        )
+                        .lead(INDENT, RowKind::Meta),
+                    );
+                    if let Some(error) = &preview.error {
+                        rows.push(
+                            Row::new(RowKind::Meta, error.clone()).lead(INDENT, RowKind::Meta),
+                        );
+                    }
+                }
                 if let Some(options) = &question.options {
                     for (index, option) in options.iter().enumerate() {
                         rows.push(
@@ -1206,6 +1258,103 @@ mod tests {
             assert!(screen.contains("Saved answer: Accept"), "{screen}");
             assert!(screen.contains("Saved answer: ***"), "{screen}");
             assert!(!screen.contains("PRIVATE_BATCH_ANSWER"));
+        }
+    }
+
+    #[test]
+    fn question_panel_renders_verified_preview_summary_path_and_open_hint() {
+        let mut request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &serde_json::json!({
+            "threadId":"root","turnId":"one","questions":[{
+                "id":"q","header":"Choice","question":"Which candidate?","preview":{
+                    "html_path":"review/index.html","png_path":"review/review.png","data_sha256":"a".repeat(64)
+                }
+            }]
+        })).unwrap();
+        let crate::interactions::RequestKind::UserInput { questions } = &mut request.kind else {
+            unreachable!()
+        };
+        let preview = questions[0].preview.as_mut().unwrap();
+        preview.review_type = Some("question_preview".into());
+        preview.candidate_count = Some(7);
+        let mut snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            request_panel: true,
+            ..Default::default()
+        };
+        sync_local_requests(&mut local, &snapshot);
+        let painted = screen(&render(&snapshot, &local, dark(), 120, 30));
+        for expected in [
+            "Which candidate?",
+            "question_preview",
+            "Candidates: 7",
+            "PNG: review/review.png",
+            "Ctrl+O",
+        ] {
+            assert!(painted.contains(expected), "{painted}");
+        }
+        let crate::interactions::RequestKind::UserInput { questions } =
+            &mut snapshot.requests[0].kind
+        else {
+            unreachable!()
+        };
+        let preview = questions[0].preview.as_mut().unwrap();
+        preview.review_type = None;
+        preview.candidate_count = None;
+        preview.error = Some("domain_setup unavailable".into());
+        let painted = screen(&render(&snapshot, &local, dark(), 120, 30));
+        for expected in ["Candidates: unknown", "domain_setup unavailable"] {
+            assert!(painted.contains(expected), "{painted}");
+        }
+        assert!(!painted.contains("Candidates: 7"));
+    }
+
+    #[test]
+    fn question_preview_long_paths_wrap_and_remain_reachable_by_panel_scrolling() {
+        let path = format!("review/{}/PNG_PATH_END.png", "long-directory/".repeat(7));
+        let html = format!("review/{}/HTML_PATH_END.html", "long-directory/".repeat(7));
+        let request = RequestView::decode(
+            RpcId::Number(1),
+            "item/tool/requestUserInput",
+            &serde_json::json!({
+                "threadId":"root","turnId":"one","questions":[{
+                    "id":"q","header":"Pick","question":"Which candidate?","preview":{
+                        "html_path":html,"png_path":path,"data_sha256":"a".repeat(64)
+                    }
+                }]
+            }),
+        )
+        .unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Running,
+            requests: vec![request],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            request_panel: true,
+            ..Default::default()
+        };
+        sync_local_requests(&mut local, &snapshot);
+        for width in [40, 60, 80] {
+            let area = ratatui::layout::Rect::new(0, 0, width, 18);
+            let maximum = super::max_scroll(&snapshot, &local, area);
+            assert!(maximum > 0);
+            let mut painted = String::new();
+            for scroll in 0..=maximum {
+                local.request_scroll = scroll;
+                painted.push_str(&screen(&render(&snapshot, &local, dark(), width, 18)));
+            }
+            for expected in [
+                "Which candidate?",
+                "PNG_PATH_END.png",
+                "HTML_PATH_END.html",
+                "Ctrl+O",
+            ] {
+                assert!(painted.contains(expected), "width={width}: {expected}");
+            }
         }
     }
 }

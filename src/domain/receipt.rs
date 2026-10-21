@@ -136,6 +136,7 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "source_region_inventory"
                 | "job_index"
                 | "delivery_status"
+                | "reference_evaluation"
                 // Server-driven batches; projected as unrelated facts.
                 | "auto_batch"
                 | "precedent_auto_batch"

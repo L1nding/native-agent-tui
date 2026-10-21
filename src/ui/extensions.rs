@@ -320,7 +320,7 @@ impl Registry<'_> {
                         .get(panel.selected_image.min(images.len().saturating_sub(1)))
                         .filter(|image| image.verified_path().is_some())
                         .map_or(ExtensionAction::ImageUnavailable, |image| {
-                            ExtensionAction::OpenImage(image.binding.clone())
+                            ExtensionAction::OpenImage(Box::new(image.binding.clone()))
                         }),
                 );
             }
@@ -377,7 +377,7 @@ pub(super) enum ExtensionAction {
     Handled,
     Confirm(ExtensionConfirmation),
     NoDisplayedConfirmation,
-    OpenImage(crate::domain::ReviewImageBinding),
+    OpenImage(Box<crate::domain::ReviewImageBinding>),
     ImageUnavailable,
 }
 

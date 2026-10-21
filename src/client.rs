@@ -28,6 +28,8 @@ use crate::state::{
 use crate::tool_details::{ToolDetailLocator, ToolDetails, ToolLifecycle};
 use crate::transport::{PipeTransport, TransportError};
 
+pub type QuestionPreviewCheck = (String, Result<(String, usize), String>);
+
 /// Continue only an idle, successful modeling turn on a known-incomplete floor,
 /// within the user's budget and never while the user owes an answer.
 fn should_auto_continue(
@@ -75,6 +77,18 @@ pub enum Command {
     },
     OpenDomainImage {
         binding: crate::domain::ReviewImageBinding,
+    },
+    OpenQuestionPreview {
+        request: RequestRef,
+        question_id: String,
+    },
+    QuestionPreviewsChecked {
+        request: RequestRef,
+        results: Vec<QuestionPreviewCheck>,
+    },
+    QuestionPreviewOpened {
+        request: RequestRef,
+        result: Result<(), String>,
     },
     DomainImagesChecked {
         attempt_id: u64,
@@ -357,6 +371,7 @@ impl ClientHandle {
                 domain_authorization_task: None,
                 domain_image_check_task: None,
                 domain_image_open_task: None,
+                review_web: ReviewWebTasks::new(config.domain_setup.clone()),
                 domain_image_attempt: 0,
                 domain_generation: 0,
                 domain_auto_approval_attempt: None,
@@ -557,6 +572,7 @@ struct Core {
     domain_authorization_task: Option<JoinHandle<()>>,
     domain_image_check_task: Option<(u64, JoinHandle<()>)>,
     domain_image_open_task: Option<(u64, JoinHandle<()>)>,
+    review_web: ReviewWebTasks,
     domain_image_attempt: u64,
     domain_generation: u64,
     domain_auto_approval_attempt: Option<crate::domain::ProposalBinding>,
@@ -590,6 +606,37 @@ struct Core {
     saving_provider: Option<(String, bool)>,
     /// The dsh session a pending resume switches to, until its messages are shown.
     resuming: Option<crate::conversations::ConversationSummary>,
+}
+
+struct ReviewWebTasks {
+    server: Option<Arc<tokio::sync::Mutex<crate::review_web::ReviewWebServer>>>,
+    checks: BTreeMap<RequestRef, JoinHandle<()>>,
+    opening: Option<(RequestRef, JoinHandle<()>)>,
+}
+
+impl ReviewWebTasks {
+    fn new(setup: Option<crate::domain::DomainSetup>) -> Self {
+        Self {
+            server: setup.map(|setup| {
+                Arc::new(tokio::sync::Mutex::new(
+                    crate::review_web::ReviewWebServer::new(setup),
+                ))
+            }),
+            checks: BTreeMap::new(),
+            opening: None,
+        }
+    }
+}
+
+impl Drop for ReviewWebTasks {
+    fn drop(&mut self) {
+        for task in self.checks.values() {
+            task.abort();
+        }
+        if let Some((_, task)) = &self.opening {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1074,7 +1121,17 @@ impl Core {
         }
         if let Some((_, task)) = self.domain_image_open_task.take() {
             task.abort();
+            let _ = task.await;
         }
+        for (_, task) in std::mem::take(&mut self.review_web.checks) {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some((_, task)) = self.review_web.opening.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.review_web.server.take();
         if let Some(task) = self.domain_authorization_task.take() {
             task.abort();
             let _ = task.await;
@@ -1147,6 +1204,35 @@ impl Core {
     }
 
     fn publish(&mut self) {
+        self.review_web.checks.retain(|reference, task| {
+            let live = self
+                .state
+                .view
+                .requests
+                .iter()
+                .any(|r| r.matches(reference));
+            if !live {
+                task.abort();
+            }
+            live
+        });
+        if self
+            .review_web
+            .opening
+            .as_ref()
+            .is_some_and(|(reference, _)| {
+                !self
+                    .state
+                    .view
+                    .requests
+                    .iter()
+                    .any(|r| r.matches(reference))
+            })
+        {
+            if let Some((_, task)) = self.review_web.opening.take() {
+                task.abort();
+            }
+        }
         self.check_domain_images();
         self.maybe_auto_approve_domain();
         if self.wait.is_some() {
@@ -1764,6 +1850,68 @@ impl Core {
                 }
             },
             Command::OpenDomainImage { binding } => self.open_domain_image(binding),
+            Command::OpenQuestionPreview {
+                request,
+                question_id,
+            } => {
+                self.open_question_preview(request, question_id);
+            }
+            Command::QuestionPreviewsChecked { request, results } => {
+                if self.review_web.checks.remove(&request).is_none() {
+                    return;
+                }
+                if let Some(live) = self
+                    .state
+                    .view
+                    .requests
+                    .iter_mut()
+                    .find(|r| r.matches(&request))
+                {
+                    if let crate::interactions::RequestKind::UserInput { questions } =
+                        &mut live.kind
+                    {
+                        for (id, result) in results {
+                            if let Some(preview) = questions
+                                .iter_mut()
+                                .find(|q| q.id == id)
+                                .and_then(|q| q.preview.as_mut())
+                            {
+                                match result {
+                                    Ok((review_type, count)) => {
+                                        preview.review_type = Some(review_type);
+                                        preview.candidate_count = Some(count);
+                                        preview.error = None;
+                                    }
+                                    Err(reason) => preview.error = Some(reason),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Command::QuestionPreviewOpened { request, result } => {
+                if self
+                    .review_web
+                    .opening
+                    .as_ref()
+                    .is_none_or(|(owner, _)| owner != &request)
+                {
+                    return;
+                }
+                self.review_web.opening.take();
+                if self
+                    .state
+                    .view
+                    .requests
+                    .iter()
+                    .any(|r| r.matches(&request) && self.request_is_live(r))
+                {
+                    self.state.view.notice = Some(match result {
+                        Ok(()) => "已打开问题预览网页；请在 TUI 回答".into(),
+                        Err(reason) => reason,
+                    });
+                }
+            }
             Command::DomainImagesChecked {
                 attempt_id,
                 generation,
@@ -2669,6 +2817,116 @@ impl Core {
         ));
     }
 
+    fn check_question_previews(&mut self, request: &RequestView) {
+        let crate::interactions::RequestKind::UserInput { questions } = &request.kind else {
+            return;
+        };
+        let packages: Vec<_> = questions
+            .iter()
+            .filter_map(|question| {
+                question
+                    .preview
+                    .as_ref()
+                    .map(|preview| (question.id.clone(), preview.package()))
+            })
+            .collect();
+        if packages.is_empty() {
+            return;
+        }
+        let reference = request.reference();
+        let owner = reference.clone();
+        let setup = self.config.domain_setup.clone();
+        let commands = self.command_tx.clone();
+        let task = tokio::spawn(async move {
+            let mut results = Vec::new();
+            for (id, package) in packages {
+                let result = match &setup {
+                    Some(setup) => {
+                        crate::review_web::inspect(setup, package)
+                            .await
+                            .and_then(|summary| {
+                                if summary.review_type != "question_preview" {
+                                    return Err("问题预览类型不匹配".into());
+                                }
+                                Ok((summary.review_type, summary.candidate_count))
+                            })
+                    }
+                    None => Err("问题预览不可用：请在模型器仓库配置 domain_context".into()),
+                };
+                results.push((id, result));
+            }
+            if let Some(commands) = commands.upgrade() {
+                let _ = commands
+                    .send(Command::QuestionPreviewsChecked {
+                        request: reference,
+                        results,
+                    })
+                    .await;
+            }
+        });
+        self.review_web.checks.insert(owner, task);
+    }
+
+    fn open_question_preview(&mut self, request: RequestRef, question_id: String) {
+        if self.review_web.opening.is_some() {
+            return;
+        }
+        let Some(live) = self
+            .state
+            .view
+            .requests
+            .iter()
+            .find(|r| r.matches(&request) && self.request_is_live(r) && !r.responding)
+        else {
+            self.state.view.notice = Some("问题已提交或不可用".into());
+            return;
+        };
+        let crate::interactions::RequestKind::UserInput { questions } = &live.kind else {
+            return;
+        };
+        let Some(preview) = questions
+            .iter()
+            .find(|q| q.id == question_id)
+            .and_then(|q| q.preview.as_ref())
+        else {
+            return;
+        };
+        if let Some(reason) = &preview.error {
+            self.state.view.notice = Some(reason.clone());
+            return;
+        }
+        if preview.review_type.as_deref() != Some("question_preview")
+            || preview.candidate_count.is_none()
+        {
+            self.state.view.notice = Some("问题预览正在校验，请稍后重试 Ctrl+O".into());
+            return;
+        }
+        let package = preview.package();
+        if self.review_web.server.is_none() {
+            self.state.view.notice =
+                Some("问题预览不可用：请在模型器仓库配置 domain_context".into());
+            return;
+        }
+        let server = self.review_web.server.clone();
+        let commands = self.command_tx.clone();
+        let owner = request.clone();
+        self.state.view.notice = Some("正在打开问题预览网页".into());
+        let task = tokio::spawn(async move {
+            let result = async {
+                let server = server.ok_or("当前会话没有复核网页服务")?;
+                let url = server.lock().await.register(package).await?;
+                crate::review_web::open_browser(url).await
+            }
+            .await;
+            if let Some(commands) = commands.upgrade() {
+                let _ = commands
+                    .send(Command::QuestionPreviewOpened { request, result })
+                    .await;
+            }
+        });
+        self.review_web.opening = Some((owner, task));
+    }
+
     fn open_domain_image(&mut self, binding: crate::domain::ReviewImageBinding) {
         if self.domain_image_open_task.is_some() || self.domain.snapshot.authorizing {
             return;
@@ -2690,6 +2948,7 @@ impl Core {
         }
         let generation = self.generation;
         let commands = self.command_tx.clone();
+        let web_server = self.review_web.server.clone();
         self.domain_image_attempt = self.domain_image_attempt.wrapping_add(1);
         let attempt_id = self.domain_image_attempt;
         for image in &mut self.domain.snapshot.review_images {
@@ -2701,7 +2960,33 @@ impl Core {
         self.domain_image_open_task = Some((
             attempt_id,
             tokio::spawn(async move {
-                let outcome = crate::domain::review::open_image(binding.clone()).await;
+                let outcome = if let Some(package) = binding.web_review.clone() {
+                    match crate::domain::review::verify_image(&binding).await {
+                        Err(reason) => crate::domain::review::ImageOpenOutcome {
+                            file_valid: false,
+                            result: Err(reason),
+                        },
+                        Ok(()) => {
+                            let registered = if let Some(server) = web_server {
+                                server.lock().await.register(package).await
+                            } else {
+                                Err("复核网页不可用：未配置建模环境（domain_setup）".into())
+                            };
+                            match registered {
+                                Ok(url) => crate::domain::review::ImageOpenOutcome {
+                                    file_valid: true,
+                                    result: crate::review_web::open_browser(url).await,
+                                },
+                                Err(reason) => crate::domain::review::ImageOpenOutcome {
+                                    file_valid: false,
+                                    result: Err(reason),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    crate::domain::review::open_image(binding.clone()).await
+                };
                 if let Some(commands) = commands.upgrade() {
                     let _ = commands
                         .send(Command::DomainImageOpened {
@@ -3204,6 +3489,7 @@ impl Core {
                         } else if self.state.view.requests.len() < 64 {
                             request.received_seq = self.ingress_seq;
                             self.file_previews.attach(&mut request);
+                            self.check_question_previews(&request);
                             self.state.view.requests.push(request);
                         } else {
                             let _ = self.send_effect(
@@ -6364,6 +6650,185 @@ mod tests {
             .wait_for(|snapshot| snapshot.observation.raw_message_count > raw)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn question_preview_without_domain_setup_projects_error_and_returns_bound_hash() {
+        let (mut client, mut server) = harness().await;
+        running_root(&mut client, &mut server).await;
+        let data_hash = "a".repeat(64);
+        observation_event(&mut client, &mut server, json!({
+            "id":"preview-question","method":"item/tool/requestUserInput","params":{
+                "threadId":"root","turnId":"root-turn","questions":[{
+                    "id":"candidate","header":"Pick","question":"Which candidate?","preview":{
+                        "html_path":"missing/index.html","png_path":"missing/review.png","data_sha256":data_hash
+                    }
+                }]
+            }
+        })).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.requests.first().is_some_and(|request| {
+                    let crate::interactions::RequestKind::UserInput { questions } = &request.kind
+                    else {
+                        return false;
+                    };
+                    questions[0]
+                        .preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.error.is_some())
+                })
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let reference = {
+            let snapshot = client.snapshots.borrow();
+            let request = &snapshot.requests[0];
+            let crate::interactions::RequestKind::UserInput { questions } = &request.kind else {
+                unreachable!()
+            };
+            let preview = questions[0].preview.as_ref().unwrap();
+            assert!(preview.error.as_deref().unwrap().contains("domain_context"));
+            assert!(preview.candidate_count.is_none());
+            assert!(preview.review_type.is_none());
+            request.reference()
+        };
+        client
+            .commands
+            .send(Command::OpenQuestionPreview {
+                request: reference.clone(),
+                question_id: "candidate".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("domain_context"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client
+            .commands
+            .send(Command::AnswerUserInput {
+                request: reference,
+                answers: BTreeMap::from([("candidate".into(), vec!["Revise".into()])]),
+            })
+            .await
+            .unwrap();
+        let reply = next(&mut server).await;
+        assert_eq!(reply["id"], "preview-question");
+        assert_eq!(
+            reply["result"]["answers"]["candidate"],
+            json!({
+                "answers":["Revise"],"preview_data_sha256":data_hash,
+            })
+        );
+        assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only real question preview; set REVIEW_MODELER_REPO and REVIEW_QUESTION_PACKAGE_DIR"]
+    async fn real_question_preview_projects_inspected_candidates_and_returns_data_hash() {
+        let repository = std::path::PathBuf::from(std::env::var("REVIEW_MODELER_REPO").unwrap());
+        let root = std::path::PathBuf::from(std::env::var("REVIEW_QUESTION_PACKAGE_DIR").unwrap());
+        let envelope: Value =
+            serde_json::from_slice(&std::fs::read(root.join("review.json")).unwrap()).unwrap();
+        let setup = crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            python: repository.join(if cfg!(windows) {
+                ".venv/Scripts/python.exe"
+            } else {
+                ".venv/bin/python"
+            }),
+            repository,
+            context_path: Default::default(),
+            run_id: "preview-test".into(),
+            context_sha256: "test".into(),
+            floor_id: "floor".into(),
+        };
+        let package = crate::review_web::WebReviewPackage {
+            html_path: root.join("index.html"),
+            png_path: root.join("review.png"),
+            data_sha256: envelope["data_sha256"].as_str().unwrap().into(),
+            manifest_sha256: None,
+            artifact_sha256: None,
+            url_hash: None,
+        };
+        let expected = crate::review_web::inspect(&setup, package.clone())
+            .await
+            .unwrap();
+        assert_eq!(expected.review_type, "question_preview");
+        let (mut client, mut server) = harness_with_config(Config {
+            domain_setup: Some(setup),
+            ..Default::default()
+        })
+        .await;
+        running_root(&mut client, &mut server).await;
+        observation_event(&mut client, &mut server, json!({
+            "id":"real-preview","method":"item/tool/requestUserInput","params":{
+                "threadId":"root","turnId":"root-turn","questions":[{
+                    "id":"candidate","header":"Pick","question":"Which candidate?","preview":{
+                        "html_path":package.html_path,"png_path":package.png_path,"data_sha256":package.data_sha256
+                    }
+                }]
+            }
+        })).await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.requests.first().is_some_and(|request| {
+                    let crate::interactions::RequestKind::UserInput { questions } = &request.kind
+                    else {
+                        return false;
+                    };
+                    questions[0].preview.as_ref().is_some_and(|preview| {
+                        preview.candidate_count.is_some() || preview.error.is_some()
+                    })
+                })
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let request = {
+            let snapshot = client.snapshots.borrow();
+            let request = &snapshot.requests[0];
+            let crate::interactions::RequestKind::UserInput { questions } = &request.kind else {
+                unreachable!()
+            };
+            let preview = questions[0].preview.as_ref().unwrap();
+            assert_eq!(preview.error, None);
+            assert_eq!(preview.review_type.as_deref(), Some("question_preview"));
+            assert_eq!(preview.candidate_count, Some(expected.candidate_count));
+            assert_eq!(preview.data_sha256, package.data_sha256);
+            request.reference()
+        };
+        client
+            .commands
+            .send(Command::AnswerUserInput {
+                request,
+                answers: BTreeMap::from([("candidate".into(), vec!["Revise".into()])]),
+            })
+            .await
+            .unwrap();
+        let reply = next(&mut server).await;
+        assert_eq!(
+            reply["result"]["answers"]["candidate"]["preview_data_sha256"],
+            package.data_sha256
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
     }
 
     #[tokio::test]

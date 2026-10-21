@@ -105,3 +105,67 @@ test('question identity is never shortened before matching the reply', async () 
   questions.settle({ id: sent[0].id, result: { answers: { [id]: { answers: ['Approve'] } } } })
   assert.deepEqual((await response).answers, [{ id, selected: ['Approve'] }])
 })
+
+test('previews and their answer hashes retain each question identity in a mixed batch', async () => {
+  const { ask, sent, questions, agent } = host()
+  const preview = {
+    html_path: `D:/项目/${'x'.repeat(6000)}/review.html`,
+    png_path: 'D:/项目/review.png', data_sha256: 'a'.repeat(64),
+  }
+  const second = { html_path: 'other/review.html', png_path: 'other/review.png', data_sha256: 'b'.repeat(64) }
+  const response = ask({ agent, questions: [
+    { ...review, preview },
+    { id: 'note', header: 'Note', question: 'Anything else?' },
+    { ...review, id: 'second', multiSelect: true, preview: second },
+  ] })
+  assert.deepEqual(sent[0].params.questions[0].preview, preview)
+  assert.equal(Object.hasOwn(sent[0].params.questions[1], 'preview'), false)
+  assert.deepEqual(sent[0].params.questions[2].preview, second)
+  assert.equal(questions.settle({ id: sent[0].id, result: { answers: {
+    second: { answers: ['Approve', 'Keep planning', 'move X'], preview_data_sha256: second.data_sha256 },
+    note: { answers: ['looks good'] },
+    'plan-review': { answers: ['Approve'], preview_data_sha256: preview.data_sha256 },
+  } } }), true)
+  assert.deepEqual(await response, { answers: [
+    { id: 'plan-review', selected: ['Approve'], preview_data_sha256: preview.data_sha256 },
+    { id: 'note', selected: [], custom: 'looks good' },
+    { id: 'second', selected: ['Approve', 'Keep planning'], custom: 'move X', preview_data_sha256: second.data_sha256 },
+  ] })
+})
+
+test('preview answers reject missing, invalid and mismatched hashes without synthesizing one', async () => {
+  for (const reply of [
+    undefined,
+    { answers: ['Approve'] },
+    ...[null, '', 123, 'b'.repeat(64), 'A'.repeat(64), `${'a'.repeat(64)} `].map(hash => ({
+      answers: ['Approve'], preview_data_sha256: hash,
+    })),
+  ]) {
+    const { ask, sent, questions, agent } = host()
+    const response = ask({ agent, questions: [{ ...review, preview: {
+      html_path: 'review.html', png_path: 'review.png', data_sha256: 'a'.repeat(64),
+    } }] })
+    const rejected = assert.rejects(response, /missing or mismatched preview_data_sha256.*plan-review/)
+    assert.equal(questions.settle({ id: sent[0].id, result: { answers: reply === undefined ? {} : { 'plan-review': reply } } }), true)
+    await rejected
+    assert.equal(questions.settle({ id: sent[0].id, result: { answers: {
+      'plan-review': { answers: ['Approve'], preview_data_sha256: 'a'.repeat(64) },
+    } } }), false)
+  }
+})
+
+test('preview hashes cannot be swapped between questions or replaced after dispatch', async () => {
+  const { ask, sent, questions, agent } = host()
+  const first = { html_path: 'a.html', png_path: 'a.png', data_sha256: 'a'.repeat(64) }
+  const second = { html_path: 'b.html', png_path: 'b.png', data_sha256: 'b'.repeat(64) }
+  const response = ask({ agent, questions: [
+    { ...review, preview: first }, { ...review, id: 'second', preview: second },
+  ] })
+  const rejected = assert.rejects(response, /missing or mismatched preview_data_sha256.*plan-review/)
+  first.data_sha256 = second.data_sha256
+  questions.settle({ id: sent[0].id, result: { answers: {
+    'plan-review': { answers: ['Approve'], preview_data_sha256: second.data_sha256 },
+    second: { answers: ['Approve'], preview_data_sha256: 'a'.repeat(64) },
+  } } })
+  await rejected
+})

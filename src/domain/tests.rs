@@ -1896,6 +1896,40 @@ fn opening_completion_scope() -> Value {
 }
 
 #[test]
+fn opening_completion_first_use_allows_only_authorized_null_cad_source_hashes() {
+    let mut scope = opening_completion_scope();
+    scope["proposal"]["source_dependencies"]["proof.json"] = json!("1".repeat(64));
+    let mut required = json!({
+        "review_key":"2".repeat(64),"component_id":"door.1","component_ids":["door.1"],
+        "category":"door","template_id":"typed.door","source_kind":"cad",
+        "source_instance_id":"door.1","source_sha256":null,"source_geometry_sha256":null,
+        "definition_sha256":"3".repeat(64),"arguments_sha256":"4".repeat(64),
+        "source_bindings":[{"component_id":"door.1","source_instance_id":"door.1",
+            "source_sha256":null,"source_geometry_sha256":null}]
+    });
+    scope["proposal"]["component_first_use_requirements"] = json!({
+        "contract":"component-first-use/5","required":[required.clone()],"reused":[]
+    });
+    let projected = project::scope_fact(&scope).unwrap();
+    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_some());
+
+    required["source_instance_id"] = json!("foreign-door");
+    scope["proposal"]["component_first_use_requirements"]["required"] = json!([required.clone()]);
+    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_none());
+    required["source_instance_id"] = json!("door.1");
+    required["source_bindings"][0]["source_sha256"] = json!("5".repeat(64));
+    scope["proposal"]["component_first_use_requirements"]["required"] = json!([required]);
+    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_none());
+    assert!(review::requirements(&scope["proposal"]).is_none());
+
+    scope["proposal"]["component_first_use_requirements"]["required"][0]["source_sha256"] =
+        json!("6".repeat(64));
+    scope["proposal"]["component_first_use_requirements"]["required"][0]["source_bindings"][0]
+        ["source_sha256"] = json!("6".repeat(64));
+    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_none());
+}
+
+#[test]
 fn opening_completion_activation_projects_all_160_openings_and_preserves_validation() {
     let mut setup = sequenced_facts().setup.unwrap();
     setup.mode = DomainMode::Project;
@@ -4761,6 +4795,218 @@ fn structural_review_accepts_more_than_sixty_four_typed_parts() {
 }
 
 #[test]
+fn web_first_use_projects_sealed_package_and_rejects_changed_evidence() {
+    let (mut proposal, mut evidence) = first_use_fixture();
+    let item = &mut evidence["component_first_use_review"]["manifest"]["items"][0];
+    item["renderer"] = json!({"engine":"REVIEW_WEB_3D","backend":"chromium"});
+    item["review_web"] = json!({
+        "review_type":"component_first_use_3d","version":"2",
+        "html_path":std::env::temp_dir().join("first-use-web/index.html"),
+        "data_sha256":"b".repeat(64),"manifest_sha256":"c".repeat(64),
+        "artifact_sha256":"d".repeat(64),
+        "manifest":{"data_sha256":"b".repeat(64),"artifact_sha256":"d".repeat(64),
+            "image_sha256":"8".repeat(64)}
+    });
+    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let (ready, mut images) = review::project(&evidence, &binding, &requirement).unwrap();
+    let package = images[0].binding.web_review.as_ref().unwrap();
+    let detail = images[0].detail.as_ref().unwrap();
+    for value in [
+        "component_first_use_3d",
+        "REVIEW_WEB_3D",
+        &"8".repeat(64),
+        &"b".repeat(64),
+        &"c".repeat(64),
+        &"d".repeat(64),
+        &"a".repeat(64),
+    ] {
+        assert!(detail.contains(value), "{value}");
+    }
+    assert_eq!(
+        package.html_path,
+        std::env::temp_dir().join("first-use-web/index.html")
+    );
+    assert_eq!(package.png_path, std::env::temp_dir().join("first-use.png"));
+    assert_eq!(package.data_sha256, "b".repeat(64));
+    assert_eq!(package.manifest_sha256, Some("c".repeat(64)));
+    assert_eq!(package.artifact_sha256, Some("d".repeat(64)));
+    assert_eq!(package.url_hash.as_deref(), Some("view=perspective"));
+    assert_eq!(images[0].binding.proposal, binding);
+    assert_eq!(images[0].binding.review_set_sha256, ready.review_set_sha256);
+    images[0].file_state = ImageFileState::Available;
+    let mut facts = sequenced_facts();
+    facts.snapshot.review_images = images;
+    let mut changed = evidence.clone();
+    changed["component_first_use_review"]["manifest"]["items"][0]["review_web"]
+        ["manifest_sha256"] = json!("e".repeat(64));
+    let (_, images) = review::project(&changed, &binding, &requirement).unwrap();
+    facts.replace_review_images(images, true);
+    assert_eq!(
+        facts.snapshot.review_images[0].file_state,
+        ImageFileState::Pending
+    );
+    assert!(!ready.satisfied(&facts.snapshot.review_images));
+
+    for (field, invalid) in [
+        ("review_type", json!("component_form_3d")),
+        ("version", json!("3")),
+        ("data_sha256", json!("invalid")),
+        ("manifest_sha256", Value::Null),
+        ("artifact_sha256", json!("invalid")),
+        ("png_path", json!(std::env::temp_dir().join("other.png"))),
+        ("url_hash", json!("view=top")),
+        ("html_path", json!("https://example.com/index.html")),
+        ("html_path", json!(r"\\server\review\index.html")),
+        ("html_path", json!("relative/index.html")),
+    ] {
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0]["review_web"][field] =
+            invalid;
+        assert!(
+            review::project(&changed, &binding, &requirement).is_none(),
+            "{field}"
+        );
+    }
+    for field in ["data_sha256", "artifact_sha256", "image_sha256"] {
+        let mut changed = evidence.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0]["review_web"]["manifest"]
+            [field] = json!("e".repeat(64));
+        assert!(
+            review::project(&changed, &binding, &requirement).is_none(),
+            "{field}"
+        );
+    }
+    let mut missing = evidence.clone();
+    missing["component_first_use_review"]["manifest"]["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("review_web");
+    assert!(review::project(&missing, &binding, &requirement).is_none());
+
+    proposal["component_first_use_review"] = evidence["component_first_use_review"].clone();
+    proposal["fact_sequence"] = json!(1);
+    proposal["ok"] = json!(true);
+    let receipt = private_receipt(&proposal);
+    let setup = facts.setup.as_ref().unwrap();
+    assert!(receipt::verify(setup, &receipt, &serde_json::to_vec(&proposal).unwrap()).is_ok());
+    for field in [
+        "html_path",
+        "data_sha256",
+        "manifest_sha256",
+        "artifact_sha256",
+    ] {
+        let mut changed = proposal.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0]["review_web"][field] =
+            json!("f".repeat(64));
+        assert!(receipt::verify(setup, &receipt, &serde_json::to_vec(&changed).unwrap()).is_err());
+    }
+}
+
+#[test]
+fn web_artifact_binds_glb_and_python_spelled_focus_to_current_proposal() {
+    let (proposal, evidence) = first_use_fixture();
+    let binding = proposal_fact(&proposal).unwrap().binding;
+    let mut value = artifact_envelope("preview", 2, "built", Some(true));
+    value["artifact"]["review_image"] =
+        evidence["component_first_use_review"]["manifest"]["items"][0]["images"][0].clone();
+    value["artifact"]["review_image"]["delivery"] = json!("attached_png");
+    value["artifact"]["review_image"]["renderer"] = json!("chromium");
+    value["artifact"]["review_image"]["request"] = json!({
+        "build_id":"preview","proposal_id":"proposal","revision":2,"prepare_token":"token",
+        "input_sha256":"candidate","blend_sha256":"b".repeat(64),"glb_sha256":"c".repeat(64),
+        "view":"front","focus_m":[0,0.000001,2,3]
+    });
+    value["artifact"]["review_image"]["review_web"] = json!({
+        "review_type":"component_form_3d","version":"2",
+        "html_path":std::env::temp_dir().join("artifact-web/index.html"),
+        "data_sha256":"d".repeat(64),"manifest_sha256":"e".repeat(64),
+        "artifact_sha256":"c".repeat(64)
+    });
+    let image = review::artifact_image(&value, &binding).unwrap();
+    let detail = image.detail.as_ref().unwrap();
+    assert!(detail.contains("component_form_3d"));
+    assert!(detail.contains("chromium"));
+    for digit in ['8', 'b', 'c', 'd', 'e'] {
+        assert!(detail.contains(&digit.to_string().repeat(64)));
+    }
+    let package = image.binding.web_review.unwrap();
+    assert_eq!(
+        package.url_hash.as_deref(),
+        Some("view=front&focus=0.0,1e-06,2.0,3.0")
+    );
+    assert_eq!(package.artifact_sha256, Some("c".repeat(64)));
+    assert_eq!(image.binding.proposal, binding);
+    assert_eq!(image.binding.review_key, "preview");
+    assert_eq!(image.binding.review_set_sha256, None);
+    for (field, invalid) in [
+        ("glb_sha256", json!("f".repeat(64))),
+        ("revision", json!(3)),
+        ("prepare_token", json!("foreign")),
+        ("view", json!("missing_walls")),
+        ("view", json!("perspective")),
+        ("focus_m", json!([2, 0, 1, 3])),
+        ("focus_m", json!([0, 1, 2])),
+    ] {
+        let mut changed = value.clone();
+        changed["artifact"]["review_image"]["request"][field] = invalid;
+        assert!(
+            review::artifact_image(&changed, &binding).is_none(),
+            "{field}"
+        );
+    }
+    let mut facts = sequenced_facts();
+    let mut prepared = proposal;
+    prepared["fact_sequence"] = json!(1);
+    assert_eq!(
+        facts.apply_verified_fact(&prepared),
+        FactProjection::Applied
+    );
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    value["fact_sequence"] = json!(3);
+    value["artifact"]["review_image"]["review_web"]["artifact_sha256"] = json!("f".repeat(64));
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    assert!(!facts.can_authorize(&binding));
+}
+
+#[test]
+fn reference_evaluation_is_read_only_without_an_active_project_scope() {
+    let mut facts = sequenced_facts();
+    facts.setup.as_mut().unwrap().mode = DomainMode::Project;
+    let mut value = envelope();
+    value["kind"] = json!("reference_evaluation");
+    value["fact_sequence"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Unrelated);
+    assert!(facts.snapshot.proposal.is_none());
+    assert!(facts.snapshot.review_images.is_empty());
+    assert!(facts.snapshot.rejected_facts.is_empty());
+    assert!(facts.deferred_sequences.is_empty());
+}
+
+#[test]
+fn evaluation_receipt_uses_empty_owner_binding_and_seals_new_report_fields() {
+    let facts = sequenced_facts();
+    let setup = facts.setup.as_ref().unwrap();
+    let mut value = json!({
+        "contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"reference_evaluation","ok":true,"fact_sequence":1,
+        "proposal_id":"proposal","scene_sha256":"b".repeat(64),
+        "evaluation":{"input_sha256":"c".repeat(64),
+            "artifacts":{"missing_wall_plan_png":"sealed/report.png"},
+            "verification_questions":[],"diagnostics":[]}
+    });
+    let mut receipt = private_receipt(&value);
+    receipt.binding = json!({});
+    let raw = serde_json::to_vec(&value).unwrap();
+    assert_eq!(receipt::verify(setup, &receipt, &raw).unwrap(), value);
+    receipt.binding = json!({"proposal_id":"proposal"});
+    assert!(receipt::verify(setup, &receipt, &raw).is_err());
+    receipt.binding = json!({});
+    value["evaluation"]["artifacts"]["missing_wall_plan_png"] = json!("changed/report.png");
+    assert!(receipt::verify(setup, &receipt, &serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
 fn first_use_requires_exact_template_arguments_sources_revision_and_opened_review_set() {
     let (proposal, evidence) = first_use_fixture();
     let requirement = review::requirements(&proposal["proposal"]).unwrap();
@@ -4833,6 +5079,13 @@ fn first_use_accepts_review_set_from_attached_delivery_record() {
     .unwrap();
     assert_eq!(ready.review_set_sha256, Some("a".repeat(64)));
     assert_eq!(images.len(), 1);
+    evidence["component_first_use_review"]["review_set_sha256"] = json!("b".repeat(64));
+    assert!(review::project(
+        &evidence,
+        &proposal_fact(&proposal).unwrap().binding,
+        &requirement,
+    )
+    .is_none());
 }
 
 #[test]
@@ -5394,6 +5647,27 @@ async fn png_verification_rejects_missing_changed_dimensions_and_nonlocal_files_
     assert!(missing.result.is_err());
     tokio::fs::write(&path, &bytes).await.unwrap();
     assert!(review::verify_image(&images[0].binding).await.is_ok());
+    let mut web_image = images[0].binding.clone();
+    web_image.web_review = Some(crate::review_web::WebReviewPackage {
+        html_path: dir.join("index.html"),
+        png_path: path.clone(),
+        data_sha256: "tampered".into(),
+        manifest_sha256: Some("b".repeat(64)),
+        artifact_sha256: Some("c".repeat(64)),
+        url_hash: Some("view=perspective".into()),
+    });
+    assert!(review::verify_image(&web_image).await.is_ok());
+    let setup = sequenced_facts().setup.unwrap();
+    let error = authorize_with_policy(
+        setup,
+        binding.clone(),
+        web_image.review_set_sha256.clone(),
+        vec![web_image],
+        crate::config::DomainApprovalPolicy::Manual,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("复核"), "{error}");
     tokio::fs::write(&path, [bytes.clone(), vec![0]].concat())
         .await
         .unwrap();

@@ -1079,7 +1079,15 @@ Enter a new task to continue; F8 retries a failed workflow task."
                 if questions.len() > 1 {
                     title = format!("{title} ({}/{})", local.question_index + 1, questions.len());
                 }
-                format!("{title}\n{choices}{}\n{options}", question.question)
+                let preview = question
+                    .preview
+                    .as_ref()
+                    .map(|preview| format!("{}\n", requests::preview_summary(preview)))
+                    .unwrap_or_default();
+                format!(
+                    "{title}\n{preview}{choices}{}\n{options}",
+                    question.question
+                )
             }
             _ => format!(
                 "{} · {}\n{}",

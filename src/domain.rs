@@ -1053,7 +1053,7 @@ impl DomainFacts {
         // current floor state to project. Envelope identity was checked above.
         if matches!(
             kind,
-            "fact_page" | "diagnostic_log" | "project_floor_preparing"
+            "fact_page" | "diagnostic_log" | "project_floor_preparing" | "reference_evaluation"
         ) {
             return FactProjection::Unrelated;
         }
@@ -1426,7 +1426,8 @@ impl DomainFacts {
                 let Some(proposal) = proposal_fact(value) else {
                     return invalid!("proposal_fact");
                 };
-                let Some(first_use) = review::requirements(&value["proposal"]) else {
+                let Some(first_use) = review::requirements_for_scope(&value["proposal"], &scope)
+                else {
                     return invalid!("review::requirements");
                 };
                 if self.snapshot.project_scope.as_ref() != Some(&scope) {
@@ -1554,7 +1555,11 @@ impl DomainFacts {
             }
             Some("proposal") => {
                 if let Some(proposal) = proposal_fact(value) {
-                    let Some(mut first_use) = review::requirements(&value["proposal"]) else {
+                    let Some(mut first_use) = (if let Some(scope) = &self.snapshot.project_scope {
+                        review::requirements_for_scope(&value["proposal"], scope)
+                    } else {
+                        review::requirements(&value["proposal"])
+                    }) else {
                         return invalid!("review::requirements");
                     };
                     let mut images = Vec::new();
@@ -1809,6 +1814,11 @@ impl DomainFacts {
                             &self.snapshot.proposal.as_ref().unwrap().binding,
                         ) {
                             self.replace_review_images(vec![image], false);
+                        } else if value["artifact"]["review_image"]
+                            .get("review_web")
+                            .is_some()
+                        {
+                            return invalid!("artifact.review_image.review_web binding");
                         }
                     }
                 }
@@ -3581,6 +3591,9 @@ pub async fn authorize_with_policy(
             return Err("首用图片与当前批准版本不一致".into());
         }
         review::verify_image(image).await?;
+        if let Some(package) = &image.web_review {
+            crate::review_web::verify(&setup, package.clone()).await?;
+        }
     }
     let raw = tokio::fs::read(&setup.context_path)
         .await

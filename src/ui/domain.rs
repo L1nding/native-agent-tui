@@ -358,6 +358,21 @@ fn business_lines(
             if let Some(path) = image.verified_path() {
                 lines.push(Line::from(display_text(&path.to_string_lossy())));
             }
+            if let Some(package) = &image.binding.web_review {
+                for text in [
+                    format!(
+                        "复核网页：{} · Ctrl+O 优先打开网页",
+                        package.html_path.display()
+                    ),
+                    format!("网页 PNG：{}", package.png_path.display()),
+                ] {
+                    lines.extend(
+                        wrap_text(&display_text(&text), usize::from(width.max(1)))
+                            .into_iter()
+                            .map(Line::from),
+                    );
+                }
+            }
             if let Some(detail) = &image.detail {
                 lines.extend(
                     wrap_text(&display_text(detail), usize::from(width.max(1)))
@@ -880,7 +895,7 @@ pub(super) fn compact_approval_card_lines(
 
 pub(super) fn approval_card_lines(
     domain: &crate::domain::DomainSnapshot,
-    _selected_image: usize,
+    selected_image: usize,
 ) -> Vec<String> {
     let Some(proposal) = &domain.proposal else {
         return Vec::new();
@@ -1085,10 +1100,36 @@ pub(super) fn approval_card_lines(
         }
         .into(),
     );
-    lines.push(format!(
+    let mut image_summary = format!(
         "图片 {} 张（Ctrl+O 查看，Alt+←/→ 切换）",
         domain.review_images.len()
-    ));
+    );
+    if let Some(image) = domain
+        .review_images
+        .get(selected_image.min(domain.review_images.len().saturating_sub(1)))
+    {
+        if let Some(package) = &image.binding.web_review {
+            let review_type = image
+                .detail
+                .as_deref()
+                .and_then(|detail| {
+                    detail
+                        .lines()
+                        .find_map(|line| line.strip_prefix("复核类型："))
+                })
+                .unwrap_or("未提供");
+            image_summary = format!(
+                "复核网页 {review_type} · Ctrl+O 打开 · F6 路径/SHA详情\n网页：{}\nPNG：{}\nPNG SHA256：{}\n数据 SHA256：{}\nmanifest SHA256：{}\nartifact SHA256：{}",
+                display_text(&package.html_path.to_string_lossy()),
+                display_text(&package.png_path.to_string_lossy()),
+                image.binding.image_sha256,
+                package.data_sha256,
+                package.manifest_sha256.as_deref().unwrap_or("未提供"),
+                package.artifact_sha256.as_deref().unwrap_or("未提供"),
+            );
+        }
+    }
+    lines.push(image_summary);
     let reason = if let Some(reason) = domain.fact_sync_notice.as_deref() {
         Some(reason)
     } else if domain.authorizing {
@@ -2552,6 +2593,42 @@ mod tests {
         let text = approval_card_lines(&domain, 0).join("\n");
         assert!(!text.contains("宿主映射"));
         assert!(!text.contains("void.1"));
+    }
+
+    #[test]
+    fn approval_card_projects_selected_web_review_paths_type_and_integrity_hashes() {
+        let proposal = proposal(7);
+        let mut image = crate::domain::review::test_image(&proposal.binding, "build");
+        image.binding.web_review = Some(crate::review_web::WebReviewPackage {
+            html_path: "/review/question/index.html".into(),
+            png_path: "/review/question/review.png".into(),
+            data_sha256: "a".repeat(64),
+            manifest_sha256: Some("b".repeat(64)),
+            artifact_sha256: Some("c".repeat(64)),
+            url_hash: None,
+        });
+        image.detail = Some("复核类型：component_form_3d".into());
+        let mut domain = DomainSnapshot {
+            proposal: Some(proposal),
+            review_images: vec![image],
+            ..Default::default()
+        };
+        let text = approval_card_lines(&domain, 0).join("\n");
+        for expected in [
+            "component_form_3d",
+            "Ctrl+O 打开",
+            "/review/question/index.html",
+            "/review/question/review.png",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        domain.review_images[0].binding.web_review = None;
+        let fallback = approval_card_lines(&domain, 0).join("\n");
+        assert!(fallback.contains("Ctrl+O 查看"));
+        assert!(!fallback.contains("/review/question/index.html"));
     }
 
     #[test]

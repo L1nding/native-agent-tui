@@ -55,6 +55,35 @@ pub struct InputQuestion {
     pub options: Option<Vec<InputOption>>,
     #[serde(default, rename = "multiSelect")]
     pub multi_select: bool,
+    #[serde(default)]
+    pub preview: Option<QuestionPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionPreview {
+    pub html_path: std::path::PathBuf,
+    pub png_path: std::path::PathBuf,
+    pub data_sha256: String,
+    #[serde(skip)]
+    pub review_type: Option<String>,
+    #[serde(skip)]
+    pub candidate_count: Option<usize>,
+    #[serde(skip)]
+    pub error: Option<String>,
+}
+
+impl QuestionPreview {
+    pub fn package(&self) -> crate::review_web::WebReviewPackage {
+        crate::review_web::WebReviewPackage {
+            html_path: self.html_path.clone(),
+            png_path: self.png_path.clone(),
+            data_sha256: self.data_sha256.clone(),
+            manifest_sha256: None,
+            artifact_sha256: None,
+            url_hash: None,
+        }
+    }
 }
 
 impl InputQuestion {
@@ -228,6 +257,22 @@ impl RequestView {
                             "question IDs must be nonempty and unique".into(),
                         ));
                     }
+                    if questions
+                        .iter()
+                        .filter_map(|question| question.preview.as_ref())
+                        .any(|preview| {
+                            preview.html_path.as_os_str().is_empty()
+                                || preview.png_path.as_os_str().is_empty()
+                                || preview.data_sha256.len() != 64
+                                || !preview.data_sha256.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                    {
+                        return Err(InteractionError::Invalid(
+                            "invalid question preview reference".into(),
+                        ));
+                    }
                     RequestKind::UserInput { questions }
                 }
                 _ => return Err(InteractionError::Unsupported(method.into())),
@@ -312,9 +357,18 @@ impl RequestView {
         answers: &BTreeMap<String, Vec<String>>,
     ) -> Result<Value, InteractionError> {
         self.validate_input_answers(answers, true)?;
-        Ok(
-            json!({"answers":answers.iter().map(|(id, answers)| (id.clone(), json!({"answers":answers}))).collect::<serde_json::Map<_,_>>()}),
-        )
+        let RequestKind::UserInput { questions } = &self.kind else {
+            return Err(InteractionError::DecisionUnavailable);
+        };
+        let mut result = serde_json::Map::new();
+        for question in questions {
+            let mut answer = json!({"answers": answers[&question.id]});
+            if let Some(preview) = &question.preview {
+                answer["preview_data_sha256"] = json!(preview.data_sha256);
+            }
+            result.insert(question.id.clone(), answer);
+        }
+        Ok(json!({"answers": result}))
     }
 
     /// Checks partial drafts as well as final answers without exposing protocol JSON to UI.
@@ -444,6 +498,41 @@ impl RequestDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_answers_return_each_previews_data_hash_without_using_display_metadata() {
+        let request = RequestView::decode(RpcId::Number(1), "item/tool/requestUserInput", &json!({
+            "threadId":"root", "turnId":"turn", "questions":[
+                {"id":"a","header":"A","question":"First?","preview":{
+                    "html_path":"a/index.html","png_path":"a/review.png","data_sha256":"a".repeat(64)}},
+                {"id":"b","header":"B","question":"Second?","preview":{
+                    "html_path":"b/index.html","png_path":"b/review.png","data_sha256":"b".repeat(64)}},
+                {"id":"c","header":"C","question":"Other?"}
+            ]
+        })).unwrap();
+        let answers = BTreeMap::from([
+            ("a".into(), vec!["Accept".into()]),
+            ("b".into(), vec!["Revise".into()]),
+            ("c".into(), vec!["Other".into()]),
+        ]);
+        let result = request.input_result(&answers).unwrap();
+        assert_eq!(
+            result["answers"]["a"],
+            json!({"answers":["Accept"],"preview_data_sha256":"a".repeat(64)})
+        );
+        assert_eq!(
+            result["answers"]["b"],
+            json!({"answers":["Revise"],"preview_data_sha256":"b".repeat(64)})
+        );
+        assert_eq!(result["answers"]["c"], json!({"answers":["Other"]}));
+        let RequestKind::UserInput { questions } = &request.kind else {
+            unreachable!()
+        };
+        let preview = questions[0].preview.as_ref().unwrap();
+        assert_eq!(preview.png_path, std::path::PathBuf::from("a/review.png"));
+        assert!(preview.review_type.is_none());
+        assert!(preview.candidate_count.is_none());
+    }
 
     #[test]
     fn request_context_keeps_proposals_explicit_and_rejects_invalid_identity_field_types() {

@@ -1213,6 +1213,9 @@ impl AcpBridge {
                 let mut item = json!({"id":question["id"],
                     "header":clip(&question["header"], 200),
                     "question":clip(&question["question"], budget)});
+                if let Some(preview) = question.get("preview") {
+                    item["preview"] = preview.clone();
+                }
                 if !options.is_empty() {
                     item["options"] = Value::Array(options);
                     item["multiSelect"] = json!(question["multiSelect"] == true);
@@ -4089,6 +4092,51 @@ mod tests {
         );
         drop(core_client);
         let _ = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+    }
+
+    #[tokio::test]
+    async fn question_preview_reference_and_bound_answer_survive_acp_conversion() {
+        let (mut core_client, core_bridge) = pair();
+        let (mut acp_server, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge.turn_id = Some("t".into());
+        let preview = json!({"html_path":"review/index.html","png_path":"review/review.png","data_sha256":"a".repeat(64)});
+        let id = RpcId::String("preview".into());
+        bridge
+            .ask(
+                id.clone(),
+                json!({"sessionId":"s","questions":[{
+                    "id":"candidate","header":"Pick","question":"Which?","preview":preview
+                }]}),
+            )
+            .unwrap();
+        let request = core_client.recv().await.unwrap();
+        let params = request.params.unwrap();
+        assert_eq!(params["questions"][0]["preview"], preview);
+        let request = crate::interactions::RequestView::decode(
+            id.clone(),
+            "item/tool/requestUserInput",
+            &params,
+        )
+        .unwrap();
+        let result = request
+            .input_result(&std::collections::BTreeMap::from([(
+                "candidate".into(),
+                vec!["Revise".into()],
+            )]))
+            .unwrap();
+        assert_eq!(
+            result["answers"]["candidate"]["preview_data_sha256"],
+            preview["data_sha256"]
+        );
+        bridge
+            .handle_core(Envelope::response(id.clone(), Some(result.clone())))
+            .await
+            .unwrap();
+        let reply = acp_server.recv().await.unwrap();
+        assert_eq!(reply.id, Some(id));
+        assert_eq!(reply.result.unwrap(), result);
     }
 
     #[tokio::test]

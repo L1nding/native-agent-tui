@@ -20,6 +20,7 @@ pub struct ReviewImageBinding {
     pub review_set_sha256: Option<String>,
     pub review_key: String,
     pub image_sha256: String,
+    pub web_review: Option<crate::review_web::WebReviewPackage>,
     path: PathBuf,
     dimensions: Option<[u32; 2]>,
 }
@@ -194,6 +195,61 @@ pub(crate) fn category_label(category: &str) -> &str {
 }
 
 pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
+    requirements_with_openings(proposal, None)
+}
+
+pub(super) fn requirements_for_scope(
+    proposal: &Value,
+    scope: &ProjectScopeFact,
+) -> Option<FirstUseReviewFact> {
+    let Some(completion) = &scope.opening_completion_binding else {
+        return requirements(proposal);
+    };
+    let needs_completion_sources = proposal["component_first_use_requirements"]["required"]
+        .as_array()
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("source_sha256").is_some_and(Value::is_null)
+                    || item
+                        .get("source_geometry_sha256")
+                        .is_some_and(Value::is_null)
+            })
+        });
+    if !needs_completion_sources {
+        return requirements(proposal);
+    }
+    let evidence = &proposal["opening_completion_source"];
+    let path = text(evidence, "path").ok()?;
+    let certificate_sha = hash(&evidence["sha256"])?;
+    let operations = proposal["draft"]["operations"].as_array()?;
+    if evidence["contract"] != "project-opening-completion/1"
+        || proposal["source_dependencies"][&path] != certificate_sha
+        || operations.is_empty()
+        || operations.iter().any(|operation| {
+            operation["op"] != "set"
+                || operation["collection"] != "openings"
+                || operation["field"] != "assets"
+                || operation["target_id"]
+                    .as_str()
+                    .is_none_or(|id| !completion.opening_ids.iter().any(|allowed| allowed == id))
+        })
+    {
+        return None;
+    }
+    let operation_ids: BTreeSet<String> = operations
+        .iter()
+        .map(|operation| operation["target_id"].as_str().map(str::to_owned))
+        .collect::<Option<_>>()?;
+    if operation_ids.len() != operations.len() {
+        return None;
+    }
+    requirements_with_openings(proposal, Some(&operation_ids))
+}
+
+fn requirements_with_openings(
+    proposal: &Value,
+    opening_ids: Option<&BTreeSet<String>>,
+) -> Option<FirstUseReviewFact> {
     let value = &proposal["component_first_use_requirements"];
     if !proposal["structure_revision_source"].is_null()
         && proposal["candidate_sha256"]
@@ -275,6 +331,7 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
     };
     let mut seen = BTreeSet::new();
     let mut components = BTreeSet::new();
+    let mut reviewed_openings = BTreeSet::new();
     if value["contract"] == "component-first-use/structure-revision-1" && required.len() != 1 {
         return None;
     }
@@ -282,13 +339,51 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
         if !seen.insert(hash(&item["review_key"])?) {
             return None;
         }
-        for key in [
-            "definition_sha256",
-            "arguments_sha256",
-            "source_sha256",
-            "source_geometry_sha256",
-        ] {
+        let opening_completion_item = opening_ids
+            .and_then(|allowed| {
+                let ids = strings(&item["component_ids"], 500)?;
+                if item["source_kind"] != "cad"
+                    || !matches!(item["category"].as_str(), Some("door" | "window"))
+                    || item["component_id"] != item["source_instance_id"]
+                    || !ids.contains(item["component_id"].as_str()?)
+                    || ids.iter().any(|id| !allowed.contains(id))
+                    || !item["source_sha256"].is_null()
+                    || !item["source_geometry_sha256"].is_null()
+                {
+                    return Some(false);
+                }
+                let bindings = item["source_bindings"].as_array()?;
+                let binding_ids: BTreeSet<_> = bindings
+                    .iter()
+                    .map(|binding| binding["component_id"].as_str())
+                    .collect();
+                Some(
+                    bindings.len() == ids.len()
+                        && binding_ids.len() == bindings.len()
+                        && binding_ids
+                            .iter()
+                            .all(|id| id.is_some_and(|id| ids.contains(id)))
+                        && bindings.iter().all(|binding| {
+                            binding["source_instance_id"] == binding["component_id"]
+                                && binding["source_sha256"].is_null()
+                                && binding["source_geometry_sha256"].is_null()
+                        }),
+                )
+            })
+            .unwrap_or(false);
+        if opening_completion_item {
+            reviewed_openings.extend(strings(&item["component_ids"], 500)?);
+        }
+        for key in ["definition_sha256", "arguments_sha256"] {
             hash(&item[key])?;
+        }
+        if opening_completion_item {
+            if !matches!(item["category"].as_str()?, "door" | "window") {
+                return None;
+            }
+        } else {
+            hash(&item["source_sha256"])?;
+            hash(&item["source_geometry_sha256"])?;
         }
         for key in ["component_id", "category", "template_id"] {
             text(item, key).ok()?;
@@ -506,7 +601,13 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 }
             }
             for key in ["source_sha256", "source_geometry_sha256"] {
-                hash(&binding[key])?;
+                if opening_completion_item {
+                    if !binding[key].is_null() {
+                        return None;
+                    }
+                } else {
+                    hash(&binding[key])?;
+                }
                 if binding[key] != item[key]
                     && !(opening_style_group
                         && key == "source_geometry_sha256"
@@ -526,6 +627,11 @@ pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
                 return None;
             }
         }
+    }
+    if opening_ids
+        .is_some_and(|allowed| !reviewed_openings.is_empty() && &reviewed_openings != allowed)
+    {
+        return None;
     }
     Some(FirstUseReviewFact {
         status: if required.is_empty() {
@@ -589,6 +695,7 @@ fn image_fact(
             review_set_sha256: set,
             review_key: key,
             image_sha256: hash(&value["image_sha256"])?.into(),
+            web_review: None,
             path,
             dimensions,
         },
@@ -600,6 +707,69 @@ fn image_fact(
         notice: None,
         detail: None,
     })
+}
+
+fn web_package(
+    value: &Value,
+    image: &ReviewImageBinding,
+    url_hash: String,
+) -> Option<crate::review_web::WebReviewPackage> {
+    let html_path = PathBuf::from(text(value, "html_path").ok()?);
+    let name = html_path.to_string_lossy();
+    if !html_path.is_absolute()
+        || name.contains("://")
+        || name.contains('\0')
+        || name.starts_with(r"\\")
+        || !html_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("html"))
+    {
+        return None;
+    }
+    if value.get("png_path").is_some_and(|path| {
+        path.as_str()
+            .is_none_or(|path| Path::new(path) != image.path)
+    }) || value
+        .get("url_hash")
+        .is_some_and(|value| value.as_str() != Some(url_hash.as_str()))
+    {
+        return None;
+    }
+    let data_sha256 = hash(&value["data_sha256"])?;
+    let manifest_sha256 = hash(&value["manifest_sha256"])?;
+    let artifact_sha256 = hash(&value["artifact_sha256"])?;
+    if let Some(manifest) = value.get("manifest") {
+        if manifest["data_sha256"] != data_sha256
+            || manifest["artifact_sha256"] != artifact_sha256
+            || manifest["image_sha256"] != image.image_sha256
+        {
+            return None;
+        }
+    }
+    Some(crate::review_web::WebReviewPackage {
+        html_path,
+        png_path: image.path.clone(),
+        data_sha256: data_sha256.into(),
+        manifest_sha256: Some(manifest_sha256.into()),
+        artifact_sha256: Some(artifact_sha256.into()),
+        url_hash: Some(url_hash),
+    })
+}
+
+fn web_detail(review_type: &str, engine: &str, image: &ReviewImageBinding) -> String {
+    let package = image.web_review.as_ref().expect("projected web package");
+    let mut detail = format!(
+        "复核类型：{review_type}\n渲染引擎：{}\nPNG SHA256：{}\n数据 SHA256：{}\nmanifest SHA256：{}\nartifact SHA256：{}",
+        crate::state::display_text(engine),
+        image.image_sha256,
+        package.data_sha256,
+        package.manifest_sha256.as_deref().unwrap_or("未提供"),
+        package.artifact_sha256.as_deref().unwrap_or("未提供"),
+    );
+    if let Some(set) = &image.review_set_sha256 {
+        detail.push_str(&format!("\nreview_set SHA256：{set}"));
+    }
+    detail
 }
 
 pub(super) fn project(
@@ -674,11 +844,12 @@ pub(super) fn project(
     if items.len() != required.len() {
         return None;
     }
-    if top_level_set.is_none() {
+    if top_level_set.is_none() || !review["delivery"].is_null() {
         let delivery = &review["delivery"];
         let delivery_key = hash(&delivery["review_key"])?;
         let delivery_image = hash(&delivery["image_sha256"])?;
         if delivery["delivery"] != "attached_png"
+            || delivery["review_set_sha256"] != set
             || !items.iter().any(|item| {
                 item["review_key"] == delivery_key
                     && item["images"].as_array().is_some_and(|images| {
@@ -717,6 +888,7 @@ pub(super) fn project(
             // sealed 2-D overlay; the modeler decides eligibility before sealing, so Core
             // does not keep its own (inevitably stale) category list.
             Some("PIL_2D_OVERLAY") => {}
+            Some("REVIEW_WEB_3D") if item["review_web"].is_object() => {}
             _ => return None,
         }
         hash(&item["cad_evidence_sha256"])?;
@@ -943,6 +1115,25 @@ pub(super) fn project(
                 true,
             )?;
             fact.detail = Some(detail.clone());
+            if let Some(web) = item.get("review_web") {
+                if web["review_type"] != "component_first_use_3d"
+                    || web["version"].as_str() != Some(&proposal.revision.to_string())
+                {
+                    return None;
+                }
+                fact.binding.web_review =
+                    Some(web_package(web, &fact.binding, "view=perspective".into())?);
+                fact.detail = Some(format!(
+                    "{detail}\n{}\nCAD 证据 SHA256：{}\nBLEND SHA256：{}",
+                    web_detail(
+                        "component_first_use_3d",
+                        item["renderer"]["engine"].as_str()?,
+                        &fact.binding,
+                    ),
+                    item["cad_evidence_sha256"].as_str()?,
+                    manifest["blend_sha256"].as_str()?,
+                ));
+            }
             images.push(fact);
         }
     }
@@ -1011,7 +1202,7 @@ pub(super) fn artifact_image(value: &Value, binding: &ProposalBinding) -> Option
     } else {
         "候选局部"
     };
-    image_fact(
+    let mut image = image_fact(
         &a["review_image"],
         binding,
         None,
@@ -1023,10 +1214,71 @@ pub(super) fn artifact_image(value: &Value, binding: &ProposalBinding) -> Option
             ReviewImageView::Detail
         },
         false,
-    )
+    )?;
+    if let Some(web) = a["review_image"].get("review_web") {
+        if web["review_type"] != "component_form_3d"
+            || web["version"].as_str() != Some(&binding.revision.to_string())
+            || hash(&request["glb_sha256"])? != hash(&web["artifact_sha256"])?
+        {
+            return None;
+        }
+        let view = request["view"].as_str()?;
+        if !matches!(view, "perspective" | "top" | "front") {
+            return None;
+        }
+        let mut fragment = format!("view={view}");
+        if !request["focus_m"].is_null() {
+            let focus = request["focus_m"].as_array()?;
+            if focus.len() != 4 || view == "perspective" {
+                return None;
+            }
+            let mut values = Vec::new();
+            for value in focus {
+                let number = value.as_f64()?;
+                if !number.is_finite() {
+                    return None;
+                }
+                let mut encoded = Vec::new();
+                number
+                    .serialize(&mut serde_json::Serializer::with_formatter(
+                        &mut encoded,
+                        PythonGeometryFormatter,
+                    ))
+                    .ok()?;
+                values.push(String::from_utf8(encoded).ok()?);
+            }
+            if focus[0].as_f64()? >= focus[2].as_f64()?
+                || focus[1].as_f64()? >= focus[3].as_f64()?
+            {
+                return None;
+            }
+            fragment.push_str("&focus=");
+            fragment.push_str(&values.join(","));
+        }
+        image.binding.web_review = Some(web_package(web, &image.binding, fragment)?);
+        let renderer = &a["review_image"]["renderer"];
+        let engine = renderer
+            .as_str()
+            .or_else(|| renderer["engine"].as_str())
+            .or_else(|| renderer["backend"].as_str())
+            .unwrap_or("REVIEW_WEB_3D");
+        image.detail = Some(format!(
+            "{}\nBLEND SHA256：{}",
+            web_detail("component_form_3d", engine, &image.binding),
+            request["blend_sha256"].as_str()?,
+        ));
+    }
+    Some(image)
 }
 
 pub async fn verify_image(binding: &ReviewImageBinding) -> Result<(), String> {
+    if binding
+        .web_review
+        .as_ref()
+        .is_some_and(|package| package.png_path != binding.path)
+    {
+        return Err("网页复核截图与当前图片绑定不一致".into());
+    }
     if !local_png(&binding.path) {
         return Err("图片不可用：仅支持绝对本地PNG文件".into());
     }
@@ -1105,6 +1357,7 @@ pub(crate) fn test_image(proposal: &ProposalBinding, build_id: &str) -> ReviewIm
             review_set_sha256: None,
             review_key: build_id.into(),
             image_sha256: "a".repeat(64),
+            web_review: None,
             path: std::env::temp_dir().join("verified-candidate.png"),
             dimensions: Some([1, 1]),
         },
