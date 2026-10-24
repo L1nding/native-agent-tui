@@ -671,13 +671,25 @@ pub(super) fn catalog_fact(value: &Value) -> Option<ProjectCatalogFact> {
     } else {
         None
     };
+    let mut rows = floor_rows(floors)?;
+    if let Some(discovery) = value.get("import_discovery") {
+        let status = label(discovery, "status")?;
+        rows.insert(
+            0,
+            format!(
+                "导入状态 {status} · 单位 {} · 请让 Agent 检查图纸并确认首次建模范围",
+                discovery["units"].as_str().unwrap_or("待确认")
+            ),
+        );
+        rows.push("楼板、墙层与高度须确认；导入与配置均不授予建模批准".into());
+    }
     Some(ProjectCatalogFact {
         catalog_id: sha(project, "catalog_id")?,
         project_path: label(project, "project_path")?,
         source_sha256: sha(project, "source_sha256")?,
         total_floors: floors.len(),
         component_source_layers,
-        rows: floor_rows(floors)?,
+        rows,
         floor_keys: floors
             .iter()
             .map(|floor| label(floor, "key"))
@@ -1482,7 +1494,7 @@ pub struct ProjectEntry {
 }
 
 /// Drawing units the modeler accepts for a new project's DXF source.
-pub const PROJECT_UNITS: [&str; 3] = ["millimeters", "centimeters", "meters"];
+pub const PROJECT_UNITS: [&str; 4] = ["auto", "millimeters", "centimeters", "meters"];
 
 /// A user's request to create a project from one DXF drawing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1529,6 +1541,10 @@ pub fn list_projects(cwd: &Path) -> Vec<ProjectEntry> {
 
 /// The modeler repository's own interpreter, as used for the domain tools.
 pub(super) fn modeler_python(repository: &Path) -> PathBuf {
+    let portable = repository.join("py/python.exe");
+    if cfg!(windows) && portable.is_file() {
+        return portable;
+    }
     repository.join(if cfg!(windows) {
         ".venv/Scripts/python.exe"
     } else {
@@ -1542,7 +1558,7 @@ pub fn create_project(cwd: &Path, request: &NewProject) -> Result<String, String
     let repository = normalized_path(cwd)?;
     let python = modeler_python(&repository);
     if !python.is_file() {
-        return Err("当前工作目录不是带 .venv 的模型器仓库，无法新建项目".into());
+        return Err("当前目录缺少建模 Python 运行时（py 或 .venv），无法新建项目".into());
     }
     let source = request.source.trim().trim_matches('"');
     if request.name.trim().is_empty() || source.is_empty() {
@@ -1551,6 +1567,7 @@ pub fn create_project(cwd: &Path, request: &NewProject) -> Result<String, String
     let output = std::process::Command::new(&python)
         .current_dir(&repository)
         .env("PYTHONUTF8", "1")
+        .env("PYTHONNOUSERSITE", "1")
         .args(["-m", "blender_agent.cli.main", "init-project"])
         .arg(request.name.trim())
         .arg("--source")

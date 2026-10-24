@@ -225,7 +225,10 @@ impl ProjectsPanel {
                     0 => form.name.clone(),
                     1 => form.description.clone(),
                     2 => form.source.clone(),
-                    _ => format!("◀ {} ▶", PROJECT_UNITS[form.units]),
+                    _ => format!(
+                        "◀ {} ▶",
+                        ["按 DXF 声明（自动）", "毫米", "厘米", "米"][form.units]
+                    ),
                 };
                 let cursor = if index == form.focus && index < 3 {
                     "▏"
@@ -243,7 +246,7 @@ impl ProjectsPanel {
                 });
             }
             lines.push(Line::from(Span::styled(
-                "名称只用小写字母、数字和连字符；图纸会复制到 projects/<名称>/sources",
+                "导入保留原图；打开项目后配置 /model，再输入“开始首次建模”确认范围与尺寸",
                 palette.faint(),
             )));
             return lines;
@@ -414,7 +417,7 @@ mod tests {
                 name: "clinic-a".into(),
                 description: "诊所".into(),
                 source: "D:\\cad\\一层.dxf".into(),
-                units: "centimeters".into(),
+                units: "millimeters".into(),
             })
         );
         assert_eq!(panel.key(key(KeyCode::Esc)), ProjectsEvent::Consumed);

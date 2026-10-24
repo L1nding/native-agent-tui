@@ -9,6 +9,14 @@ native-agent-tui (Rust) ──stdio JSON-RPC──> dsh --profile zf-tui ──>
 ```
 
 ## Run
+Windows 便携包解压后双击 `Start.cmd`，无需另外安装 Rust、Python、Node、dsh 或 pnpm。默认打开包内建模工作区，首次显示项目导入页，可从任意位置选择有效 ASCII 或 binary DXF；图纸原样复制进项目，单位默认读取 DXF 声明。打开项目后输入 `/model`，按 `Ctrl+N` 添加模型服务、模型和 API Key，再输入“开始首次建模”。配置、凭据、会话与 TUI 日志保存在包内的 `data/`；图纸、建模项目及产物保存在 `m/`，移动程序时一起保留。分发给别人前使用新构建的空白包。
+
+命令行也通过 `Start.cmd` 启动，可显式指定工作目录，例如 `Start.cmd --cwd D:\work\my-project`。直接运行 exe 不会设置便携后端。包内 `m/py` 是独立 CPython 及所需 CAD/MCP/网格依赖，`m/src` 和 `m/review-web/dist` 提供建模及三维预览；原生网格与 GLB 构建不需要 Blender。浏览器预览与截图使用 Windows 的 Edge，浏览器不可用时会明确报告复核未执行。
+
+在已安装受验证的 dsh `0.1.7-rc.2`、Windows x64 Node 和模型器开发环境的开发机上，用 `python scripts/package-windows.py --dsh-root <dsh安装目录> --node <node.exe路径> --modeler-root <blender-agent-modeler目录>` 构建便携包，产物为 `target/packages/<时间>/zf-tui-win64.zip`。打包只复制所需运行依赖和编译产物，使用空白项目与配置，并在副本上生成可搬移的宿主修复。ZIP 成员路径限制保持 180 字符，供普通 Windows 解压。
+
+首次建模时 Agent 先读取真实图纸、图层和闭合轮廓，通过提问确认单层范围、墙层、图纸单位、层高、墙高与板厚；内部参数由 Agent 填写。缺失或不支持的几何有明确诊断。没有真实楼层标题时只称为用户确认的工作范围，闭合楼板来源未确认时不会拿图纸包围框生成楼板。原图、单位转换工作副本、配置及来源清单都绑定到具体方案；F6 查看后用 `Ctrl+Y` 批准该版本，Agent 才能应用、构建、GLB 回读与预览。单次首建不代表整张图纸或整栋已完成。
+
 Install Rust and dsh, then install the bridge plugin from this repository into a dsh profile named `zf-tui` (see [dsh-plugin/README.md](dsh-plugin/README.md)):
 
 ```text

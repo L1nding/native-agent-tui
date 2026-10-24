@@ -204,7 +204,9 @@ pub async fn pick_project(context: ProjectContext) -> Result<Option<ProjectChoic
                         match create_project(&context.cwd, request).await {
                             Ok(path) => {
                                 panel.refresh(crate::domain::list_projects(&context.cwd), &path);
-                                panel.notice = Some(format!("已创建 {path}；按 Enter 打开"));
+                                panel.notice = Some(format!(
+                                    "已导入 {path}；Enter 打开，/model 配置后输入“开始首次建模”"
+                                ));
                             }
                             Err(reason) => panel.notice = Some(reason),
                         }

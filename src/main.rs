@@ -531,7 +531,8 @@ async fn run_tui(base: Config, mut tasks: Vec<RootTaskSpec>) -> Result<(), (u8, 
     // In a modeler repository without a named project, ask which one to open.
     if current == ui::ProjectChoice::Plain
         && tasks.is_empty()
-        && !native_agent_tui::domain::list_projects(&base.cwd).is_empty()
+        && (base.cwd.join("src/blender_agent").is_dir()
+            || !native_agent_tui::domain::list_projects(&base.cwd).is_empty())
     {
         let context = ui::ProjectContext {
             cwd: base.cwd.clone(),
