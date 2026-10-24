@@ -730,7 +730,7 @@ mod tests {
             "楼板 1",
             "图纸参考线 2559",
             "尺寸依据：按图纸重建",
-            "已在 Blender 建好并通过检查",
+            "模型已建好并通过检查",
             "Ctrl+Y 确认",
         ] {
             let expected: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
@@ -852,7 +852,7 @@ mod tests {
         for expected in [
             "待你确认：扶手椅 100 把",
             "尺寸依据：高度 0.83 米（暂用值）",
-            "已在 Blender 建好并通过检查",
+            "模型已建好并通过检查",
             "图片 1 张",
             "Ctrl+Y 确认",
         ] {

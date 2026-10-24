@@ -48,6 +48,10 @@ fn should_auto_continue(
 }
 
 const AUTO_CONTINUE_PROMPT: &str = "继续";
+const DOMAIN_IMAGE_AUTHORIZING_NOTICE: &str =
+    "确认正在保存，暂不能打开复核图片；完成后请再按 Ctrl+O";
+const DOMAIN_IMAGE_BUSY_NOTICE: &str = "复核图片或网页正在打开，请稍候";
+const DOMAIN_IMAGE_OPENING_NOTICE: &str = "正在校验并打开复核图片或网页，请稍候";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -1143,6 +1147,7 @@ impl Core {
         self.domain_fact_queue.clear();
         self.domain.synchronizing = false;
         self.domain.snapshot.authorizing = false;
+        self.clear_domain_image_progress_notice();
         self.unknown_pending_outbox();
         let outcome = self.state.view.phase;
         self.scheduler.disconnected();
@@ -1961,6 +1966,14 @@ impl Core {
                     return;
                 }
                 self.domain_image_open_task.take();
+                // 仅当前任务可收尾自己的进行中提示，不能覆盖后来产生的提示。
+                let owns_notice = matches!(
+                    self.state.view.notice.as_deref(),
+                    Some(DOMAIN_IMAGE_BUSY_NOTICE | DOMAIN_IMAGE_OPENING_NOTICE)
+                );
+                if owns_notice {
+                    self.state.view.notice = None;
+                }
                 if generation == self.generation {
                     if let Some(image) = self
                         .domain
@@ -1970,6 +1983,9 @@ impl Core {
                         .find(|image| image.binding == binding)
                     {
                         image.finish_open(outcome);
+                        if owns_notice {
+                            self.state.view.notice.clone_from(&image.notice);
+                        }
                     }
                 }
             }
@@ -1987,6 +2003,9 @@ impl Core {
                 }
                 self.domain_authorization_task.take();
                 self.domain.snapshot.authorizing = false;
+                if self.state.view.notice.as_deref() == Some(DOMAIN_IMAGE_AUTHORIZING_NOTICE) {
+                    self.state.view.notice = None;
+                }
                 let manual = policy == crate::config::DomainApprovalPolicy::Manual;
                 if (!manual
                     && (generation != self.generation
@@ -2268,6 +2287,9 @@ impl Core {
                     task.abort();
                     self.domain_generation = self.domain_generation.wrapping_add(1);
                     self.domain.snapshot.authorizing = false;
+                    if self.state.view.notice.as_deref() == Some(DOMAIN_IMAGE_AUTHORIZING_NOTICE) {
+                        self.state.view.notice = None;
+                    }
                     self.domain.snapshot.notice =
                         Some("批准已中断，外部记录结果未知；未提交场景应用".into());
                 }
@@ -2363,6 +2385,7 @@ impl Core {
         if let Some((_, task)) = self.domain_image_open_task.take() {
             task.abort();
         }
+        self.clear_domain_image_progress_notice();
         if self.config.domain_setup.is_none() {
             return;
         }
@@ -2928,7 +2951,12 @@ impl Core {
     }
 
     fn open_domain_image(&mut self, binding: crate::domain::ReviewImageBinding) {
-        if self.domain_image_open_task.is_some() || self.domain.snapshot.authorizing {
+        if self.domain.snapshot.authorizing && binding.web_review.is_none() {
+            self.state.view.notice = Some(DOMAIN_IMAGE_AUTHORIZING_NOTICE.into());
+            return;
+        }
+        if self.domain_image_open_task.is_some() {
+            self.state.view.notice = Some(DOMAIN_IMAGE_BUSY_NOTICE.into());
             return;
         }
         if !self
@@ -2949,6 +2977,7 @@ impl Core {
         let generation = self.generation;
         let commands = self.command_tx.clone();
         let web_server = self.review_web.server.clone();
+        self.state.view.notice = Some(DOMAIN_IMAGE_OPENING_NOTICE.into());
         self.domain_image_attempt = self.domain_image_attempt.wrapping_add(1);
         let attempt_id = self.domain_image_attempt;
         for image in &mut self.domain.snapshot.review_images {
@@ -2999,6 +3028,19 @@ impl Core {
                 }
             }),
         ));
+    }
+
+    fn clear_domain_image_progress_notice(&mut self) {
+        if matches!(
+            self.state.view.notice.as_deref(),
+            Some(
+                DOMAIN_IMAGE_AUTHORIZING_NOTICE
+                    | DOMAIN_IMAGE_BUSY_NOTICE
+                    | DOMAIN_IMAGE_OPENING_NOTICE
+            )
+        ) {
+            self.state.view.notice = None;
+        }
     }
 
     fn approve_domain_change(&mut self, confirmation: crate::extensions::ModelingConfirmation) {

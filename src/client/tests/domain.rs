@@ -387,7 +387,7 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
 async fn manual_grant_steered_into_an_ending_turn_is_resubmitted_when_still_unapplied() {
     use crate::config::DomainApprovalPolicy;
     use sha2::{Digest, Sha256};
-    {
+    for completion in ["approved", "failed", "expired", "newer_notice"] {
         let policy = DomainApprovalPolicy::Manual;
         let directory = std::env::temp_dir().join(format!(
             "tui-policy-{}-{:?}-{}",
@@ -404,11 +404,14 @@ async fn manual_grant_steered_into_an_ending_turn_is_resubmitted_when_still_unap
         std::fs::write(directory.join("context.json"), b"{}").unwrap();
         let context_hash = format!("{:x}", Sha256::digest(b"{}"));
         std::fs::write(directory.join("blender_agent/cli/main.py"), format!(r#"
-import sys,json
+import sys,json,time
 from pathlib import Path
 a=sys.argv
 actor=a[a.index('--actor')+1]
 Path('actor.txt').write_text(actor)
+deadline=time.monotonic()+10
+while not Path('release-authorization').exists() and time.monotonic()<deadline:
+ time.sleep(0.01)
 print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha256':'{context_hash}',
 'grant':{{'authorization_id':'unit-policy-grant','proposal_id':'p','revision':1,'prepare_token':'token','approval_policy':'reviewed-template'}}}}))
 "#)).unwrap();
@@ -495,10 +498,141 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         client
             .commands
             .send(Command::ConfirmExtension {
-                confirmation: crate::extensions::ExtensionConfirmation::Modeling(binding.into()),
+                confirmation: crate::extensions::ExtensionConfirmation::Modeling(
+                    binding.clone().into(),
+                ),
             })
             .await
             .unwrap();
+        client
+            .snapshots
+            .wait_for(|s| s.extensions[0].modeling().unwrap().authorizing)
+            .await
+            .unwrap();
+        let image = client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .review_images[0]
+            .clone();
+        client
+            .commands
+            .send(Command::OpenDomainImage {
+                binding: image.binding.clone(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.snapshots.wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|text| text.contains("确认正在保存"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let during = client.snapshots.borrow().clone();
+        let domain = during.extensions[0].modeling().unwrap();
+        assert!(domain.authorizing);
+        assert_eq!(domain.review_images[0], image);
+        assert!(!directory.join("release-authorization").exists());
+        if completion == "approved" {
+            let mut unbound_web = image.binding.clone();
+            unbound_web.web_review = Some(crate::review_web::WebReviewPackage {
+                html_path: directory.join("unbound.html"),
+                png_path: path.clone(),
+                data_sha256: "a".repeat(64),
+                manifest_sha256: None,
+                artifact_sha256: None,
+                url_hash: None,
+            });
+            client
+                .commands
+                .send(Command::OpenDomainImage {
+                    binding: unbound_web,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.snapshots.wait_for(|s| {
+                    s.extensions[0].modeling().unwrap().notice.as_deref()
+                        == Some("图片不可用或已属于旧版本；请核对当前图片列表")
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let current = client.snapshots.borrow();
+            assert!(current.extensions[0].modeling().unwrap().authorizing);
+            assert_eq!(
+                current.extensions[0].modeling().unwrap().review_images[0],
+                image
+            );
+            assert_eq!(current.root_start_requests, 1);
+        }
+        if completion != "approved" {
+            if completion == "newer_notice" {
+                client
+                    .commands
+                    .send(Command::SaveSetting {
+                        setting: crate::preferences::Setting::Language,
+                        value: "unsupported".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut returned_binding = binding.clone();
+            if completion == "expired" {
+                returned_binding.revision += 1;
+            }
+            client
+                .commands
+                .send(Command::DomainAuthorizationFinished {
+                    attempt_id: 1,
+                    generation: 1,
+                    root_turn_count: 1,
+                    binding: returned_binding,
+                    review_set_sha256: None,
+                    policy,
+                    outcome: Err("测试批准失败".into()),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client
+                    .snapshots
+                    .wait_for(|s| !s.extensions[0].modeling().unwrap().authorizing),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let finished = client.snapshots.borrow().clone();
+            assert_eq!(
+                finished.notice.as_deref(),
+                if completion == "newer_notice" {
+                    Some("Unsupported setting value.")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                finished.extensions[0].modeling().unwrap().notice.as_deref(),
+                Some(if completion == "expired" {
+                    "批准结果已过期；请核对当前方案"
+                } else {
+                    "测试批准失败"
+                })
+            );
+            std::fs::write(directory.join("release-authorization"), b"ready").unwrap();
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+            continue;
+        }
+        std::fs::write(directory.join("release-authorization"), b"ready").unwrap();
         // Approval while the turn runs is steered in; the turn then ends without
         // applying it, so the grant must come back as the next input.
         let steer = next(&mut server).await;
@@ -1165,136 +1299,258 @@ async fn project_discovery_facts_flow_through_the_normal_client_and_cannot_be_ap
 #[tokio::test]
 async fn old_image_callbacks_do_not_release_current_check_and_missing_file_open_is_not_credited() {
     use sha2::{Digest, Sha256};
-    let path = std::env::temp_dir().join(format!(
-        "tui-owned-image-{}-{}.png",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut bytes = vec![0u8; 16 * 1024 * 1024];
-    bytes[..24].copy_from_slice(&[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-    ]);
-    std::fs::write(&path, &bytes).unwrap();
-    let sha = format!("{:x}", Sha256::digest(&bytes));
-    let config = Config {
-        permission: Some("read-only".into()),
-        domain_setup: Some(crate::domain::DomainSetup {
-            mode: crate::domain::DomainMode::Floor,
-            context_path: "context.json".into(),
-            repository: ".".into(),
-            python: "python".into(),
-            run_id: "run".into(),
-            context_sha256: "hash".into(),
-            floor_id: "floor".into(),
-        }),
-        ..Default::default()
-    };
-    let (mut client, mut server) = harness_with_config(config).await;
-    initialized(&mut server).await;
-    let set = next(&mut server).await;
-    send(
-        &mut server,
-        json!({"id":set["id"],"result":{"current":"read-only","presets":[]}}),
-    )
-    .await;
-    phase(&mut client, SessionPhase::Ready).await;
-    skip_skills(&mut server).await;
-    client
-        .commands
-        .send(Command::SubmitRootInput {
-            text: "prepare chair".into(),
-        })
-        .await
-        .unwrap();
-    let start = next(&mut server).await;
-    send(
-        &mut server,
-        json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
-    )
-    .await;
-    phase(&mut client, SessionPhase::Running).await;
-    let proposal = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"hash","kind":"proposal","fact_sequence":1,"current":true,"diagnostics":[],"proposal":{
+    for completion in [
+        "missing",
+        "replaced",
+        "newer_notice",
+        "stale_attempt",
+        "stale_generation",
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "tui-owned-image-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut bytes = vec![0u8; 16 * 1024 * 1024];
+        bytes[..24].copy_from_slice(&[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+        ]);
+        std::fs::write(&path, &bytes).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        let config = Config {
+            permission: Some("read-only".into()),
+            domain_setup: Some(crate::domain::DomainSetup {
+                mode: crate::domain::DomainMode::Floor,
+                context_path: "context.json".into(),
+                repository: ".".into(),
+                python: "python".into(),
+                run_id: "run".into(),
+                context_sha256: "hash".into(),
+                floor_id: "floor".into(),
+            }),
+            ..Default::default()
+        };
+        let (mut client, mut server) = harness_with_config(config).await;
+        initialized(&mut server).await;
+        let set = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":set["id"],"result":{"current":"read-only","presets":[]}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Ready).await;
+        skip_skills(&mut server).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "prepare chair".into(),
+            })
+            .await
+            .unwrap();
+        let start = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        let proposal = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"hash","kind":"proposal","fact_sequence":1,"current":true,"diagnostics":[],"proposal":{
         "proposal_id":"p","revision":1,"prepare_token":"token","base_sha256":"base","candidate_sha256":"candidate","state":"prepared","summary":"chair","draft":{"operations":[]},"assumed":[],"issues":[],"pending":[],
         "component_first_use_requirements":{"contract":"component-first-use/1","required":[],"reused":[]}}});
-    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal}}}})).await;
-    let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"hash","kind":"artifact_validation","fact_sequence":2,
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal}}}})).await;
+        let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"hash","kind":"artifact_validation","fact_sequence":2,
         "artifact":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","candidate":true,"authority_sha256":"base","input_sha256":"candidate","state":"built","output":"model.glb","valid":true,"current":true,
         "review_image":{"delivery":"attached_png","image_sha256":sha,"image_path":path,"dimensions_px":[1,1],"request":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","input_sha256":"candidate","blend_sha256":"a".repeat(64),"focus_m":null}}}});
-    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
-    let image = client.snapshots.borrow().extensions[0]
-        .modeling()
-        .unwrap()
-        .review_images[0]
-        .binding
-        .clone();
-    client
-        .commands
-        .send(Command::DomainImagesChecked {
-            attempt_id: 0,
-            generation: 1,
-            results: vec![(image.clone(), Err("stale check must not apply".into()))],
-        })
-        .await
-        .unwrap();
-    client
-        .commands
-        .send(Command::DomainImageOpened {
-            attempt_id: 0,
-            generation: 1,
-            binding: image.clone(),
-            outcome: crate::domain::review::ImageOpenOutcome {
-                file_valid: true,
-                result: Ok(()),
-            },
-        })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let current = client.snapshots.borrow().extensions[0]
-                .modeling()
-                .unwrap()
-                .review_images[0]
-                .clone();
-            assert!(!current.externally_opened);
-            assert!(!current
-                .notice
-                .as_deref()
-                .is_some_and(|text| text.contains("stale check")));
-            if current.file_state == crate::domain::ImageFileState::Available {
-                break;
-            }
-            client.snapshots.changed().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
-    std::fs::remove_file(&path).unwrap();
-    client
-        .commands
-        .send(Command::OpenDomainImage { binding: image })
-        .await
-        .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        client.snapshots.wait_for(|snapshot| {
-            snapshot.extensions[0].modeling().unwrap().review_images[0].file_state
-                == crate::domain::ImageFileState::Unavailable
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(
-        !client.snapshots.borrow().extensions[0]
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
+        let image = client.snapshots.borrow().extensions[0]
             .modeling()
             .unwrap()
             .review_images[0]
-            .externally_opened
-    );
-    client.commands.send(Command::Quit).await.unwrap();
-    client.join.await.unwrap();
+            .binding
+            .clone();
+        client
+            .commands
+            .send(Command::DomainImagesChecked {
+                attempt_id: 0,
+                generation: 1,
+                results: vec![(image.clone(), Err("stale check must not apply".into()))],
+            })
+            .await
+            .unwrap();
+        client
+            .commands
+            .send(Command::DomainImageOpened {
+                attempt_id: 0,
+                generation: 1,
+                binding: image.clone(),
+                outcome: crate::domain::review::ImageOpenOutcome {
+                    file_valid: true,
+                    result: Ok(()),
+                },
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = client.snapshots.borrow().extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .review_images[0]
+                    .clone();
+                assert!(!current.externally_opened);
+                assert!(!current
+                    .notice
+                    .as_deref()
+                    .is_some_and(|text| text.contains("stale check")));
+                if current.file_state == crate::domain::ImageFileState::Available {
+                    break;
+                }
+                client.snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        client
+            .commands
+            .try_send(Command::OpenDomainImage {
+                binding: image.clone(),
+            })
+            .unwrap();
+        if completion != "missing" {
+            if completion == "newer_notice" {
+                client
+                    .commands
+                    .try_send(Command::SaveSetting {
+                        setting: crate::preferences::Setting::Language,
+                        value: "unsupported".into(),
+                    })
+                    .unwrap();
+            }
+            let mut removed = image.clone();
+            removed.proposal.revision += 1;
+            client
+                .commands
+                .try_send(Command::DomainImageOpened {
+                    // 本地文件验真占用 attempt 1，首次打开属于 attempt 2。
+                    attempt_id: 2,
+                    generation: u64::from(completion != "stale_generation"),
+                    binding: removed,
+                    outcome: crate::domain::review::ImageOpenOutcome {
+                        file_valid: true,
+                        result: Ok(()),
+                    },
+                })
+                .unwrap();
+            if completion == "stale_attempt" {
+                client
+                    .commands
+                    .try_send(Command::OpenDomainImage {
+                        binding: image.clone(),
+                    })
+                    .unwrap();
+                client
+                    .commands
+                    .try_send(Command::SaveSetting {
+                        setting: crate::preferences::Setting::Language,
+                        value: "unsupported".into(),
+                    })
+                    .unwrap();
+                client
+                    .commands
+                    .try_send(Command::DomainImageOpened {
+                        attempt_id: 2,
+                        generation: 1,
+                        binding: image.clone(),
+                        outcome: crate::domain::review::ImageOpenOutcome {
+                            file_valid: true,
+                            result: Err("旧任务不能结束新打开任务".into()),
+                        },
+                    })
+                    .unwrap();
+            }
+            // A command after the callback gives the snapshot a deterministic barrier.
+            client
+                .commands
+                .try_send(Command::CompletePath {
+                    query: "SUP028-barrier".into(),
+                })
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client
+                    .snapshots
+                    .wait_for(|s| s.path_hints.query == "SUP028-barrier"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let finished = client.snapshots.borrow().clone();
+            assert_eq!(
+                finished.notice.as_deref(),
+                if matches!(completion, "newer_notice" | "stale_attempt") {
+                    Some("Unsupported setting value.")
+                } else {
+                    None
+                }
+            );
+            assert!(!finished.extensions[0].modeling().unwrap().review_images[0].externally_opened);
+            if completion == "stale_attempt" {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.snapshots.wait_for(|s| {
+                        s.extensions[0].modeling().unwrap().review_images[0].file_state
+                            == crate::domain::ImageFileState::Unavailable
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    client.snapshots.borrow().notice.as_deref(),
+                    Some("Unsupported setting value.")
+                );
+            }
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+            continue;
+        }
+        client
+            .commands
+            .try_send(Command::OpenDomainImage { binding: image })
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.snapshots.wait_for(|s| {
+                s.notice
+                    .as_deref()
+                    .is_some_and(|text| text.contains("复核图片或网页正在打开"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.snapshots.wait_for(|snapshot| {
+                snapshot.extensions[0].modeling().unwrap().review_images[0].file_state
+                    == crate::domain::ImageFileState::Unavailable
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !client.snapshots.borrow().extensions[0]
+                .modeling()
+                .unwrap()
+                .review_images[0]
+                .externally_opened
+        );
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
 }

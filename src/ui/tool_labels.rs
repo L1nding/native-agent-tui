@@ -83,7 +83,7 @@ fn slow_hint(name: &str) -> Option<&'static str> {
     match short_name(name) {
         "prepare_project_floor" => Some("大图纸通常需要 1–3 分钟"),
         "build_scene" | "preview_candidate" | "assemble_project_building" => {
-            Some("Blender 构建通常需要几十秒到数分钟")
+            Some("构建耗时取决于图纸和构件数量")
         }
         _ => None,
     }

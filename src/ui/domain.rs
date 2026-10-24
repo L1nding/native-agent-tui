@@ -226,7 +226,7 @@ fn business_lines(
         }
     }
     if domain.artifacts.is_empty() {
-        lines.push(Line::from("Blender 产物 not_run"));
+        lines.push(Line::from("模型产物 not_run"));
         lines.push(Line::from("产物验证 not_run"));
     }
     for artifact in domain.artifacts.iter().rev() {
@@ -244,7 +244,7 @@ fn business_lines(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".into());
         lines.push(Line::from(format!(
-            "Blender 产物 {} · current={} · build_id={}",
+            "模型产物 {} · current={} · build_id={}",
             artifact.state.as_str(),
             current,
             artifact.binding.build_id
@@ -326,14 +326,25 @@ fn business_lines(
         }
         if !domain.first_use_satisfied() {
             lines.push(Line::from(
-                "批准前需本版真实Blender对照图；审批卡已交付任一张即可复核，Ctrl+O 可打开当前图。",
+                "批准前需本版真实模型对照图；审批卡已交付任一张即可复核，Ctrl+O 可打开当前图。",
             ));
         }
     }
     if domain.first_use_review.is_some() || !domain.review_images.is_empty() {
         let count = domain.review_images.len();
+        let selected_web = domain
+            .review_images
+            .get(context.panel.selected_image.min(count.saturating_sub(1)))
+            .is_some_and(|image| image.binding.web_review.is_some());
+        let open_hint = if domain.authorizing && selected_web {
+            "确认正在保存 · Ctrl+O 打开复核网页"
+        } else if domain.authorizing {
+            "确认正在保存，完成后可按 Ctrl+O"
+        } else {
+            "Ctrl+O 外部打开"
+        };
         lines.push(Line::from(format!(
-            "本版 {count} 张图片 · Alt+←/→ 选图 · Ctrl+O 外部打开"
+            "本版 {count} 张图片 · Alt+←/→ 选图 · {open_hint}"
         )));
         if let Some(image) = domain
             .review_images
@@ -361,8 +372,13 @@ fn business_lines(
             if let Some(package) = &image.binding.web_review {
                 for text in [
                     format!(
-                        "复核网页：{} · Ctrl+O 优先打开网页",
-                        package.html_path.display()
+                        "复核网页：{} · {}",
+                        package.html_path.display(),
+                        if domain.authorizing {
+                            open_hint
+                        } else {
+                            "Ctrl+O 优先打开网页"
+                        }
                     ),
                     format!("网页 PNG：{}", package.png_path.display()),
                 ] {
@@ -388,7 +404,7 @@ fn business_lines(
     if let Some(proposal) = domain.proposal.as_ref().filter(|proposal| proposal.ready) {
         if !domain.candidate_review_delivered(&proposal.binding) {
             lines.push(Line::from(
-                "等待当前已验证的 Blender 候选复核图交付 Agent，之后才能批准。",
+                "等待当前已验证的候选模型复核图交付 Agent，之后才能批准。",
             ));
         } else if !domain.first_use_satisfied() {
             lines.push(Line::from("首用图复核尚未满足，暂不能批准。"));
@@ -876,7 +892,23 @@ pub(super) fn draw(
     } else {
         "等待本轮结束后批准"
     };
-    frame.render_widget(Paragraph::new(format!("Ctrl+O 外部打开 · Alt+←/→ 选图 · {approval_hint} · Enter 反馈 · F4 工作流 · F6/Esc 会话 · PgUp/PgDn 滚动")), chunks[4]);
+    let selected_web = domain
+        .review_images
+        .get(
+            context
+                .panel
+                .selected_image
+                .min(domain.review_images.len().saturating_sub(1)),
+        )
+        .is_some_and(|image| image.binding.web_review.is_some());
+    let open_hint = if domain.authorizing && selected_web {
+        "确认正在保存 · Ctrl+O 打开复核网页"
+    } else if domain.authorizing {
+        "确认正在保存，完成后可按 Ctrl+O"
+    } else {
+        "Ctrl+O 外部打开"
+    };
+    frame.render_widget(Paragraph::new(format!("{open_hint} · Alt+←/→ 选图 · {approval_hint} · Enter 反馈 · F4 工作流 · F6/Esc 会话 · PgUp/PgDn 滚动")), chunks[4]);
 }
 
 pub(super) struct ModelingView;
@@ -1064,7 +1096,7 @@ pub(super) fn approval_card_lines(
         });
     lines.push(
         if built {
-            "✓ 已在 Blender 建好并通过检查"
+            "✓ 模型已建好并通过检查"
         } else if failed {
             "✗ 模型构建或检查未通过，需修正后重试"
         } else {
@@ -1100,8 +1132,19 @@ pub(super) fn approval_card_lines(
         }
         .into(),
     );
+    let selected_web = domain
+        .review_images
+        .get(selected_image.min(domain.review_images.len().saturating_sub(1)))
+        .is_some_and(|image| image.binding.web_review.is_some());
+    let open_hint = if domain.authorizing && selected_web {
+        "确认正在保存 · Ctrl+O 打开复核网页"
+    } else if domain.authorizing {
+        "确认正在保存，完成后可按 Ctrl+O"
+    } else {
+        "Ctrl+O 查看"
+    };
     let mut image_summary = format!(
-        "图片 {} 张（Ctrl+O 查看，Alt+←/→ 切换）",
+        "图片 {} 张（{open_hint}，Alt+←/→ 切换）",
         domain.review_images.len()
     );
     if let Some(image) = domain
@@ -1119,7 +1162,8 @@ pub(super) fn approval_card_lines(
                 })
                 .unwrap_or("未提供");
             image_summary = format!(
-                "复核网页 {review_type} · Ctrl+O 打开 · F6 路径/SHA详情\n网页：{}\nPNG：{}\nPNG SHA256：{}\n数据 SHA256：{}\nmanifest SHA256：{}\nartifact SHA256：{}",
+                "复核网页 {review_type} · {} · F6 路径/SHA详情\n网页：{}\nPNG：{}\nPNG SHA256：{}\n数据 SHA256：{}\nmanifest SHA256：{}\nartifact SHA256：{}",
+                if domain.authorizing { open_hint } else { "Ctrl+O 打开" },
                 display_text(&package.html_path.to_string_lossy()),
                 display_text(&package.png_path.to_string_lossy()),
                 image.binding.image_sha256,
@@ -2219,7 +2263,7 @@ mod tests {
             .split("构建任务 preview-valid")
             .next()
             .unwrap();
-        assert!(failed.contains("Blender 产物 failed"), "{screen}");
+        assert!(failed.contains("模型产物 failed"), "{screen}");
         assert!(failed.contains("valid=false"), "{screen}");
         assert!(!failed.contains("valid=true"), "{screen}");
         let previous = screen.split("构建任务 preview-valid").nth(1).unwrap();
@@ -2625,10 +2669,29 @@ mod tests {
         ] {
             assert!(text.contains(expected), "{text}");
         }
+        domain.authorizing = true;
+        let saving_web = approval_card_lines(&domain, 0).join("\n");
+        assert!(saving_web.contains("确认正在保存 · Ctrl+O 打开复核网页"));
+        let snapshot = CoreSnapshot::default();
+        let panel = ExtensionPanel::default();
+        let details = business_lines(&domain, &ViewContext::new(&snapshot, &panel, "", None), 160)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(details.contains("确认正在保存 · Ctrl+O 打开复核网页"));
+        assert!(!details.contains("Ctrl+O 外部打开"));
+        assert!(!details.contains("Ctrl+O 优先打开网页"));
+        domain.authorizing = false;
         domain.review_images[0].binding.web_review = None;
         let fallback = approval_card_lines(&domain, 0).join("\n");
         assert!(fallback.contains("Ctrl+O 查看"));
         assert!(!fallback.contains("/review/question/index.html"));
+        domain.authorizing = true;
+        let saving = approval_card_lines(&domain, 0).join("\n");
+        assert!(saving.contains("确认正在保存，完成后可按 Ctrl+O"));
+        assert!(!saving.contains("Ctrl+O 查看"));
+        assert!(!saving.contains("Ctrl+O 打开"));
     }
 
     #[test]
