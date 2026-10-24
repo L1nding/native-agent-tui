@@ -30,6 +30,8 @@ const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_STRUCTURED_RESULT_BYTES: usize = 64 * 1024;
 // MCP may duplicate the same JSON as structuredContent and escaped text content.
 const MAX_RESULT_WRAPPER_BYTES: usize = 4 * MAX_STRUCTURED_RESULT_BYTES;
+// Review batches carry multiple images beside one unambiguous bounded receipt.
+const MAX_CONTENT_BLOCKS: usize = 32;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AcpProtocolError {
@@ -603,7 +605,7 @@ fn bounded_content_result(value: &Value) -> Option<Value> {
         if items.len() == 1 {
             return content(&items[0], depth + 1);
         }
-        if items.len() > 8 {
+        if items.len() > MAX_CONTENT_BLOCKS {
             return None;
         }
         // MCP image delivery may include display-only diagnostics beside the sealed
@@ -849,18 +851,20 @@ mod structured_result_tests {
     use super::*;
 
     #[test]
-    fn mixed_review_image_blocks_preserve_small_fact_receipt_without_binary_output() {
+    fn mixed_review_image_batch_preserves_small_fact_receipt_without_binary_output() {
         let receipt = json!({"contract":"modeling-fact-receipt/v1", "kind":"artifact_validation",
             "fact_sha256":"a".repeat(64), "fact_bytes":1200, "fact_sequence":10,
             "run_id":"run", "context_sha256":"ctx", "ok":true,
             "binding":{"build_id":"review-build"}});
+        let mut content =
+            vec![json!({"type":"content","content":{"type":"text","text":receipt.to_string()}})];
+        content.extend((0..24).map(|_| {
+            json!({"type":"content","content":{"type":"image",
+            "mimeType":"image/png","data":"BINARY_IMAGE_DATA".repeat(4096)}})
+        }));
         let payload = json!({"sessionId":"s","update":{
         "sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed",
-        "content":[
-            {"type":"content","content":{"type":"text","text":receipt.to_string()}},
-            {"type":"content","content":{"type":"image","mimeType":"image/png",
-                "data":"BINARY_IMAGE_DATA".repeat(100_000)}}
-        ]}});
+        "content":content}});
         let (
             _,
             Update::ToolCallUpdate {
@@ -885,6 +889,15 @@ mod structured_result_tests {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), receipt);
         assert!(text.len() < 6000);
         assert!(!text.contains("BINARY_IMAGE_DATA"));
+        let mut ambiguous = payload["update"]["content"].as_array().unwrap().clone();
+        ambiguous
+            .push(json!({"type":"content","content":{"type":"text","text":receipt.to_string()}}));
+        assert!(bounded_content_result(&json!(ambiguous)).is_none());
+        let mut too_many = payload["update"]["content"].as_array().unwrap().clone();
+        while too_many.len() <= MAX_CONTENT_BLOCKS {
+            too_many.push(json!({"type":"image","data":"not retained"}));
+        }
+        assert!(bounded_content_result(&json!(too_many)).is_none());
     }
 
     #[test]

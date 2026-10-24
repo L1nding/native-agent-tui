@@ -838,7 +838,17 @@ pub(super) fn project(
     }
     result.blocked_count = manifest["blocked"].as_array().map_or(0, Vec::len);
     text(manifest, "build_id").ok()?;
-    hash(&manifest["blend_sha256"])?;
+    let blend_sha256 = match manifest.get("blend_sha256") {
+        Some(value) => Some(hash(value)?),
+        None => None,
+    };
+    let glb_sha256 = match manifest.get("glb_sha256") {
+        Some(value) => Some(hash(value)?),
+        None => None,
+    };
+    if blend_sha256.is_none() && glb_sha256.is_none() {
+        return None;
+    }
     let required = previous.requirements["required"].as_array()?;
     let items = manifest["items"].as_array()?;
     if items.len() != required.len() {
@@ -879,6 +889,7 @@ pub(super) fn project(
         }
         match item["renderer"]["engine"].as_str() {
             Some("BLENDER_WORKBENCH") => {
+                blend_sha256?;
                 hash(&item["renderer"]["script_sha256"])?;
                 if item["renderer"]["blender_version"].is_null() {
                     return None;
@@ -887,8 +898,14 @@ pub(super) fn project(
             // Openings, schematic fixtures and server schematic extrusions use a fast
             // sealed 2-D overlay; the modeler decides eligibility before sealing, so Core
             // does not keep its own (inevitably stale) category list.
-            Some("PIL_2D_OVERLAY") => {}
-            Some("REVIEW_WEB_3D") if item["review_web"].is_object() => {}
+            Some("PIL_2D_OVERLAY") if blend_sha256.is_some() => {}
+            Some("REVIEW_WEB_3D") if item["review_web"].is_object() => {
+                if glb_sha256
+                    .is_some_and(|sha| hash(&item["review_web"]["artifact_sha256"]) != Some(sha))
+                {
+                    return None;
+                }
+            }
             _ => return None,
         }
         hash(&item["cad_evidence_sha256"])?;
@@ -1123,16 +1140,22 @@ pub(super) fn project(
                 }
                 fact.binding.web_review =
                     Some(web_package(web, &fact.binding, "view=perspective".into())?);
-                fact.detail = Some(format!(
-                    "{detail}\n{}\nCAD 证据 SHA256：{}\nBLEND SHA256：{}",
+                let mut web_description = format!(
+                    "{detail}\n{}\nCAD 证据 SHA256：{}",
                     web_detail(
                         "component_first_use_3d",
                         item["renderer"]["engine"].as_str()?,
                         &fact.binding,
                     ),
                     item["cad_evidence_sha256"].as_str()?,
-                    manifest["blend_sha256"].as_str()?,
-                ));
+                );
+                if let Some(sha) = blend_sha256 {
+                    web_description.push_str(&format!("\nBLEND SHA256：{sha}"));
+                }
+                if let Some(sha) = glb_sha256 {
+                    web_description.push_str(&format!("\nGLB SHA256：{sha}"));
+                }
+                fact.detail = Some(web_description);
             }
             images.push(fact);
         }
@@ -1188,12 +1211,21 @@ pub(super) fn artifact_image(value: &Value, binding: &ProposalBinding) -> Option
         return None;
     }
     let request = &a["review_image"]["request"];
+    let blend_sha256 = match request.get("blend_sha256") {
+        Some(value) => Some(hash(value)?),
+        None => None,
+    };
+    let glb_sha256 = match request.get("glb_sha256") {
+        Some(value) => Some(hash(value)?),
+        None => None,
+    };
     if request["build_id"] != a["build_id"]
         || request["proposal_id"] != binding.proposal_id
         || request["revision"] != binding.revision
         || request["prepare_token"] != binding.prepare_token
         || request["input_sha256"] != binding.candidate_sha256
-        || hash(&request["blend_sha256"]).is_none()
+        || (blend_sha256.is_none() && glb_sha256.is_none())
+        || (blend_sha256.is_none() && !a["review_image"]["review_web"].is_object())
     {
         return None;
     }
@@ -1262,11 +1294,14 @@ pub(super) fn artifact_image(value: &Value, binding: &ProposalBinding) -> Option
             .or_else(|| renderer["engine"].as_str())
             .or_else(|| renderer["backend"].as_str())
             .unwrap_or("REVIEW_WEB_3D");
-        image.detail = Some(format!(
-            "{}\nBLEND SHA256：{}",
-            web_detail("component_form_3d", engine, &image.binding),
-            request["blend_sha256"].as_str()?,
-        ));
+        let mut detail = web_detail("component_form_3d", engine, &image.binding);
+        if let Some(sha) = blend_sha256 {
+            detail.push_str(&format!("\nBLEND SHA256：{sha}"));
+        }
+        if let Some(sha) = glb_sha256 {
+            detail.push_str(&format!("\nGLB SHA256：{sha}"));
+        }
+        image.detail = Some(detail);
     }
     Some(image)
 }

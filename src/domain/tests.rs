@@ -1109,6 +1109,403 @@ fn schematic_stair_parts_preserve_assumed_rise_and_unverified_connection_for_app
     assert!(proposal_fact(&legacy_landing).is_none());
 }
 
+fn reference_stair_proposal() -> Value {
+    let mut value = envelope();
+    value["source_current"] = json!(true);
+    value["fact_sequence"] = json!(10);
+    value["proposal"]["scope"] = json!({"floor_id":"floor.lower"});
+    let connection = json!({
+        "component_id":"stair.1", "source_instance_id":"source.stair", "kind":"stair",
+        "mode":"single_floor_schematic", "served_floors":["floor.lower"],
+        "openings":[], "dimension_basis":"assumed", "rise_m":2.0,
+        "geometry_basis":"region_bounds", "reference_sha256":"a".repeat(64),
+        "limitations":"Only the visible CAD surfaces; elevations and soffit remain assumed",
+        "reference_surfaces":[
+            {"vertices_m":[[0,0,1],[1,0,1],[1,1,1],[0,1,1]],"role":"stair_step",
+                "thickness_m":0.2,"source_ids":["cad.tread"],
+                "soffit_m":{"start":{"x":0,"y":0},"end":{"x":0,"y":1},"start_z":0.7,"end_z":0.8}},
+            {"vertices_m":[[0,1,1.5],[1,1,1.5],[1,2,2],[0,2,2]],"role":"landing",
+                "thickness_m":0.2,"source_ids":["cad.landing"]}
+        ], "steps":null,"riser_m":null
+    });
+    value["proposal"]["component_plan"] = json!({"connections":[connection.clone()]});
+    value["proposal"]["vertical_sources"] = json!({"source.stair":{
+        "source_id":"source.stair","component_id":"stair.1","floor_id":"floor.lower",
+        "origin_m":[2,3],"scale":[1,1],"rotation_z_deg":0,"instance_path":[],
+        "source_sha256":"b".repeat(64),"geometry_sha256":"c".repeat(64)
+    }});
+    let mut operations = Vec::new();
+    for (index, surface) in connection["reference_surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let id = format!("stair.1.surface.{:03}", index + 1);
+        let mut metadata = json!({
+            "relation_validator":"vertical-schematic/1","component_id":"stair.1",
+            "source_instance_id":"source.stair","source_sha256":"b".repeat(64),
+            "source_geometry_sha256":"c".repeat(64),"source_instance_path":"",
+            "modeling_mode":"single_floor_schematic","connection_status":"unverified",
+            "step_dimension_basis":"assumed","geometry_status":"reference_informed_schematic",
+            "geometry_basis":"assumed_region_bounds","reference_sha256":"a".repeat(64),
+            "reference_status":"caller-supplied trial geometry; reference hash is an evidence citation",
+            "vertical_spec_owner":"stair.1.surface.001",
+            "solid_representation":"stepped tread surface with explicit sloping soffit",
+            "not_checked":"served floors; slab openings; vertical connection; headroom; structural design; building-code compliance",
+            "limitations":connection["limitations"]
+        });
+        if index == 0 {
+            metadata["vertical_spec"] = json!(connection.to_string());
+        } else {
+            metadata["reason_ref"] = json!("stair.1.surface.001");
+        }
+        let mut element = json!({
+            "id":id,"role":surface["role"],"metadata":metadata,"base_z":10,"height":if index==0 {1.0} else {2.0},
+            "boundary":surface["vertices_m"].as_array().unwrap().iter().map(|p| json!({"x":2.0+p[0].as_f64().unwrap(),"y":3.0+p[1].as_f64().unwrap()})).collect::<Vec<_>>(),
+            "holes":[],"source_ids":["source.stair",surface["source_ids"][0]],
+            "stair_soffit":{"start":{"x":2,"y":3+index},"end":{"x":2,"y":4+index},
+                "start_z":if index==0 {10.7} else {11.3},"end_z":if index==0 {10.8} else {11.8}}
+        });
+        if index == 1 {
+            element["stair_top"] =
+                json!({"start":{"x":2,"y":4},"end":{"x":2,"y":5},"start_z":11.5,"end_z":12});
+        }
+        operations.push(json!({"op":"add","collection":"elements","target_id":id,
+            "floor_id":"floor.lower","basis":"assumed","source_ids":element["source_ids"],
+            "value_json":element.to_string()}));
+    }
+    value["proposal"]["draft"]["operations"] = json!(operations);
+    value
+}
+
+#[test]
+fn reference_stair_replaces_the_old_card_and_preserves_assumptions_and_approval_gates() {
+    let value = reference_stair_proposal();
+    let mut facts = sequenced_facts();
+    let mut old = envelope();
+    old["fact_sequence"] = json!(9);
+    old["proposal"]["proposal_id"] = json!("old-card");
+    old["proposal"]["revision"] = json!(8);
+    assert_eq!(facts.apply_verified_fact(&old), FactProjection::Applied);
+    let old_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &old_binding);
+    assert!(facts.can_authorize(&old_binding));
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let proposal = facts.snapshot.proposal.as_ref().unwrap();
+    let binding = proposal.binding.clone();
+    let detail = proposal.objects.join("\n");
+    for expected in [
+        "参考",
+        &"a".repeat(64),
+        "仅证据引用",
+        "连接待核验",
+        "局部坐标",
+        "相对楼面",
+        "最高表面相对楼面 2.0 m",
+        "斜底",
+        "10.7",
+        "stair.1.surface.002",
+        "Only the visible CAD surfaces",
+    ] {
+        assert!(detail.contains(expected), "missing {expected}");
+    }
+    assert!(proposal.ready);
+    assert!(!facts.can_authorize(&old_binding));
+    assert!(!facts.can_authorize(&binding));
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    assert!(facts.snapshot.application.is_none());
+    assert!(!facts.snapshot.authorizing);
+}
+
+#[test]
+fn reference_stair_rejects_unbound_sources_states_and_reference_contracts() {
+    let original = reference_stair_proposal();
+    for (key, invalid) in [
+        ("reference_sha256", json!("invalid")),
+        ("reference_sha256", json!("d".repeat(64))),
+        ("geometry_basis", json!("cad_treads")),
+        ("limitations", Value::Null),
+        ("flights", json!([{}])),
+        ("landings", json!([{}])),
+        ("steps", json!(4)),
+        ("riser_m", json!(0.15)),
+        ("rise_m", json!(3.0)),
+        ("source_instance_id", json!("source.other")),
+        ("dimension_basis", json!("user_confirmed")),
+    ] {
+        let mut bad = original.clone();
+        bad["proposal"]["component_plan"]["connections"][0][key] = invalid;
+        let mut owner: Value = serde_json::from_str(
+            bad["proposal"]["draft"]["operations"][0]["value_json"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        owner["metadata"]["vertical_spec"] =
+            json!(bad["proposal"]["component_plan"]["connections"][0].to_string());
+        bad["proposal"]["draft"]["operations"][0]["value_json"] = json!(owner.to_string());
+        assert!(proposal_fact(&bad).is_none(), "connection {key}");
+    }
+    for (key, invalid) in [
+        ("relation_validator", json!("vertical-schematic/2")),
+        ("geometry_status", json!("verified")),
+        ("geometry_status", json!("schematic")),
+        ("reference_status", json!("verified")),
+        ("reference_sha256", json!("d".repeat(64))),
+        ("source_instance_id", json!("source.other")),
+        ("source_sha256", json!("d".repeat(64))),
+        ("source_geometry_sha256", json!("d".repeat(64))),
+        ("source_instance_path", json!("another/instance")),
+        ("vertical_spec_owner", json!("other.surface.001")),
+        ("connection_status", json!("verified")),
+    ] {
+        let mut bad = original.clone();
+        let mut part: Value = serde_json::from_str(
+            bad["proposal"]["draft"]["operations"][1]["value_json"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        part["metadata"][key] = invalid;
+        bad["proposal"]["draft"]["operations"][1]["value_json"] = json!(part.to_string());
+        assert!(proposal_fact(&bad).is_none(), "part {key}");
+    }
+    for fault in [
+        "target",
+        "floor",
+        "missing_part",
+        "duplicate_part",
+        "soffit",
+        "soffit_above_top",
+        "top",
+        "source",
+        "source_identity",
+        "surface_role",
+        "surface_vertices",
+        "surface_soffit",
+    ] {
+        let mut bad = original.clone();
+        let mut part: Value = serde_json::from_str(
+            bad["proposal"]["draft"]["operations"][1]["value_json"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        match fault {
+            "target" => bad["proposal"]["draft"]["operations"][1]["target_id"] = json!("other"),
+            "floor" => bad["proposal"]["draft"]["operations"][1]["floor_id"] = json!("floor.other"),
+            "missing_part" => {
+                bad["proposal"]["draft"]["operations"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }
+            "duplicate_part" => {
+                let duplicate = bad["proposal"]["draft"]["operations"][1].clone();
+                bad["proposal"]["draft"]["operations"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            "soffit" => part["stair_soffit"]["start_z"] = json!("assumed"),
+            "soffit_above_top" => part["stair_soffit"]["start_z"] = json!(15),
+            "top" => part["stair_top"]["end"] = part["stair_top"]["start"].clone(),
+            "source" => part["source_ids"] = json!(["source.other"]),
+            "source_identity" => {
+                bad["proposal"]["vertical_sources"]["source.stair"]["source_id"] =
+                    json!("source.other")
+            }
+            "surface_role" => {
+                bad["proposal"]["component_plan"]["connections"][0]["reference_surfaces"][1]
+                    ["role"] = json!("shaft_wall")
+            }
+            "surface_vertices" => {
+                bad["proposal"]["component_plan"]["connections"][0]["reference_surfaces"][1]
+                    ["vertices_m"][0][2] = json!("2")
+            }
+            "surface_soffit" => {
+                bad["proposal"]["component_plan"]["connections"][0]["reference_surfaces"][0]
+                    ["soffit_m"]["end_z"] = json!(5)
+            }
+            _ => unreachable!(),
+        }
+        if !matches!(fault, "missing_part" | "duplicate_part") {
+            bad["proposal"]["draft"]["operations"][1]["value_json"] = json!(part.to_string());
+        }
+        if fault.starts_with("surface_") {
+            let mut owner: Value = serde_json::from_str(
+                bad["proposal"]["draft"]["operations"][0]["value_json"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            owner["metadata"]["vertical_spec"] =
+                json!(bad["proposal"]["component_plan"]["connections"][0].to_string());
+            bad["proposal"]["draft"]["operations"][0]["value_json"] = json!(owner.to_string());
+        }
+        assert!(proposal_fact(&bad).is_none(), "{fault}");
+    }
+}
+
+#[test]
+fn reference_stair_keeps_partition_holes_and_accepts_parts_before_the_spec_owner() {
+    let mut value = reference_stair_proposal();
+    value["proposal"]["component_plan"]["connections"][0]["reference_surfaces"][1]["role"] =
+        json!("partition");
+    value["proposal"]["component_plan"]["connections"][0]["reference_surfaces"][1]["holes_m"] =
+        json!([[[0.2, 1.2], [0.4, 1.2], [0.3, 1.4]]]);
+    let mut owner: Value = serde_json::from_str(
+        value["proposal"]["draft"]["operations"][0]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    owner["metadata"]["vertical_spec"] =
+        json!(value["proposal"]["component_plan"]["connections"][0].to_string());
+    value["proposal"]["draft"]["operations"][0]["value_json"] = json!(owner.to_string());
+    let mut part: Value = serde_json::from_str(
+        value["proposal"]["draft"]["operations"][1]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    part["role"] = json!("partition");
+    part["holes"] = json!([[{"x":2.2,"y":4.2},{"x":2.4,"y":4.2},{"x":2.3,"y":4.4}]]);
+    value["proposal"]["draft"]["operations"][1]["value_json"] = json!(part.to_string());
+    value["proposal"]["draft"]["operations"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    let proposal = proposal_fact(&value).unwrap();
+    assert!(proposal
+        .objects
+        .iter()
+        .any(|line| line.contains("partition")));
+    assert!(proposal
+        .objects
+        .iter()
+        .any(|line| line.contains("参考表面孔洞")));
+}
+
+#[tokio::test]
+#[ignore = "read-only reference stair replay; set DOMAIN_FACT_REPLAY to the sealed facts directory"]
+async fn replay_reference_stair_restores_current_binding_after_validation_and_delivery() {
+    let root = std::env::var_os("DOMAIN_FACT_REPLAY").expect("DOMAIN_FACT_REPLAY");
+    let sequences = [
+        2, 4, 16, 371, 730, 731, 732, 733, 734, 735, 736, 737, 738, 739, 741, 742, 743, 744, 745,
+        746, 747, 748,
+    ];
+    let mut values = BTreeMap::new();
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let path = entry.unwrap().path();
+        let raw = std::fs::read(&path).unwrap();
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        let sequence = value["fact_sequence"].as_u64().unwrap();
+        if sequences.contains(&sequence) && value["kind"] != "fact_page" {
+            assert_eq!(
+                path.file_stem().unwrap().to_str().unwrap(),
+                format!("{:x}", Sha256::digest(&raw))
+            );
+            assert!(values.insert(sequence, value).is_none());
+        }
+    }
+    assert_eq!(values.len(), sequences.len());
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.run_id = values[&730]["run_id"].as_str().unwrap().into();
+    setup.context_sha256 = values[&730]["context_sha256"].as_str().unwrap().into();
+    let directory = PathBuf::from(root);
+    setup.repository = directory.ancestors().nth(5).unwrap().to_path_buf();
+    setup.context_path = directory
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("context.json");
+    // 通过生产扫描器展开封存分页，不能把 manifest 当作完整事实投影。
+    values.clear();
+    receipt::scan(&setup, 0, &mut receipt::FactFiles::new(), |value| {
+        let sequence = value["fact_sequence"].as_u64().unwrap();
+        if sequences.contains(&sequence) {
+            assert!(values.insert(sequence, value).is_none());
+        }
+        true
+    });
+    assert_eq!(values.len(), sequences.len());
+    let mut facts = sequenced_facts();
+    facts.setup = Some(setup);
+    let expected = ProposalBinding {
+        run_id: values[&730]["run_id"].as_str().unwrap().into(),
+        context_sha256: values[&730]["context_sha256"].as_str().unwrap().into(),
+        proposal_id: "05740d9482ee45859a7c1bed6a7241a6".into(),
+        revision: 1,
+        prepare_token: values[&730]["proposal"]["prepare_token"]
+            .as_str()
+            .unwrap()
+            .into(),
+        base_sha256: "6edbc945925bbe1ec07bb2a597e82a84e0749858a77902b1959455a4e4283fbf".into(),
+        candidate_sha256: "f7ff1064dc37ef0cd2ee67586c4d2579961abb919b93b8288e60be3ecb0a987c".into(),
+    };
+    for (sequence, value) in values {
+        let result = facts.apply_verified_fact(&value);
+        eprintln!(
+            "seq={sequence} kind={} projection={result:?} authorize={}",
+            value["kind"],
+            facts.can_authorize(&expected)
+        );
+        assert_eq!(
+            result,
+            if sequence == 747 {
+                FactProjection::Unrelated
+            } else {
+                FactProjection::Applied
+            },
+            "sequence {sequence}: {:?}",
+            facts.projection_failure
+        );
+        if sequence == 371 {
+            assert_eq!(
+                facts.snapshot.proposal.as_ref().unwrap().binding.revision,
+                8
+            );
+        }
+        if sequence >= 730 {
+            assert_eq!(facts.snapshot.proposal.as_ref().unwrap().binding, expected);
+            assert!(!facts.can_authorize(&expected));
+        }
+        if sequence == 733 {
+            assert!(facts
+                .snapshot
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.valid == Some(true)
+                    && artifact.current == Some(true)
+                    && artifact.binding.input_sha256 == expected.candidate_sha256));
+        }
+    }
+    assert!(!facts.snapshot.first_use_satisfied());
+    assert_eq!(
+        facts.snapshot.first_use_review.as_ref().unwrap().status,
+        "ready"
+    );
+    assert!(facts.snapshot.rejected_facts.is_empty());
+    assert!(!facts.snapshot.review_images.is_empty());
+    for image in &mut facts.snapshot.review_images {
+        review::verify_image(&image.binding).await.unwrap();
+        image.file_state = ImageFileState::Available;
+    }
+    assert!(facts.snapshot.first_use_satisfied());
+    assert!(facts.can_authorize(&expected));
+    let mut wrong = expected.clone();
+    wrong.revision += 1;
+    assert!(!facts.can_authorize(&wrong));
+    assert!(facts.snapshot.application.is_none());
+    assert!(!facts.snapshot.authorizing);
+    eprintln!("verified image identities={} current proposal={} r{} authorize=true; no authorization sent", facts.snapshot.review_images.len(), expected.proposal_id, expected.revision);
+}
+
 fn private_receipt(value: &Value) -> receipt::FactReceipt {
     let raw = serde_json::to_vec(value).unwrap();
     receipt::FactReceipt {
@@ -1760,6 +2157,20 @@ fn ordinary_project_launch_creates_a_bound_context_and_registers_pure_tools() {
         ..Default::default()
     })
     .is_err());
+    if cfg!(windows) {
+        std::fs::create_dir_all(root.join("py")).unwrap();
+        std::fs::write(root.join("py/python.exe"), "portable interpreter").unwrap();
+        let portable = configure(Config {
+            cwd: root.clone(),
+            domain_project: Some("projects/test".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            portable.domain_setup.unwrap().python,
+            normalized_path(&root).unwrap().join("py/python.exe")
+        );
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -4486,6 +4897,183 @@ fn first_use_fixture() -> (Value, Value) {
     (proposal, review)
 }
 
+fn first_use_scope_fixture() -> Value {
+    let (proposal, evidence) = first_use_fixture();
+    let mut scope = project_scope(3, "f08", &"d".repeat(64));
+    scope["proposal"]["component_first_use_requirements"] =
+        proposal["proposal"]["component_first_use_requirements"].clone();
+    scope["component_first_use_review"] = evidence["component_first_use_review"].clone();
+    scope["component_first_use_review"]["manifest"]["proposal_id"] =
+        scope["proposal"]["proposal_id"].clone();
+    scope
+}
+
+#[test]
+fn project_scope_restores_first_use_review_without_new_image_delivery() {
+    let mut facts = sequenced_facts();
+    facts.setup.as_mut().unwrap().mode = DomainMode::Project;
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let scope = first_use_scope_fixture();
+    assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    let review = facts.snapshot.first_use_review.as_ref().unwrap();
+    assert_eq!(review.status, "ready");
+    assert_eq!(review.review_set_sha256, Some("a".repeat(64)));
+    assert_eq!(review.required_count, 1);
+    assert_eq!(facts.snapshot.review_images.len(), 1);
+    assert_eq!(
+        facts.snapshot.review_images[0].file_state,
+        ImageFileState::Pending
+    );
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(!facts.can_authorize(&binding));
+    facts.snapshot.review_images[0].file_state = ImageFileState::Available;
+    assert!(facts.can_authorize(&binding));
+    assert!(!facts.snapshot.authorizing);
+    assert!(facts.snapshot.application.is_none());
+}
+
+#[test]
+fn project_scope_repeated_after_ready_proposal_preserves_verified_image_state() {
+    let mut facts = sequenced_facts();
+    facts.setup.as_mut().unwrap().mode = DomainMode::Project;
+    facts.apply_verified_fact(&project_catalog(1));
+    facts.apply_verified_fact(&project_selection(2, true));
+    let scope = first_use_scope_fixture();
+    let mut initial = scope.clone();
+    initial
+        .as_object_mut()
+        .unwrap()
+        .remove("component_first_use_review");
+    assert_eq!(facts.apply_verified_fact(&initial), FactProjection::Applied);
+    assert!(!facts.snapshot.first_use_satisfied());
+    let mut proposal = scope.clone();
+    proposal["kind"] = json!("proposal");
+    proposal["fact_sequence"] = json!(4);
+    assert_eq!(
+        facts.apply_verified_fact(&proposal),
+        FactProjection::Applied
+    );
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    facts.snapshot.review_images[0].file_state = ImageFileState::Available;
+    facts.snapshot.review_images[0].externally_opened = true;
+    facts.snapshot.review_images[0].notice = Some("verified locally".into());
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    for _ in 0..2 {
+        assert_eq!(facts.apply_verified_fact(&scope), FactProjection::Applied);
+        assert_eq!(
+            facts.snapshot.first_use_review.as_ref().unwrap().status,
+            "ready"
+        );
+        assert_eq!(facts.snapshot.review_images.len(), 2);
+        let image = &facts.snapshot.review_images[0];
+        assert_eq!(image.file_state, ImageFileState::Available);
+        assert!(image.externally_opened);
+        assert_eq!(image.notice.as_deref(), Some("verified locally"));
+        assert!(facts.can_authorize(&binding));
+    }
+    let mut blocked = scope.clone();
+    blocked["fact_sequence"] = json!(5);
+    blocked["component_first_use_review"]["current"] = json!(false);
+    assert_eq!(facts.apply_verified_fact(&blocked), FactProjection::Applied);
+    assert!(!facts.snapshot.first_use_satisfied());
+    assert!(!facts.can_authorize(&binding));
+}
+
+#[test]
+fn project_scope_rejects_invalid_embedded_first_use_manifest_before_activation() {
+    for field in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+        "input_sha256",
+        "requirements_sha256",
+        "items",
+    ] {
+        let mut facts = sequenced_facts();
+        facts.setup.as_mut().unwrap().mode = DomainMode::Project;
+        facts.apply_verified_fact(&project_catalog(1));
+        facts.apply_verified_fact(&project_selection(2, true));
+        let mut scope = first_use_scope_fixture();
+        scope["component_first_use_review"]["manifest"][field] = json!("foreign");
+        assert_eq!(
+            facts.apply_verified_fact(&scope),
+            FactProjection::Invalid,
+            "{field}"
+        );
+        assert!(facts.snapshot.project_scope.is_none(), "{field}");
+        assert!(facts.snapshot.proposal.is_none(), "{field}");
+        assert!(facts.snapshot.review_images.is_empty(), "{field}");
+    }
+}
+
+#[test]
+fn project_scope_baseline_restores_ready_review_and_rejects_bad_manifest() {
+    let root = std::env::temp_dir().join(format!(
+        "domain-scope-first-use-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let directory = root.join("outputs/domain/run/project");
+    std::fs::create_dir_all(directory.join("facts")).unwrap();
+    std::fs::write(root.join("context.json"), b"{}").unwrap();
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.repository = root.clone();
+    setup.context_path = root.join("context.json");
+    setup.context_sha256 = format!("{:x}", Sha256::digest(b"{}"));
+    let mut values = vec![
+        project_catalog(1),
+        project_selection(2, true),
+        first_use_scope_fixture(),
+    ];
+    let mut bad = values[2].clone();
+    bad["fact_sequence"] = json!(4);
+    bad["component_first_use_review"]["manifest"]["candidate_sha256"] = json!("foreign");
+    values.push(bad);
+    let mut index = serde_json::Map::new();
+    for value in &mut values {
+        value["context_sha256"] = json!(setup.context_sha256);
+        let raw = serde_json::to_vec(value).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
+        index.insert(sha, value["fact_sequence"].clone());
+        std::fs::write(
+            directory.join("fact-sequences.json"),
+            json!({"next":5,"facts":index}).to_string(),
+        )
+        .unwrap();
+        if value["fact_sequence"].as_u64().unwrap() < 3 {
+            continue;
+        }
+        let resumed = DomainFacts::new(Some(setup.clone()));
+        assert_eq!(
+            resumed.snapshot.first_use_review.as_ref().unwrap().status,
+            "ready"
+        );
+        assert_eq!(resumed.snapshot.review_images.len(), 1);
+        assert_eq!(
+            resumed.snapshot.review_images[0].file_state,
+            ImageFileState::Pending
+        );
+        let binding = &resumed.snapshot.proposal.as_ref().unwrap().binding;
+        assert!(!resumed.can_authorize(binding));
+        assert!(!resumed.snapshot.authorizing);
+        assert_eq!(
+            resumed.snapshot.rejected_facts.len(),
+            usize::from(value["fact_sequence"] == 4)
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn structure_revision_fixture() -> (Value, Value) {
     let (mut proposal, mut evidence) = first_use_fixture();
     let certificate = json!({"contract":"cad-structure-revision/1","path":"sealed-certificate.json","sha256":"c".repeat(64)});
@@ -4834,6 +5422,34 @@ fn web_first_use_projects_sealed_package_and_rejects_changed_evidence() {
     assert_eq!(package.url_hash.as_deref(), Some("view=perspective"));
     assert_eq!(images[0].binding.proposal, binding);
     assert_eq!(images[0].binding.review_set_sha256, ready.review_set_sha256);
+    let mut native = evidence.clone();
+    let native_manifest = &mut native["component_first_use_review"]["manifest"];
+    native_manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("blend_sha256");
+    native_manifest["glb_sha256"] = json!("d".repeat(64));
+    let (_, native_images) = review::project(&native, &binding, &requirement).unwrap();
+    let native_detail = native_images[0].detail.as_ref().unwrap();
+    assert!(native_detail.contains(&format!("GLB SHA256：{}", "d".repeat(64))));
+    assert!(!native_detail.contains("BLEND SHA256"));
+    for invalid in [json!("e".repeat(64)), json!("invalid"), Value::Null] {
+        let mut changed = native.clone();
+        changed["component_first_use_review"]["manifest"]["glb_sha256"] = invalid;
+        assert!(review::project(&changed, &binding, &requirement).is_none());
+    }
+    for engine in ["PIL_2D_OVERLAY", "BLENDER_WORKBENCH"] {
+        let mut changed = native.clone();
+        changed["component_first_use_review"]["manifest"]["items"][0]["renderer"]["engine"] =
+            json!(engine);
+        assert!(review::project(&changed, &binding, &requirement).is_none());
+    }
+    let mut changed = native.clone();
+    changed["component_first_use_review"]["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("glb_sha256");
+    assert!(review::project(&changed, &binding, &requirement).is_none());
     images[0].file_state = ImageFileState::Available;
     let mut facts = sequenced_facts();
     facts.snapshot.review_images = images;
@@ -4939,6 +5555,33 @@ fn web_artifact_binds_glb_and_python_spelled_focus_to_current_proposal() {
     assert_eq!(image.binding.proposal, binding);
     assert_eq!(image.binding.review_key, "preview");
     assert_eq!(image.binding.review_set_sha256, None);
+    let mut native = value.clone();
+    native["artifact"]["review_image"]["request"]
+        .as_object_mut()
+        .unwrap()
+        .remove("blend_sha256");
+    let native_image = review::artifact_image(&native, &binding).unwrap();
+    assert!(native_image.detail.as_ref().unwrap().contains("GLB SHA256"));
+    assert!(!native_image
+        .detail
+        .as_ref()
+        .unwrap()
+        .contains("BLEND SHA256"));
+    let mut changed = native.clone();
+    changed["artifact"]["review_image"]["request"]["glb_sha256"] = json!("f".repeat(64));
+    assert!(review::artifact_image(&changed, &binding).is_none());
+    changed = native.clone();
+    changed["artifact"]["review_image"]
+        .as_object_mut()
+        .unwrap()
+        .remove("review_web");
+    assert!(review::artifact_image(&changed, &binding).is_none());
+    changed = native;
+    changed["artifact"]["review_image"]["request"]
+        .as_object_mut()
+        .unwrap()
+        .remove("glb_sha256");
+    assert!(review::artifact_image(&changed, &binding).is_none());
     for (field, invalid) in [
         ("glb_sha256", json!("f".repeat(64))),
         ("revision", json!(3)),

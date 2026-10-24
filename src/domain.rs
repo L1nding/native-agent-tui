@@ -81,7 +81,7 @@ pub fn configure(mut config: Config) -> Result<Config, String> {
     let repository = normalized_path(&config.cwd)?;
     let python = project::modeler_python(&repository);
     if !python.is_file() {
-        return Err("模型器 .venv Python 不存在".into());
+        return Err("建模 Python 运行时不存在（py 或 .venv）".into());
     }
     if let Some(path) = config.domain_project.as_ref() {
         config.domain_context = Some(project::create_context(&repository, path)?);
@@ -1426,10 +1426,25 @@ impl DomainFacts {
                 let Some(proposal) = proposal_fact(value) else {
                     return invalid!("proposal_fact");
                 };
-                let Some(first_use) = review::requirements_for_scope(&value["proposal"], &scope)
+                let Some(mut first_use) =
+                    review::requirements_for_scope(&value["proposal"], &scope)
                 else {
                     return invalid!("review::requirements");
                 };
+                let mut images = Vec::new();
+                if value.get("component_first_use_review").is_some() {
+                    let Some((projected, projected_images)) =
+                        review::project(value, &proposal.binding, &first_use)
+                    else {
+                        self.remember_projection_failure(
+                            value,
+                            review::project_failure_reason(value),
+                        );
+                        return invalid!();
+                    };
+                    first_use = projected;
+                    images = projected_images;
+                }
                 if self.snapshot.project_scope.as_ref() != Some(&scope) {
                     self.activation_sequence = sequence.unwrap_or(0);
                     self.clear_project_scope();
@@ -1453,6 +1468,7 @@ impl DomainFacts {
                     self.snapshot.artifacts.clear();
                 }
                 self.snapshot.first_use_review = Some(first_use);
+                self.replace_review_images(images, true);
                 self.snapshot.proposal_categories = proposal_category_counts(&value["proposal"]);
                 self.snapshot.proposal = Some(proposal);
                 self.snapshot.structure_review = structure_review(&value["structure_review"]);
@@ -3131,8 +3147,8 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     };
     let mut objects = Vec::new();
     let mut seen_connections = std::collections::BTreeSet::new();
-    // Verified facts already have an 8 MiB transport bound. Every approved operation
-    // must be projected and validated, including parts after a large batch boundary.
+    let mut remaining_reference_parts = std::collections::BTreeSet::new();
+    // 已验证事实受单文件及分页聚合预算约束，批准前必须逐条投影全部操作。
     let correction = p.get("drawing_review").filter(|v| !v.is_null());
     let edit = p.get("component_edit").filter(|v| !v.is_null());
     let structure_revision =
@@ -3368,14 +3384,16 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             let element: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
             let metadata = &element["metadata"];
             let schematic = metadata["relation_validator"] == "vertical-schematic/1";
+            let reference = metadata["geometry_status"] == "reference_informed_schematic";
             let role = element["role"].as_str()?;
             let boundary = element["boundary"].as_array()?;
             let valid_role = if schematic {
-                matches!(role, "stair_step" | "landing")
+                matches!(role, "stair_step" | "landing") || reference && role == "partition"
             } else {
                 matches!(role, "stair_step" | "shaft_wall")
             };
             if !valid_role
+                || reference && !schematic
                 || !schematic
                     && !matches!(
                         metadata["relation_validator"].as_str(),
@@ -3426,17 +3444,255 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     || metadata["step_dimension_basis"] != "assumed"
                     || !matches!(
                         metadata["geometry_status"].as_str(),
-                        Some("schematic" | "partial_schematic")
+                        Some("schematic" | "partial_schematic" | "reference_informed_schematic")
                     )
                     || bounded_text(metadata, "solid_representation", 1000).is_none()
                     || op["basis"] != "assumed")
             {
                 return None;
             }
+            let has_reference = !connection["reference_sha256"].is_null()
+                || !connection["reference_surfaces"].is_null()
+                    && !connection["reference_surfaces"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty);
+            if schematic
+                && (has_reference != reference
+                    || !reference && !metadata["reference_sha256"].is_null())
+            {
+                return None;
+            }
+            if reference {
+                let reference_sha256 = connection["reference_sha256"].as_str()?;
+                let surfaces = connection["reference_surfaces"].as_array()?;
+                let source_fact = &p["vertical_sources"][source];
+                let source_path = source_fact["instance_path"]
+                    .as_array()?
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
+                    .join("/");
+                let owner = format!("{component}.surface.001");
+                let id = element["id"].as_str()?;
+                let number: usize = id
+                    .strip_prefix(&format!("{component}.surface."))?
+                    .parse()
+                    .ok()?;
+                let surface = surfaces.get(number.checked_sub(1)?)?;
+                let vertices = surface["vertices_m"].as_array()?;
+                let limitations = bounded_text(connection, "limitations", 2000)?;
+                if reference_sha256.len() != 64
+                    || !reference_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || metadata["reference_sha256"] != reference_sha256
+                    || metadata["reference_status"]
+                        != "caller-supplied trial geometry; reference hash is an evidence citation"
+                    || connection["geometry_basis"] != "region_bounds"
+                    || metadata["geometry_basis"] != "assumed_region_bounds"
+                    || connection["limitations"] != metadata["limitations"]
+                    || ["flights", "landings"].iter().any(|key| {
+                        !connection[key].is_null()
+                            && !connection[key].as_array().is_some_and(Vec::is_empty)
+                    })
+                    || !connection["steps"].is_null()
+                    || !connection["riser_m"].is_null()
+                    || surfaces.is_empty()
+                    || surfaces.len() > 2000
+                    || source_fact["source_id"] != source
+                    || source_fact["component_id"] != component
+                    || source_fact["floor_id"] != p["scope"]["floor_id"]
+                    || metadata["source_instance_path"] != source_path
+                    || ["source_sha256", "source_geometry_sha256"]
+                        .iter()
+                        .any(|key| {
+                            let source_key = if *key == "source_sha256" {
+                                "source_sha256"
+                            } else {
+                                "geometry_sha256"
+                            };
+                            source_fact[source_key].as_str().is_none_or(|sha| {
+                                sha.len() != 64
+                                    || !sha
+                                        .bytes()
+                                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                            }) || metadata[key] != source_fact[source_key]
+                        })
+                    || metadata["vertical_spec_owner"] != owner
+                    || op["op"] != "add"
+                    || op["target_id"] != id
+                    || op["floor_id"] != p["scope"]["floor_id"]
+                    || id != format!("{component}.surface.{number:03}")
+                    || surface["role"] != role
+                    || !matches!(role, "stair_step" | "landing" | "partition")
+                    || !(3..=100).contains(&vertices.len())
+                    || vertices.iter().any(|point| {
+                        point.as_array().is_none_or(|point| {
+                            point.len() != 3
+                                || point.iter().any(|v| v.as_f64().is_none())
+                                || point[2].as_f64().is_none_or(|z| z <= 0.0)
+                        })
+                    })
+                    || surface["thickness_m"].as_f64().is_none_or(|v| v <= 0.0)
+                {
+                    return None;
+                }
+                if first_connection {
+                    for index in 1..=surfaces.len() {
+                        remaining_reference_parts.insert(format!("{component}.surface.{index:03}"));
+                    }
+                    let highest = surfaces.iter().try_fold(0.0_f64, |highest, surface| {
+                        surface["vertices_m"]
+                            .as_array()?
+                            .iter()
+                            .try_fold(highest, |highest, point| {
+                                Some(highest.max(point[2].as_f64()?))
+                            })
+                    })?;
+                    if (highest - connection["rise_m"].as_f64()?).abs() > 0.001 {
+                        return None;
+                    }
+                    // 引用哈希只标识证据；参考构型和斜底仍是调用方假设。
+                    objects.push(format!(
+                        "参考 SHA256 {reference_sha256} · 仅证据引用，非认证 · 构型 assumed"
+                    ));
+                    objects.push(format!("参考限制：{limitations}"));
+                }
+                if id == owner {
+                    if serde_json::from_str::<Value>(metadata["vertical_spec"].as_str()?)
+                        .ok()?
+                        .ne(connection)
+                    {
+                        return None;
+                    }
+                } else if metadata["reason_ref"] != owner {
+                    return None;
+                }
+                if !remaining_reference_parts.remove(id) {
+                    return None;
+                }
+                for (holes, local) in [(&surface["holes_m"], true), (&element["holes"], false)] {
+                    if holes.is_null() {
+                        continue;
+                    }
+                    for ring in holes.as_array()? {
+                        let ring = ring.as_array()?;
+                        if !(3..=512).contains(&ring.len())
+                            || ring.iter().any(|point| {
+                                if local {
+                                    point.as_array().is_none_or(|point| {
+                                        point.len() != 2
+                                            || point.iter().any(|v| v.as_f64().is_none())
+                                    })
+                                } else {
+                                    point["x"].as_f64().is_none() || point["y"].as_f64().is_none()
+                                }
+                            })
+                        {
+                            return None;
+                        }
+                    }
+                }
+                let surface_sources = surface["source_ids"].as_array()?;
+                let element_sources = element["source_ids"].as_array()?;
+                let operation_sources = op["source_ids"].as_array()?;
+                if surface_sources.is_empty()
+                    || surface_sources.len() > 100
+                    || surface_sources.iter().any(|source| {
+                        source.as_str().is_none_or(str::is_empty)
+                            || !element_sources.contains(source)
+                            || !operation_sources.contains(source)
+                    })
+                    || !element_sources.contains(&Value::String(source.to_owned()))
+                    || !operation_sources.contains(&Value::String(source.to_owned()))
+                {
+                    return None;
+                }
+                let plane_at = |plane: &Value, x: f64, y: f64| -> Option<f64> {
+                    let sx = plane["start"]["x"].as_f64()?;
+                    let sy = plane["start"]["y"].as_f64()?;
+                    let dx = plane["end"]["x"].as_f64()? - sx;
+                    let dy = plane["end"]["y"].as_f64()? - sy;
+                    let length_squared = dx * dx + dy * dy;
+                    if length_squared <= 1e-18 || !length_squared.is_finite() {
+                        return None;
+                    }
+                    let start = plane["start_z"].as_f64()?;
+                    let end = plane["end_z"].as_f64()?;
+                    let z =
+                        start + (end - start) * ((x - sx) * dx + (y - sy) * dy) / length_squared;
+                    z.is_finite().then_some(z)
+                };
+                if !surface["soffit_m"].is_null() {
+                    for point in vertices {
+                        let z =
+                            plane_at(&surface["soffit_m"], point[0].as_f64()?, point[1].as_f64()?)?;
+                        if z < 0.0 || z >= point[2].as_f64()? - 1e-7 {
+                            return None;
+                        }
+                    }
+                }
+                let base = element["base_z"].as_f64()?;
+                let height = element["height"].as_f64()?;
+                let highest = vertices.iter().try_fold(0.0_f64, |highest, point| {
+                    Some(highest.max(point[2].as_f64()?))
+                })?;
+                if (height - highest).abs() > 0.001 {
+                    return None;
+                }
+                for point in boundary {
+                    let x = point["x"].as_f64()?;
+                    let y = point["y"].as_f64()?;
+                    let underside = plane_at(&element["stair_soffit"], x, y)?;
+                    let top = if element["stair_top"].is_null() {
+                        base + height
+                    } else {
+                        plane_at(&element["stair_top"], x, y)?
+                    };
+                    if underside < base - 0.001
+                        || underside >= top - 1e-7
+                        || top <= base
+                        || top > base + height + 0.001
+                    {
+                        return None;
+                    }
+                }
+                objects.push(format!(
+                    "参考表面局部坐标(m) {} · Z 相对楼面 · 厚 {} m · assumed",
+                    surface["vertices_m"], surface["thickness_m"]
+                ));
+                if element["holes"]
+                    .as_array()
+                    .is_some_and(|holes| !holes.is_empty())
+                {
+                    objects.push(format!("参考表面孔洞(m) {} · assumed", element["holes"]));
+                }
+                objects.push(format!(
+                    "斜底(m)：{} → {} · 标高 {} → {} · assumed",
+                    element["stair_soffit"]["start"],
+                    element["stair_soffit"]["end"],
+                    element["stair_soffit"]["start_z"],
+                    element["stair_soffit"]["end_z"]
+                ));
+                if !element["stair_top"].is_null() {
+                    objects.push(format!(
+                        "顶面(m)：{} → {} · 标高 {} → {} · assumed",
+                        element["stair_top"]["start"],
+                        element["stair_top"]["end"],
+                        element["stair_top"]["start_z"],
+                        element["stair_top"]["end_z"]
+                    ));
+                }
+            }
             if first_connection {
                 if schematic {
+                    let rise_label = if reference {
+                        "最高表面相对楼面"
+                    } else {
+                        "层高"
+                    };
                     objects.push(format!(
-                        "单层示意楼梯 · 层高 {} m · assumed · 连接待核验 · 楼层 {} · 来源位置 {}",
+                        "单层示意楼梯 · {rise_label} {} m · assumed · 连接待核验 · 楼层 {} · 来源位置 {}",
                         connection["rise_m"],
                         connection["served_floors"],
                         p["vertical_sources"][source]["origin_m"]
@@ -3473,6 +3729,9 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             solid["source_ids"],
             op["basis"].as_str().unwrap_or("unknown")
         ));
+    }
+    if !remaining_reference_parts.is_empty() {
+        return None;
     }
     let assumptions = p["assumed"]
         .as_array()?
