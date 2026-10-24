@@ -1,6 +1,6 @@
 ---
 name: rust-development
-description: Use for Rust work in this repository: Cargo setup, async execution, JSONL/RPC transport, scheduler state, terminal UI, tests, formatting, linting, and Windows process cleanup.
+description: "Use for Rust work in this repository: Cargo setup, async execution, JSONL/RPC transport, scheduler state, terminal UI, tests, formatting, linting, and Windows process cleanup."
 ---
 
 # Rust development
@@ -50,6 +50,15 @@ Use this skill when changing Rust code, Cargo metadata, execution boundaries, or
 - Keep JSON-RPC, process management, gate logic, and mutable execution facts out of views.
 - Bound log, telemetry, and queue memory. Redact credentials, full prompts, and unsanitized tool output before diagnostics or export.
 - On Windows, test process-tree termination and handle cleanup through the transport seam; do not rely on Unix-only signals.
+- For DSH background delegation or parent continuation changes, read the lifecycle contract in [`dsh-plugin/README.md`](../../../dsh-plugin/README.md). Verify two independently settled children across the real ACP bridge transport, including delayed output, failure and stop; keep DSH as the sole sender of its settlement messages and automatic model requests.
+
+## DSH image context
+
+- DSH may merge a complete small domain receipt and an image-spill footer into one text block. Recover only the exact known zero-text-loss wrapper at the ACP normalization seam, within the original wrapper, structured-result and content-block budgets; never follow the spill locator. Keep private fact SHA, byte count, context and proposal binding verification unchanged. Truncated text, ambiguous receipts and unknown suffixes remain explicit synchronization failures. Replay the actual result to distinguish receipt transport failure from an invalid proposal; do not replay modeling operations or rerender images to clear the error.
+- For ACP context overflow, distinguish the provider's terminal response, adapter window checks, and DSH compaction events. A successful compaction marker alone does not prove pressure fell; inspect retained image occurrences and the next request's usage.
+- Read [`dsh-plugin/README.md`](../../../dsh-plugin/README.md) before changing the image-budget seam. Keep model selection and domain authority intact; apply the checked host repair to the actual DSH entry and verify it before the session owner restarts. When multiple DSH installations exist, pin `--dsh` or `DSH_BIN` to the launcher belonging to the checked `--host-entry`, run the installer with `--check` before launch, and verify the spawned host path; checking another installation does not validate this session.
+- Bind each image batch's observations to full image identities, reader arguments, build/evidence receipts, and assistant message IDs. Carry these records unchanged across summaries; use existing observations and sealed artifacts for recovery, and reread only explicitly missing evidence.
+- Complete the offline trace regression with the installed host modules: meter pricing and request selection must agree, new unobserved images must survive every offload source including byte limits, summary inputs must fit their budget, and all original identities/observations must remain recoverable. Verify installer rollback after partial writes or replacement failures. During an active probe use the documented in-memory source mode; only install after the session owner confirms closure. Report conservative visual estimates separately from provider-reported token usage and online validation.
 
 ## References
 
