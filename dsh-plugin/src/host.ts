@@ -117,6 +117,9 @@ export interface LiveAgent {
   readonly status: 'idle' | 'running'
   /** Queue a message for the next step of the running turn. */
   steer(message: unknown): void
+  followup?(message: unknown): void
+  cancel?(cause: { kind: 'user' }): void
+  whenIdle?(): Promise<void>
 }
 
 /** `ctx.agents`: agents running in this process. */
@@ -216,7 +219,19 @@ export interface HostContext {
  * Cordis instance and always matches the host's version.
  */
 export async function loadHostAcp(): Promise<PluginModule> {
-  return (await import(pathToFileURL(resolveHostAcp()).href)) as PluginModule
+  const fromHost = createRequire(resolveHostAcp())
+  const adapter = (await import(pathToFileURL(fromHost.resolve('@deepseek-ai/dsh-llm-pi-ai')).href)) as {
+    PiAiAdapter?: { prototype?: { zfContextRepairVersion?: () => number } }
+  }
+  const compaction = (await import(pathToFileURL(fromHost.resolve('@deepseek-ai/dsh-compaction-basic')).href)) as {
+    ZF_CONTEXT_REPAIR_VERSION?: number
+  }
+  if (adapter.PiAiAdapter?.prototype?.zfContextRepairVersion?.() !== 2 || compaction.ZF_CONTEXT_REPAIR_VERSION !== 2) {
+    throw new Error('DSH context repair is missing; build dsh-plugin and run scripts/install-dsh-context.mjs for this host before starting the TUI')
+  }
+  const acp = await import(pathToFileURL(resolveHostAcp()).href) as PluginModule & { ZF_TUI_LIFECYCLE_VERSION?: number }
+  if (acp.ZF_TUI_LIFECYCLE_VERSION !== 1) throw new Error('DSH ACP lifecycle repair is missing; run scripts/install-dsh-context.mjs for this host before starting the TUI')
+  return acp
 }
 
 function resolveHostAcp(): string {

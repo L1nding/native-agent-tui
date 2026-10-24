@@ -233,6 +233,12 @@ export function apply(ctx: HostContext, config: BridgeConfig = {}): void {
       return turns.setGoals(sessionId, allowed)
     },
 
+    'zf/session/background/cancel': (params) => {
+      const session = params['sessionId']
+      if (typeof session !== 'string' || session === '') throw new Error('sessionId is required')
+      return turns.cancelBackground(session)
+    },
+
     /** dsh's slash commands for one live session. */
     'zf/commands/list': (params) => {
       const sessionId = params['sessionId']

@@ -5229,6 +5229,15 @@ impl Core {
                 }
             }
             "turn/notice" => match params["kind"].as_str() {
+                Some("background") => {
+                    if let (Some(turn), Some(pending), Some(running)) = (
+                        turn,
+                        params["pending"].as_u64().filter(|n| *n <= 256),
+                        params["running"].as_bool(),
+                    ) {
+                        self.state.background_notice(turn, pending, running);
+                    }
+                }
                 Some("retry") => {
                     if let (Some(turn), Some(retry)) = (turn, params["retry"].as_u64()) {
                         self.state.retry_notice(
@@ -10571,6 +10580,66 @@ mod tests {
             assert_eq!(summary.role, "TimingSummary");
             assert!(summary.text.starts_with(&format!("{step} steps · ")));
         }
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_parent_output_remains_active_until_the_same_execution_is_drained() {
+        let (mut client, mut server) = harness().await;
+        ready(&mut server).await;
+        phase(&mut client, SessionPhase::Ready).await;
+        client
+            .commands
+            .send(Command::SubmitRootInput {
+                text: "independent work".into(),
+            })
+            .await
+            .unwrap();
+        let request = next(&mut server).await;
+        send(
+            &mut server,
+            json!({"id":request["id"],"result":{"turn":{"id":"one"}}}),
+        )
+        .await;
+        phase(&mut client, SessionPhase::Running).await;
+        let attempt = client.snapshots.borrow().scheduler.active_root;
+        for (pending, running, text) in [
+            (2, true, "parent independent work"),
+            (2, false, "parent segment ended"),
+            (0, true, "child result registered"),
+        ] {
+            send(&mut server, json!({"method":"turn/notice","params":{"threadId":"root","turnId":"one","kind":"background","pending":pending,"running":running}})).await;
+            observation_event(&mut client, &mut server, json!({"method":"item/agentMessage/delta","params":{"threadId":"root","turnId":"one","itemId":text,"delta":text}})).await;
+            let snapshot = client.snapshots.borrow().clone();
+            assert_eq!(snapshot.phase, SessionPhase::Running);
+            assert_eq!(snapshot.scheduler.active_root, attempt);
+            assert_eq!(snapshot.root_start_requests, 1);
+            if !running {
+                assert!(snapshot
+                    .messages
+                    .iter()
+                    .any(|m| m.text.contains("任务尚未完成")));
+            }
+        }
+        send(&mut server, json!({"method":"turn/notice","params":{"threadId":"root","turnId":"one","kind":"background","pending":0,"running":false}})).await;
+        observation_event(&mut client, &mut server, json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"one","status":"completed"}}})).await;
+        let snapshot = client.snapshots.borrow().clone();
+        assert_eq!(snapshot.phase, SessionPhase::Completed);
+        assert!(snapshot.scheduler.active_root.is_none());
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.text == "child result registered"));
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|m| m.id == "background:one" && m.complete));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), next(&mut server))
+                .await
+                .is_err()
+        );
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
     }

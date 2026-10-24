@@ -132,8 +132,48 @@ export function goalRoundOf(data: unknown): Record<string, unknown> | undefined 
  * @returns what the relay knows about live turns, for steering.
  */
 export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): LiveTurns {
-  const notify = (session: string, event: Record<string, unknown>): void =>
-    send({ jsonrpc: '2.0', method: EVENT_METHOD, params: { sessionId: session, event } })
+  const notify = (session: string, event: Record<string, unknown>): void => {
+    const scoped = ['stage', 'delta', 'delta-end', 'step', 'steer', 'retry', 'todos', 'goal-round'].includes(String(event['type']))
+    const turn = scoped ? count(event['turn']) ?? hostTurns.get(session) : undefined
+    send({ jsonrpc: '2.0', method: EVENT_METHOD, params: { sessionId: session, event: turn === undefined ? event : { ...event, turn } } })
+  }
+
+  const childRuns = new Map<string, { session: string; id: string }>()
+  ctx.on('subagent/start', (payload: unknown) => {
+    const info = record(payload)
+    const id = info?.['id'], run = info?.['runId']
+    if (typeof id !== 'string' || id.length > 1024 || typeof run !== 'string' || run.length > 128 || childRuns.has(run)) return
+    const child = record(ctx.get('sessions')?.get(id))
+    const parent = record(child?.['header'])?.['parentSession']
+    if (typeof parent !== 'string' || parent === '') return
+    if (childRuns.size >= 256) {
+      notify(parent, { type: 'background-error', code: 'run_limit' })
+      return
+    }
+    childRuns.set(run, { session: parent, id })
+    notify(parent, { type: 'subagent-run', id, runId: run, state: 'start' })
+  }, { global: true })
+  ctx.on('subagent/end', (payload: unknown) => {
+    const info = record(payload)
+    const run = info?.['runId']
+    const own = typeof run === 'string' ? childRuns.get(run) : undefined
+    if (own === undefined || own.id !== info?.['id']) return
+    childRuns.delete(run as string)
+    notify(own.session, { type: 'subagent-run', id: own.id, runId: run, state: 'end' })
+  }, { global: true })
+  ctx.on('zf-tui/acp-turn-settled', (payload: unknown) => {
+    const value = record(payload)
+    const session = value?.['sessionId'], turn = count(value?.['turn']), state = value?.['state']
+    if (typeof session === 'string' && turn !== undefined && (state === 'completed' || state === 'failed' || state === 'interrupted')) {
+      const category = value?.['failureCategory'], code = value?.['failureCode']
+      const failureCategory = category === 'provider' || category === 'output_delivery' ? category : 'unknown'
+      const failureCode = failureCategory === 'provider' && typeof code === 'string'
+        && ['AUTH', 'QUOTA_EXCEEDED', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'PI_AI_ERROR', 'CONTEXT_WINDOW_EXCEEDED', 'EMPTY_RESPONSE'].includes(code) ? code : undefined
+      notify(session, { type: 'host-settled', turn, state,
+        ...(state === 'failed' ? { failureCategory, ...(failureCode === undefined ? {} : { failureCode }) } : {}),
+      })
+    }
+  }, { global: true })
 
   // Generated text of one request, batched per content block.
   interface Batch {
@@ -141,6 +181,7 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
     block: number
     text: string
     timer: ReturnType<typeof setTimeout>
+    turn?: number
   }
   const batches = new Map<string, Batch>()
   const flush = (session: string): void => {
@@ -148,13 +189,13 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
     if (batch === undefined) return
     batches.delete(session)
     clearTimeout(batch.timer)
-    notify(session, { type: 'delta', kind: batch.kind, block: batch.block, text: batch.text })
+    notify(session, { type: 'delta', kind: batch.kind, block: batch.block, text: batch.text, ...(batch.turn === undefined ? {} : { turn: batch.turn }) })
   }
   const preview = (session: string, frame: Record<string, unknown> | undefined): void => {
     if (frame?.['type'] === 'end') {
       flush(session)
       // Committed or abandoned, the preview is over; only the former is followed by a message.
-      notify(session, { type: 'delta-end', committed: record(frame['outcome'])?.['kind'] === 'committed' })
+      notify(session, { type: 'delta-end', committed: record(frame['outcome'])?.['kind'] === 'committed', ...(count(frame['turn']) === undefined ? {} : { turn: frame['turn'] }) })
       return
     }
     const chunk = frame?.['type'] === 'chunk' ? record(frame['chunk']) : undefined
@@ -172,7 +213,8 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
     if (batches.size >= 256) for (const other of [...batches.keys()]) flush(other)
     const timer = setTimeout(() => flush(session), DELTA_BATCH_MS)
     timer.unref?.()
-    batches.set(session, { kind, block, text: text.slice(0, MAX_DELTA_CHARS), timer })
+    const turn = count(frame?.['turn'])
+    batches.set(session, { kind, block, text: text.slice(0, MAX_DELTA_CHARS), timer, ...(turn === undefined ? {} : { turn }) })
   }
 
   // One notification per change of stage, not per token.
@@ -184,13 +226,15 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
       const frame = record(record(payload)?.['frame'])
       const stage = stageOf(frame)
       if (session === undefined) return
+      const hostTurn = count(frame?.['turn'])
+      if (hostTurn !== undefined && hostTurns.get(session) !== hostTurn) return
       if (stage !== undefined && stages.get(session) !== stage) {
         if (stages.size >= 256 && !stages.has(session)) stages.clear()
         stages.set(session, stage)
         // A change of stage closes the batch before it, so text never trails its stage.
         flush(session)
         const step = steps.get(session)
-        notify(session, { type: 'stage', stage, ...(step === undefined ? {} : { step }) })
+        notify(session, { type: 'stage', stage, ...(step === undefined ? {} : { step }), ...(count(frame?.['turn']) === undefined ? {} : { turn: frame?.['turn'] }) })
       }
       preview(session, frame)
     },
@@ -236,8 +280,11 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
       }, 0)
     }
     // Host turns include the ones dsh starts itself to continue a goal.
-    if (type === 'turn/start') notify(session, { type: 'host-turn', state: 'start' })
-    else if (type === 'turn/end') notify(session, { type: 'host-turn', state: 'end' })
+    const hostTurn = count(record(record(event)?.['data'])?.['turn'])
+    if (type === 'turn/start' || type === 'turn/end') {
+      flush(session)
+      notify(session, { type: 'host-turn', state: type === 'turn/start' ? 'start' : 'end', ...(hostTurn === undefined ? {} : { turn: hostTurn }) })
+    }
     if (type === 'goal/change') {
       const goal = goalOf(record(event)?.['data'])
       if (goal !== undefined) notify(session, goal)
@@ -266,7 +313,7 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
         hostTurns.clear()
         steps.clear()
       }
-      open.set(session, new Set())
+      if (!open.has(session)) open.set(session, new Set())
       const turn = count(record(record(event)?.['data'])?.['turn'])
       if (turn !== undefined) hostTurns.set(session, turn)
       else hostTurns.delete(session)
@@ -289,7 +336,7 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
           steps.set(session, step)
         } else if (steps.get(session) !== step) return
         flush(session)
-        notify(session, { type: 'step', step, state: type === 'step/start' ? 'start' : 'end' })
+        notify(session, { type: 'step', turn, step, state: type === 'step/start' ? 'start' : 'end' })
       }
     } else if (type === 'todo/write') {
       const todos = todosOf(record(event)?.['data'])
@@ -306,6 +353,16 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
   })
 
   return {
+    async cancelBackground(session) {
+      const agent = ctx.get('agents')?.get(session)
+      const service = ctx.get('subagents') as { drainContinuableChildren?: (parent: unknown, ids: string[]) => Promise<void> } | undefined
+      if (agent?.cancel === undefined || agent.whenIdle === undefined || service?.drainContinuableChildren === undefined) throw new Error('this host cannot confirm background cancellation')
+      const ids = [...childRuns.values()].filter(child => child.session === session).map(child => child.id)
+      await service.drainContinuableChildren(agent, [...new Set(ids)])
+      agent.cancel({ kind: 'user' })
+      await agent.whenIdle()
+      return { stopped: true }
+    },
     setGoals(session, allowed) {
       if (allowed) noGoals.delete(session)
       else {
@@ -316,16 +373,19 @@ export function relayEvents(ctx: HostContext, send: (frame: Frame) => void): Liv
       return { allowed }
     },
     steer(session, text, createUserMessage) {
-      const pending = open.get(session)
       const agent = ctx.get('agents')?.get(session)
       if (agent === undefined) throw new Error(`session "${session}" has no running agent in this dsh process`)
+      const background = [...childRuns.values()].some(child => child.session === session)
+      if (background && !open.has(session)) open.set(session, new Set())
+      const pending = open.get(session)
       // An idle agent would start a turn of its own that no prompt is waiting for.
-      if (pending === undefined || agent.status !== 'running') throw new Error('no turn is running; send this as a new task')
+      if (pending === undefined || (agent.status !== 'running' && (!background || agent.followup === undefined))) throw new Error('no turn is running; send this as a new task')
       if (text.trim() === '' || text.length > MAX_STEER_CHARS) throw new Error('steering text is empty or too long')
       const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
       pending.add(message.id)
       try {
-        agent.steer(message)
+        if (agent.status === 'idle') agent.followup?.(message)
+        else agent.steer(message)
       } catch (error) {
         pending.delete(message.id)
         throw error
@@ -343,6 +403,7 @@ interface GoalService {
 
 /** Live turns as the relay tracks them. */
 export interface LiveTurns {
+  cancelBackground(session: string): Promise<{ stopped: boolean }>
   /** Allow or forbid dsh session goals for one session; forbidding clears an existing one. */
   setGoals(session: string, allowed: boolean): { allowed: boolean }
   /**

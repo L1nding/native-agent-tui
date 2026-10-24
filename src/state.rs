@@ -1367,6 +1367,30 @@ impl SessionState {
         self.notice_item(format!("goal:{turn}:{round}"), turn, text, true);
     }
 
+    pub fn background_notice(&mut self, turn: &str, pending: u64, running: bool) {
+        if self.view.turn_id.as_deref() != Some(turn)
+            || !matches!(
+                self.view.phase,
+                SessionPhase::Running | SessionPhase::GatePending
+            )
+        {
+            return;
+        }
+        let text = if running {
+            format!("主 Agent 正在工作 · 后台子 Agent {pending} 项未结束")
+        } else if pending > 0 {
+            format!("主 Agent 本段已结束 · 后台子 Agent {pending} 项仍在运行，任务尚未完成")
+        } else {
+            "后台子 Agent 与主 Agent 续行已结束".into()
+        };
+        self.notice_item(
+            format!("background:{turn}"),
+            turn,
+            text,
+            !running && pending == 0,
+        );
+    }
+
     /// 上下文压缩的开始与结果；同一次压缩始终是同一行。
     pub fn compaction_notice(&mut self, turn: Option<&str>, id: &str, state: &str) {
         let (text, complete) = match state {
@@ -1394,6 +1418,8 @@ impl SessionState {
                     "Steering outcome unknown."
                 } else if message.id.starts_with("command:") {
                     "Command outcome unknown."
+                } else if message.id.starts_with("background:") {
+                    "后台子 Agent 或主 Agent 续行结果未知。"
                 } else {
                     "Context compaction ended, outcome unknown."
                 }

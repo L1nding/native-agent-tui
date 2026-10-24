@@ -323,7 +323,12 @@ enum Pending {
         session: String,
         result: Value,
     },
-    Prompt,
+    Prompt {
+        turn_id: String,
+    },
+    BackgroundCancel {
+        core_id: RpcId,
+    },
     /// The plugin's skill catalog, to be reshaped into the inventory Core reads.
     Skills {
         cwd: String,
@@ -390,6 +395,7 @@ struct AcpBridge {
     no_goals: bool,
     /// A dsh host turn (prompted or a goal round) is between its start and end.
     host_turn_running: bool,
+    background: BackgroundWork,
     /// The prompt already returned; the turn ends when the goal rounds stop.
     deferred_finish: Option<(RpcId, String)>,
     /// No new goal round started by then: end the deferred turn.
@@ -428,6 +434,28 @@ struct AcpBridge {
         HashMap<String, (acp_protocol::ToolKind, String, Vec<acp_protocol::FileDiff>)>,
 }
 
+#[derive(Default)]
+struct BackgroundWork {
+    runs: HashMap<String, String>,
+    first_host_turn: Option<u64>,
+    host_turn: Option<u64>,
+    settled_turn: Option<u64>,
+    closed_host_turn: u64,
+    resume_pending: bool,
+    canceling: bool,
+    failure: Option<BackgroundFailure>,
+    interrupted: bool,
+    delegated: bool,
+    step_offset: u64,
+    host_step: u64,
+}
+
+enum BackgroundFailure {
+    Provider(Option<&'static str>),
+    OutputDelivery,
+    Unknown,
+}
+
 struct LiveItem {
     id: String,
     thinking: bool,
@@ -448,6 +476,7 @@ impl AcpBridge {
             goal_active: false,
             no_goals: config.domain_setup.is_some(),
             host_turn_running: false,
+            background: BackgroundWork::default(),
             deferred_finish: None,
             goal_idle_deadline: None,
             pending: HashMap::new(),
@@ -635,6 +664,7 @@ impl AcpBridge {
         result: &Value,
     ) -> Result<(), TransportError> {
         self.session_id = Some(session.clone());
+        self.background = BackgroundWork::default();
         self.suppress_goals(&session)?;
         self.message_text.clear();
         self.tool_inputs.clear();
@@ -744,7 +774,8 @@ impl AcpBridge {
                 self.block = None;
                 self.live_items.clear();
                 self.live_settled = false;
-                self.turn_id = Some(format!("acp-turn-{}", id_text(&id)));
+                let turn_id = format!("acp-turn-{}", id_text(&id));
+                self.turn_id = Some(turn_id.clone());
                 self.turn_started = true;
                 self.core.send(Envelope::notification(
                     "turn/started",
@@ -753,7 +784,7 @@ impl AcpBridge {
                         "turn": {"id": self.turn_id.as_deref().unwrap_or_default()}
                     })),
                 ))?;
-                self.pending.insert(id.clone(), Pending::Prompt);
+                self.pending.insert(id.clone(), Pending::Prompt { turn_id });
                 self.acp.send(acp_protocol::session_prompt_request(
                     id.clone(),
                     &session,
@@ -771,10 +802,27 @@ impl AcpBridge {
                 if let Some(session) = &self.session_id {
                     self.acp.send(acp_protocol::session_cancel(session))?;
                 }
+                if !self.background.runs.is_empty() {
+                    self.background.canceling = true;
+                    let request = RpcId::String(format!("acp-background-cancel-{}", id_text(&id)));
+                    self.pending.insert(
+                        request.clone(),
+                        Pending::BackgroundCancel {
+                            core_id: id.clone(),
+                        },
+                    );
+                    self.deferred_finish = Some((id, "interrupted".into()));
+                    return self.acp.send(with_jsonrpc(Envelope::request(
+                        request,
+                        "zf/session/background/cancel",
+                        Some(json!({"sessionId":self.session_id})),
+                    )));
+                }
                 // The prompt already returned while goal rounds ran: end the turn here.
-                if let Some((prompt, _)) = self.deferred_finish.take() {
+                if let Some((_, status)) = self.deferred_finish.as_mut() {
                     self.goal_idle_deadline = None;
-                    self.finish_prompt(prompt, "interrupted", None)?;
+                    *status = "interrupted".into();
+                    self.finish_deferred()?;
                 }
                 // ACP cancel is a notification. The synthetic acknowledgement
                 // only releases Core's pending RPC; terminal state comes from
@@ -1257,7 +1305,136 @@ impl AcpBridge {
             return Ok(());
         };
         let event = &params["event"];
+        let scoped = matches!(
+            event["type"].as_str(),
+            Some(
+                "step"
+                    | "stage"
+                    | "delta"
+                    | "delta-end"
+                    | "steer"
+                    | "retry"
+                    | "todos"
+                    | "goal-round"
+            )
+        );
+        if scoped
+            && (event["turn"].is_number() || self.background.host_turn.is_some())
+            && event["turn"].as_u64() != self.background.host_turn
+        {
+            return Ok(());
+        }
+        if let Some(host) = event["turn"].as_u64() {
+            let boundary = matches!(event["type"].as_str(), Some("host-turn" | "host-settled"));
+            if !boundary
+                && self
+                    .background
+                    .host_turn
+                    .is_some_and(|current| host != current)
+            {
+                return Ok(());
+            }
+        }
         match event["type"].as_str() {
+            Some("background-error") => return Err(TransportError::Overloaded),
+            Some("subagent-run") => {
+                let (Some(run), Some(id)) = (
+                    event["runId"]
+                        .as_str()
+                        .filter(|s| !s.is_empty() && s.len() <= 128),
+                    event["id"]
+                        .as_str()
+                        .filter(|s| !s.is_empty() && s.len() <= 1024),
+                ) else {
+                    return Ok(());
+                };
+                if self.turn_id.is_none() {
+                    return Ok(());
+                }
+                match event["state"].as_str() {
+                    Some("start")
+                        if self.background.runs.len() >= 256
+                            && !self.background.runs.contains_key(run) =>
+                    {
+                        return Err(TransportError::Overloaded);
+                    }
+                    Some("start") if self.background.runs.len() < 256 => {
+                        self.background.delegated = true;
+                        self.background
+                            .runs
+                            .entry(run.into())
+                            .or_insert_with(|| id.into());
+                    }
+                    Some("end")
+                        if self
+                            .background
+                            .runs
+                            .get(run)
+                            .is_some_and(|child| child == id) =>
+                    {
+                        self.background.runs.remove(run);
+                        self.background.resume_pending |= !self.host_turn_running;
+                    }
+                    _ => return Ok(()),
+                }
+                self.background_notice()?;
+                self.settle_background()?;
+            }
+            Some("host-settled") => {
+                if !matches!(
+                    event["state"].as_str(),
+                    Some("completed" | "failed" | "interrupted")
+                ) {
+                    return Ok(());
+                }
+                let Some(host) = event["turn"].as_u64().filter(|turn| {
+                    self.background
+                        .first_host_turn
+                        .is_some_and(|first| *turn >= first)
+                        && self.background.host_turn.is_some_and(|last| *turn <= last)
+                }) else {
+                    return Ok(());
+                };
+                self.background.settled_turn =
+                    Some(self.background.settled_turn.unwrap_or(0).max(host));
+                if event["state"] == "failed" {
+                    let failure = match event["failureCategory"].as_str() {
+                        Some("provider") => BackgroundFailure::Provider(
+                            [
+                                "AUTH",
+                                "QUOTA_EXCEEDED",
+                                "RATE_LIMIT",
+                                "SERVER",
+                                "TIMEOUT",
+                                "TRANSPORT",
+                                "PI_AI_ERROR",
+                                "CONTEXT_WINDOW_EXCEEDED",
+                                "EMPTY_RESPONSE",
+                            ]
+                            .into_iter()
+                            .find(|code| Some(*code) == event["failureCode"].as_str()),
+                        ),
+                        Some("output_delivery") => BackgroundFailure::OutputDelivery,
+                        _ => BackgroundFailure::Unknown,
+                    };
+                    // 旧宿主缺少分类时保留已有明确失败；投递失败优先，避免误报 provider。
+                    if matches!(
+                        self.background.failure,
+                        None | Some(BackgroundFailure::Unknown)
+                    ) || matches!(failure, BackgroundFailure::OutputDelivery)
+                    {
+                        self.background.failure = Some(failure);
+                    }
+                }
+                self.background.interrupted |= event["state"] == "interrupted";
+                self.background_notice()?;
+                if event["state"] == "interrupted" {
+                    if let Some((_, status)) = self.deferred_finish.as_mut() {
+                        *status = "interrupted".into();
+                    }
+                }
+                self.settle_background()?;
+            }
             Some("subagent") => {
                 let (Some(id), Some(state), Some(summary)) = (
                     event["id"]
@@ -1287,6 +1464,8 @@ impl AcpBridge {
                 ) else {
                     return Ok(());
                 };
+                self.background.host_step = self.background.host_step.max(step);
+                let step = self.background.step_offset.saturating_add(step);
                 if !self.turn_started {
                     if state != "start" {
                         return Ok(());
@@ -1326,7 +1505,7 @@ impl AcpBridge {
                     .as_u64()
                     .filter(|step| *step <= 9_007_199_254_740_991)
                 {
-                    params["step"] = json!(step);
+                    params["step"] = json!(self.background.step_offset.saturating_add(step));
                 }
                 self.core
                     .send(Envelope::notification("turn/stage", Some(params)))?;
@@ -1413,11 +1592,35 @@ impl AcpBridge {
             }
             Some("host-turn") => match event["state"].as_str() {
                 Some("start") => {
+                    if let Some(host) = event["turn"].as_u64() {
+                        if self.turn_id.is_none()
+                            || host <= self.background.closed_host_turn
+                            || self.background.host_turn.is_some_and(|last| host <= last)
+                        {
+                            return Ok(());
+                        }
+                        self.background.first_host_turn.get_or_insert(host);
+                        self.background.step_offset = self
+                            .background
+                            .step_offset
+                            .saturating_add(self.background.host_step);
+                        self.background.host_step = 0;
+                        self.background.host_turn = Some(host);
+                        self.background.resume_pending = false;
+                    }
                     self.host_turn_running = true;
                     self.goal_idle_deadline = None;
+                    self.background_notice()?;
                 }
                 Some("end") => {
+                    if event["turn"]
+                        .as_u64()
+                        .is_some_and(|host| self.background.host_turn != Some(host))
+                    {
+                        return Ok(());
+                    }
                     self.host_turn_running = false;
+                    self.background_notice()?;
                     if self.deferred_finish.is_some() {
                         if self.goal_active {
                             self.goal_idle_deadline = Some(tokio::time::Instant::now() + GOAL_IDLE);
@@ -1592,7 +1795,17 @@ impl AcpBridge {
         if matches!(kind, Pending::Ignored) {
             return Ok(());
         }
-        if let (Some(error), Pending::Prompt) = (&message.error, &kind) {
+        if let Pending::Prompt { turn_id } = &kind {
+            if self.turn_id.as_ref() != Some(turn_id) {
+                return Ok(());
+            }
+        }
+        if matches!(kind, Pending::BackgroundCancel { .. }) && message.error.is_some() {
+            return Err(TransportError::Failed(
+                "DSH background cancellation was not confirmed".into(),
+            ));
+        }
+        if let (Some(error), Pending::Prompt { .. }) = (&message.error, &kind) {
             // ACP 的 prompt 错误响应表示这一轮已确定以错误结束，不是不确定结果；
             // 映射为 failed 终态，用户可以继续提交或重试。
             let text = error
@@ -1600,6 +1813,13 @@ impl AcpBridge {
                 .and_then(Value::as_str)
                 .unwrap_or("ACP prompt failed")
                 .to_owned();
+            if !self.background.runs.is_empty() || self.background.host_turn.is_some() {
+                self.background
+                    .failure
+                    .get_or_insert(BackgroundFailure::Unknown);
+                self.deferred_finish = Some((id, "failed".into()));
+                return self.finish_deferred();
+            }
             return self.finish_prompt(id, "failed", Some(text));
         }
         if let (
@@ -1759,6 +1979,7 @@ impl AcpBridge {
                     ));
                 };
                 self.session_id = Some(session.clone());
+                self.background = BackgroundWork::default();
                 self.suppress_goals(&session)?;
                 self.reloaded(core_id, session, &result)?;
             }
@@ -1808,6 +2029,7 @@ impl AcpBridge {
                     return Ok(());
                 };
                 self.session_id = Some(session.clone());
+                self.background = BackgroundWork::default();
                 self.suppress_goals(&session)?;
                 let models = acp_protocol::model_choices(&result);
                 self.models = models.clone();
@@ -1890,13 +2112,24 @@ impl AcpBridge {
                 label,
                 ..
             } => self.confirm(core_id, &session, Some(label))?,
-            Pending::Prompt => {
+            Pending::Prompt { .. } => {
                 let status = match acp_protocol::stop_reason(&result) {
                     Some("end_turn" | "completed") => "completed",
                     Some("cancelled" | "canceled") => "interrupted",
                     Some(_) | None => "failed",
                 };
-                if status == "completed" && self.goal_active && self.turn_id.is_some() {
+                if self.background.host_turn.is_some()
+                    || !self.background.runs.is_empty()
+                    || self.background.canceling
+                {
+                    let status = if self.background.canceling {
+                        "interrupted"
+                    } else {
+                        status
+                    };
+                    self.deferred_finish = Some((id, status.into()));
+                    self.settle_background()?;
+                } else if status == "completed" && self.goal_active && self.turn_id.is_some() {
                     // dsh continues the goal on its own; keep this turn open for those rounds.
                     self.deferred_finish = Some((id, status.into()));
                     if !self.host_turn_running {
@@ -1905,6 +2138,18 @@ impl AcpBridge {
                 } else {
                     self.finish_prompt(id, status, None)?;
                 }
+            }
+            Pending::BackgroundCancel { core_id } => {
+                if result["stopped"] != true {
+                    return Err(TransportError::Failed(
+                        "DSH background cancellation was not confirmed".into(),
+                    ));
+                }
+                self.background.canceling = false;
+                self.background.resume_pending = false;
+                self.core
+                    .send(Envelope::response(core_id, Some(json!({}))))?;
+                self.finish_deferred()?;
             }
             Pending::Skills { cwd } => {
                 self.core.send(Envelope::response(
@@ -1935,10 +2180,59 @@ impl AcpBridge {
     }
 
     /// End a turn whose prompt returned while dsh was still continuing its goal.
+    fn settle_background(&mut self) -> Result<(), TransportError> {
+        if self.goal_active
+            && self.background.failure.is_none()
+            && !self.background.interrupted
+            && !self.background.canceling
+        {
+            if !self.host_turn_running && self.deferred_finish.is_some() {
+                self.goal_idle_deadline
+                    .get_or_insert(tokio::time::Instant::now() + GOAL_IDLE);
+            }
+            return Ok(());
+        }
+        self.finish_deferred()
+    }
+
+    /// 等后台 children、宿主续行及其输出一起收尾，不触发额外 prompt。
     fn finish_deferred(&mut self) -> Result<(), TransportError> {
+        if !self.background.runs.is_empty()
+            || self.background.resume_pending
+            || self.background.canceling
+            || self.host_turn_running
+            || self
+                .background
+                .host_turn
+                .is_some_and(|host| self.background.settled_turn != Some(host))
+        {
+            return Ok(());
+        }
         self.goal_idle_deadline = None;
         match self.deferred_finish.take() {
-            Some((id, status)) => self.finish_prompt(id, &status, None),
+            Some((id, status)) => self.finish_prompt(
+                id,
+                if self.background.failure.is_some() {
+                    "failed"
+                } else if self.background.interrupted {
+                    "interrupted"
+                } else {
+                    &status
+                },
+                self.background
+                    .failure
+                    .as_ref()
+                    .map(|failure| match failure {
+                        BackgroundFailure::Provider(Some(code)) => {
+                            format!("模型服务请求失败（{code}）")
+                        }
+                        BackgroundFailure::Provider(None) => {
+                            "模型服务请求失败（未知错误码）".into()
+                        }
+                        BackgroundFailure::OutputDelivery => "DSH 输出转换或投递失败".into(),
+                        BackgroundFailure::Unknown => "DSH 后台续行或输出投递失败".into(),
+                    }),
+            ),
             None => Ok(()),
         }
     }
@@ -1975,6 +2269,7 @@ impl AcpBridge {
                 ))?;
             }
         }
+        self.background_notice()?;
         self.core.send(Envelope::notification(
             "turn/completed",
             Some(json!({
@@ -1984,13 +2279,75 @@ impl AcpBridge {
         ))?;
         self.turn_started = false;
         self.turn_id = None;
+        // 后台取消可先于原 prompt 响应完成；退休其 RPC，避免迟到响应作用于下一轮。
+        self.pending.retain(
+            |_, pending| !matches!(pending, Pending::Prompt { turn_id } if turn_id == &turn),
+        );
+        self.background.closed_host_turn = self
+            .background
+            .host_turn
+            .unwrap_or(self.background.closed_host_turn);
+        self.background.first_host_turn = None;
+        self.background.host_turn = None;
+        self.background.settled_turn = None;
+        self.background.resume_pending = false;
+        self.background.failure = None;
+        self.background.interrupted = false;
+        self.background.delegated = false;
+        self.background.step_offset = 0;
+        self.background.host_step = 0;
+        Ok(())
+    }
+
+    fn background_notice(&self) -> Result<(), TransportError> {
+        if !self.background.delegated {
+            return Ok(());
+        }
+        if let Some(turn) = &self.turn_id {
+            let running = self.host_turn_running
+                || self.background.resume_pending
+                || self
+                    .background
+                    .host_turn
+                    .is_some_and(|host| self.background.settled_turn != Some(host));
+            self.core.send(Envelope::notification(
+                "turn/notice",
+                Some(json!({
+                    "threadId":self.session_id,"turnId":turn,"kind":"background",
+                    "pending":self.background.runs.len(),"running":running
+                })),
+            ))?;
+        }
         Ok(())
     }
 
     async fn update(&mut self, params: Value) -> Result<(), TransportError> {
+        if params["sessionId"].as_str() != self.session_id.as_deref() {
+            return Ok(());
+        }
+        if let Some(host) = params["_meta"]["zfHostTurn"].as_u64() {
+            if self
+                .background
+                .first_host_turn
+                .is_none_or(|first| host < first)
+                || self.background.host_turn.is_none_or(|last| host > last)
+                || host <= self.background.closed_host_turn
+            {
+                return Ok(());
+            }
+        } else if self.background.host_turn.is_some()
+            && params["update"]["sessionUpdate"] != "config_option_update"
+        {
+            return Ok(());
+        }
         let (session, update) = match acp_protocol::update(&params) {
             Ok(value) => value,
             Err(error) => {
+                if !self.background.runs.is_empty() || self.background.host_turn.is_some() {
+                    return Err(TransportError::Failed(
+                        "DSH ACP update failed during background work".into(),
+                    ));
+                }
                 if let (Some(session), Some(turn)) = (self.session_id.clone(), self.turn_id.clone())
                 {
                     self.core.send(Envelope::notification(
@@ -2275,6 +2632,618 @@ mod tests {
             event.params.unwrap(),
             json!({"threadId":"s","id":"child","state":"completed","summary":"区域判读结束"})
         );
+    }
+
+    #[tokio::test]
+    async fn background_children_keep_parent_continuations_and_drained_outputs_in_one_execution() {
+        for status in ["completed", "failed", "interrupted"] {
+            let (mut core, core_bridge) = pair();
+            let (mut acp, acp_bridge) = pair();
+            let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+            bridge.session_id = Some("s".into());
+            bridge
+                .handle_core(app_server::turn_start(RpcId::Number(7), "s", "work", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                acp.recv().await.unwrap().method.as_deref(),
+                Some("session/prompt")
+            );
+            let event = |value: Value| json!({"sessionId":"s","event":value});
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":1,"state":"start"})))
+                .unwrap();
+            bridge
+                .plugin_event(event(
+                    json!({"type":"subagent-run","id":"child","runId":"run-1","state":"start"}),
+                ))
+                .unwrap();
+            bridge
+                .plugin_event(event(
+                    json!({"type":"step","turn":1,"step":1,"state":"start"}),
+                ))
+                .unwrap();
+            assert_eq!(until(&mut core, "turn/step").await.1["step"], 1);
+            bridge
+                .plugin_event(event(
+                    json!({"type":"step","turn":1,"step":1,"state":"end"}),
+                ))
+                .unwrap();
+            until(&mut core, "turn/step").await;
+            bridge
+                .plugin_event(event(
+                    json!({"type":"subagent-run","id":"child","runId":"run-1","state":"start"}),
+                ))
+                .unwrap();
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":1,"state":"end"})))
+                .unwrap();
+            bridge
+                .plugin_event(event(
+                    json!({"type":"host-settled","turn":1,"state":"completed"}),
+                ))
+                .unwrap();
+            bridge
+                .response(
+                    RpcId::Number(7),
+                    Envelope::response(RpcId::Number(7), Some(json!({"stopReason":"end_turn"}))),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bridge.turn_id.as_deref(),
+                Some("acp-turn-7"),
+                "a background child is not a completed workflow"
+            );
+            assert_eq!(bridge.background.runs.len(), 1);
+            bridge
+                .plugin_event(event(
+                    json!({"type":"subagent-run","id":"wrong","runId":"run-1","state":"end"}),
+                ))
+                .unwrap();
+            assert_eq!(bridge.background.runs.len(), 1);
+            bridge
+                .plugin_event(event(
+                    json!({"type":"subagent-run","id":"child","runId":"run-1","state":"end"}),
+                ))
+                .unwrap();
+            assert!(
+                bridge.turn_id.is_some(),
+                "settlement must wait for the already-enqueued parent continuation"
+            );
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+                .unwrap();
+            bridge
+                .plugin_event(event(
+                    json!({"type":"step","turn":2,"step":1,"state":"start"}),
+                ))
+                .unwrap();
+            assert_eq!(until(&mut core, "turn/step").await.1["step"], 2);
+            bridge.update(json!({"sessionId":"s","_meta":{"zfHostTurn":2},"update":{
+                "sessionUpdate":"agent_message_chunk","messageId":"parent-result","content":{"type":"text","text":"child result registered"}
+            }})).await.unwrap();
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":1,"state":"end"})))
+                .unwrap();
+            assert!(
+                bridge.host_turn_running,
+                "a late old boundary cannot end the continuation"
+            );
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":2,"state":"end"})))
+                .unwrap();
+            assert!(
+                bridge.turn_id.is_some(),
+                "raw host turn/end is not an output drain"
+            );
+            bridge
+                .plugin_event(event(
+                    json!({"type":"host-settled","turn":2,"state":status}),
+                ))
+                .unwrap();
+            let (methods, finished) = until(&mut core, "turn/completed").await;
+            assert_eq!(finished["turn"]["id"], "acp-turn-7");
+            assert_eq!(finished["turn"]["status"], status);
+            assert!(methods.iter().any(|m| m == "item/agentMessage/delta"));
+            assert!(methods.iter().any(|m| m == "item/completed"));
+            assert!(bridge.turn_id.is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), acp.recv())
+                    .await
+                    .is_err(),
+                "Native must not issue another prompt to consume the same child result"
+            );
+            bridge
+                .handle_core(app_server::turn_start(RpcId::Number(8), "s", "next", None))
+                .await
+                .unwrap();
+            acp.recv().await.unwrap();
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+                .unwrap();
+            bridge
+                .update(json!({"sessionId":"s","_meta":{"zfHostTurn":2},"update":null}))
+                .await
+                .unwrap();
+            assert_eq!(
+                bridge.turn_id.as_deref(),
+                Some("acp-turn-8"),
+                "a malformed retired update cannot fail the new turn"
+            );
+            bridge.update(json!({"sessionId":"s","_meta":{"zfHostTurn":2},"update":{
+                "sessionUpdate":"agent_message_chunk","messageId":"late","content":{"type":"text","text":"old output"}
+            }})).await.unwrap();
+            assert!(!bridge.message_text.contains_key("late"));
+            bridge
+                .plugin_event(event(json!({"type":"host-turn","turn":3,"state":"start"})))
+                .unwrap();
+            bridge.update(json!({"sessionId":"s","_meta":{"zfHostTurn":3},"update":{
+                "sessionUpdate":"agent_message_chunk","messageId":"current","content":{"type":"text","text":"new output"}
+            }})).await.unwrap();
+            assert!(bridge.message_text.contains_key("current"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_background_children_resume_parent_over_mock_acp_without_another_prompt() {
+        for (terminal, category, code, expected_error) in [
+            ("completed", None, None, None),
+            ("interrupted", None, None, None),
+            ("failed", None, None, Some("DSH 后台续行或输出投递失败")),
+            (
+                "failed",
+                Some("provider"),
+                Some("PI_AI_ERROR"),
+                Some("模型服务请求失败（PI_AI_ERROR）"),
+            ),
+            (
+                "failed",
+                Some("provider"),
+                Some("RATE_LIMIT"),
+                Some("模型服务请求失败（RATE_LIMIT）"),
+            ),
+            (
+                "failed",
+                Some("provider"),
+                Some("PRIVATE_CODE"),
+                Some("模型服务请求失败（未知错误码）"),
+            ),
+            (
+                "failed",
+                Some("output_delivery"),
+                Some("PRIVATE_CODE"),
+                Some("DSH 输出转换或投递失败"),
+            ),
+            (
+                "failed",
+                Some("PRIVATE_CATEGORY"),
+                Some("PRIVATE_CODE"),
+                Some("DSH 后台续行或输出投递失败"),
+            ),
+        ] {
+            let (mut core, core_bridge) = pair();
+            let (mut acp, acp_bridge) = pair();
+            let config = Config::default();
+            let task = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+            let prompt = prompted_turn(&mut core, &mut acp, &config).await;
+            let event = |value: Value| {
+                Envelope::notification(
+                    "zf/session/event",
+                    Some(json!({"sessionId":"s","event":value})),
+                )
+            };
+            let message = |host: u64, id: &str, text: &str| {
+                Envelope::notification(
+                    "session/update",
+                    Some(
+                        json!({"sessionId":"s","_meta":{"zfHostTurn":host},"update":{
+                            "sessionUpdate":"agent_message_chunk","messageId":id,"content":{"type":"text","text":text}
+                        }}),
+                    ),
+                )
+            };
+            acp.send(event(json!({"type":"host-turn","turn":1,"state":"start"})))
+                .unwrap();
+            for id in ["a", "b"] {
+                acp.send(event(
+                    json!({"type":"subagent-run","runId":id,"id":id,"state":"start"}),
+                ))
+                .unwrap();
+            }
+            acp.send(message(1, "independent", "parent independent work"))
+                .unwrap();
+            acp.send(event(json!({"type":"host-turn","turn":1,"state":"end"})))
+                .unwrap();
+            acp.send(event(
+                json!({"type":"host-settled","turn":1,"state":"completed"}),
+            ))
+            .unwrap();
+            acp.send(Envelope::response(
+                prompt,
+                Some(json!({"stopReason":"end_turn"})),
+            ))
+            .unwrap();
+            let mut output = Vec::new();
+            let mut messages = Vec::new();
+            let mut root_turn = String::new();
+            for pending in [2, 1] {
+                loop {
+                    let frame = tokio::time::timeout(Duration::from_secs(2), core.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_ne!(
+                        frame.method.as_deref(),
+                        Some("turn/completed"),
+                        "{terminal}: unfinished background work was declared complete"
+                    );
+                    let params = frame.params.unwrap_or(Value::Null);
+                    if frame.method.as_deref() == Some("item/agentMessage/delta") {
+                        messages.push(params["delta"].as_str().unwrap().to_owned());
+                        root_turn = params["turnId"].as_str().unwrap().into();
+                    }
+                    if frame.method.as_deref() == Some("turn/notice")
+                        && params["kind"] == "background"
+                        && params["pending"] == pending
+                        && params["running"] == false
+                    {
+                        break;
+                    }
+                }
+                if pending == 2 {
+                    acp.send(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+                        .unwrap();
+                    acp.send(event(
+                        json!({"type":"subagent-run","runId":"a","id":"a","state":"end"}),
+                    ))
+                    .unwrap();
+                    acp.send(message(
+                        2,
+                        "resume-a",
+                        "child A registered; parent continues independent work",
+                    ))
+                    .unwrap();
+                    acp.send(event(json!({"type":"host-turn","turn":2,"state":"end"})))
+                        .unwrap();
+                    acp.send(event(
+                        json!({"type":"host-settled","turn":2,"state":"completed"}),
+                    ))
+                    .unwrap();
+                }
+            }
+            assert!(messages.iter().any(|m| m.starts_with("child A registered")));
+            let cancel = if terminal == "interrupted" {
+                core.send(Envelope::request(
+                    RpcId::Number(9),
+                    "turn/interrupt",
+                    Some(json!({"threadId":"s","turnId":root_turn})),
+                ))
+                .unwrap();
+                assert_eq!(
+                    acp.recv().await.unwrap().method.as_deref(),
+                    Some("session/cancel")
+                );
+                let cancel = acp.recv().await.unwrap();
+                assert_eq!(
+                    cancel.method.as_deref(),
+                    Some("zf/session/background/cancel")
+                );
+                cancel.id
+            } else {
+                None
+            };
+            // 已退休宿主轮的边界、预览和坏帧均不得影响下一次 parent 续行。
+            acp.send(event(json!({"type":"host-turn","turn":1,"state":"end"})))
+                .unwrap();
+            acp.send(event(json!({"type":"host-turn","turn":3,"state":"start"})))
+                .unwrap();
+            acp.send(event(
+                json!({"type":"delta","turn":1,"kind":"text","block":0,"text":"LATE_PREVIEW"}),
+            ))
+            .unwrap();
+            acp.send(event(
+                json!({"type":"subagent-run","runId":"b","id":"b","state":"end"}),
+            ))
+            .unwrap();
+            acp.send(event(
+                json!({"type":"subagent-run","runId":"a","id":"a","state":"end"}),
+            ))
+            .unwrap();
+            acp.send(message(3, "resume-b", "child B registered"))
+                .unwrap();
+            acp.send(event(json!({"type":"host-turn","turn":3,"state":"end"})))
+                .unwrap();
+            acp.send(event(
+                json!({"type":"host-settled","turn":3,"state":terminal,
+                    "failureCategory":category,"failureCode":code,"message":"PRIVATE_PROVIDER_SECRET"}),
+            ))
+            .unwrap();
+            if let Some(id) = cancel {
+                acp.send(Envelope::response(id, Some(json!({"stopped":true}))))
+                    .unwrap();
+            }
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(2), core.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let params = frame.params.unwrap_or(Value::Null);
+                if frame.method.as_deref() == Some("item/agentMessage/delta") {
+                    assert_eq!(params["turnId"], root_turn);
+                    messages.push(params["delta"].as_str().unwrap().to_owned());
+                }
+                output.push(frame.method.clone());
+                if frame.method.as_deref() == Some("turn/completed") {
+                    assert_eq!(params["turn"]["id"], root_turn);
+                    assert_eq!(params["turn"]["status"], terminal);
+                    assert_eq!(params["turn"]["error"]["message"].as_str(), expected_error);
+                    assert!(!params.to_string().contains("PRIVATE_"));
+                    break;
+                }
+            }
+            assert_eq!(
+                messages,
+                [
+                    "parent independent work",
+                    "child A registered; parent continues independent work",
+                    "child B registered"
+                ]
+            );
+            assert_eq!(
+                output
+                    .iter()
+                    .filter(|method| method.as_deref() == Some("turn/completed"))
+                    .count(),
+                1
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), acp.recv())
+                    .await
+                    .is_err(),
+                "{terminal}: duplicate prompt or restart"
+            );
+            drop(core);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_background_prompt_response_cannot_finish_the_next_execution() {
+        for old_error in [false, true] {
+            for after_host_start in [false, true] {
+                let (mut core, core_bridge) = pair();
+                let (mut acp, acp_bridge) = pair();
+                let config = Config::default();
+                let task = tokio::spawn(AcpBridge::new(core_bridge, acp_bridge, &config).run());
+                let old_prompt = prompted_turn(&mut core, &mut acp, &config).await;
+                let event = |value: Value| {
+                    Envelope::notification(
+                        "zf/session/event",
+                        Some(json!({"sessionId":"s","event":value})),
+                    )
+                };
+                acp.send(event(json!({"type":"host-turn","turn":1,"state":"start"})))
+                    .unwrap();
+                acp.send(event(
+                    json!({"type":"subagent-run","runId":"a","id":"a","state":"start"}),
+                ))
+                .unwrap();
+                loop {
+                    let (_, notice) = until(&mut core, "turn/notice").await;
+                    if notice["kind"] == "background" && notice["pending"] == 1 {
+                        break;
+                    }
+                }
+                core.send(Envelope::request(
+                    RpcId::Number(9),
+                    "turn/interrupt",
+                    Some(json!({"threadId":"s","turnId":"acp-turn-3"})),
+                ))
+                .unwrap();
+                assert_eq!(
+                    acp.recv().await.unwrap().method.as_deref(),
+                    Some("session/cancel")
+                );
+                let cancel = acp.recv().await.unwrap();
+                assert_eq!(
+                    cancel.method.as_deref(),
+                    Some("zf/session/background/cancel")
+                );
+                acp.send(event(
+                    json!({"type":"subagent-run","runId":"a","id":"a","state":"end"}),
+                ))
+                .unwrap();
+                acp.send(event(json!({"type":"host-turn","turn":1,"state":"end"})))
+                    .unwrap();
+                acp.send(event(
+                    json!({"type":"host-settled","turn":1,"state":"interrupted"}),
+                ))
+                .unwrap();
+                acp.send(Envelope::response(
+                    cancel.id.unwrap(),
+                    Some(json!({"stopped":true})),
+                ))
+                .unwrap();
+                let (before, finished) = until(&mut core, "turn/completed").await;
+                assert!(!before.iter().any(|method| method == "turn/completed"));
+                assert_eq!(finished["turn"]["id"], "acp-turn-3");
+                assert_eq!(finished["turn"]["status"], "interrupted");
+
+                core.send(app_server::turn_start(RpcId::Number(10), "s", "next", None))
+                    .unwrap();
+                let next_prompt = acp.recv().await.unwrap();
+                assert_eq!(next_prompt.method.as_deref(), Some("session/prompt"));
+                let (_, started) = until(&mut core, "turn/started").await;
+                assert_eq!(started["turn"]["id"], "acp-turn-10");
+                if after_host_start {
+                    acp.send(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+                        .unwrap();
+                }
+                acp.send(if old_error {
+                    Envelope::error_response(old_prompt, -32000, "retired prompt failed")
+                } else {
+                    Envelope::response(old_prompt, Some(json!({"stopReason":"end_turn"})))
+                })
+                .unwrap();
+                if !after_host_start {
+                    acp.send(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+                        .unwrap();
+                }
+                acp.send(Envelope::notification(
+                    "session/update",
+                    Some(json!({
+                        "sessionId":"s","_meta":{"zfHostTurn":2},"update":{
+                            "sessionUpdate":"agent_message_chunk","messageId":"next-output",
+                            "content":{"type":"text","text":"new execution output"}
+                        }
+                    })),
+                ))
+                .unwrap();
+                acp.send(event(json!({"type":"host-turn","turn":2,"state":"end"})))
+                    .unwrap();
+                acp.send(event(
+                    json!({"type":"host-settled","turn":2,"state":"completed"}),
+                ))
+                .unwrap();
+                acp.send(Envelope::response(
+                    next_prompt.id.unwrap(),
+                    Some(json!({"stopReason":"end_turn"})),
+                ))
+                .unwrap();
+                let mut output = Vec::new();
+                loop {
+                    let frame = tokio::time::timeout(Duration::from_secs(2), core.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let params = frame.params.unwrap_or(Value::Null);
+                    if frame.method.as_deref() == Some("item/agentMessage/delta") {
+                        assert_eq!(params["turnId"], "acp-turn-10");
+                        output.push(params["delta"].as_str().unwrap().to_owned());
+                    }
+                    if frame.method.as_deref() == Some("turn/completed") {
+                        assert_eq!(params["turn"]["id"], "acp-turn-10");
+                        assert_eq!(
+                            params["turn"]["status"], "completed",
+                            "old_error={old_error}, after_host_start={after_host_start}"
+                        );
+                        assert!(params["turn"]["error"].is_null());
+                        break;
+                    }
+                }
+                assert_eq!(
+                    output,
+                    ["new execution output"],
+                    "old_error={old_error}, after_host_start={after_host_start}"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), core.recv())
+                        .await
+                        .is_err(),
+                    "a retired response must not emit a second terminal"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), acp.recv())
+                        .await
+                        .is_err(),
+                    "each execution sends exactly one prompt"
+                );
+                drop(core);
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn background_interrupt_waits_for_descendant_cancellation_and_parent_output_drain() {
+        let (mut core, core_bridge) = pair();
+        let (mut acp, acp_bridge) = pair();
+        let mut bridge = AcpBridge::new(core_bridge, acp_bridge, &Config::default());
+        bridge.session_id = Some("s".into());
+        bridge
+            .handle_core(app_server::turn_start(RpcId::Number(7), "s", "work", None))
+            .await
+            .unwrap();
+        acp.recv().await.unwrap();
+        let event = |value: Value| json!({"sessionId":"s","event":value});
+        bridge
+            .plugin_event(event(json!({"type":"host-turn","turn":1,"state":"start"})))
+            .unwrap();
+        bridge
+            .plugin_event(event(
+                json!({"type":"subagent-run","id":"child","runId":"run-1","state":"start"}),
+            ))
+            .unwrap();
+        bridge
+            .plugin_event(event(json!({"type":"host-turn","turn":1,"state":"end"})))
+            .unwrap();
+        bridge
+            .plugin_event(event(
+                json!({"type":"host-settled","turn":1,"state":"completed"}),
+            ))
+            .unwrap();
+        bridge
+            .response(
+                RpcId::Number(7),
+                Envelope::response(RpcId::Number(7), Some(json!({"stopReason":"end_turn"}))),
+            )
+            .await
+            .unwrap();
+        bridge
+            .handle_core(Envelope::request(
+                RpcId::Number(9),
+                "turn/interrupt",
+                Some(json!({"threadId":"s","turnId":"acp-turn-7"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            acp.recv().await.unwrap().method.as_deref(),
+            Some("session/cancel")
+        );
+        let cancel = acp.recv().await.unwrap();
+        assert_eq!(
+            cancel.method.as_deref(),
+            Some("zf/session/background/cancel")
+        );
+        assert!(bridge.turn_id.is_some());
+        bridge
+            .plugin_event(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+            .unwrap();
+        bridge
+            .plugin_event(event(
+                json!({"type":"subagent-run","id":"child","runId":"run-1","state":"end"}),
+            ))
+            .unwrap();
+        bridge
+            .response(
+                cancel.id.clone().unwrap(),
+                Envelope::response(cancel.id.unwrap(), Some(json!({"stopped":true}))),
+            )
+            .await
+            .unwrap();
+        assert!(bridge.turn_id.is_some());
+        bridge
+            .plugin_event(event(json!({"type":"host-turn","turn":2,"state":"end"})))
+            .unwrap();
+        bridge
+            .plugin_event(event(
+                json!({"type":"host-settled","turn":2,"state":"interrupted"}),
+            ))
+            .unwrap();
+        let (_, finished) = until(&mut core, "turn/completed").await;
+        assert_eq!(finished["turn"]["status"], "interrupted");
+        bridge
+            .plugin_event(event(json!({"type":"host-turn","turn":2,"state":"start"})))
+            .unwrap();
+        assert!(bridge.turn_id.is_none());
     }
 
     #[tokio::test]
