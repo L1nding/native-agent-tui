@@ -221,6 +221,7 @@ fn expand_fact_pages(setup: &DomainSetup, value: &mut Value, bytes: usize) -> Re
         directory: Option<PathBuf>,
         remaining: usize,
         references: usize,
+        active_pages: std::collections::BTreeSet<String>,
     }
     impl Pages<'_> {
         fn charge(&mut self, bytes: usize) -> Result<(), String> {
@@ -248,7 +249,7 @@ fn expand_fact_pages(setup: &DomainSetup, value: &mut Value, bytes: usize) -> Re
                 .as_object()
                 .is_some_and(|map| map.contains_key("$fact_pages"))
             {
-                // Python 只分割原数组，不递归分割页；拒绝页内引用也阻断循环图。
+                // 占位元数据不允许引用页；模型器可在页的 items 中继续分割嵌套数组。
                 if !self.allowed || !allow_pages || self.ok.as_bool().is_none() {
                     return Err("领域事实分页包含不支持的递归引用".into());
                 }
@@ -332,6 +333,9 @@ fn expand_fact_pages(setup: &DomainSetup, value: &mut Value, bytes: usize) -> Re
                                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                         })
                         .ok_or("领域事实分页 SHA256 无效")?;
+                    if self.active_pages.len() >= 64 || !self.active_pages.insert(hash.to_owned()) {
+                        return Err("领域事实分页循环或嵌套超过资源上限".into());
+                    }
                     let directory = self.directory.as_ref().unwrap();
                     let path = directory
                         .join(format!("{hash}.json"))
@@ -374,7 +378,8 @@ fn expand_fact_pages(setup: &DomainSetup, value: &mut Value, bytes: usize) -> Re
                         return Err("领域事实分页上下文、序号或计数不一致".into());
                     }
                     // 页封装也计费；items 的深度保持为展开后数组所在位置。
-                    self.walk(&mut page, depth.saturating_sub(1), false)?;
+                    self.walk(&mut page, depth.saturating_sub(1), true)?;
+                    self.active_pages.remove(hash);
                     items.append(page["items"].as_array_mut().unwrap());
                 }
                 *value = Value::Array(items);
@@ -402,11 +407,21 @@ fn expand_fact_pages(setup: &DomainSetup, value: &mut Value, bytes: usize) -> Re
         ok: value["ok"].clone(),
         allowed: matches!(
             value["kind"].as_str(),
-            Some("proposal" | "capabilities" | "project_scope")
+            Some(
+                "proposal"
+                    | "capabilities"
+                    | "project_scope"
+                    | "linework_presort"
+                    | "source_groups"
+                    | "source_linework"
+                    | "schematic_circulation"
+                    | "schematic_templates"
+            )
         ),
         directory: None,
         remaining: FACT_GRAPH_BUDGET,
         references: 0,
+        active_pages: std::collections::BTreeSet::new(),
     };
     pages.charge(bytes)?;
     pages.walk(value, 0, true)
@@ -963,6 +978,25 @@ pub(crate) mod tests {
             verify(&setup, &receipt, &raw)
         };
         assert_eq!(check(&value).unwrap()["entries"], json!(["first", "last"]));
+        // Match FactStore.seal's partitionable fact kinds, including real presort receipts.
+        for kind in [
+            "proposal",
+            "capabilities",
+            "project_scope",
+            "linework_presort",
+            "source_groups",
+            "source_linework",
+            "schematic_circulation",
+            "schematic_templates",
+        ] {
+            let mut manifest = value.clone();
+            manifest["kind"] = json!(kind);
+            expand_fact_pages(&setup, &mut manifest, 0).unwrap();
+            assert_eq!(manifest["entries"], json!(["first", "last"]), "{kind}");
+        }
+        let mut unsupported = value.clone();
+        unsupported["kind"] = json!("artifact");
+        assert!(expand_fact_pages(&setup, &mut unsupported, 0).is_err());
         for (field, invalid) in [
             ("contract", json!("other/v2")),
             ("kind", json!("proposal")),
@@ -996,7 +1030,23 @@ pub(crate) mod tests {
         let mut recursive = page.clone();
         recursive["items"] = json!([value["entries"], "last"]);
         value["entries"]["$fact_pages"] = json!([seal(&recursive)]);
-        assert!(check(&value).unwrap_err().contains("递归"));
+        assert_eq!(
+            check(&value).unwrap()["entries"],
+            json!([["first", "last"], "last"])
+        );
+        let mut malformed = recursive.clone();
+        malformed["items"][0]["count"] = json!(3);
+        value["entries"]["$fact_pages"] = json!([seal(&malformed)]);
+        assert!(check(&value).is_err());
+        let mut nested_hash = hash.clone();
+        for _ in 0..66 {
+            let mut nested = page.clone();
+            nested["items"] =
+                json!([{"$fact_pages":[nested_hash],"page_counts":[2],"count":2}, "last"]);
+            nested_hash = seal(&nested);
+        }
+        value["entries"]["$fact_pages"] = json!([nested_hash]);
+        assert!(check(&value).unwrap_err().contains("资源上限"));
         value["entries"]["$fact_pages"] = json!([hash]);
         std::fs::write(directory.join(format!("{hash}.json")), b"{}").unwrap();
         assert!(check(&value).unwrap_err().contains("SHA256"));
@@ -1006,6 +1056,33 @@ pub(crate) mod tests {
         std::fs::write(&setup.context_path, b"{\"changed\":true}").unwrap();
         assert!(check(&value).unwrap_err().contains("上下文"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires REHEARSAL_NESTED_ROOT generated by the modeler's FactStore"]
+    fn modeler_nested_presort_fact_expands_all_member_proofs() {
+        let root = PathBuf::from(std::env::var("REHEARSAL_NESTED_ROOT").unwrap());
+        let setup = DomainSetup {
+            mode: DomainMode::Project,
+            context_path: root.join("context.json"),
+            repository: root.clone(),
+            python: PathBuf::new(),
+            run_id: "nested-presort".into(),
+            context_sha256: format!("{:x}", Sha256::digest(b"{}")),
+            floor_id: String::new(),
+        };
+        let receipt: FactReceipt =
+            serde_json::from_slice(&std::fs::read(root.join("receipt.json")).unwrap()).unwrap();
+        let raw = std::fs::read(
+            root.join("outputs/domain/nested-presort/project/facts")
+                .join(format!("{}.json", receipt.fact_sha256)),
+        )
+        .unwrap();
+        let fact = verify(&setup, &receipt, &raw).unwrap();
+        let routes = fact["regions"][0]["member_routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 5000);
+        assert_eq!(routes[0]["member_id"], "member.0");
+        assert_eq!(routes[4999]["member_id"], "member.4999");
     }
 
     #[test]
