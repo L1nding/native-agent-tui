@@ -564,7 +564,34 @@ fn bounded_json_result(value: &Value) -> Option<Value> {
         if text.len() > MAX_RESULT_WRAPPER_BYTES {
             return None;
         }
-        serde_json::from_str::<Value>(text).ok()?
+        serde_json::from_str::<Value>(text).ok().or_else(|| {
+            let mut values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+            let receipt = values.next()?.ok()?;
+            if receipt["contract"] != "modeling-fact-receipt/v1" {
+                return None;
+            }
+            // DSH 图片溢出会合并尾注；仅恢复文字零遗漏的完整小回执。
+            let tail = text[values.byte_offset()..]
+                .strip_prefix("\n\n[...]\n\n\n\n(Omitted 0 bytes. Omitted ")?;
+            let (images, location) =
+                tail.split_once(" images. Full formatted result stored at: ")?;
+            let count = images.parse::<u64>().ok()?;
+            // DSH 遗漏数量必须是 JavaScript 可精确表示的正整数。
+            if count == 0 || count > 9_007_199_254_740_991 || count.to_string() != images {
+                return None;
+            }
+            let locator = location.strip_suffix(
+                ". Use read with offset/limit, or grep this path to search within it.)",
+            )?;
+            if locator.is_empty()
+                || locator.trim() != locator
+                || locator.chars().any(char::is_control)
+            {
+                return None;
+            }
+            // 尾注路径仅作语法边界，禁止读取或跟随它。
+            Some(receipt)
+        })?
     } else {
         if serde_json::to_vec(value).ok()?.len() > MAX_RESULT_WRAPPER_BYTES {
             return None;
@@ -849,6 +876,8 @@ mod tests {
 #[cfg(test)]
 mod structured_result_tests {
     use super::*;
+    use crate::domain::{receipt, DomainFacts, DomainMode, DomainSetup, FactProjection};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn mixed_review_image_batch_preserves_small_fact_receipt_without_binary_output() {
@@ -1053,5 +1082,299 @@ mod structured_result_tests {
                 "sessionUpdate":"tool_call_update","toolCallId":"t","status":status,"rawOutput":receipt}})).unwrap() else { panic!() };
             assert!(structured_output.is_none());
         }
+    }
+
+    fn spill(text: &str) -> String {
+        format!("{text}\n\n[...]\n\n\n\n(Omitted 0 bytes. Omitted 2 images. Full formatted result stored at: X:\\not-read\\result.txt. Use read with offset/limit, or grep this path to search within it.)")
+    }
+
+    fn completed_tool_update(raw: Value, content_field: bool) -> ToolContent {
+        let mut payload = json!({"sessionId":"s","update":{
+            "sessionUpdate":"tool_call_update","toolCallId":"call","status":"completed"}});
+        if content_field {
+            payload["update"]["content"] = raw;
+        } else {
+            payload["update"]["rawOutput"] = raw;
+        }
+        let (_, Update::ToolCallUpdate { content, .. }) = update(&payload).unwrap() else {
+            panic!("tool update")
+        };
+        content
+    }
+
+    fn proposal_envelope() -> Value {
+        json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"ctx",
+            "kind":"proposal","ok":true,"current":true,"source_current":true,"fact_sequence":776,
+            "diagnostics":[],"proposal":{"proposal_id":"proposal","revision":1,"prepare_token":"token",
+            "base_sha256":"b".repeat(64),"candidate_sha256":"c".repeat(64),"state":"prepared","summary":"trial",
+            "draft":{"operations":[]},"issues":[],"pending":[],"assumed":[],
+            "component_first_use_requirements":{"contract":"component-first-use/1","required":[],"reused":[]}}})
+    }
+
+    fn sealed_receipt(fact: &Value) -> Value {
+        let raw = serde_json::to_vec(fact).unwrap();
+        json!({"contract":"modeling-fact-receipt/v1","run_id":"run","context_sha256":"ctx","kind":"proposal",
+            "ok":true,"fact_sequence":776,"fact_sha256":format!("{:x}",Sha256::digest(&raw)),"fact_bytes":raw.len(),
+            "binding":{"proposal_id":"proposal","revision":1,"prepare_token":"token",
+                "base_sha256":"b".repeat(64),"candidate_sha256":"c".repeat(64)}})
+    }
+
+    fn domain_setup() -> DomainSetup {
+        DomainSetup {
+            mode: DomainMode::Floor,
+            context_path: "sup056-context-not-created".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor".into(),
+        }
+    }
+
+    fn mcp_item(result: Value) -> Value {
+        json!({"id":"call","type":"mcpToolCall","server":"modeling_domain",
+            "tool":"inspect_change","status":"completed","result":result})
+    }
+
+    fn completed_notice(item: &Value) -> crate::protocol::ObservedTool {
+        crate::protocol::decode_observed_tool(
+            "item/completed",
+            &json!({"threadId":"root","turnId":"turn","item":item}),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn complete_receipt_survives_zero_text_spill_without_reading_locator() {
+        let expected = sealed_receipt(&proposal_envelope());
+        let text = spill(&expected.to_string());
+        for raw in [
+            json!(text),
+            json!({"type":"text","text":text}),
+            json!([{"type":"text","text":text}]),
+            json!({"content":[{"type":"text","text":text}]}),
+        ] {
+            assert_eq!(
+                completed_tool_update(raw, false).structured_output,
+                Some(expected.clone())
+            );
+        }
+        let content = completed_tool_update(
+            json!([{"type":"content","content":{"type":"text","text":text}}]),
+            true,
+        );
+        assert_eq!(content.structured_output, Some(expected));
+        assert!(content
+            .output
+            .unwrap()
+            .contains("Omitted 0 bytes. Omitted 2 images."));
+        for status in ["failed", "cancelled", "in_progress"] {
+            let (_, Update::ToolCallUpdate { content, .. }) = update(&json!({
+                "sessionId":"s","update":{"sessionUpdate":"tool_call_update",
+                "toolCallId":"call","status":status,"rawOutput":text}
+            }))
+            .unwrap() else {
+                panic!("tool update")
+            };
+            assert!(content.structured_output.is_none());
+        }
+    }
+
+    #[test]
+    fn spill_recovery_preserves_strict_whole_json_and_sibling_ambiguity() {
+        let receipt = sealed_receipt(&proposal_envelope());
+        let text = receipt.to_string();
+        assert_eq!(
+            bounded_json_result(&json!(format!(" {text}\n"))),
+            Some(receipt.clone())
+        );
+        for suffix in [
+            "{}",
+            " trailing",
+            "\n{\"contract\":\"modeling-fact-receipt/v1\"}",
+        ] {
+            assert!(bounded_json_result(&json!(format!("{text}{suffix}"))).is_none());
+        }
+        let retained = json!({"type":"text","text":spill(&text)});
+        let canonical = json!({"type":"text","text":text});
+        let diagnostic = json!({"type":"text","text":"[image unavailable]"});
+        assert_eq!(
+            bounded_content_result(&json!([canonical.clone(), diagnostic.clone()])),
+            Some(receipt.clone())
+        );
+        assert!(bounded_content_result(&json!([
+            canonical.clone(),
+            json!({"type":"text","text":"{}"})
+        ]))
+        .is_none());
+        assert_eq!(
+            bounded_content_result(&json!([retained.clone(), diagnostic])),
+            Some(receipt)
+        );
+        for second in [
+            canonical,
+            retained.clone(),
+            json!({"type":"text","text":"{}"}),
+        ] {
+            assert!(bounded_content_result(&json!([retained.clone(), second])).is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_truncated_and_ambiguous_spills_stay_rejected() {
+        let receipt = sealed_receipt(&proposal_envelope()).to_string();
+        let valid = spill(&receipt);
+        for bad in [
+            valid.replace("Omitted 0 bytes.", "Omitted 1 bytes."),
+            valid.replace("Omitted 0 bytes.", "Omitted unknown bytes."),
+            valid.replace("Omitted 2 images.", "Omitted 0 images."),
+            valid.replace("Omitted 2 images.", "Omitted 02 images."),
+            valid.replace("Omitted 2 images.", "Omitted +2 images."),
+            valid.replace("Omitted 2 images.", "Omitted 9007199254740992 images."),
+            valid.replace("Omitted 2 images.", "Omitted 18446744073709551616 images."),
+            valid.replace(
+                "Use read with offset/limit, or grep this path to search within it.",
+                "Use arbitrary recovery.",
+            ),
+            valid.replace("\n\n[...]\n\n\n\n(", "\n\n[...]\n\n("),
+            valid.replace("X:\\not-read\\result.txt", ""),
+            valid.replace("X:\\not-read\\result.txt", "unknown\npath"),
+            format!("{valid}\n"),
+            format!("{valid}{{}}"),
+            spill(&format!("{receipt}{{}}")),
+            spill("{\"contract\":\"modeling-fact-receipt/v1\""),
+            spill("{\"ok\":true}"),
+            spill(
+                &json!({"structuredContent":serde_json::from_str::<Value>(&receipt).unwrap()})
+                    .to_string(),
+            ),
+        ] {
+            assert!(bounded_json_result(&json!(bad)).is_none());
+        }
+    }
+
+    #[test]
+    fn spill_recovery_preserves_original_wrapper_and_receipt_budgets() {
+        let mut receipt = sealed_receipt(&proposal_envelope());
+        receipt["large"] = json!("x".repeat(MAX_STRUCTURED_RESULT_BYTES));
+        assert!(bounded_json_result(&json!(spill(&receipt.to_string()))).is_none());
+        let receipt = sealed_receipt(&proposal_envelope());
+        let oversized = spill(&receipt.to_string()).replace(
+            "X:\\not-read\\result.txt",
+            &"x".repeat(MAX_RESULT_WRAPPER_BYTES),
+        );
+        assert!(oversized.len() > MAX_RESULT_WRAPPER_BYTES);
+        assert!(bounded_json_result(&json!(oversized)).is_none());
+        let mut content = vec![json!({"type":"text","text":spill(&receipt.to_string())})];
+        content.extend((1..MAX_CONTENT_BLOCKS).map(|_| json!({"type":"text","text":"diagnostic"})));
+        assert_eq!(bounded_content_result(&json!(content)), Some(receipt));
+        content.push(json!({"type":"text","text":"diagnostic"}));
+        assert!(bounded_content_result(&json!(content)).is_none());
+    }
+
+    #[test]
+    fn spill_recovery_keeps_public_receipt_and_private_fact_validation() {
+        let fact = proposal_envelope();
+        let raw = serde_json::to_vec(&fact).unwrap();
+        let expected = sealed_receipt(&fact);
+        let domain_setup = domain_setup();
+        let decorated = spill(&expected.to_string());
+        let unnormalized = mcp_item(json!(decorated));
+        assert!(receipt::from_tool(
+            &domain_setup,
+            &completed_notice(&unnormalized),
+            &unnormalized
+        )
+        .unwrap_err()
+        .contains("回执缺失或损坏"));
+        let output = completed_tool_update(
+            json!([{"type":"content","content":{"type":"text","text":decorated}}]),
+            true,
+        );
+        let item = mcp_item(output.structured_output.unwrap());
+        let receipt = receipt::from_tool(&domain_setup, &completed_notice(&item), &item)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt::verify(&domain_setup, &receipt, &raw).unwrap(),
+            fact
+        );
+        let mut facts = DomainFacts::new(Some(domain_setup.clone()));
+        assert_eq!(facts.apply_verified_fact(&fact), FactProjection::Applied);
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        assert!(!facts.can_authorize(&binding));
+        let mut wrong = receipt.clone();
+        wrong.binding["revision"] = json!(2);
+        assert!(receipt::verify(&domain_setup, &wrong, &raw).is_err());
+        wrong = receipt.clone();
+        wrong.binding["candidate_sha256"] = json!("d".repeat(64));
+        assert!(receipt::verify(&domain_setup, &wrong, &raw).is_err());
+        let mut tampered = raw;
+        tampered.push(b' ');
+        assert!(receipt::verify(&domain_setup, &receipt, &tampered).is_err());
+        let mut foreign = item.clone();
+        foreign["result"]["run_id"] = json!("foreign");
+        assert!(receipt::from_tool(&domain_setup, &completed_notice(&foreign), &foreign).is_err());
+    }
+
+    #[test]
+    #[ignore = "read-only real event replay; set ACP_SPILL_REPLAY_SESSION and ACP_SPILL_REPLAY_FACTS"]
+    fn replay_spilled_first_use_receipt_through_private_fact_verification() {
+        let session =
+            std::env::var_os("ACP_SPILL_REPLAY_SESSION").expect("ACP_SPILL_REPLAY_SESSION");
+        let script = r#"const fs=require('node:fs'),z=require('node:zlib');
+const rows=z.zstdDecompressSync(fs.readFileSync(process.argv[1])).toString('utf8').split('\n').filter(Boolean).map(JSON.parse);
+const event=rows.find(v=>v.type==='tool/result'&&v.seq===597);
+if(event.data.message.role!=='tool'||event.data.message.isError)throw Error('wrong event');
+const call=rows.find(v=>v.type==='tool/call'&&v.data.callId===event.data.message.toolCallId);
+if(call?.data.name!=='mcp__modeling_domain__read_component_first_use_images')throw Error('wrong tool');
+const block=event.data.message.content.find(b=>b.type==='text');
+process.stdout.write(JSON.stringify(block.text));"#;
+        let response = std::process::Command::new("node")
+            .args(["-e", script])
+            .arg(session)
+            .output()
+            .unwrap();
+        assert!(response.status.success(), "read-only session decode failed");
+        let text: String = serde_json::from_slice(&response.stdout).unwrap();
+        let expected: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(expected["fact_sequence"], 776);
+        assert!(serde_json::from_str::<Value>(&text).is_err());
+        let output = completed_tool_update(
+            json!([{"type":"content","content":{"type":"text","text":text}}]),
+            true,
+        );
+        assert!(
+            output.structured_output.as_ref() == Some(&expected),
+            "complete first-use receipt was lost after a zero-text image spill"
+        );
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("ACP_SPILL_REPLAY_FACTS").expect("ACP_SPILL_REPLAY_FACTS"),
+        );
+        let mut domain_setup = domain_setup();
+        domain_setup.mode = DomainMode::Project;
+        domain_setup.repository = directory.ancestors().nth(5).unwrap().to_path_buf();
+        domain_setup.context_path = directory
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("context.json");
+        domain_setup.run_id = expected["run_id"].as_str().unwrap().into();
+        domain_setup.context_sha256 = expected["context_sha256"].as_str().unwrap().into();
+        let item = mcp_item(output.structured_output.unwrap());
+        let receipt = receipt::from_tool(&domain_setup, &completed_notice(&item), &item)
+            .unwrap()
+            .unwrap();
+        let raw = std::fs::read(directory.join(format!("{}.json", receipt.fact_sha256))).unwrap();
+        let fact = receipt::verify(&domain_setup, &receipt, &raw).unwrap();
+        assert_eq!(fact["kind"], "component_first_use_review");
+        assert_eq!(
+            fact["component_first_use_review"]["proposal_id"],
+            "2f85f6877ec34301a88272ce9ba62481"
+        );
+        assert_eq!(fact["component_first_use_review"]["status"], "ready");
+        eprintln!("real event597: completed_tool_update complete receipt776; private verified fact bytes={} sha={} proposal matched; no spill locator read",receipt.fact_bytes,receipt.fact_sha256);
     }
 }
