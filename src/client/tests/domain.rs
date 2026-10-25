@@ -1,6 +1,70 @@
 use super::*;
 
 #[tokio::test]
+async fn tool_operation_waits_never_replace_scope_or_authorize_business_facts() {
+    let (mut client, mut server) = harness_with_config(Config {
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Project,
+            context_path: "context.json".into(),
+            repository: ".".into(),
+            python: "unused-python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor".into(),
+        }),
+        ..Default::default()
+    })
+    .await;
+    ready(&mut server).await;
+    phase(&mut client, SessionPhase::Ready).await;
+    client
+        .commands
+        .send(Command::SubmitRootInput {
+            text: "检查作业".into(),
+        })
+        .await
+        .unwrap();
+    let start = next(&mut server).await;
+    send(
+        &mut server,
+        json!({"id":start["id"],"result":{"turn":{"id":"root-turn"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Running).await;
+    for (index, state) in ["running", "unknown"].into_iter().enumerate() {
+        let fact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":"ctx",
+            "kind":"tool_operation","ok":true,"fact_sequence":801+index,
+            "op_id":"c".repeat(32),"state":state,"replay_allowed":false,"error":null,
+            "recommended_call":{"tool":"inspect_tool_operation","arguments":{"op_id":"c".repeat(32),"wait_s":60}}});
+        observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+            "item":{"id":format!("wait-{index}"),"type":"mcpToolCall","server":"modeling_domain","tool":"inspect_tool_operation","status":"completed","result":{"structuredContent":fact}}}})).await;
+        let snapshot = client.snapshots.borrow().clone();
+        let domain = snapshot.extensions[0].modeling().unwrap();
+        assert!(domain.rejected_facts.is_empty());
+        assert!(domain.fact_sync_notice.is_none());
+        assert!(
+            domain.project_scope.is_none()
+                && domain.proposal.is_none()
+                && domain.operation.is_none()
+        );
+        assert_eq!(snapshot.root_start_requests, 1);
+    }
+    let mut unscoped = crate::domain::tests::floor_story_height_proposal();
+    unscoped["fact_sequence"] = json!(803);
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"business","type":"mcpToolCall","server":"modeling_domain","tool":"inspect_change","status":"completed","result":{"structuredContent":unscoped}}}})).await;
+    let snapshot = client.snapshots.borrow().clone();
+    let domain = snapshot.extensions[0].modeling().unwrap();
+    assert!(domain.proposal.is_none());
+    assert!(domain
+        .rejected_facts
+        .iter()
+        .any(|f| f.kind == "proposal" && f.blocking));
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
 async fn domain_poll_refreshes_snapshot_without_any_parent_tool_receipt() {
     use sha2::{Digest, Sha256};
     let root = std::env::temp_dir().join(format!(
@@ -256,12 +320,13 @@ async fn resumed_domain_verifies_old_and_out_of_order_receipts_and_rejects_bad_f
 }
 
 #[tokio::test]
-async fn reviewed_template_policy_waits_for_turn_end_and_uses_the_private_authorization_chain() {
+async fn reviewed_template_policy_keeps_parameter_decisions_manual_and_binds_grants_to_version() {
     use crate::config::DomainApprovalPolicy;
     use sha2::{Digest, Sha256};
-    for policy in [
-        DomainApprovalPolicy::Manual,
-        DomainApprovalPolicy::ReviewedTemplate,
+    for (policy, parameter_only) in [
+        (DomainApprovalPolicy::Manual, false),
+        (DomainApprovalPolicy::ReviewedTemplate, false),
+        (DomainApprovalPolicy::ReviewedTemplate, true),
     ] {
         let directory = std::env::temp_dir().join(format!(
             "tui-policy-{}-{:?}-{}",
@@ -330,18 +395,27 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         )
         .await;
         phase(&mut client, SessionPhase::Running).await;
-        let proposal = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+        let mut proposal = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
             "kind":"proposal","fact_sequence":1,"current":true,"source_current":true,"diagnostics":[],
             "auto_approval":{"contract":"reviewed-template-approval/1","eligible":true},
             "proposal":{"proposal_id":"p","revision":1,"prepare_token":"token","base_sha256":"base",
             "candidate_sha256":"candidate","state":"prepared","summary":"reviewed chair","draft":{"operations":[]},
             "assumed":[],"issues":[],"pending":[],"component_first_use_requirements":{
                 "contract":"component-first-use/1","required":[],"reused":[{"review_key":"human-reviewed"}]}}});
+        if parameter_only {
+            proposal = crate::domain::tests::floor_story_height_proposal();
+            proposal["context_sha256"] = json!(context_hash);
+            proposal["proposal"]["proposal_id"] = json!("p");
+            proposal["proposal"]["revision"] = json!(1);
+            proposal["auto_approval"] =
+                json!({"contract":"reviewed-template-approval/1","eligible":true});
+            proposal["source_current"] = json!(true);
+        }
         observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
-            "item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal}}}})).await;
+            "item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal.clone()}}}})).await;
         let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,"kind":"artifact_validation","fact_sequence":2,
-            "artifact":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","candidate":true,"authority_sha256":"base","input_sha256":"candidate","state":"built","output":"model.glb","valid":true,"current":true,
-            "review_image":{"delivery":"attached_png","image_sha256":image_sha,"image_path":path,"dimensions_px":[1,1],"request":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","input_sha256":"candidate","blend_sha256":"a".repeat(64),"focus_m":null}}}});
+            "artifact":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","candidate":true,"authority_sha256":proposal["proposal"]["base_sha256"],"input_sha256":proposal["proposal"]["candidate_sha256"],"state":"built","output":"model.glb","valid":true,"current":true,
+            "review_image":{"delivery":"attached_png","image_sha256":image_sha,"image_path":path,"dimensions_px":[1,1],"request":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","input_sha256":proposal["proposal"]["candidate_sha256"],"blend_sha256":"a".repeat(64),"focus_m":null}}}});
         observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
             "item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
         tokio::time::timeout(
@@ -361,7 +435,7 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         assert!(!directory.join("actor.txt").exists());
         assert_eq!(client.snapshots.borrow().root_start_requests, 1);
         observation_event(&mut client,&mut server,json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
-        if policy == DomainApprovalPolicy::ReviewedTemplate {
+        if policy == DomainApprovalPolicy::ReviewedTemplate && !parameter_only {
             let approved = next(&mut server).await;
             assert_eq!(approved["method"], "turn/start");
             let text = approved["params"]["input"][0]["text"].as_str().unwrap();
@@ -376,6 +450,72 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
             phase(&mut client, SessionPhase::Completed).await;
             assert!(!directory.join("actor.txt").exists());
             assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+            if parameter_only {
+                let binding = client.snapshots.borrow().extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .proposal
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .clone();
+                assert!(client.snapshots.borrow().extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .first_use_satisfied());
+                client
+                    .commands
+                    .send(Command::ConfirmExtension {
+                        confirmation: crate::extensions::ExtensionConfirmation::Modeling(
+                            binding.clone().into(),
+                        ),
+                    })
+                    .await
+                    .unwrap();
+                let approved = next(&mut server).await;
+                assert_eq!(approved["method"], "turn/start");
+                let text = approved["params"]["input"][0]["text"].as_str().unwrap();
+                let payload: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+                assert_eq!(payload["user_action"], "approve_concrete_change");
+                assert_eq!(
+                    payload["apply_change_arguments"]["proposal_id"],
+                    binding.proposal_id
+                );
+                assert_eq!(
+                    payload["apply_change_arguments"]["revision"],
+                    binding.revision
+                );
+                assert_eq!(
+                    payload["apply_change_arguments"]["expected_sha256"],
+                    binding.base_sha256
+                );
+                assert_eq!(
+                    payload["apply_change_arguments"]["prepare_token"],
+                    binding.prepare_token
+                );
+                assert_eq!(
+                    std::fs::read_to_string(directory.join("actor.txt")).unwrap(),
+                    "native-agent-tui:user"
+                );
+                send(
+                    &mut server,
+                    json!({"id":approved["id"],"result":{"turn":{"id":"apply-turn"}}}),
+                )
+                .await;
+                phase(&mut client, SessionPhase::Running).await;
+                let applied = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+                    "kind":"operation","fact_sequence":3,"receipt":{"proposal_id":binding.proposal_id,
+                    "revision":binding.revision,"prepare_token":binding.prepare_token,"base_sha256":binding.base_sha256,
+                    "candidate_sha256":binding.candidate_sha256,"operation_id":"height-apply","state":"applied",
+                    "current_sha256":binding.candidate_sha256}});
+                observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"apply-turn",
+                    "item":{"id":"apply","type":"mcpToolCall","server":"modeling_domain","tool":"apply_change","status":"completed","result":{"structuredContent":applied}}}})).await;
+                let snapshot = client.snapshots.borrow().clone();
+                let domain = snapshot.extensions[0].modeling().unwrap();
+                assert_eq!(domain.operation.as_ref().unwrap().state, "applied");
+                assert!(!domain.proposal.as_ref().unwrap().ready);
+                assert!(domain.rejected_facts.is_empty());
+            }
         }
         client.commands.send(Command::Quit).await.unwrap();
         client.join.await.unwrap();
@@ -546,6 +686,7 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
                 manifest_sha256: None,
                 artifact_sha256: None,
                 url_hash: None,
+                first_use_comparison: None,
             });
             client
                 .commands

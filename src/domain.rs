@@ -322,6 +322,8 @@ pub struct ProposalFact {
     pub assumptions: Vec<String>,
     pub diagnostics: Vec<String>,
     pub ready: bool,
+    #[serde(default)]
+    pub parameter_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1049,11 +1051,16 @@ impl DomainFacts {
         let Some(kind) = value["kind"].as_str() else {
             return invalid!();
         };
-        // Immutable pages, project diagnostics and pre-activation waits have no
-        // current floor state to project. Envelope identity was checked above.
+        // Tool jobs report waiting/unknown outcomes, not floor execution facts;
+        // completed inspection returns the separately scoped business result.
+        // Envelope identity was checked above, and sealed reads verify its hash.
         if matches!(
             kind,
-            "fact_page" | "diagnostic_log" | "project_floor_preparing" | "reference_evaluation"
+            "fact_page"
+                | "diagnostic_log"
+                | "project_floor_preparing"
+                | "reference_evaluation"
+                | "tool_operation"
         ) {
             return FactProjection::Unrelated;
         }
@@ -3146,6 +3153,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         candidate_sha256: p["candidate_sha256"].as_str().unwrap_or("").to_owned(),
     };
     let mut objects = Vec::new();
+    let mut parameter_only = false;
     let mut seen_connections = std::collections::BTreeSet::new();
     let mut remaining_reference_parts = std::collections::BTreeSet::new();
     // 已验证事实受单文件及分页聚合预算约束，批准前必须逐条投影全部操作。
@@ -3181,6 +3189,73 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         );
     }
     for op in p["draft"]["operations"].as_array()? {
+        if op["op"] == "set_floor_story_height" {
+            let decision: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+            let record = &p["decision_drafts"][0];
+            let body: Value = serde_json::from_str(record["body"].as_str()?).ok()?;
+            let request = text(&decision, "request_id").ok()?;
+            let floor = text(&decision, "floor_id").ok()?;
+            let reason = bounded_text(&decision, "reason", 2000)?;
+            if p["draft"]["operations"].as_array()?.len() != 1
+                || p["decision_drafts"].as_array()?.len() != 1
+                || structure_revision
+                || edit.is_some()
+                || correction.is_some()
+                || op["target_id"] != floor
+                || op["floor_id"] != floor
+                || p["scope"]["floor_id"] != floor
+                || (value["project_scope"].is_object()
+                    && value["project_scope"]["floor_id"] != floor)
+                || !op["collection"].is_null()
+                || !op["field"].is_null()
+                || op["basis"] != "decision"
+                || !op["source_ids"].as_array()?.is_empty()
+                || op["decision_id"] != format!("floor-height-{request}")
+                || record["id"] != op["decision_id"]
+                || body != decision
+                || op["reason"] != decision["reason"]
+                || decision["height_m"].as_f64().is_none_or(|v| v <= 0.0)
+                || decision["no_split_levels"] != true
+                || decision["allow_stair_above_floor"] != true
+                || (!decision["reference_wall_height_m"].is_null()
+                    && decision["reference_wall_height_m"]
+                        .as_f64()
+                        .is_none_or(|v| v <= 0.0))
+                || text(&decision, "decided_at").is_err()
+                || ["base_sha256", "candidate_sha256"].iter().any(|key| {
+                    p[key].as_str().is_none_or(|sha| {
+                        sha.len() != 64
+                            || !sha
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                })
+                || !p["component_first_use_requirements"]["required"]
+                    .as_array()?
+                    .is_empty()
+                || !p["component_first_use_requirements"]["reused"]
+                    .as_array()?
+                    .is_empty()
+            {
+                return None;
+            }
+            objects.push(format!(
+                "楼层层高参数决定 · {floor} · {} m · 几何不变",
+                decision["height_m"]
+            ));
+            parameter_only = true;
+            objects.push(format!(
+                "决定 {} · {} · {reason}",
+                record["id"], decision["decided_at"]
+            ));
+            objects.push(format!(
+                "无错层 {} · 允许楼梯超层 {} · 参考墙高 {} m",
+                decision["no_split_levels"],
+                decision["allow_stair_above_floor"],
+                decision["reference_wall_height_m"]
+            ));
+            continue;
+        }
         if structure_revision {
             continue; // Exact revision operations were projected with their certificate.
         }
@@ -3233,6 +3308,9 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             objects.push(format!("修正来源 {}", op["source_ids"]));
             continue;
         }
+        // Dedicated projections above validate operations that may omit a collection.
+        // Other operations must not fall through as an empty parameter-decision card.
+        op["collection"].as_str()?;
         if value["project_structure"] == true
             && matches!(
                 op["collection"].as_str(),
@@ -3773,6 +3851,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
         binding,
         state,
         ready,
+        parameter_only,
         summary: if correction.is_some() {
             bounded_text(p, "summary", 4000)?
         } else {
@@ -3937,6 +4016,7 @@ pub async fn authorize_with_policy(
     let mut payload = json!({"user_action":if automatic { "policy_approve_concrete_change" } else { "approve_concrete_change" }, "proposal":binding,
               "approval_policy": if automatic { "reviewed-template" } else { "manual" },
               "authorization_id":authorization_id,
+              "review_set_sha256":review_set_sha256,
               "apply_change_arguments": {
                   "proposal_id": binding.proposal_id, "revision": binding.revision,
                   "prepare_token": binding.prepare_token,
@@ -3961,4 +4041,4 @@ pub async fn authorize_with_policy(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

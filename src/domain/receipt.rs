@@ -133,6 +133,7 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "diagnostic"
                 | "diagnostic_log"
                 | "project_floor_preparing"
+                | "tool_operation"
                 | "wall_mount_inspection"
                 | "source_region_inventory"
                 | "job_index"

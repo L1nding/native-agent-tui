@@ -3,7 +3,9 @@ use super::*;
 use std::collections::BTreeSet;
 use tokio::io::AsyncReadExt;
 
-pub const MAX_IMAGES: usize = 128;
+// Whole-floor batches can contain hundreds of review groups. Only metadata is
+// retained here; PNG bytes are streamed under MAX_PNG_BYTES when checked.
+pub const MAX_IMAGES: usize = 512;
 const MAX_PNG_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,9 +285,13 @@ fn requirements_with_openings(
                 | "component-first-use/3"
                 | "component-first-use/4"
                 | "component-first-use/5"
+                | "component-first-use/6"
                 | "component-first-use/structure-revision-1"
         )
-    ) || required.len() > MAX_IMAGES
+    ) || value
+        .get("comparison_contract")
+        .is_some_and(|contract| contract != "component-first-use-comparison/1")
+        || required.len() > MAX_IMAGES
         || value["reused"].as_array()?.len() > 500
     {
         return None;
@@ -459,7 +465,10 @@ fn requirements_with_openings(
         if bindings.len() != ids.len() {
             return None;
         }
-        let directional = value["contract"] == "component-first-use/5";
+        let directional = matches!(
+            value["contract"].as_str(),
+            Some("component-first-use/5" | "component-first-use/6")
+        );
         let template = plan["templates"]
             .as_array()
             .and_then(|templates| templates.iter().find(|t| t["id"] == item["template_id"]));
@@ -486,12 +495,12 @@ fn requirements_with_openings(
         } else {
             None
         };
-        // V4/V5 opening style groups retain each aperture's geometry hash. The
+        // V4+ opening style groups retain each aperture's geometry hash. The
         // representative must still match, and project() binds every member to
         // the frozen requirements and the exact rendered review manifest.
         let opening_style_group = matches!(
             value["contract"].as_str(),
-            Some("component-first-use/4" | "component-first-use/5")
+            Some("component-first-use/4" | "component-first-use/5" | "component-first-use/6")
         ) && kind == "cad"
             && matches!(item["category"].as_str(), Some("door" | "window"))
             && hash(&item["style_signature_sha256"]).is_some();
@@ -753,6 +762,7 @@ fn web_package(
         manifest_sha256: Some(manifest_sha256.into()),
         artifact_sha256: Some(artifact_sha256.into()),
         url_hash: Some(url_hash),
+        first_use_comparison: None,
     })
 }
 
@@ -887,6 +897,11 @@ pub(super) fn project(
         {
             return None;
         }
+        if previous.requirements.get("comparison_contract").is_some()
+            && item["renderer"]["engine"] != "REVIEW_WEB_3D"
+        {
+            return None;
+        }
         match item["renderer"]["engine"].as_str() {
             Some("BLENDER_WORKBENCH") => {
                 blend_sha256?;
@@ -918,8 +933,22 @@ pub(super) fn project(
             },
         )?;
         let dimensions = &item["dimensions"];
+        let assumptions_valid = if let Some(reference) = dimensions.get("assumed_ref") {
+            reference
+                .as_object()
+                .is_some_and(|fields| fields.len() == 2)
+                && hash(&reference["sha256"]).is_some()
+                && reference["count"].as_u64().is_some()
+                && dimensions.get("assumed").is_none()
+                && dimensions["assumed_rows"].as_array().is_some_and(|rows| {
+                    rows.iter()
+                        .all(|row| row.as_str().is_some_and(|row| !row.is_empty()))
+                })
+        } else {
+            dimensions["assumed"].is_array()
+        };
         if !dimensions.is_object()
-            || dimensions.get("assumed").is_none()
+            || !assumptions_valid
             || dimensions.get("parameters").is_none()
             || dimensions["model_xyz_m"].as_array()?.len() != 3
             || (item["source_kind"] == "cad" && dimensions["cad_xy_m"].as_array()?.len() != 2)
@@ -1140,6 +1169,19 @@ pub(super) fn project(
                 }
                 fact.binding.web_review =
                     Some(web_package(web, &fact.binding, "view=perspective".into())?);
+                if previous.requirements.get("comparison_contract").is_some() {
+                    fact.binding.web_review.as_mut()?.first_use_comparison =
+                        Some(crate::review_web::FirstUseComparison {
+                            proposal_sha256: proposal.candidate_sha256.clone(),
+                            cad_required: item["source_kind"] == "cad",
+                            part_ids: item["part_ids"]
+                                .as_array()?
+                                .iter()
+                                .map(|id| id.as_str().map(str::to_owned))
+                                .collect::<Option<_>>()?,
+                            dimensions: dimensions.clone(),
+                        });
+                }
                 let mut web_description = format!(
                     "{detail}\n{}\nCAD 证据 SHA256：{}",
                     web_detail(

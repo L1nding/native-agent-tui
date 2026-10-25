@@ -25,6 +25,15 @@ pub struct WebReviewPackage {
     pub manifest_sha256: Option<String>,
     pub artifact_sha256: Option<String>,
     pub url_hash: Option<String>,
+    pub first_use_comparison: Option<FirstUseComparison>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FirstUseComparison {
+    pub proposal_sha256: String,
+    pub cad_required: bool,
+    pub part_ids: Vec<String>,
+    pub dimensions: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,13 +194,15 @@ from PIL import Image
 from blender_agent.review_web.integrity import validate_review_package
 from blender_agent.review_web.contract import SCHEMA_PATH
 try:
- p=json.loads(sys.argv[1])
+ p=json.load(sys.stdin)
  root=Path(p['html_path']).resolve().parent
+ # First-use screenshots live beside the sealed manifest, outside w/<key>/.
+ image_paths={Path(p['png_path']).resolve(),Path(p['png_path']+'.review.json').resolve()}
  # All repeated integrity and Pillow reads must describe the same byte snapshot.
  cached={}
  def bounded_bytes(path):
   resolved=path.resolve(strict=True)
-  if not resolved.is_relative_to(root) and resolved != SCHEMA_PATH.resolve():
+  if not resolved.is_relative_to(root) and resolved not in image_paths and resolved != SCHEMA_PATH.resolve():
    raise ValueError('review_resource_outside_package')
   if resolved in cached:
    return cached[resolved]
@@ -224,6 +235,23 @@ try:
  Image.open=snapshot_image
  v=validate_review_package(p['html_path'],image_path=p['png_path'],expected_data_sha256=p['data_sha256'],expected_manifest_sha256=p['manifest_sha256'],expected_artifact_sha256=p['artifact_sha256'],expected_url_hash=p['url_hash'])
  d=v['data']
+ if expected := p.get('first_use_comparison'):
+  import hashlib
+  from blender_agent.review_web.contract import comparison_rows
+  def compact_dimensions(dimensions):
+   if 'assumed' not in dimensions:
+    return dimensions
+   assumptions=dimensions['assumed']
+   identity=hashlib.sha256(json.dumps(assumptions,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+   return {**{k:v for k,v in dimensions.items() if k != 'assumed'},'assumed_ref':{'sha256':identity,'count':len(assumptions)},'assumed_rows':comparison_rows({'assumed':assumptions})['assumptions']}
+  comparison=d.get('comparison')
+  if (not comparison or comparison.get('contract') != 'component-first-use-comparison/1'
+      or comparison.get('cad_required') != expected['cad_required']
+      or d.get('review_type') != 'component_first_use_3d'
+      or d.get('binding',{}).get('proposal_sha256') != expected['proposal_sha256']
+      or sorted(part for item in d['items'] for part in item.get('object_ids',[])) != sorted(expected['part_ids'])
+      or compact_dimensions(comparison['dimensions']) != compact_dimensions(expected['dimensions'])):
+   raise ValueError('component_first_use_comparison_binding')
  print(json.dumps({'manifest':v['manifest'],'manifest_sha256':v['manifest_sha256'],'review_type':d['review_type'],'candidate_count':len(d['items']),'model_path':d.get('model',{}).get('path')}))
 except Exception as e:
  print(json.dumps({'error':str(e)[:300]}))
@@ -293,14 +321,6 @@ async fn validate(
             }
         }
     }
-    for path in [&package.html_path, &package.png_path] {
-        let resolved = tokio::fs::canonicalize(path)
-            .await
-            .map_err(|_| "复核文件不可读")?;
-        if !resolved.starts_with(&root) {
-            return Err("拒绝复核包外文件".into());
-        }
-    }
     // Bound every caller-controlled file before the Python validator performs
     // its own reads; this also limits compressed transport input size.
     let data_path = root.join("review.json");
@@ -334,7 +354,10 @@ async fn validate(
         let canonical = tokio::fs::canonicalize(&path)
             .await
             .map_err(|_| "复核文件不可读")?;
-        if !canonical.starts_with(&root) {
+        if !canonical.starts_with(&root)
+            && path != package.png_path
+            && path != package.png_path.with_extension("png.review.json")
+        {
             return Err("拒绝复核包外文件".into());
         }
         let metadata = tokio::fs::metadata(canonical)
@@ -350,7 +373,7 @@ async fn validate(
             return Err("复核包超过256MiB".into());
         }
     }
-    let request = serde_json::json!({"html_path":package.html_path,"png_path":package.png_path,"data_sha256":package.data_sha256,"manifest_sha256":package.manifest_sha256,"artifact_sha256":package.artifact_sha256,"url_hash":package.url_hash});
+    let request = serde_json::json!({"html_path":package.html_path,"png_path":package.png_path,"data_sha256":package.data_sha256,"manifest_sha256":package.manifest_sha256,"artifact_sha256":package.artifact_sha256,"url_hash":package.url_hash,"first_use_comparison":package.first_use_comparison});
     let mut command = tokio::process::Command::new(&setup.python);
     command
         .current_dir(&setup.repository)
@@ -358,13 +381,22 @@ async fn validate(
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .kill_on_drop(true)
         .args(["-B", "-X", "utf8", "-c", VALIDATOR])
-        .arg(request.to_string());
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
-        .await
-        .map_err(|_| "复核完整性校验超时")?
-        .map_err(|e| format!("无法运行复核校验器：{e}"))?;
+    let output = tokio::time::timeout(Duration::from_secs(60), async {
+        use tokio::io::AsyncWriteExt;
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().expect("piped review input");
+        stdin.write_all(request.to_string().as_bytes()).await?;
+        drop(stdin);
+        child.wait_with_output().await
+    })
+    .await
+    .map_err(|_| "复核完整性校验超时")?
+    .map_err(|e| format!("无法运行复核校验器：{e}"))?;
     if output.stdout.len() > 16 * 1024 {
         return Err("复核校验结果过大".into());
     }
@@ -388,6 +420,28 @@ async fn validate(
             "sidecar_sha256",
         ),
     ] {
+        let canonical = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|_| "复核文件不可读")?;
+        if !canonical.starts_with(&root)
+            && (path == package.png_path
+                || path == package.png_path.with_extension("png.review.json"))
+        {
+            // Verify only the two explicitly bound external files; do not serve
+            // their parent directory or make it an allowed package resource root.
+            add_resource(
+                canonical.parent().ok_or("复核图片目录缺失")?,
+                &canonical,
+                manifest
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or("复核manifest哈希缺失")?,
+                &mut BTreeMap::new(),
+                &mut total,
+            )
+            .await?;
+            continue;
+        }
         add_resource(
             &root,
             &path,
@@ -844,6 +898,7 @@ mod tests {
             manifest_sha256: None,
             artifact_sha256: None,
             url_hash: None,
+            first_use_comparison: None,
         };
         let summary = inspect(&setup, package.clone()).await.unwrap();
         assert!(!summary.review_type.is_empty());
@@ -918,5 +973,100 @@ mod tests {
         assert_eq!(slow.read(&mut closed).unwrap(), 0);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(TcpStream::connect(address).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "read-only first-use validation; set REVIEW_MODELER_REPO and REVIEW_FIRST_USE_MANIFEST"]
+    async fn real_first_use_comparison_rejects_changed_frozen_bindings() {
+        let repository = PathBuf::from(std::env::var("REVIEW_MODELER_REPO").unwrap());
+        let value: Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("REVIEW_FIRST_USE_MANIFEST").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let manifest = &value["manifest"];
+        let item = &manifest["items"][0];
+        let web = &item["review_web"];
+        let setup = DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            python: repository.join(if cfg!(windows) {
+                ".venv/Scripts/python.exe"
+            } else {
+                ".venv/bin/python"
+            }),
+            repository,
+            context_path: PathBuf::new(),
+            run_id: String::new(),
+            context_sha256: String::new(),
+            floor_id: String::new(),
+        };
+        let package = WebReviewPackage {
+            html_path: web["html_path"].as_str().unwrap().into(),
+            png_path: item["images"][0]["image_path"].as_str().unwrap().into(),
+            data_sha256: web["data_sha256"].as_str().unwrap().into(),
+            manifest_sha256: Some(web["manifest_sha256"].as_str().unwrap().into()),
+            artifact_sha256: Some(web["artifact_sha256"].as_str().unwrap().into()),
+            url_hash: Some("view=perspective".into()),
+            first_use_comparison: Some(FirstUseComparison {
+                proposal_sha256: manifest["candidate_sha256"].as_str().unwrap().into(),
+                cad_required: item["source_kind"] == "cad",
+                part_ids: serde_json::from_value(item["part_ids"].clone()).unwrap(),
+                dimensions: item["dimensions"].clone(),
+            }),
+        };
+        verify(&setup, package.clone()).await.unwrap();
+        // Exercise full assumptions against a frozen reference without writing
+        // either the real package or its sealed assumptions file.
+        let output=tokio::process::Command::new(&setup.python)
+            .current_dir(&setup.repository)
+            .env("PYTHONDONTWRITEBYTECODE","1")
+            .args(["-B","-X","utf8","-c",r#"
+import json,sys
+from pathlib import Path
+from blender_agent.orchestrator.component_first_use import comparison_dimensions,digest
+from blender_agent.review_web.contract import comparison_rows
+path=Path(sys.argv[1])
+d=comparison_dimensions(path.parent,json.loads(path.read_bytes())['manifest']['items'][0]['dimensions'])
+assumptions=d.pop('assumed')
+d.update(assumed_ref={'sha256':digest(assumptions),'count':len(assumptions)},assumed_rows=comparison_rows({'assumed':assumptions})['assumptions'])
+print(json.dumps(d))
+"#])
+            .arg(std::env::var("REVIEW_FIRST_USE_MANIFEST").unwrap())
+            .output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut referenced = package.clone();
+        referenced.first_use_comparison.as_mut().unwrap().dimensions =
+            serde_json::from_slice(&output.stdout).unwrap();
+        verify(&setup, referenced.clone()).await.unwrap();
+        for field in ["sha256", "count", "rows"] {
+            let mut changed = referenced.clone();
+            let dimensions = &mut changed.first_use_comparison.as_mut().unwrap().dimensions;
+            match field {
+                "sha256" => dimensions["assumed_ref"]["sha256"] = serde_json::json!("0".repeat(64)),
+                "count" => dimensions["assumed_ref"]["count"] = serde_json::json!(99999),
+                _ => dimensions["assumed_rows"] = serde_json::json!(["changed"]),
+            }
+            assert!(verify(&setup, changed).await.is_err(), "{field}");
+        }
+        for field in ["candidate", "cad", "parts", "dimensions"] {
+            let mut changed = package.clone();
+            let comparison = changed.first_use_comparison.as_mut().unwrap();
+            match field {
+                "candidate" => comparison.proposal_sha256 = "0".repeat(64),
+                "cad" => comparison.cad_required = !comparison.cad_required,
+                "parts" => comparison.part_ids.push("foreign".into()),
+                _ => comparison.dimensions["model_xyz_m"] = serde_json::json!([999, 999, 999]),
+            }
+            assert!(
+                verify(&setup, changed)
+                    .await
+                    .unwrap_err()
+                    .contains("component_first_use_comparison_binding"),
+                "{field}"
+            );
+        }
     }
 }

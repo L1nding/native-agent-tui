@@ -966,7 +966,11 @@ pub(super) fn approval_card_lines(
         format!(
             "待你确认：{}",
             if title.is_empty() {
-                "本次模型"
+                if proposal.parameter_only {
+                    "楼层参数决定"
+                } else {
+                    "本次模型"
+                }
             } else {
                 &title
             }
@@ -974,12 +978,19 @@ pub(super) fn approval_card_lines(
         format!(
             "内容：{}",
             if contents.is_empty() {
-                "具体内容待补充"
+                if proposal.parameter_only {
+                    "仅更新楼层参数和决定记录，几何不变"
+                } else {
+                    "具体内容待补充"
+                }
             } else {
                 &contents
             }
         ),
     ];
+    if proposal.parameter_only {
+        lines.extend(proposal.objects.iter().map(|row| display_text(row)));
+    }
 
     if let Some(revision) = domain
         .structure_revision
@@ -1264,6 +1275,55 @@ mod tests {
     };
     use super::*;
     use crate::state::CoreSnapshot;
+    #[test]
+    fn parameter_decision_card_shows_values_and_ctrl_y_submits_the_bound_version() {
+        let mut facts = crate::domain::DomainFacts::new(Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: "context".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor.f02.trial".into(),
+        }));
+        facts.apply_verified_fact(&crate::domain::tests::floor_story_height_proposal());
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        crate::domain::tests::add_reviewed_candidate(&mut facts.snapshot, &binding);
+        let extension = ExtensionSnapshot::Modeling(facts.snapshot);
+        let card = approval_card_lines(extension.modeling().unwrap(), 0).join("\n");
+        assert!(
+            card.contains("楼层参数决定") && card.contains("4.0") && card.contains("几何不变"),
+            "{card}"
+        );
+        let confirmation = ModelingView.confirmation(&extension).unwrap();
+        let snapshot = CoreSnapshot {
+            phase: SessionPhase::Completed,
+            thread_id: Some("root".into()),
+            extensions: vec![extension],
+            ..Default::default()
+        };
+        let mut local = LocalState {
+            extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+            viewport: Rect::new(0, 0, 160, 75),
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 75)).unwrap();
+        terminal
+            .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        super::super::handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut local,
+            &tx,
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), Command::ConfirmExtension { confirmation: sent } if sent == confirmation)
+        );
+    }
+
     fn floor_progress_domain() -> DomainSnapshot {
         DomainSnapshot {
             enabled: true,
@@ -1679,6 +1739,7 @@ mod tests {
             assumptions: vec!["示意尺寸".into()],
             diagnostics: vec![],
             ready: true,
+            parameter_only: false,
         }
     }
 
@@ -2650,6 +2711,7 @@ mod tests {
             manifest_sha256: Some("b".repeat(64)),
             artifact_sha256: Some("c".repeat(64)),
             url_hash: None,
+            first_use_comparison: None,
         });
         image.detail = Some("复核类型：component_form_3d".into());
         let mut domain = DomainSnapshot {

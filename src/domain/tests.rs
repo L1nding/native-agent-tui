@@ -1,5 +1,125 @@
 use super::*;
 
+pub(crate) fn floor_story_height_proposal() -> Value {
+    let mut value = envelope();
+    let decision = json!({"request_id":"f02-height-4m","floor_id":"floor.f02.trial",
+        "height_m":4.0,"no_split_levels":true,"allow_stair_above_floor":true,
+        "decided_at":"2026-10-25","reason":"用户确认沿用 4 m","reference_wall_height_m":3.5});
+    let p = &mut value["proposal"];
+    p["base_sha256"] = json!("a".repeat(64));
+    p["candidate_sha256"] = json!("b".repeat(64));
+    p["scope"] = json!({"floor_id":"floor.f02.trial"});
+    p["draft"]["operations"] = json!([{"op":"set_floor_story_height",
+        "target_id":"floor.f02.trial","floor_id":"floor.f02.trial","collection":null,"field":null,
+        "value_json":decision.to_string(),"basis":"decision","source_ids":[],
+        "decision_id":"floor-height-f02-height-4m","reason":decision["reason"]}]);
+    p["decision_drafts"] = json!([{"id":"floor-height-f02-height-4m",
+        "title":"用户楼层层高决定","body":decision.to_string()}]);
+    p["component_first_use_requirements"] = json!({"contract":"component-first-use/6",
+        "comparison_contract":"component-first-use-comparison/1","required":[],"reused":[]});
+    value
+}
+
+#[test]
+fn parameter_decision_requires_bound_operations_validation_and_reviewed_candidate() {
+    let value = floor_story_height_proposal();
+    let mut facts = sequenced_facts();
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(facts
+        .snapshot
+        .proposal
+        .as_ref()
+        .unwrap()
+        .objects
+        .join("\n")
+        .contains("几何不变"));
+    assert!(facts.snapshot.first_use_satisfied());
+    let mut multiline = value.clone();
+    let mut decision: Value = serde_json::from_str(
+        multiline["proposal"]["draft"]["operations"][0]["value_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    decision["reason"] = json!("用户确认 4 m\r\n沿用原方案");
+    multiline["proposal"]["draft"]["operations"][0]["reason"] = decision["reason"].clone();
+    multiline["proposal"]["draft"]["operations"][0]["value_json"] = json!(decision.to_string());
+    multiline["proposal"]["decision_drafts"][0]["body"] = json!(decision.to_string());
+    assert_eq!(
+        sequenced_facts().apply_verified_fact(&multiline),
+        FactProjection::Applied
+    );
+    assert!(!facts.can_authorize(&binding));
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    for key in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+    ] {
+        let mut stale = binding.clone();
+        match key {
+            "proposal_id" => stale.proposal_id.push('x'),
+            "revision" => stale.revision += 1,
+            "prepare_token" => stale.prepare_token.push('x'),
+            "base_sha256" => stale.base_sha256 = "c".repeat(64),
+            _ => stale.candidate_sha256 = "c".repeat(64),
+        }
+        assert!(!facts.can_authorize(&stale), "{key}");
+    }
+    facts.snapshot.artifacts[0].valid = Some(false);
+    assert!(!facts.can_authorize(&binding));
+    facts.snapshot.artifacts[0].valid = Some(true);
+    facts.snapshot.review_images[0].file_state = ImageFileState::Unavailable;
+    assert!(!facts.can_authorize(&binding));
+    for (path, invalid) in [
+        ("/proposal/draft/operations/0/op", json!("set")),
+        ("/proposal/draft/operations/0/collection", json!("walls")),
+        ("/proposal/draft/operations/0/floor_id", json!("foreign")),
+        ("/proposal/draft/operations/0/basis", json!("assumed")),
+        ("/proposal/decision_drafts/0/id", json!("foreign")),
+        ("/proposal/decision_drafts/0/body", json!("{}")),
+        ("/proposal/component_first_use_requirements", Value::Null),
+        (
+            "/proposal/component_first_use_requirements/required",
+            json!([{}]),
+        ),
+        (
+            "/proposal/component_first_use_requirements/reused",
+            json!([{}]),
+        ),
+    ] {
+        let mut bad = value.clone();
+        *bad.pointer_mut(path).unwrap() = invalid;
+        let mut facts = sequenced_facts();
+        assert_eq!(
+            facts.apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{path}"
+        );
+        assert!(facts.snapshot.proposal.is_none(), "{path}");
+    }
+    let mut mixed = value.clone();
+    mixed["proposal"]["draft"]["operations"]
+        .as_array_mut()
+        .unwrap()
+        .push(envelope()["proposal"]["draft"]["operations"][0].clone());
+    assert_eq!(
+        sequenced_facts().apply_verified_fact(&mixed),
+        FactProjection::Invalid
+    );
+    let mut invalid = value;
+    invalid["diagnostics"] = json!([{"code":"invalid_candidate"}]);
+    let mut facts = sequenced_facts();
+    assert_eq!(facts.apply_verified_fact(&invalid), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(!facts.can_authorize(&binding));
+}
+
 #[tokio::test]
 async fn domain_http_patch_file_has_global_server_and_long_timeout() {
     let path = write_http_mcp_patch(12345).await.unwrap();
@@ -222,7 +342,7 @@ fn reviewed_candidate(proposal: &ProposalBinding) -> ArtifactFact {
     }
 }
 
-fn add_reviewed_candidate(snapshot: &mut DomainSnapshot, proposal: &ProposalBinding) {
+pub(crate) fn add_reviewed_candidate(snapshot: &mut DomainSnapshot, proposal: &ProposalBinding) {
     let artifact = reviewed_candidate(proposal);
     snapshot
         .review_images
@@ -4897,6 +5017,238 @@ fn first_use_fixture() -> (Value, Value) {
     (proposal, review)
 }
 
+fn first_use_v6_fixture() -> Value {
+    // First required group from 740d08876ea94977b3ec127b949c2858.json;
+    // retain its identities, direction, installation argument hash and style group.
+    let (mut proposal, mut evidence) = first_use_fixture();
+    let item = json!({
+        "review_key":"043210a7a7a6f11ba46f7bc4e12852bf3879cd5af4ef71bcf75f36d15103e3a3",
+        "component_id":"component.cad.f02.1402E2.130359",
+        "source_instance_id":"source.cad.f02.instance.1402E2.130359",
+        "source_sha256":"5051e4b3d45c2752e2f539eabf4fc57e513fb34fbee664f8c2a4918a4b6c9cd5",
+        "source_geometry_sha256":"bd1c92f2386061e5a4c02f23edce84f83aff7b3fb87e3aa271fa8eceafbce307",
+        "category":"infusion_chair",
+        "template_id":"template.cad-minimal-v2.1a593ea8684ed3f1abb06189ec00b1e0",
+        "definition_sha256":"8fe5a0a7b201bcb0fe732a290905bdeabb81c1eb45dc030d141a0f8ed118ae89",
+        "arguments_sha256":"8dfb3ef6bd7d8c258f411bd6aa4f5eb1e5499f94389802323b62cdd149c15739",
+        "style_signature_sha256":"15b47e9da1c646214306654af10a602fc1a2e42524b07f011b6f476cedb6e332",
+        "source_kind":"cad","source_direction":[false,false,180.0],
+        "component_ids":["component.cad.f02.1402E2.130359"],
+        "source_bindings":[{"component_id":"component.cad.f02.1402E2.130359",
+            "source_instance_id":"source.cad.f02.instance.1402E2.130359",
+            "source_sha256":"5051e4b3d45c2752e2f539eabf4fc57e513fb34fbee664f8c2a4918a4b6c9cd5",
+            "source_geometry_sha256":"bd1c92f2386061e5a4c02f23edce84f83aff7b3fb87e3aa271fa8eceafbce307"}],
+        "source_dimension_ranges_m":{"cad_x":[0.8,0.8],"cad_y":[0.5,0.5]}
+    });
+    proposal["proposal"]["component_first_use_requirements"] = json!({
+        "contract":"component-first-use/6","comparison_contract":"component-first-use-comparison/1",
+        "required":[item.clone()],"reused":[]});
+    proposal["proposal"]["component_plan"] = json!({
+        "templates":[{"id":item["template_id"],"metadata":{"template_kind":"cad_minimal_form"}}],
+        "components":[{"component_id":item["component_id"],"template_id":item["template_id"],
+            "source_instance_id":item["source_instance_id"],"placement_basis":"source",
+            "scale":[1.0,1.0,1.0],"rotation_z_deg":180.0}]});
+    let manifest = &mut evidence["component_first_use_review"]["manifest"];
+    manifest["requirements_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
+        )
+    ));
+    let rendered = &mut manifest["items"][0];
+    for (key, value) in item.as_object().unwrap() {
+        rendered[key] = value.clone();
+    }
+    rendered["renderer"] = json!({"engine":"REVIEW_WEB_3D"});
+    rendered["review_web"] = json!({"review_type":"component_first_use_3d","version":"2",
+        "html_path":std::env::temp_dir().join("first-use-web/index.html"),
+        "data_sha256":"b".repeat(64),"manifest_sha256":"c".repeat(64),"artifact_sha256":"d".repeat(64),
+        "manifest":{"data_sha256":"b".repeat(64),"artifact_sha256":"d".repeat(64),"image_sha256":"8".repeat(64)}});
+    proposal["component_first_use_review"] = evidence["component_first_use_review"].clone();
+    proposal
+}
+
+#[test]
+fn first_use_v6_binds_frozen_comparison_and_review_set_before_confirmation() {
+    let value = first_use_v6_fixture();
+    let mut facts = sequenced_facts();
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    let image = &facts.snapshot.review_images[0];
+    let comparison = image
+        .binding
+        .web_review
+        .as_ref()
+        .unwrap()
+        .first_use_comparison
+        .as_ref()
+        .unwrap();
+    assert_eq!(comparison.proposal_sha256, binding.candidate_sha256);
+    assert!(comparison.cad_required);
+    assert_eq!(comparison.part_ids, vec!["chair.1.seat", "chair.1.base"]);
+    assert_eq!(
+        comparison.dimensions,
+        value["component_first_use_review"]["manifest"]["items"][0]["dimensions"]
+    );
+    assert!(!facts.can_authorize(&binding));
+    facts.snapshot.review_images[0].file_state = ImageFileState::Available;
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    assert_eq!(
+        facts.snapshot.confirmation().review_set_sha256,
+        Some("a".repeat(64))
+    );
+    facts.snapshot.review_images[0].binding.review_set_sha256 = Some("f".repeat(64));
+    assert!(!facts.can_authorize(&binding));
+    for path in [
+        "/proposal/component_first_use_requirements/comparison_contract",
+        "/proposal/component_plan/components/0/rotation_z_deg",
+        "/component_first_use_review/manifest/requirements_sha256",
+        "/component_first_use_review/manifest/items/0/renderer/engine",
+        "/component_first_use_review/manifest/items/0/arguments_sha256",
+        "/component_first_use_review/manifest/items/0/source_bindings",
+        "/component_first_use_review/manifest/items/0/source_direction",
+    ] {
+        let mut bad = value.clone();
+        *bad.pointer_mut(path).unwrap() = json!("changed");
+        assert_eq!(
+            sequenced_facts().apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{path}"
+        );
+    }
+    let mut referenced = value.clone();
+    let dimensions =
+        &mut referenced["component_first_use_review"]["manifest"]["items"][0]["dimensions"];
+    dimensions.as_object_mut().unwrap().remove("assumed");
+    dimensions["assumed_ref"] = json!({"sha256":"e".repeat(64),"count":1000});
+    dimensions["assumed_rows"] = json!(["封存假设，重复项合并显示"]);
+    assert_eq!(
+        sequenced_facts().apply_verified_fact(&referenced),
+        FactProjection::Applied
+    );
+    for (field, bad_value) in [
+        ("assumed", json!([])),
+        ("assumed_ref", json!({"sha256":"bad","count":1000})),
+        ("assumed_rows", json!([12])),
+    ] {
+        let mut bad = referenced.clone();
+        bad["component_first_use_review"]["manifest"]["items"][0]["dimensions"][field] = bad_value;
+        assert_eq!(
+            sequenced_facts().apply_verified_fact(&bad),
+            FactProjection::Invalid,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn first_use_v6_keeps_all_136_groups_and_the_candidate_image() {
+    let mut value = first_use_v6_fixture();
+    let required = value["proposal"]["component_first_use_requirements"]["required"][0].clone();
+    let rendered = value["component_first_use_review"]["manifest"]["items"][0].clone();
+    let placement = value["proposal"]["component_plan"]["components"][0].clone();
+    let mut requirements = Vec::new();
+    let mut items = Vec::new();
+    let mut placements = Vec::new();
+    for n in 0..136 {
+        let mut requirement = required.clone();
+        let id = format!("component.{n}");
+        requirement["review_key"] = json!(format!("{n:064x}"));
+        requirement["component_id"] = json!(id);
+        requirement["component_ids"] = json!([id]);
+        requirement["source_bindings"][0]["component_id"] = json!(id);
+        let mut item = rendered.clone();
+        for (key, value) in requirement.as_object().unwrap() {
+            item[key] = value.clone();
+        }
+        let mut placement = placement.clone();
+        placement["component_id"] = json!(id);
+        requirements.push(requirement);
+        items.push(item);
+        placements.push(placement);
+    }
+    value["proposal"]["component_plan"]["components"] = json!(placements);
+    value["proposal"]["component_first_use_requirements"]["required"] = json!(requirements);
+    value["component_first_use_review"]["manifest"]["items"] = json!(items);
+    value["component_first_use_review"]["manifest"]["requirements_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&value["proposal"]["component_first_use_requirements"]).unwrap()
+        )
+    ));
+    let mut facts = sequenced_facts();
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    assert_eq!(facts.snapshot.review_images.len(), 136);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert_eq!(facts.snapshot.review_images.len(), 137);
+    assert!(!facts.can_authorize(&binding));
+    for image in &mut facts.snapshot.review_images {
+        image.file_state = ImageFileState::Available;
+    }
+    assert!(facts.can_authorize(&binding));
+}
+
+#[tokio::test]
+async fn first_use_v6_authorization_passes_the_confirmed_set_and_rejects_a_different_grant() {
+    let directory =
+        std::env::temp_dir().join(format!("tui-v6-authorization-{}", std::process::id()));
+    std::fs::create_dir_all(directory.join("blender_agent/cli")).unwrap();
+    std::fs::write(directory.join("context.json"), b"{}").unwrap();
+    std::fs::write(directory.join("blender_agent/__init__.py"), "").unwrap();
+    std::fs::write(directory.join("blender_agent/cli/__init__.py"), "").unwrap();
+    std::fs::write(
+        directory.join("blender_agent/cli/main.py"),
+        r#"
+import sys,json
+from pathlib import Path
+a=sys.argv
+def arg(key): return a[a.index(key)+1]
+assert arg('--expected-review-set-sha256') == 'a'*64
+print(json.dumps({'ok':True,'kind':'authorization','run_id':'run',
+ 'context_sha256':__import__('hashlib').sha256(b'{}').hexdigest(),
+ 'grant':{'authorization_id':'v6-grant','proposal_id':arg('--proposal'),
+ 'revision':int(arg('--revision')),'prepare_token':arg('--prepare-token'),
+ 'review_set_sha256':('b' if Path('wrong-grant').exists() else 'a')*64}}))
+"#,
+    )
+    .unwrap();
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.repository = directory.clone();
+    setup.python = receipt::tests::python();
+    setup.context_path = directory.join("context.json");
+    setup.context_sha256 = format!("{:x}", Sha256::digest(b"{}"));
+    let mut value = first_use_v6_fixture();
+    value["context_sha256"] = json!(setup.context_sha256);
+    let mut facts = DomainFacts::new(Some(setup.clone()));
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    let confirmation = facts.snapshot.confirmation();
+    let binding = confirmation.proposal;
+    let text = authorize(
+        setup.clone(),
+        binding.clone(),
+        confirmation.review_set_sha256.clone(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(payload["review_set_sha256"], "a".repeat(64));
+    assert_eq!(payload["proposal"], serde_json::to_value(&binding).unwrap());
+    assert_eq!(
+        payload["apply_change_arguments"]["authorization_id"],
+        "v6-grant"
+    );
+    std::fs::write(directory.join("wrong-grant"), b"").unwrap();
+    assert!(
+        authorize(setup, binding, confirmation.review_set_sha256, Vec::new())
+            .await
+            .is_err()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn first_use_scope_fixture() -> Value {
     let (proposal, evidence) = first_use_fixture();
     let mut scope = project_scope(3, "f08", &"d".repeat(64));
@@ -5830,8 +6182,13 @@ fn first_use_v3_accepts_group_ranges_and_blocked_manifest_entries() {
 }
 
 #[test]
-fn first_use_v5_separates_source_directions_and_binds_the_manifest() {
-    for template_kind in ["schematic_extrusion", "cad_minimal_form"] {
+fn first_use_v5_and_v6_separate_source_directions_and_bind_the_manifest() {
+    for (contract, template_kind) in [
+        ("component-first-use/5", "schematic_extrusion"),
+        ("component-first-use/5", "cad_minimal_form"),
+        ("component-first-use/6", "schematic_extrusion"),
+        ("component-first-use/6", "cad_minimal_form"),
+    ] {
         let (mut proposal, mut evidence) = first_use_fixture();
         // Minimal seq 2387 structure: schematic template, source-bound placement,
         // and a normalized CAD direction (295.714285714... -> 295.714286).
@@ -5844,7 +6201,7 @@ fn first_use_v5_separates_source_directions_and_binds_the_manifest() {
              "placement_basis":"source","scale":[1.0,1.0,1.0],"rotation_z_deg":295.7142857142857}
         ]});
         let requirements = &mut proposal["proposal"]["component_first_use_requirements"];
-        requirements["contract"] = json!("component-first-use/5");
+        requirements["contract"] = json!(contract);
         requirements["required"][0]["source_direction"] = json!([false, false, 295.714286]);
         requirements["required"][0]["style_signature_sha256"] = json!("c".repeat(64));
         for (field, value) in requirements["required"][0].as_object().unwrap() {
@@ -6044,7 +6401,11 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
 
 #[test]
 fn first_use_v4_style_groups_project_with_aperture_ranges() {
-    for contract in ["component-first-use/4", "component-first-use/5"] {
+    for contract in [
+        "component-first-use/4",
+        "component-first-use/5",
+        "component-first-use/6",
+    ] {
         let (mut proposal, mut evidence) = first_use_fixture();
         let requirements = &mut proposal["proposal"]["component_first_use_requirements"];
         requirements["contract"] = json!(contract);
@@ -6298,6 +6659,7 @@ async fn png_verification_rejects_missing_changed_dimensions_and_nonlocal_files_
         manifest_sha256: Some("b".repeat(64)),
         artifact_sha256: Some("c".repeat(64)),
         url_hash: Some("view=perspective".into()),
+        first_use_comparison: None,
     });
     assert!(review::verify_image(&web_image).await.is_ok());
     let setup = sequenced_facts().setup.unwrap();
@@ -7116,6 +7478,7 @@ fn new_read_only_facts_accept_receipts_without_inventing_approval_or_scope() {
         "diagnostic_log",
         "project_floor_preparing",
         "precedent_job",
+        "tool_operation",
     ]
     .iter()
     .enumerate()
@@ -7124,7 +7487,10 @@ fn new_read_only_facts_accept_receipts_without_inventing_approval_or_scope() {
             "fact_sequence":index+4,"ok":true,"state":"running","changed":true,"next_poll_after_s":0,
             "recommended_call":{"tool":"inspect_background_job","arguments":{"wait_s":60}},
             "wait_instruction":"server waits","delivery_status":{"missing":0}});
-        if !matches!(*kind, "diagnostic_log" | "project_floor_preparing") {
+        if !matches!(
+            *kind,
+            "diagnostic_log" | "project_floor_preparing" | "tool_operation"
+        ) {
             value["project_scope"] = scope["project_scope"].clone();
         }
         let raw = serde_json::to_vec(&value).unwrap();
@@ -7155,7 +7521,10 @@ fn new_read_only_facts_accept_receipts_without_inventing_approval_or_scope() {
             FactProjection::Invalid,
             "{kind}"
         );
-        if !matches!(*kind, "diagnostic_log" | "project_floor_preparing") {
+        if !matches!(
+            *kind,
+            "diagnostic_log" | "project_floor_preparing" | "tool_operation"
+        ) {
             value["run_id"] = json!("run");
             value.as_object_mut().unwrap().remove("project_scope");
             assert_eq!(

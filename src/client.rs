@@ -6815,6 +6815,7 @@ mod tests {
             manifest_sha256: None,
             artifact_sha256: None,
             url_hash: None,
+            first_use_comparison: None,
         };
         let expected = crate::review_web::inspect(&setup, package.clone())
             .await

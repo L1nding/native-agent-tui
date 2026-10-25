@@ -82,6 +82,7 @@ impl QuestionPreview {
             manifest_sha256: None,
             artifact_sha256: None,
             url_hash: None,
+            first_use_comparison: None,
         }
     }
 }

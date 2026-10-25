@@ -411,6 +411,7 @@ mod tests {
                     assumptions: Vec::new(),
                     diagnostics: Vec::new(),
                     ready: true,
+                    parameter_only: false,
                 }),
                 artifacts: vec![ArtifactFact {
                     binding: ArtifactBinding {

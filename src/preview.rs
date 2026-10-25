@@ -495,6 +495,7 @@ mod tests {
                 assumptions: vec![],
                 diagnostics: vec![],
                 ready: true,
+                parameter_only: false,
             }),
             ..Default::default()
         };
