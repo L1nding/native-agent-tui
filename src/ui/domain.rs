@@ -305,6 +305,16 @@ fn business_lines(
                 "blocked" => "尚未满足",
                 "running" => "生成中",
                 "stalled" => "生成停滞",
+                "queued" => "等待生成",
+                "building" | "preparing" => "准备生成",
+                "not_started" => "尚未开始",
+                "failed" | "candidate_failed" => "生成失败，待处理",
+                "cancelled" => "已取消，待处理",
+                "preview_required" => "待构建候选预览",
+                "restore_candidate_review" => "待恢复候选复核",
+                "restore_applied_result" => "待核对已应用结果",
+                "proposal_not_approvable" => "方案尚不可批准",
+                "unknown" | "candidate_outcome_unknown" => "结果未知，待核对",
                 "not_required" => "无需首用对照",
                 _ => "未知",
             },
@@ -1322,6 +1332,73 @@ mod tests {
         assert!(
             matches!(rx.try_recv().unwrap(), Command::ConfirmExtension { confirmation: sent } if sent == confirmation)
         );
+    }
+
+    #[test]
+    fn pending_review_recovery_is_visible_and_ctrl_y_cannot_confirm_it() {
+        for (status, label) in [
+            ("preview_required", "待构建候选预览"),
+            ("restore_candidate_review", "待恢复候选复核"),
+        ] {
+            let mut facts = crate::domain::DomainFacts::new(Some(crate::domain::DomainSetup {
+                mode: crate::domain::DomainMode::Floor,
+                context_path: "context".into(),
+                repository: ".".into(),
+                python: "python".into(),
+                run_id: "run".into(),
+                context_sha256: "ctx".into(),
+                floor_id: "floor.f02.trial".into(),
+            }));
+            let proposal = crate::domain::tests::floor_story_height_proposal();
+            facts.apply_verified_fact(&proposal);
+            let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+            crate::domain::tests::add_reviewed_candidate(&mut facts.snapshot, &binding);
+            let mut update = proposal.clone();
+            update["kind"] = serde_json::json!("component_first_use_review");
+            update["component_first_use_review"] = proposal["proposal"].clone();
+            update["component_first_use_review"]["status"] = serde_json::json!(status);
+            update["component_first_use_review"]["current"] = serde_json::json!(true);
+            assert_eq!(
+                facts.apply_verified_fact(&update),
+                crate::domain::FactProjection::Applied
+            );
+            let extension = ExtensionSnapshot::Modeling(facts.snapshot);
+            assert!(ModelingView.confirmation(&extension).is_none());
+            let snapshot = CoreSnapshot {
+                phase: SessionPhase::Completed,
+                thread_id: Some("root".into()),
+                extensions: vec![extension],
+                ..Default::default()
+            };
+            let local = LocalState {
+                extension: ExtensionPanel::new(Some(ExtensionId::Modeling)),
+                viewport: Rect::new(0, 0, 160, 75),
+                ..Default::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 75)).unwrap();
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &snapshot, &local))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let visible: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(visible.contains(label), "{status}");
+            let mut local = local;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            super::super::handle_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                &snapshot,
+                &mut local,
+                &tx,
+            );
+            assert!(rx.try_recv().is_err(), "{status}");
+        }
     }
 
     fn floor_progress_domain() -> DomainSnapshot {

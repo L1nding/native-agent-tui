@@ -527,7 +527,16 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
 async fn manual_grant_steered_into_an_ending_turn_is_resubmitted_when_still_unapplied() {
     use crate::config::DomainApprovalPolicy;
     use sha2::{Digest, Sha256};
-    for completion in ["approved", "failed", "expired", "newer_notice"] {
+    for completion in [
+        "approved",
+        "failed",
+        "expired",
+        "newer_notice",
+        "preview_required",
+        "restore_candidate_review",
+        "unknown",
+        "pending_after_steer",
+    ] {
         let policy = DomainApprovalPolicy::Manual;
         let directory = std::env::temp_dir().join(format!(
             "tui-policy-{}-{:?}-{}",
@@ -713,7 +722,47 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
             );
             assert_eq!(current.root_start_requests, 1);
         }
-        if completion != "approved" {
+        if matches!(
+            completion,
+            "preview_required" | "restore_candidate_review" | "unknown"
+        ) {
+            let pending = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+                "kind":"component_first_use_review","fact_sequence":3,
+                "component_first_use_review":{"proposal_id":"p","revision":1,"prepare_token":"token",
+                    "base_sha256":"base","candidate_sha256":"candidate","current":true,"status":completion}});
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"pending-review","type":"mcpToolCall","server":"modeling_domain","tool":"inspect_change","status":"completed","result":{"structuredContent":pending}}}})).await;
+            assert!(!client.snapshots.borrow().extensions[0]
+                .modeling()
+                .unwrap()
+                .first_use_satisfied());
+            std::fs::write(directory.join("release-authorization"), b"ready").unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client
+                    .snapshots
+                    .wait_for(|s| !s.extensions[0].modeling().unwrap().authorizing),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let finished = client.snapshots.borrow().clone();
+            assert_eq!(finished.root_start_requests, 1);
+            assert_eq!(
+                finished.extensions[0].modeling().unwrap().notice.as_deref(),
+                Some("批准结果已过期；请核对当前方案")
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                    .await
+                    .is_err()
+            );
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+            continue;
+        }
+        if completion != "approved" && completion != "pending_after_steer" {
             if completion == "newer_notice" {
                 client
                     .commands
@@ -778,7 +827,27 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         // applying it, so the grant must come back as the next input.
         let steer = next(&mut server).await;
         assert_eq!(steer["method"], "turn/steer");
+        if completion == "pending_after_steer" {
+            let pending = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+                "kind":"component_first_use_review","fact_sequence":3,
+                "component_first_use_review":{"proposal_id":"p","revision":1,"prepare_token":"token",
+                    "base_sha256":"base","candidate_sha256":"candidate","current":true,"status":"preview_required"}});
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"pending-after-steer","type":"mcpToolCall","server":"modeling_domain","tool":"inspect_change","status":"completed","result":{"structuredContent":pending}}}})).await;
+        }
         observation_event(&mut client,&mut server,json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
+        if completion == "pending_after_steer" {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), next(&mut server))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+            continue;
+        }
         let resent = next(&mut server).await;
         assert_eq!(resent["method"], "turn/start");
         assert_eq!(

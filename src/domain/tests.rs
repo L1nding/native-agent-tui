@@ -6143,7 +6143,7 @@ fn first_use_projection_failure_names_the_missing_review_set_field() {
     evidence["component_first_use_review"]["review_set_sha256"] = Value::Null;
     let reason = review::project_failure_reason(&evidence);
     assert!(reason.contains("delivery.review_set_sha256"), "{reason}");
-    evidence["component_first_use_review"]["status"] = json!("unknown");
+    evidence["component_first_use_review"]["status"] = json!("invented_status");
     let reason = review::project_failure_reason(&evidence);
     assert!(
         reason.contains("component_first_use_review.status"),
@@ -6550,6 +6550,507 @@ fn first_use_async_progress_is_projected_without_images() {
     assert_eq!(running.total, Some(40));
     assert!(images.is_empty());
     assert!(!running.satisfied(&images));
+}
+
+#[test]
+fn modeler_review_states_project_without_turning_pending_work_into_authorization() {
+    // bam-integ b5bc642: component_first_use.py:1638-1667;
+    // artifact_review_images.py:553-627,665-675 and artifact_worker.py:31-37.
+    // domain_tools.py:4749-4823 emits the last six as approval_review.status;
+    // keep observed recovery summaries safe if delivered in the first-use slot.
+    let statuses = [
+        "ready",
+        "blocked",
+        "not_required",
+        "queued",
+        "running",
+        "building",
+        "preparing",
+        "unknown",
+        "not_started",
+        "failed",
+        "cancelled",
+        "stalled",
+        "restore_applied_result",
+        "proposal_not_approvable",
+        "preview_required",
+        "candidate_failed",
+        "candidate_outcome_unknown",
+        "restore_candidate_review",
+    ];
+    for status in statuses {
+        for required in [true, false] {
+            let (mut proposal, evidence) = first_use_fixture();
+            if !required {
+                proposal["proposal"]["component_first_use_requirements"]["required"] = json!([]);
+            }
+            if (status == "ready" && !required) || (status == "not_required" && required) {
+                continue;
+            }
+            let mut facts = sequenced_facts();
+            assert_eq!(
+                facts.apply_verified_fact(&proposal),
+                FactProjection::Applied
+            );
+            let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+            add_reviewed_candidate(&mut facts.snapshot, &binding);
+            if required {
+                let mut ready = proposal.clone();
+                ready["kind"] = json!("component_first_use_review");
+                ready["component_first_use_review"] =
+                    evidence["component_first_use_review"].clone();
+                let review = &mut ready["component_first_use_review"];
+                for key in [
+                    "proposal_id",
+                    "revision",
+                    "prepare_token",
+                    "base_sha256",
+                    "candidate_sha256",
+                ] {
+                    review[key] = proposal["proposal"][key].clone();
+                }
+                assert_eq!(facts.apply_verified_fact(&ready), FactProjection::Applied);
+                for image in &mut facts.snapshot.review_images {
+                    image.file_state = ImageFileState::Available;
+                }
+                assert!(facts.can_authorize(&binding));
+            }
+            let mut update = proposal.clone();
+            update["kind"] = json!("component_first_use_review");
+            update["component_first_use_review"] = evidence["component_first_use_review"].clone();
+            let review = &mut update["component_first_use_review"];
+            for key in [
+                "proposal_id",
+                "revision",
+                "prepare_token",
+                "base_sha256",
+                "candidate_sha256",
+            ] {
+                review[key] = proposal["proposal"][key].clone();
+            }
+            review["status"] = json!(status);
+            if status != "ready" {
+                review["manifest"] = Value::Null;
+                review["review_set_sha256"] = Value::Null;
+                review["completed"] = json!(0);
+                review["total"] = json!(0);
+            }
+            assert_eq!(
+                facts.apply_verified_fact(&update),
+                FactProjection::Applied,
+                "{status}, required={required}"
+            );
+            assert!(facts.snapshot.rejected_facts.is_empty(), "{status}");
+            if status != "ready" && status != "not_required" {
+                assert!(
+                    !facts.can_authorize(&binding),
+                    "{status}, required={required}"
+                );
+                assert_eq!(facts.snapshot.review_set_sha256(), None, "{status}");
+                assert!(
+                    facts
+                        .snapshot
+                        .review_images
+                        .iter()
+                        .all(|image| !image.required),
+                    "{status}"
+                );
+            }
+            let mut invented = update;
+            invented["component_first_use_review"]["status"] = json!("invented_status");
+            assert_eq!(
+                facts.apply_verified_fact(&invented),
+                FactProjection::Invalid
+            );
+            let mut foreign = proposal.clone();
+            foreign["kind"] = json!("component_first_use_review");
+            foreign["component_first_use_review"] =
+                json!({"proposal_id":"foreign","status":status});
+            assert_eq!(
+                facts.apply_verified_fact(&foreign),
+                FactProjection::Superseded
+            );
+        }
+    }
+}
+
+#[test]
+fn modeler_approval_recovery_summaries_do_not_replace_first_use_proof() {
+    // bam-integ b5bc642 integrations/domain_tools.py:4749,4772,4794,4815-4823.
+    for status in [
+        "restore_applied_result",
+        "proposal_not_approvable",
+        "preview_required",
+        "candidate_failed",
+        "candidate_outcome_unknown",
+        "restore_candidate_review",
+    ] {
+        let (mut proposal, _) = first_use_fixture();
+        proposal["approval_review"] = json!({"contract":"approval-review/1","status":status,
+            "approval_ready":false,"readiness_evaluation":"not_evaluated_by_inspector"});
+        let mut facts = sequenced_facts();
+        assert_eq!(
+            facts.apply_verified_fact(&proposal),
+            FactProjection::Applied,
+            "{status}"
+        );
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        add_reviewed_candidate(&mut facts.snapshot, &binding);
+        assert_eq!(
+            facts.snapshot.first_use_review.as_ref().unwrap().status,
+            "blocked"
+        );
+        assert!(!facts.can_authorize(&binding), "{status}");
+    }
+}
+
+#[test]
+fn modeler_execution_and_source_states_remain_projectable_without_granting_approval() {
+    // Producer fixtures: bam-integ b5bc642. These lists deliberately live apart
+    // from the consumers' accepted sets so a removed state is a regression.
+    // orchestrator/changes.py:87 (PreparedChange.state).
+    for state in [
+        "prepared",
+        "blocked",
+        "superseded",
+        "applied",
+        "built",
+        "unknown",
+    ] {
+        let mut facts = sequenced_facts();
+        let mut value = envelope();
+        value["proposal"]["state"] = json!(state);
+        assert_eq!(
+            facts.apply_verified_fact(&value),
+            FactProjection::Applied,
+            "proposal: {state}"
+        );
+        let proposal = facts.snapshot.proposal.as_ref().unwrap();
+        assert_eq!(proposal.ready, state == "prepared", "{state}");
+        assert!(!facts.can_authorize(&proposal.binding));
+    }
+    // orchestrator/change_artifacts.py:84-87,226,331-371. cancelled is a
+    // pre-existing TUI compatibility value, not a current producer transition.
+    for state in [
+        "queued",
+        "building",
+        "unknown",
+        "failed",
+        "built",
+        "cancelled",
+    ] {
+        for kind in ["artifact", "artifact_validation"] {
+            let mut facts = sequenced_facts();
+            assert_eq!(
+                facts.apply_verified_fact(&envelope()),
+                FactProjection::Applied
+            );
+            let mut value = artifact_envelope("enum-build", 2, state, Some(false));
+            value["kind"] = json!(kind);
+            assert_eq!(
+                facts.apply_verified_fact(&value),
+                FactProjection::Applied,
+                "{kind}: {state}"
+            );
+            assert_eq!(facts.snapshot.artifacts.len(), 1);
+            assert!(!facts.can_authorize(&facts.snapshot.proposal.as_ref().unwrap().binding));
+        }
+    }
+    // changes.py:1774-1791,1823-1858; workflow.py:175,196,201.
+    // application and operation share the same receipt; rejected is retained
+    // compatibility, not a transition of the current application workflow.
+    for kind in ["application", "operation"] {
+        for state in ["applying", "applied", "built", "failed", "rejected"] {
+            let mut facts = sequenced_facts();
+            assert_eq!(
+                facts.apply_verified_fact(&recovery_proposal()),
+                FactProjection::Applied
+            );
+            let mut value = operation_envelope(
+                state,
+                if state == "applying" {
+                    "candidate_present"
+                } else {
+                    "not_required"
+                },
+                2,
+            );
+            value["kind"] = json!(kind);
+            assert_eq!(
+                facts.apply_verified_fact(&value),
+                FactProjection::Applied,
+                "{kind}: {state}"
+            );
+            assert_eq!(facts.snapshot.operation.as_ref().unwrap().state, state);
+            assert!(!facts.can_authorize(&facts.snapshot.proposal.as_ref().unwrap().binding));
+        }
+    }
+    for recovery in [
+        "candidate_present",
+        "base_present",
+        "conflict",
+        "not_required",
+        "reconciled_without_replay",
+    ] {
+        let mut facts = sequenced_facts();
+        facts.apply_verified_fact(&recovery_proposal());
+        assert_eq!(
+            facts.apply_verified_fact(&operation_envelope("applied", recovery, 2)),
+            FactProjection::Applied,
+            "{recovery}"
+        );
+        assert_eq!(
+            facts.snapshot.operation.as_ref().unwrap().recovery,
+            recovery
+        );
+    }
+    // integrations/tool_jobs.py:66,80,95,107,110,140-178: completed records
+    // unwrap into the original business fact; queued is only a recovered input.
+    for state in ["running", "unknown", "completed", "queued"] {
+        let mut facts = sequenced_facts();
+        let value = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+            "kind":"tool_operation","state":state,"op_id":"a".repeat(32),"replay_allowed":false});
+        assert_eq!(
+            facts.apply_verified_fact(&value),
+            FactProjection::Unrelated,
+            "{state}"
+        );
+        assert!(facts.snapshot.operation.is_none() && facts.snapshot.proposal.is_none());
+    }
+    // orchestrator/source_scan.py:1591-1800,1925-1933; source_groups.py:131-147.
+    for state in [
+        "built",
+        "pending_addition",
+        "pending_confirmation",
+        "suspected_duplicate",
+        "rejected",
+        "capability_missing",
+        "skipped",
+    ] {
+        let mut facts = sequenced_facts();
+        let mut value = instance_source_view(1);
+        value["objects"][0]["state"] = json!(state);
+        assert_eq!(
+            facts.apply_verified_fact(&value),
+            FactProjection::Applied,
+            "ledger: {state}"
+        );
+        assert!(facts
+            .snapshot
+            .ledger
+            .as_ref()
+            .unwrap()
+            .counts
+            .contains_key(state));
+        assert!(facts.snapshot.proposal.is_none());
+    }
+    // source_scan.py:1617-1640: geometry binding is explicitly weaker than verification.
+    for (aperture, label) in [
+        ("verified", "已核验"),
+        ("unverified", "待核验"),
+        ("geometry_bound", "几何已绑定"),
+    ] {
+        for entity in ["complete", "missing", "unverified"] {
+            let mut facts = sequenced_facts();
+            let mut value = instance_source_view(1);
+            value["objects"][0]["aperture_status"] = json!(aperture);
+            value["objects"][0]["entity_status"] = json!(entity);
+            assert_eq!(
+                facts.apply_verified_fact(&value),
+                FactProjection::Applied,
+                "{aperture}/{entity}"
+            );
+            let rows = &facts.snapshot.ledger.as_ref().unwrap().rows;
+            assert!(rows
+                .iter()
+                .any(|row| row.starts_with(&format!("洞口 {label} ·"))));
+            if aperture == "geometry_bound" {
+                assert!(rows.iter().all(|row| !row.contains("已核验")));
+            }
+            assert!(facts.snapshot.proposal.is_none());
+        }
+    }
+}
+
+#[test]
+fn modeler_floor_progress_dispositions_and_blockers_are_read_only_summary_values() {
+    // bam-integ b5bc642 integrations/domain_tools.py:464-487,611-621,641-699.
+    let dispositions = [
+        "deferred_collision",
+        "skipped_unknown",
+        "2d_reference",
+        "schematic_built",
+        "built",
+        "pending",
+        "unidentified",
+        "skipped_unextractable",
+    ];
+    let blockers = [
+        "unreviewed_regions",
+        "uncertain_regions",
+        "stale_regions",
+        "pending_sources",
+        "unidentified_sources",
+    ];
+    for contract in ["floor-progress/1", "floor-progress/2"] {
+        for completion in [false, true] {
+            let mut value =
+                source_region_review_view(linework_source_view(instance_source_view(1), 'a'));
+            if completion {
+                value["source_region_summary"]["reviewed_region_count"] = json!(4);
+                value["source_region_summary"]["unreviewed_region_count"] = json!(0);
+                value["source_region_summary"]["uncertain_region_count"] = json!(0);
+                value["source_region_summary"]["stale_review_count"] = json!(0);
+            }
+            let counts: serde_json::Map<String, Value> = dispositions
+                .iter()
+                .map(|state| {
+                    (
+                        (*state).into(),
+                        json!(
+                            if completion && matches!(*state, "pending" | "unidentified") {
+                                0
+                            } else {
+                                1
+                            }
+                        ),
+                    )
+                })
+                .collect();
+            value["floor_progress"] = json!({"contract":contract,"scan_id":value["scan_id"],"scene_sha256":value["scene_sha256"],
+                "categories":[{"category":"chair","built":1,"pending":if completion {0} else {1},"blocked":if completion {0} else {1},"unidentified":if completion {0} else {1}}],
+                "drawing_coverage":{"covered":if completion {2} else {1},"total":2,"unit":"来源单位"},"unreviewed_regions":if completion {0} else {2},
+                "completion":completion,"completion_blockers":if completion {json!([])} else {json!(blockers)},
+                "disposition_counts":counts,"cross_floor_unverified":1,"deferrals":[],"skips":[],"legacy_items":[]});
+            let mut facts = sequenced_facts();
+            assert_eq!(
+                facts.apply_verified_fact(&value),
+                FactProjection::Applied,
+                "{contract}/{completion}"
+            );
+            if contract == "floor-progress/2" {
+                let progress = facts.snapshot.floor_progress_v2.as_ref().unwrap();
+                assert_eq!(progress.completion, completion);
+                assert_eq!(
+                    progress.completion_blockers.len(),
+                    if completion { 0 } else { blockers.len() }
+                );
+                assert!(dispositions
+                    .iter()
+                    .all(|state| progress.disposition_counts.contains_key(*state)));
+            }
+            assert!(facts.snapshot.proposal.is_none() && facts.snapshot.operation.is_none());
+        }
+    }
+}
+
+#[test]
+fn modeler_project_and_drawing_states_remain_evidence_without_scene_authorization() {
+    // bam-integ b5bc642: project_tools.py:439-469;
+    // project_location.py:74-100; project_buildings.py:458-563,617-660;
+    // building_report.py:149; drawing_reviews.py:24,123-125,221-230.
+    for state in ["selected", "needs_selection"] {
+        let mut setup = sequenced_facts().setup.unwrap();
+        setup.mode = DomainMode::Project;
+        let mut facts = DomainFacts::new(Some(setup));
+        facts.apply_verified_fact(&project_catalog(1));
+        assert_eq!(
+            facts.apply_verified_fact(&project_selection(2, state == "selected")),
+            FactProjection::Applied,
+            "{state}"
+        );
+        assert!(facts.snapshot.proposal.is_none());
+    }
+    for status in ["configured", "derived", "needs_wall_layers"] {
+        let mut setup = sequenced_facts().setup.unwrap();
+        setup.mode = DomainMode::Project;
+        let mut facts = DomainFacts::new(Some(setup));
+        facts.apply_verified_fact(&project_catalog(1));
+        facts.apply_verified_fact(&project_selection(2, true));
+        let mut value = project_location(3);
+        value["project_location"]["status"] = json!(status);
+        assert_eq!(
+            facts.apply_verified_fact(&value),
+            FactProjection::Applied,
+            "{status}"
+        );
+        assert_eq!(
+            facts.snapshot.project_location.as_ref().unwrap().status,
+            status
+        );
+        assert!(facts.snapshot.proposal.is_none());
+    }
+    // read_state's internal running/preparing values are normalized to
+    // building/unknown before publishing a project_building fact (519-521).
+    for state in [
+        "queued",
+        "building",
+        "unknown",
+        "cancelled",
+        "failed",
+        "built",
+    ] {
+        let mut setup = sequenced_facts().setup.unwrap();
+        setup.mode = DomainMode::Project;
+        let mut facts = DomainFacts::new(Some(setup));
+        facts.apply_verified_fact(&project_catalog(1));
+        facts.apply_verified_fact(&project_selection(2, true));
+        assert_eq!(
+            facts.apply_verified_fact(&project_building(3, "state-fixture", state, None)),
+            FactProjection::Applied,
+            "{state}"
+        );
+        assert_eq!(facts.snapshot.buildings[0].state, state);
+        assert!(facts.snapshot.proposal.is_none());
+    }
+    // The helpers retain the evidence/count constraints for connection
+    // attention/passed and source reconciliation attention/complete.
+    for (value, source, connection) in [
+        (project_building_report(3), "attention", "attention"),
+        (complete_building_report(3), "complete", "passed"),
+    ] {
+        let mut setup = sequenced_facts().setup.unwrap();
+        setup.mode = DomainMode::Project;
+        let mut facts = DomainFacts::new(Some(setup));
+        facts.apply_verified_fact(&project_catalog(1));
+        facts.apply_verified_fact(&project_selection(2, true));
+        assert_eq!(
+            facts.apply_verified_fact(&value),
+            FactProjection::Applied,
+            "{source}/{connection}"
+        );
+        assert_eq!(facts.snapshot.buildings[0].source_reconciliation, source);
+        assert_eq!(facts.snapshot.buildings[0].connection_check, connection);
+        assert!(facts.snapshot.proposal.is_none());
+    }
+    for status in ["not_run", "partial", "recorded"] {
+        for verdict in ["error", "doubt", "not_error"] {
+            let judgement = json!({"audit_id":"a".repeat(64),"candidate_id":"candidate.1",
+                "scene_sha256":"b".repeat(64),"image_sha256":"c".repeat(64),"actor":"platform_agent",
+                "human_review":"not_run","scene_application":"not_run",
+                "judgement":{"verdict":verdict,"explanation":"局部图纸观察，不是批准"}});
+            let mut candidates = vec![
+                json!({"id":"candidate.1","detector":"gap","message":"待复核连接",
+                "judgement":if status=="not_run" {Value::Null} else {judgement}}),
+            ];
+            if status == "partial" {
+                candidates
+                    .push(json!({"id":"candidate.2","detector":"gap","message":"待复核连接"}));
+            }
+            let value = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx","kind":"drawing_audit","ok":true,
+                "drawing_audit":{"audit_id":"a".repeat(64),"scene_sha256":"b".repeat(64),
+                    "ai_review":status,"human_review":"not_run","scene_application":"not_run",
+                    "candidate_count":candidates.len(),"judged_count":if status=="not_run" {0} else {1},
+                    "offset":0,"next_offset":null,"candidates":candidates}});
+            let mut facts = sequenced_facts();
+            assert_eq!(
+                facts.apply_verified_fact(&value),
+                FactProjection::Applied,
+                "{status}/{verdict}"
+            );
+            assert!(facts.snapshot.drawing_audit.is_some() && facts.snapshot.proposal.is_none());
+        }
+    }
 }
 
 #[test]

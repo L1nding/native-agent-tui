@@ -2014,8 +2014,11 @@ impl Core {
                     || (manual && !self.ready_for_human_approval())
                     // The grant is already sealed for this exact version. A busy agent keeps
                     // facts syncing, so a manual grant only needs the same version and review
-                    // set to still be shown; policy approval keeps the full readiness check.
-                    || (manual && !self.domain.shows_binding(&binding))
+                    // set to still be shown and satisfied; policy approval keeps the full
+                    // readiness check. A pending zero-requirement review also has no set SHA.
+                    || (manual
+                        && (!self.domain.shows_binding(&binding)
+                            || !self.domain.snapshot.first_use_satisfied()))
                     || (!manual && !self.domain.can_authorize(&binding))
                     || self.domain.snapshot.review_set_sha256() != review_set_sha256
                     || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
@@ -2681,6 +2684,7 @@ impl Core {
                     .as_ref()
                     .is_some_and(|proposal| proposal.binding == binding);
             if unapplied
+                && self.domain.snapshot.first_use_satisfied()
                 && self.state.view.phase.can_submit()
                 && self.state.view.requests.is_empty()
                 && !self.domain.snapshot.authorizing

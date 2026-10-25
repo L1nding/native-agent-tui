@@ -782,6 +782,27 @@ fn web_detail(review_type: &str, engine: &str, image: &ReviewImageBinding) -> St
     detail
 }
 
+// These are observations of unfinished review/recovery work, never approval proof.
+// Job states come from artifact_review_images; recovery summaries come from
+// domain_tools._approval_review and can also arrive in a first-use review slot.
+const PENDING_REVIEW_STATUSES: &[&str] = &[
+    "queued",
+    "running",
+    "building",
+    "preparing",
+    "unknown",
+    "not_started",
+    "failed",
+    "cancelled",
+    "stalled",
+    "restore_applied_result",
+    "proposal_not_approvable",
+    "preview_required",
+    "candidate_failed",
+    "candidate_outcome_unknown",
+    "restore_candidate_review",
+];
+
 pub(super) fn project(
     value: &Value,
     proposal: &ProposalBinding,
@@ -789,14 +810,10 @@ pub(super) fn project(
 ) -> Option<(FirstUseReviewFact, Vec<ReviewImageFact>)> {
     let review = value.get("component_first_use_review")?;
     let mut result = previous.clone();
-    if previous.requirements.is_null() {
-        return Some((result, Vec::new()));
-    }
-    if previous.required_count == 0 {
-        if review["status"] != "not_required" {
-            return None;
-        }
-        return Some((result, Vec::new()));
+    let status = review["status"].as_str()?;
+    let pending = PENDING_REVIEW_STATUSES.contains(&status);
+    if !pending && !matches!(status, "ready" | "blocked" | "not_required") {
+        return None;
     }
     result.completed = review["completed"].as_u64().map(|value| value as usize);
     result.total = review["total"].as_u64().map(|value| value as usize);
@@ -804,16 +821,18 @@ pub(super) fn project(
     if result
         .completed
         .zip(result.total)
-        .is_some_and(|(completed, total)| total == 0 || completed > total)
+        .is_some_and(|(completed, total)| completed > total || (total == 0 && status == "ready"))
     {
         return None;
     }
-    if review["current"] == true && matches!(review["status"].as_str(), Some("running" | "stalled"))
-    {
-        result.status = review["status"].as_str()?.to_owned();
+    if pending {
+        result.status = status.to_owned();
         result.review_set_sha256 = None;
         result.blocked_count = 0;
         result.dimensions.clear();
+        return Some((result, Vec::new()));
+    }
+    if previous.requirements.is_null() {
         return Some((result, Vec::new()));
     }
     result.review_set_sha256 = None;
@@ -821,6 +840,14 @@ pub(super) fn project(
     if review["status"] == "blocked" || review["current"] == false {
         result.status = "blocked".into();
         result.blocked_count = review["manifest"]["blocked"].as_array().map_or(1, Vec::len);
+        return Some((result, Vec::new()));
+    }
+    if previous.required_count == 0 {
+        if status != "not_required" {
+            return None;
+        }
+        result.status = "not_required".into();
+        result.blocked_count = 0;
         return Some((result, Vec::new()));
     }
     if review["status"] != "ready" || review["current"] != true {
@@ -1218,10 +1245,10 @@ pub(super) fn project(
 
 pub(super) fn project_failure_reason(value: &Value) -> String {
     let review = &value["component_first_use_review"];
-    if !matches!(
-        review["status"].as_str(),
-        Some("ready" | "blocked" | "running" | "stalled" | "not_required")
-    ) {
+    if review["status"].as_str().is_none_or(|status| {
+        !PENDING_REVIEW_STATUSES.contains(&status)
+            && !matches!(status, "ready" | "blocked" | "not_required")
+    }) {
         return "字段 component_first_use_review.status 不是可投影的复核状态".into();
     }
     if hash(&review["review_set_sha256"]).is_none()

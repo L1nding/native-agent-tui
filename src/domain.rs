@@ -3031,17 +3031,17 @@ fn source_ledger_fact(value: &Value) -> Option<SourceLedgerFact> {
         }
         if let Some(aperture) = row["aperture_status"].as_str() {
             let entity = row["entity_status"].as_str()?;
-            if !matches!(aperture, "verified" | "unverified")
+            if !matches!(aperture, "verified" | "unverified" | "geometry_bound")
                 || !matches!(entity, "complete" | "missing" | "unverified")
             {
                 return None;
             }
             rows.push(format!(
                 "洞口 {} · 门窗实体 {}",
-                if aperture == "verified" {
-                    "已核验"
-                } else {
-                    "待核验"
+                match aperture {
+                    "verified" => "已核验",
+                    "geometry_bound" => "几何已绑定",
+                    _ => "待核验",
                 },
                 match entity {
                     "complete" => "已建",
