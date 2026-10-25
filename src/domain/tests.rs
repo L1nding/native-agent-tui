@@ -1229,6 +1229,153 @@ fn schematic_stair_parts_preserve_assumed_rise_and_unverified_connection_for_app
     assert!(proposal_fact(&legacy_landing).is_none());
 }
 
+#[test]
+fn schematic_shaft_massing_and_cad_side_panels_require_bound_sources() {
+    for role in ["shaft_wall", "partition"] {
+        let mut value = vertical_proposal();
+        value["proposal"]["scope"] = json!({"floor_id":"floor.lower"});
+        value["proposal"]["vertical_sources"]["source.stair"] = json!({
+            "source_id":"source.stair", "component_id":"stair.1", "floor_id":"floor.lower",
+            "source_sha256":"a".repeat(64), "geometry_sha256":"b".repeat(64),
+            "origin_m":[2,2], "linework_m":[[[0,0],[1,0]],[[0,0.1],[1,0.1]]]
+        });
+        let shaft = role == "shaft_wall";
+        value["proposal"]["component_plan"]["connections"][0] = json!({
+            "component_id":"stair.1", "source_instance_id":"source.stair",
+            "kind":if shaft {"shaft"} else {"stair"},
+            "mode":"single_floor_schematic", "served_floors":["floor.lower"],
+            "openings":[], "dimension_basis":"assumed", "rise_m":3.6,
+            "shaft_representation":"exterior_massing"
+        });
+        let mut element: Value = serde_json::from_str(
+            value["proposal"]["draft"]["operations"][0]["value_json"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        element["id"] = json!(if shaft {
+            "stair.1.enclosure"
+        } else {
+            "stair.1.flight.01.side.01"
+        });
+        element["role"] = json!(role);
+        element["height"] = json!(3.6);
+        element["holes"] = json!([]);
+        element["metadata"] = json!({
+            "component_id":"stair.1", "source_instance_id":"source.stair",
+            "source_sha256":"a".repeat(64), "source_geometry_sha256":"b".repeat(64),
+            "relation_validator":"vertical-schematic/1", "modeling_mode":"single_floor_schematic",
+            "connection_status":"unverified", "step_dimension_basis":"assumed",
+            "geometry_status":"schematic", "circulation_type":if shaft {"elevator"} else {"stair"},
+            "vertical_spec_owner":if shaft {"stair.1.enclosure"} else {"stair.1.flight.01.step.001"},
+            "solid_representation":if shaft {"exterior massing only; cavity and entrance not inferred"} else {"stepped tread surface with explicit sloping soffit"},
+            "not_checked":"served floors; slab openings; vertical connection; headroom; structural design; building-code compliance"
+        });
+        if !shaft {
+            element["metadata"]["side_panel_line_indices"] = json!("[0,1]");
+            element["stair_soffit"] =
+                json!({"start":{"x":2,"y":2},"end":{"x":2.3,"y":2},"start_z":0,"end_z":0.1});
+            element["stair_top"] =
+                json!({"start":{"x":2,"y":2},"end":{"x":2.3,"y":2},"start_z":0.9,"end_z":1});
+        }
+        value["proposal"]["draft"]["operations"][0]["value_json"] = json!(element.to_string());
+        value["proposal"]["draft"]["operations"][0]["op"] = json!("add");
+        value["proposal"]["draft"]["operations"][0]["target_id"] = element["id"].clone();
+        value["proposal"]["draft"]["operations"][0]["floor_id"] = json!("floor.lower");
+        value["proposal"]["draft"]["operations"][0]["source_ids"] = json!(["source.stair"]);
+        let fact = proposal_fact(&value).unwrap();
+        assert!(fact.ready);
+        assert!(fact.objects.iter().any(|row| row.contains(if shaft {
+            "电梯外部体量"
+        } else {
+            "CAD 侧板线索引"
+        })));
+        let mut facts = sequenced_facts();
+        facts.snapshot.proposal = Some(fact.clone());
+        assert!(!facts.can_authorize(&fact.binding));
+        add_reviewed_candidate(&mut facts.snapshot, &fact.binding);
+        assert!(facts.can_authorize(&fact.binding));
+        for (pointer, invalid) in [
+            (
+                "/proposal/component_plan/connections/0/mode",
+                json!("two_floor"),
+            ),
+            (
+                "/proposal/component_plan/connections/0/openings",
+                json!([{"floor_id":"floor.upper"}]),
+            ),
+            (
+                "/proposal/vertical_sources/source.stair/geometry_sha256",
+                json!("c".repeat(64)),
+            ),
+            (
+                "/proposal/vertical_sources/source.stair/floor_id",
+                json!("floor.other"),
+            ),
+            ("/proposal/draft/operations/0/op", json!("remove")),
+            ("/proposal/draft/operations/0/target_id", json!("other")),
+            (
+                "/proposal/draft/operations/0/floor_id",
+                json!("floor.other"),
+            ),
+            ("/proposal/draft/operations/0/source_ids", json!([])),
+        ] {
+            let mut malformed = value.clone();
+            *malformed.pointer_mut(pointer).unwrap() = invalid;
+            assert!(proposal_fact(&malformed).is_none(), "{role}: {pointer}");
+        }
+        for (key, invalid) in if shaft {
+            vec![
+                ("role", json!("stair_step")),
+                ("height", json!(0.5)),
+                ("stair_top", json!({})),
+                (
+                    "holes",
+                    json!([[{"x":2.1,"y":2.1},{"x":2.2,"y":2.1},{"x":2.2,"y":2.2}]]),
+                ),
+            ]
+        } else {
+            vec![
+                ("stair_soffit", Value::Null),
+                ("stair_top", element["stair_soffit"].clone()),
+            ]
+        } {
+            let mut malformed = value.clone();
+            let mut part = element.clone();
+            part[key] = invalid;
+            malformed["proposal"]["draft"]["operations"][0]["value_json"] = json!(part.to_string());
+            assert!(proposal_fact(&malformed).is_none(), "{role}: {key}");
+        }
+        let mut malformed = value.clone();
+        let mut part = element.clone();
+        if shaft {
+            part["metadata"]["circulation_type"] = json!("stair");
+        } else {
+            part["metadata"]["side_panel_line_indices"] = json!("[0,9]");
+        }
+        malformed["proposal"]["draft"]["operations"][0]["value_json"] = json!(part.to_string());
+        assert!(proposal_fact(&malformed).is_none(), "{role}: evidence");
+        if !shaft {
+            let mut same_polyline = value.clone();
+            let mut part = element.clone();
+            part["metadata"]["side_panel_line_indices"] = json!("[0,0]");
+            same_polyline["proposal"]["vertical_sources"]["source.stair"]["linework_m"] =
+                json!([[[0, 0], [1, 0], [1, 0.1], [0, 0.1], [0, 0]]]);
+            same_polyline["proposal"]["draft"]["operations"][0]["value_json"] =
+                json!(part.to_string());
+            assert!(proposal_fact(&same_polyline).is_some());
+            for key in ["stair_soffit", "stair_top"] {
+                let mut part = element.clone();
+                part[key]["start"]["x"] = json!(2.1);
+                part[key]["end"]["x"] = json!(2.2);
+                let mut short = value.clone();
+                short["proposal"]["draft"]["operations"][0]["value_json"] = json!(part.to_string());
+                assert!(proposal_fact(&short).is_none(), "{key} span");
+            }
+        }
+    }
+}
+
 fn reference_stair_proposal() -> Value {
     let mut value = envelope();
     value["source_current"] = json!(true);

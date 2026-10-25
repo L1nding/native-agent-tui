@@ -3466,7 +3466,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             let role = element["role"].as_str()?;
             let boundary = element["boundary"].as_array()?;
             let valid_role = if schematic {
-                matches!(role, "stair_step" | "landing") || reference && role == "partition"
+                matches!(role, "stair_step" | "landing" | "partition" | "shaft_wall")
             } else {
                 matches!(role, "stair_step" | "shaft_wall")
             };
@@ -3506,8 +3506,14 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                 .iter()
                 .find(|c| c["component_id"].as_str() == Some(component))?;
             let source = metadata["source_instance_id"].as_str()?;
+            let shaft = schematic && connection["kind"] == "shaft";
+            let matching_schematic_role = match connection["kind"].as_str() {
+                Some("shaft") => role == "shaft_wall",
+                Some("stair") => role != "shaft_wall",
+                _ => false,
+            };
             if schematic
-                && (connection["kind"] != "stair"
+                && (!matching_schematic_role
                     || connection["mode"] != "single_floor_schematic"
                     || connection["dimension_basis"] != "assumed"
                     || connection["rise_m"].as_f64().is_none_or(|v| v <= 0.0)
@@ -3528,6 +3534,126 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     || op["basis"] != "assumed")
             {
                 return None;
+            }
+            if shaft || schematic && role == "partition" && !reference {
+                let source_fact = &p["vertical_sources"][source];
+                if op["op"] != "add"
+                    || op["target_id"] != element["id"]
+                    || op["floor_id"] != p["scope"]["floor_id"]
+                    || !op["source_ids"].as_array()?.contains(&json!(source))
+                    || !element["source_ids"].as_array()?.contains(&json!(source))
+                    || source_fact["source_id"] != source
+                    || source_fact["component_id"] != component
+                    || source_fact["floor_id"] != p["scope"]["floor_id"]
+                {
+                    return None;
+                }
+                for (source_key, metadata_key) in [
+                    ("source_sha256", "source_sha256"),
+                    ("geometry_sha256", "source_geometry_sha256"),
+                ] {
+                    let sha = source_fact[source_key].as_str()?;
+                    if sha.len() != 64
+                        || !sha
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        || metadata[metadata_key] != sha
+                    {
+                        return None;
+                    }
+                }
+            }
+            if shaft {
+                let id = element["id"].as_str()?;
+                if reference
+                    || connection["shaft_representation"] != "exterior_massing"
+                    || id != format!("{component}.enclosure")
+                    || metadata["vertical_spec_owner"] != id
+                    || metadata["circulation_type"] != "elevator"
+                    || metadata["solid_representation"]
+                        != "exterior massing only; cavity and entrance not inferred"
+                    || !metadata["cavity_world_m"].is_null()
+                    || !element["stair_soffit"].is_null()
+                    || !element["stair_top"].is_null()
+                    || !element["holes"].as_array()?.is_empty()
+                    || ["flights", "landings", "reference_surfaces"]
+                        .iter()
+                        .any(|key| {
+                            !connection[key].is_null()
+                                && !connection[key].as_array().is_some_and(Vec::is_empty)
+                        })
+                    || !connection["steps"].is_null()
+                    || !connection["riser_m"].is_null()
+                    || (element["height"].as_f64()? - connection["rise_m"].as_f64()?).abs() > 0.001
+                {
+                    return None;
+                }
+            }
+            if schematic && role == "partition" && !reference {
+                let indices: Vec<usize> =
+                    serde_json::from_str(metadata["side_panel_line_indices"].as_str()?).ok()?;
+                let lines = p["vertical_sources"][source]["linework_m"].as_array()?;
+                if indices.len() != 2 || indices.iter().any(|index| *index >= lines.len()) {
+                    return None;
+                }
+                let mut elevations = Vec::new();
+                for plane in [&element["stair_soffit"], &element["stair_top"]] {
+                    let sx = plane["start"]["x"].as_f64()?;
+                    let sy = plane["start"]["y"].as_f64()?;
+                    let dx = plane["end"]["x"].as_f64()? - sx;
+                    let dy = plane["end"]["y"].as_f64()? - sy;
+                    let length_squared = dx * dx + dy * dy;
+                    if length_squared <= 1e-18 || !length_squared.is_finite() {
+                        return None;
+                    }
+                    let start = plane["start_z"].as_f64()?;
+                    let end = plane["end_z"].as_f64()?;
+                    if boundary.iter().any(|point| {
+                        let t = ((point["x"].as_f64().unwrap() - sx) * dx
+                            + (point["y"].as_f64().unwrap() - sy) * dy)
+                            / length_squared;
+                        !(-1e-7..=1.0 + 1e-7).contains(&t)
+                    }) {
+                        return None;
+                    }
+                    elevations.push(
+                        boundary
+                            .iter()
+                            .map(|point| {
+                                start
+                                    + (end - start)
+                                        * ((point["x"].as_f64().unwrap() - sx) * dx
+                                            + (point["y"].as_f64().unwrap() - sy) * dy)
+                                        / length_squared
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                let base = element["base_z"].as_f64()?;
+                let height = element["height"].as_f64()?;
+                if elevations[0]
+                    .iter()
+                    .zip(&elevations[1])
+                    .any(|(bottom, top)| {
+                        !bottom.is_finite()
+                            || !top.is_finite()
+                            || *bottom < base - 0.001
+                            || *bottom >= *top - 1e-7
+                            || *top > base + height + 0.001
+                    })
+                {
+                    return None;
+                }
+                objects.push(format!(
+                    "CAD 侧板线索引 {} · 斜底 {} · 顶面 {} · 高度 assumed",
+                    metadata["side_panel_line_indices"],
+                    element["stair_soffit"],
+                    element["stair_top"]
+                ));
+                objects.push(format!(
+                    "CAD 侧板来源折线(m) {} · {}",
+                    lines[indices[0]], lines[indices[1]]
+                ));
             }
             let has_reference = !connection["reference_sha256"].is_null()
                 || !connection["reference_surfaces"].is_null()
@@ -3770,7 +3896,8 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                         "层高"
                     };
                     objects.push(format!(
-                        "单层示意楼梯 · {rise_label} {} m · assumed · 连接待核验 · 楼层 {} · 来源位置 {}",
+                        "单层示意{} · {rise_label} {} m · assumed · 连接待核验 · 楼层 {} · 来源位置 {}",
+                        if shaft { "电梯外部体量" } else { "楼梯" },
                         connection["rise_m"],
                         connection["served_floors"],
                         p["vertical_sources"][source]["origin_m"]
