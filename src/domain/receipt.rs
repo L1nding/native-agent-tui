@@ -57,13 +57,23 @@ fn unwrap_receipt(value: &Value, depth: usize) -> Option<Value> {
     if let Some(raw) = value.as_str().filter(|raw| raw.len() <= RECEIPT_LIMIT) {
         return unwrap_receipt(&serde_json::from_str::<Value>(raw).ok()?, depth + 1);
     }
-    for key in ["structuredContent", "result"] {
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return unwrap_receipt(&Value::String(text.to_owned()), depth + 1);
+    }
+    for key in ["structuredContent", "result", "content"] {
         if let Some(result) = value.get(key).and_then(|v| unwrap_receipt(v, depth + 1)) {
             return Some(result);
         }
     }
+    if let Some(items) = value.as_array() {
+        for item in items.iter().take(8) {
+            if let Some(result) = unwrap_receipt(item, depth + 1) {
+                return Some(result);
+            }
+        }
+    }
     for block in value["content"].as_array().into_iter().flatten().take(8) {
-        if let Some(result) = unwrap_receipt(&block["text"], depth + 1) {
+        if let Some(result) = unwrap_receipt(block, depth + 1) {
             return Some(result);
         }
     }
@@ -774,6 +784,41 @@ async fn read_with_deadline(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn replay_nested_content_floor_advance_receipt() {
+        let (setup, _, _root) = fixture("");
+        let receipt = json!({
+            "contract": RECEIPT_CONTRACT,
+            "run_id": setup.run_id,
+            "context_sha256": setup.context_sha256,
+            "kind": "floor_advance",
+            "ok": true,
+            "fact_sha256": "a".repeat(64),
+            "fact_bytes": 274317,
+            "fact_sequence": 1738,
+            "binding": {},
+            "needs": {"type":"blocked", "diagnostic":{"message":"drawing_audit_integrity",
+                "rejection":{"category":"platform_contract", "code":"drawing_audit_integrity",
+                "next_action":"stop_and_report_original_binding_and_diagnostic",
+                "split_batch_allowed":false}}}
+        });
+        let notice = ObservedTool {
+            thread_id: "root".into(),
+            turn_id: "turn-1".into(),
+            item_id: "advance".into(),
+            outcome: Some(ObservedToolOutcome::Completed),
+            category: ToolCategory::Mcp,
+            compaction: None,
+        };
+        let item = json!({
+            "type":"mcpToolCall", "server":"modeling_domain", "tool":"advance_floor",
+            "result":{"content":[{"type":"content", "content":{"type":"text", "text":receipt.to_string()}}]}
+        });
+        let parsed = from_tool(&setup, &notice, &item).unwrap().unwrap();
+        assert_eq!(parsed.kind, "floor_advance");
+        assert_eq!(parsed.fact_sequence, 1738);
+    }
 
     pub(crate) fn python() -> PathBuf {
         if let Ok(path) = std::env::var("MODELING_TEST_PYTHON") {

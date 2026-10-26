@@ -4647,10 +4647,10 @@ impl Core {
     }
 
     fn observe_tool_detail_event(&mut self, notice: &protocol::ObservedTool, params: &Value) {
-        let Some(locator) = self.tool_locator(&notice.thread_id, &notice.turn_id, &notice.item_id)
-        else {
-            return;
-        };
+        // Domain receipts are execution facts, not UI detail.  A completed MCP
+        // item may arrive without a matching detail locator (for example after
+        // a turn is retired), but it must still enter the private fact sync
+        // queue so floor blockers can affect auto-continue.
         if let Some(setup) = self.config.domain_setup.as_ref() {
             match crate::domain::receipt::from_tool(setup, notice, &params["item"]) {
                 Ok(Some(receipt)) => self.queue_domain_fact(receipt),
@@ -4658,6 +4658,10 @@ impl Core {
                 Ok(None) => self.domain.observe(notice, &params["item"]),
             }
         }
+        let Some(locator) = self.tool_locator(&notice.thread_id, &notice.turn_id, &notice.item_id)
+        else {
+            return;
+        };
         let fields = protocol::decode_observed_tool_details(&params["item"], notice.category);
         if self.state.view.thread_id.as_deref() == Some(notice.thread_id.as_str()) {
             self.state.view.observe_dsh_tool(&params["item"]);
