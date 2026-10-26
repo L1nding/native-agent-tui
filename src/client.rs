@@ -461,6 +461,7 @@ impl ClientHandle {
                 interrupt_requested: false,
                 auto_continues: 0,
                 auto_continue_retry: AutoContinueRetry::default(),
+                pending_domain_auto_continue: None,
                 auto_submission: false,
                 undelivered_grant: None,
                 interrupt_sent: false,
@@ -606,6 +607,7 @@ struct Core {
     /// Consecutive turns continued automatically since the user last typed.
     auto_continues: u32,
     auto_continue_retry: AutoContinueRetry,
+    pending_domain_auto_continue: Option<bool>,
     auto_submission: bool,
     /// A grant steered into a running turn may be lost when that turn ends first;
     /// it is resubmitted when the turn ends while the change is still unapplied.
@@ -2749,6 +2751,24 @@ impl Core {
     /// The modeling agent tends to end a turn while background builds run; keep it
     /// going while the floor is incomplete, bounded, and never over a pending question.
     fn maybe_auto_continue(&mut self, retryable_failure: bool) {
+        if self.domain_fact_task.is_some()
+            || !self.domain_fact_queue.is_empty()
+            || self.domain.synchronizing
+        {
+            self.pending_domain_auto_continue = Some(retryable_failure);
+            self.state.view.notice = Some("等待领域事实同步完成后评估自动续接".into());
+            return;
+        }
+        self.pending_domain_auto_continue = None;
+        if self.domain.synchronization_has_errors() {
+            self.state.view.notice = self
+                .domain
+                .snapshot
+                .fact_sync_notice
+                .clone()
+                .or_else(|| Some("领域事实同步失败，已停止自动续接".into()));
+            return;
+        }
         if self.domain.snapshot.floor_advance_auto_continue_paused {
             let code = self
                 .domain
@@ -2952,6 +2972,15 @@ impl Core {
             ),
         }
         self.start_domain_fact_read();
+        if self.domain_fact_task.is_none()
+            && self.domain_fact_queue.is_empty()
+            && self.pending_domain_auto_continue.is_some()
+        {
+            self.domain.synchronization_queue_drained();
+            if let Some(retryable_failure) = self.pending_domain_auto_continue.take() {
+                self.maybe_auto_continue(retryable_failure);
+            }
+        }
     }
 
     fn check_domain_images(&mut self) {
@@ -5058,6 +5087,29 @@ impl Core {
         // Decode observation only for an owned current turn. Unrelated malformed
         // telemetry cannot make this execution uncertain.
         if let (Some(thread), Some(turn)) = (thread, params["turnId"].as_str()) {
+            // A provider may deliver the terminal tool item after turn/completed.
+            // Preserve its domain receipt even though the normal observation gate
+            // has already retired the turn.
+            let late_root_item = method == "item/completed"
+                && Some(thread) == self.state.view.thread_id.as_deref()
+                && Some(turn) == self.state.view.turn_id.as_deref()
+                && !matches!(
+                    self.state.view.phase,
+                    SessionPhase::Running | SessionPhase::GatePending
+                );
+            if late_root_item {
+                if let Some(Ok(notice)) = protocol::decode_observed_tool(method, &params) {
+                    if let Some(setup) = self.config.domain_setup.as_ref() {
+                        match crate::domain::receipt::from_tool(setup, &notice, &params["item"]) {
+                            Ok(Some(receipt)) => self.queue_domain_fact(receipt),
+                            Err(reason) => {
+                                self.domain.synchronization_failed("transport", 0, reason)
+                            }
+                            Ok(None) => {}
+                        }
+                    }
+                }
+            }
             let owned = (Some(thread) == self.state.view.thread_id.as_deref()
                 && Some(turn) == self.state.view.turn_id.as_deref()
                 && matches!(
@@ -6307,6 +6359,90 @@ mod tests {
             ClientHandle::spawn(config).await,
             Err(ClientError::Journal(JournalError::Io))
         ));
+    }
+
+    #[test]
+    fn auto_continue_waits_for_blocked_receipt_sync_and_stops_after_one_retry() {
+        assert!(!should_auto_continue(
+            true,
+            0,
+            3,
+            SessionPhase::Completed,
+            false,
+            Some(false),
+            true,
+            false,
+        ));
+        assert!(should_auto_continue(
+            true,
+            0,
+            1,
+            SessionPhase::Completed,
+            false,
+            Some(false),
+            false,
+            false,
+        ));
+        assert!(!should_auto_continue(
+            true,
+            1,
+            1,
+            SessionPhase::Completed,
+            false,
+            Some(false),
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn failed_domain_fact_sync_is_a_conservative_auto_continue_stop() {
+        let mut facts = crate::domain::DomainFacts::new(None);
+        facts.synchronization_failed("floor_advance", 42, "reader failed".into());
+        assert!(facts.synchronization_has_errors());
+        assert!(facts.snapshot.fact_sync_notice.is_some());
+    }
+
+    #[test]
+    fn late_root_inspect_tool_operation_receipt_is_recognized_for_sync() {
+        let setup = crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: "context.json".into(),
+            repository: ".".into(),
+            python: "python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor".into(),
+        };
+        let receipt = json!({
+            "contract": "modeling-fact-receipt/v1",
+            "run_id": "run",
+            "context_sha256": "ctx",
+            "kind": "floor_advance",
+            "ok": true,
+            "fact_sha256": "a".repeat(64),
+            "fact_bytes": 1,
+            "fact_sequence": 7,
+            "binding": {}
+        });
+        let notice = crate::protocol::ObservedTool {
+            thread_id: "root".into(),
+            turn_id: "root-turn".into(),
+            item_id: "inspect".into(),
+            outcome: Some(crate::protocol::ObservedToolOutcome::Completed),
+            category: crate::protocol::ToolCategory::Mcp,
+            compaction: None,
+        };
+        let item = json!({
+            "type": "mcpToolCall",
+            "server": "modeling_domain",
+            "result": {"structuredContent": receipt}
+        });
+        let parsed = crate::domain::receipt::from_tool(&setup, &notice, &item)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.kind, "floor_advance");
+        assert_eq!(parsed.fact_sequence, 7);
     }
 
     #[derive(Clone)]

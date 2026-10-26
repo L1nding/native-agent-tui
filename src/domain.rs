@@ -2294,6 +2294,10 @@ impl DomainFacts {
         }
     }
 
+    pub(crate) fn synchronization_has_errors(&self) -> bool {
+        !self.synchronization_errors.is_empty()
+    }
+
     fn refresh_rejections(&mut self) {
         let scope = self.snapshot.project_scope.as_ref();
         let proposal = self.snapshot.proposal.as_ref().map(|p| &p.binding);
