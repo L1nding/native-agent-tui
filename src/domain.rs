@@ -366,6 +366,28 @@ pub struct FloorProgressV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorAdvanceNeeds {
+    pub needs_type: String,
+    pub diagnostic_code: Option<String>,
+    pub rejection_category: Option<String>,
+    pub split_batch_allowed: Option<bool>,
+    pub next_action: Option<String>,
+}
+
+impl FloorAdvanceNeeds {
+    pub fn blocks_auto_continue(&self) -> bool {
+        self.needs_type == "blocked"
+            && (matches!(
+                self.rejection_category.as_deref(),
+                Some("unclassified" | "platform_contract")
+            ) || (self.split_batch_allowed == Some(false)
+                && self.next_action.as_deref().is_some_and(|action| {
+                    action.starts_with("report") || action.starts_with("stop")
+                })))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceGroupsFact {
     pub scan_id: String,
     pub scene_sha256: String,
@@ -534,6 +556,8 @@ pub struct DomainSnapshot {
     pub ledger: Option<SourceLedgerFact>,
     pub floor_progress: Option<FloorProgress>,
     pub floor_progress_v2: Option<FloorProgressV2>,
+    pub floor_advance_needs: Option<FloorAdvanceNeeds>,
+    pub floor_advance_auto_continue_paused: bool,
     pub groups: Option<SourceGroupsFact>,
     pub linework: Option<LineworkCoverageFact>,
     pub existing_structure: Option<ExistingStructureCoverageFact>,
@@ -1922,6 +1946,22 @@ impl DomainFacts {
                 | "drawing_sheet"
                 | "drawing_comparison",
             ) => {
+                if kind == "floor_advance" {
+                    let needs = &value["needs"];
+                    let needs_type = needs["type"].as_str().unwrap_or("unknown").to_owned();
+                    let parsed = FloorAdvanceNeeds {
+                        needs_type,
+                        diagnostic_code: needs["diagnostic"]["code"].as_str().map(str::to_owned),
+                        rejection_category: needs["diagnostic"]["rejection"]["category"]
+                            .as_str()
+                            .map(str::to_owned),
+                        split_batch_allowed: needs["split_batch_allowed"].as_bool(),
+                        next_action: needs["next_action"].as_str().map(str::to_owned),
+                    };
+                    self.snapshot.floor_advance_auto_continue_paused =
+                        parsed.blocks_auto_continue();
+                    self.snapshot.floor_advance_needs = Some(parsed);
+                }
                 accepted = true;
             }
             _ => {}

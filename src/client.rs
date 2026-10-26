@@ -32,6 +32,7 @@ pub type QuestionPreviewCheck = (String, Result<(String, usize), String>);
 
 /// Continue only an idle modeling turn on a known-incomplete floor,
 /// within the user's budget and never while the user owes an answer.
+#[allow(clippy::too_many_arguments)]
 fn should_auto_continue(
     modeling: bool,
     used: u32,
@@ -39,6 +40,7 @@ fn should_auto_continue(
     phase: SessionPhase,
     awaiting_user: bool,
     floor_complete: Option<bool>,
+    floor_advance_auto_continue_paused: bool,
     retryable_failure: bool,
 ) -> bool {
     modeling
@@ -47,6 +49,7 @@ fn should_auto_continue(
             || (phase == SessionPhase::Failed && retryable_failure))
         && !awaiting_user
         && floor_complete == Some(false)
+        && !floor_advance_auto_continue_paused
 }
 
 fn retryable_model_failure(error: &Value) -> bool {
@@ -2130,6 +2133,7 @@ impl Core {
             }
             Command::SubmitRootInput { text } => {
                 if !std::mem::take(&mut self.auto_submission) {
+                    self.domain.snapshot.floor_advance_auto_continue_paused = false;
                     self.auto_continues = 0;
                     self.auto_continue_retry.failures = 0;
                 }
@@ -2745,6 +2749,17 @@ impl Core {
     /// The modeling agent tends to end a turn while background builds run; keep it
     /// going while the floor is incomplete, bounded, and never over a pending question.
     fn maybe_auto_continue(&mut self, retryable_failure: bool) {
+        if self.domain.snapshot.floor_advance_auto_continue_paused {
+            let code = self
+                .domain
+                .snapshot
+                .floor_advance_needs
+                .as_ref()
+                .and_then(|needs| needs.diagnostic_code.as_deref())
+                .unwrap_or("unknown");
+            self.state.view.notice = Some(format!("推进器报告平台阻塞（{code}），已暂停自动续接"));
+            return;
+        }
         if let Some((binding, text)) = self.undelivered_grant.take() {
             let unapplied = self.domain.snapshot.operation.is_none()
                 && self
@@ -2799,6 +2814,7 @@ impl Core {
                     .floor_progress_v2
                     .as_ref()
                     .map(|progress| progress.completion),
+                self.domain.snapshot.floor_advance_auto_continue_paused,
                 retryable_failure,
             )
     }
@@ -2914,7 +2930,20 @@ impl Core {
                 ),
                 crate::domain::FactProjection::Invalid
                 | crate::domain::FactProjection::DependencyRejected => {}
-                _ => self.domain.synchronization_finished(&pending.receipt),
+                _ => {
+                    self.domain.synchronization_finished(&pending.receipt);
+                    if self.domain.snapshot.floor_advance_auto_continue_paused {
+                        let code = self
+                            .domain
+                            .snapshot
+                            .floor_advance_needs
+                            .as_ref()
+                            .and_then(|needs| needs.diagnostic_code.as_deref())
+                            .unwrap_or("unknown");
+                        self.state.view.notice =
+                            Some(format!("推进器报告平台阻塞（{code}），已暂停自动续接"));
+                    }
+                }
             },
             Err(reason) => self.domain.synchronization_failed(
                 &pending.receipt.kind,
@@ -5615,6 +5644,7 @@ mod tests {
                 SessionPhase::Failed,
                 false,
                 Some(false),
+                false,
                 retryable_model_failure(&error)
             ));
             assert!(!should_auto_continue(
@@ -5624,6 +5654,7 @@ mod tests {
                 SessionPhase::Failed,
                 false,
                 Some(false),
+                false,
                 retryable_model_failure(&error)
             ));
             assert!(!should_auto_continue(
@@ -5633,6 +5664,7 @@ mod tests {
                 SessionPhase::Failed,
                 true,
                 Some(false),
+                false,
                 retryable_model_failure(&error)
             ));
             assert!(!should_auto_continue(
@@ -5642,6 +5674,7 @@ mod tests {
                 SessionPhase::Failed,
                 false,
                 Some(true),
+                false,
                 retryable_model_failure(&error)
             ));
             assert!(!should_auto_continue(
@@ -5651,6 +5684,7 @@ mod tests {
                 SessionPhase::Failed,
                 false,
                 Some(false),
+                false,
                 retryable_model_failure(&error)
             ));
         }
@@ -5673,6 +5707,7 @@ mod tests {
                     SessionPhase::Failed,
                     false,
                     Some(false),
+                    false,
                     retryable_model_failure(&error)
                 ),
                 "{error}"
@@ -5716,6 +5751,7 @@ mod tests {
             Completed,
             false,
             Some(false),
+            false,
             false
         ));
         assert!(!should_auto_continue(
@@ -5725,24 +5761,27 @@ mod tests {
             Completed,
             false,
             Some(false),
-            false
-        ));
-        assert!(!should_auto_continue(
-            true,
-            3,
-            3,
-            Completed,
             false,
-            Some(false),
             false
         ));
         assert!(!should_auto_continue(
             true,
+            3,
+            3,
+            Completed,
+            false,
+            Some(false),
+            false,
+            false
+        ));
+        assert!(!should_auto_continue(
+            true,
             0,
             0,
             Completed,
             false,
             Some(false),
+            false,
             false
         ));
         assert!(!should_auto_continue(
@@ -5752,6 +5791,7 @@ mod tests {
             Failed,
             false,
             Some(false),
+            false,
             false
         ));
         assert!(!should_auto_continue(
@@ -5761,6 +5801,7 @@ mod tests {
             Interrupted,
             false,
             Some(false),
+            false,
             false
         ));
         assert!(!should_auto_continue(
@@ -5770,6 +5811,7 @@ mod tests {
             Completed,
             true,
             Some(false),
+            false,
             false
         ));
         assert!(!should_auto_continue(
@@ -5779,11 +5821,62 @@ mod tests {
             Completed,
             false,
             Some(true),
+            false,
             false
         ));
         assert!(!should_auto_continue(
-            true, 0, 3, Completed, false, None, false
+            true, 0, 3, Completed, false, None, false, false
         ));
+    }
+
+    #[test]
+    fn platform_blocked_floor_advance_pauses_until_a_new_receipt_or_manual_input() {
+        let blocked = crate::domain::FloorAdvanceNeeds {
+            needs_type: "blocked".into(),
+            diagnostic_code: Some("fact_too_large".into()),
+            rejection_category: Some("unclassified".into()),
+            split_batch_allowed: Some(false),
+            next_action: Some("report_without_guessing_or_splitting".into()),
+        };
+        assert!(blocked.blocks_auto_continue());
+        assert!(!should_auto_continue(
+            true,
+            0,
+            3,
+            SessionPhase::Completed,
+            false,
+            Some(false),
+            true,
+            false
+        ));
+
+        let agent_input = crate::domain::FloorAdvanceNeeds {
+            needs_type: "blocked".into(),
+            diagnostic_code: Some("need_user_input".into()),
+            rejection_category: Some("agent_input".into()),
+            split_batch_allowed: Some(false),
+            next_action: Some("ask_user".into()),
+        };
+        assert!(!agent_input.blocks_auto_continue());
+        assert!(should_auto_continue(
+            true,
+            0,
+            3,
+            SessionPhase::Completed,
+            false,
+            Some(false),
+            false,
+            false
+        ));
+
+        let completed = crate::domain::FloorAdvanceNeeds {
+            needs_type: "ready".into(),
+            diagnostic_code: None,
+            rejection_category: None,
+            split_batch_allowed: None,
+            next_action: None,
+        };
+        assert!(!completed.blocks_auto_continue());
     }
     use crate::journal::{tests::Fixture as JournalFixture, JournalView, Payload, Replay};
     use serde_json::json;
