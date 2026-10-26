@@ -2791,7 +2791,9 @@ impl Core {
                 self.auto_continues,
                 self.config.auto_continue,
                 self.state.view.phase,
-                !self.state.view.requests.is_empty() || self.domain.snapshot.authorizing,
+                !self.state.view.requests.is_empty()
+                    || self.domain.snapshot.authorizing
+                    || self.domain.snapshot.approval_card_waiting(),
                 self.domain
                     .snapshot
                     .floor_progress_v2

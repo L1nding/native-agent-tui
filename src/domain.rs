@@ -669,6 +669,18 @@ impl DomainSnapshot {
         })
     }
 
+    /// The approval card is visible and waiting for the user's decision.
+    pub fn approval_card_waiting(&self) -> bool {
+        self.fact_sync_notice.is_none()
+            && !self.authorizing
+            && self.operation.is_none()
+            && self.proposal.as_ref().is_some_and(|proposal| {
+                proposal.ready
+                    && self.candidate_review_delivered(&proposal.binding)
+                    && self.first_use_satisfied()
+            })
+    }
+
     /// The floor as the drawing names it (`二层`), falling back to the scene id.
     pub fn floor_title(&self) -> String {
         let key = self
@@ -1900,6 +1912,16 @@ impl DomainFacts {
                 self.snapshot.notice = value["diagnostics"][0]["message"]
                     .as_str()
                     .map(str::to_owned);
+                accepted = true;
+            }
+            Some(
+                "floor_advance"
+                | "approval_card_restore"
+                | "circulation_revision"
+                | "drawing_batch"
+                | "drawing_sheet"
+                | "drawing_comparison",
+            ) => {
                 accepted = true;
             }
             _ => {}

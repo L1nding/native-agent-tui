@@ -139,6 +139,12 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "job_index"
                 | "delivery_status"
                 | "reference_evaluation"
+                | "floor_advance"
+                | "approval_card_restore"
+                | "circulation_revision"
+                | "drawing_batch"
+                | "drawing_sheet"
+                | "drawing_comparison"
                 // Server-driven batches; projected as unrelated facts.
                 | "auto_batch"
                 | "precedent_auto_batch"
@@ -162,7 +168,10 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         || !receipt.binding.is_object()
     {
-        return Err("领域事实回执身份或大小无效；完整事实尚未同步".into());
+        let kind = receipt.kind.chars().take(64).collect::<String>();
+        return Err(format!(
+            "领域事实回执身份或大小无效（kind={kind}）；完整事实尚未同步"
+        ));
     }
     Ok(())
 }
@@ -1211,12 +1220,20 @@ pub(crate) mod tests {
             "delivery_status",
             "diagnostic_log",
             "project_floor_preparing",
+            "floor_advance",
+            "approval_card_restore",
+            "circulation_revision",
+            "drawing_batch",
+            "drawing_sheet",
+            "drawing_comparison",
         ] {
             receipt.kind = kind.into();
             assert!(validate(&setup, &receipt).is_ok(), "{kind}");
         }
         receipt.kind = "invented".into();
-        assert!(validate(&setup, &receipt).is_err());
+        assert!(validate(&setup, &receipt)
+            .unwrap_err()
+            .contains("kind=invented"));
         let _ = std::fs::remove_dir_all(root);
     }
 
