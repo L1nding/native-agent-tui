@@ -4164,6 +4164,42 @@ fn edit_certificate_rejects_changed_selection_unknown_parts_protected_scope_and_
 }
 
 #[test]
+fn edit_projection_accepts_the_modeler_cap_of_two_hundred_components() {
+    let build = |count: usize| {
+        let mut value = edit_envelope();
+        let mut parts = Vec::new();
+        let mut selected = Vec::new();
+        let mut baseline = serde_json::Map::new();
+        for i in 0..count {
+            let component = format!("bed.{i}");
+            selected.push(component.clone());
+            let id = format!("{component}.p0");
+            baseline.insert(
+                component,
+                json!([{"id":id,"role":"furniture","origin":[2,2,0],"source_ids":[],
+                    "primitive_id":"primitive.old-frame","arguments":{},"rotation_z_deg":0,"scale":[1,1,1]}]),
+            );
+            parts.push(
+                json!({"op":"remove","target_id":id,"floor_id":"floor.ground","collection":"solids",
+                "basis":"assumed","source_ids":[],"reason":"whole selected removal"}),
+            );
+        }
+        value["proposal"]["component_edit"]["plan"]["selected_component_ids"] = json!(selected);
+        value["proposal"]["component_edit"]["plan"]["remove_component_ids"] = json!(selected);
+        value["proposal"]["component_edit"]["plan"]["replacements"]["components"] = json!([]);
+        value["proposal"]["component_edit"]["selected_parts"] = json!(baseline);
+        value["proposal"]["component_edit"]["feedback"]["object_ids"] = json!(selected);
+        value["proposal"]["feedback"]["object_ids"] = json!(selected);
+        value["proposal"]["draft"]["operations"] = json!(parts);
+        value
+    };
+    // 阶段 5 椅子模板升级一次选中 165 个实例；与模型器上限 200 对齐。
+    assert!(proposal_fact(&build(165)).is_some());
+    assert!(proposal_fact(&build(200)).is_some());
+    assert!(proposal_fact(&build(201)).is_none());
+}
+
+#[test]
 fn edit_projection_validates_all_parts_after_the_hundredth_row() {
     let mut value = edit_envelope();
     let mut parts = Vec::new();

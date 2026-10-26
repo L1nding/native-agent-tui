@@ -2,9 +2,12 @@
 use super::*;
 use std::collections::BTreeSet;
 
+/// Matches the modeler's `selected_component_ids` cap (max_length=200).
+const MAX_EDIT_COMPONENTS: usize = 200;
+
 fn ids(value: &Value) -> Option<BTreeSet<String>> {
     let values = value.as_array()?;
-    if values.len() > 100 {
+    if values.len() > MAX_EDIT_COMPONENTS {
         return None;
     }
     let mut result = BTreeSet::new();
