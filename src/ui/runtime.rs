@@ -16,8 +16,8 @@ use super::projects::{ProjectChoice, ProjectsEvent, ProjectsPanel};
 use super::search::SearchHandle;
 use super::terminal::TerminalGuard;
 use super::{
-    draw, handle_key, handle_paste, paste_rejected, reject_paste, sync_local_requests, LocalState,
-    UiError,
+    draw, handle_key, handle_paste, paste_rejected, reject_paste, send, sync_local_requests,
+    LocalState, UiError,
 };
 
 /// Coalesce ordinary output snapshots while keeping input and state transitions immediate.
@@ -323,6 +323,13 @@ pub async fn run_tasks_with_history(
                     // Bound each input batch so snapshots and redraw remain responsive.
                     for _ in 0..128 {
                         let Some(event) = terminal.input.read_ready()? else { break; };
+                        if client.snapshots.borrow().phase == crate::state::SessionPhase::Failed
+                            && (matches!(&event, InputEvent::Paste(_))
+                                || matches!(&event, InputEvent::Key(key)
+                                    if key.kind != KeyEventKind::Release && matches!(key.code, KeyCode::Char(_))))
+                        {
+                            send(Command::CancelAutoContinue, &client.commands, &mut local);
+                        }
                         match event {
                             InputEvent::Key(key) if key.kind != KeyEventKind::Release => {
                                 let snapshot = client.snapshots.borrow().clone();

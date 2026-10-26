@@ -30,7 +30,7 @@ use crate::transport::{PipeTransport, TransportError};
 
 pub type QuestionPreviewCheck = (String, Result<(String, usize), String>);
 
-/// Continue only an idle, successful modeling turn on a known-incomplete floor,
+/// Continue only an idle modeling turn on a known-incomplete floor,
 /// within the user's budget and never while the user owes an answer.
 fn should_auto_continue(
     modeling: bool,
@@ -39,12 +39,57 @@ fn should_auto_continue(
     phase: SessionPhase,
     awaiting_user: bool,
     floor_complete: Option<bool>,
+    retryable_failure: bool,
 ) -> bool {
     modeling
         && used < budget
-        && phase == SessionPhase::Completed
+        && (phase == SessionPhase::Completed
+            || (phase == SessionPhase::Failed && retryable_failure))
         && !awaiting_user
         && floor_complete == Some(false)
+}
+
+fn retryable_model_failure(error: &Value) -> bool {
+    error.get("category").and_then(Value::as_str) == Some("provider")
+        && matches!(
+            error.get("code").and_then(Value::as_str),
+            Some("TRANSPORT" | "TIMEOUT" | "RATE_LIMIT" | "SERVER" | "EMPTY_RESPONSE")
+        )
+}
+
+#[derive(Default)]
+struct AutoContinueRetry {
+    failures: u32,
+    pending: Option<AutoContinueWait>,
+}
+
+struct AutoContinueWait {
+    generation: u64,
+    turn: Option<String>,
+    deadline: Instant,
+}
+
+impl AutoContinueWait {
+    fn is_current(&self, generation: u64, turn: Option<&str>) -> bool {
+        self.generation == generation && self.turn.as_deref() == turn
+    }
+}
+
+impl AutoContinueRetry {
+    fn finish_turn(&mut self, phase: SessionPhase) {
+        self.pending = None;
+        if phase == SessionPhase::Completed {
+            self.failures = 0;
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let seconds = 30_u64
+            .saturating_mul(1_u64 << self.failures.min(5))
+            .min(600);
+        self.failures = self.failures.saturating_add(1);
+        Duration::from_secs(seconds)
+    }
 }
 
 const AUTO_CONTINUE_PROMPT: &str = "继续";
@@ -55,6 +100,7 @@ const DOMAIN_IMAGE_OPENING_NOTICE: &str = "正在校验并打开复核图片或�
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    CancelAutoContinue,
     PreviewEvent {
         epoch: u64,
         event: crate::preview::Event,
@@ -411,6 +457,7 @@ impl ClientHandle {
                 child_interrupts: VecDeque::new(),
                 interrupt_requested: false,
                 auto_continues: 0,
+                auto_continue_retry: AutoContinueRetry::default(),
                 auto_submission: false,
                 undelivered_grant: None,
                 interrupt_sent: false,
@@ -555,6 +602,7 @@ struct Core {
     interrupt_requested: bool,
     /// Consecutive turns continued automatically since the user last typed.
     auto_continues: u32,
+    auto_continue_retry: AutoContinueRetry,
     auto_submission: bool,
     /// A grant steered into a running turn may be lost when that turn ends first;
     /// it is resubmitted when the turn ends while the change is still unapplied.
@@ -900,6 +948,8 @@ impl Core {
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut observation_clock = tokio::time::interval(Duration::from_secs(1));
         observation_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut retry_clock = tokio::time::interval(Duration::from_secs(1));
+        retry_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut domain_clock = tokio::time::interval(Duration::from_secs(5));
         domain_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut checked = crate::domain::receipt::FactFiles::new();
@@ -909,6 +959,9 @@ impl Core {
         let mut journal_status = self.journal.as_ref().map(|journal| journal.status.clone());
         loop {
             tokio::select! {
+                _ = retry_clock.tick(), if self.auto_continue_retry.pending.is_some() => {
+                    self.tick_auto_continue();
+                }
                 _ = domain_clock.tick(), if self.config.domain_setup.is_some() && poll_task.is_none() => {
                     if poll_generation != self.domain_generation {
                         checked.clear();
@@ -1661,7 +1714,23 @@ impl Core {
     }
 
     fn command(&mut self, command: Command) {
+        if matches!(
+            command,
+            Command::CancelAutoContinue
+                | Command::Interrupt
+                | Command::SubmitRootInput { .. }
+                | Command::NewConversation
+                | Command::ResumeConversation { .. }
+                | Command::ReloadBackend
+                | Command::Schedule(_)
+                | Command::ScheduleTask { .. }
+                | Command::QueueRootTasks { .. }
+        ) && self.auto_continue_retry.pending.take().is_some()
+        {
+            self.state.view.notice = Some("已取消自动重试".into());
+        }
         match command {
+            Command::CancelAutoContinue => {}
             Command::HeadlessRequest { request: reference } => {
                 let Some(request) = self
                     .state
@@ -2062,6 +2131,7 @@ impl Core {
             Command::SubmitRootInput { text } => {
                 if !std::mem::take(&mut self.auto_submission) {
                     self.auto_continues = 0;
+                    self.auto_continue_retry.failures = 0;
                 }
                 if self.domain.snapshot.authorizing {
                     self.state.view.notice = Some("正在记录具体版本批准，请等待结果或取消".into());
@@ -2674,7 +2744,7 @@ impl Core {
 
     /// The modeling agent tends to end a turn while background builds run; keep it
     /// going while the floor is incomplete, bounded, and never over a pending question.
-    fn maybe_auto_continue(&mut self) {
+    fn maybe_auto_continue(&mut self, retryable_failure: bool) {
         if let Some((binding, text)) = self.undelivered_grant.take() {
             let unapplied = self.domain.snapshot.operation.is_none()
                 && self
@@ -2683,7 +2753,8 @@ impl Core {
                     .proposal
                     .as_ref()
                     .is_some_and(|proposal| proposal.binding == binding);
-            if unapplied
+            if self.state.view.phase == SessionPhase::Completed
+                && unapplied
                 && self.domain.snapshot.first_use_satisfied()
                 && self.state.view.phase.can_submit()
                 && self.state.view.requests.is_empty()
@@ -2694,20 +2765,71 @@ impl Core {
                 return;
             }
         }
-        if !should_auto_continue(
-            self.config.domain_setup.is_some(),
-            self.auto_continues,
-            self.config.auto_continue,
-            self.state.view.phase,
-            !self.state.view.requests.is_empty() || self.domain.snapshot.authorizing,
-            self.domain
-                .snapshot
-                .floor_progress_v2
-                .as_ref()
-                .map(|progress| progress.completion),
-        ) {
+        if !self.can_auto_continue(retryable_failure) {
             return;
         }
+        if self.state.view.phase == SessionPhase::Failed {
+            let delay = self.auto_continue_retry.next_delay();
+            self.auto_continue_retry.pending = Some(AutoContinueWait {
+                generation: self.generation,
+                turn: self.state.view.turn_id.clone(),
+                deadline: Instant::now() + delay,
+            });
+            self.tick_auto_continue();
+            return;
+        }
+        self.submit_auto_continue();
+    }
+
+    fn can_auto_continue(&self, retryable_failure: bool) -> bool {
+        self.session_ready
+            && self.wait.is_none()
+            && !self.interrupt_requested
+            && self.token_budget_exhausted().is_none()
+            && should_auto_continue(
+                self.config.domain_setup.is_some(),
+                self.auto_continues,
+                self.config.auto_continue,
+                self.state.view.phase,
+                !self.state.view.requests.is_empty() || self.domain.snapshot.authorizing,
+                self.domain
+                    .snapshot
+                    .floor_progress_v2
+                    .as_ref()
+                    .map(|progress| progress.completion),
+                retryable_failure,
+            )
+    }
+
+    fn tick_auto_continue(&mut self) {
+        let Some(wait) = &self.auto_continue_retry.pending else {
+            return;
+        };
+        if !wait.is_current(self.generation, self.state.view.turn_id.as_deref())
+            || self.state.view.phase != SessionPhase::Failed
+            || !self.can_auto_continue(true)
+        {
+            self.auto_continue_retry.pending = None;
+            self.state.view.notice = None;
+            return;
+        }
+        let remaining = wait.deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            self.state.view.notice = Some(format!(
+                "模型连接中断，{} 秒后自动重试（{}/{}）；输入或 Ctrl+C 取消",
+                remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() > 0)),
+                self.auto_continues + 1,
+                self.config.auto_continue
+            ));
+            return;
+        }
+        self.auto_continue_retry.pending = None;
+        self.submit_auto_continue();
+    }
+
+    fn submit_auto_continue(&mut self) {
         self.auto_continues += 1;
         self.auto_submission = true;
         self.state.view.notice = Some(format!(
@@ -3424,6 +3546,7 @@ impl Core {
             }
         };
         self.state.view.root_start_requests += 1;
+        self.auto_continue_retry.pending = None;
         self.generation += 1;
         self.state.view.turn_id = None;
         self.state.submission(text);
@@ -5204,7 +5327,11 @@ impl Core {
                         self.state.view.notice = Some("Dependent tasks remain blocked; retry the failed task or cancel queued work in F4.".into());
                     }
                 }
-                self.maybe_auto_continue();
+                self.auto_continue_retry.finish_turn(self.state.view.phase);
+                let retryable_failure = params
+                    .pointer("/turn/error")
+                    .is_some_and(retryable_model_failure);
+                self.maybe_auto_continue(retryable_failure);
             }
             "turn/step" => {
                 if let (Some(turn), Some(step)) = (
@@ -5470,6 +5597,114 @@ mod tests {
     }
 
     #[test]
+    fn auto_continue_retries_only_typed_transient_provider_failures() {
+        for code in [
+            "TRANSPORT",
+            "TIMEOUT",
+            "RATE_LIMIT",
+            "SERVER",
+            "EMPTY_RESPONSE",
+        ] {
+            let error = json!({"category":"provider", "code":code});
+            assert!(should_auto_continue(
+                true,
+                0,
+                3,
+                SessionPhase::Failed,
+                false,
+                Some(false),
+                retryable_model_failure(&error)
+            ));
+            assert!(!should_auto_continue(
+                true,
+                3,
+                3,
+                SessionPhase::Failed,
+                false,
+                Some(false),
+                retryable_model_failure(&error)
+            ));
+            assert!(!should_auto_continue(
+                true,
+                0,
+                3,
+                SessionPhase::Failed,
+                true,
+                Some(false),
+                retryable_model_failure(&error)
+            ));
+            assert!(!should_auto_continue(
+                true,
+                0,
+                3,
+                SessionPhase::Failed,
+                false,
+                Some(true),
+                retryable_model_failure(&error)
+            ));
+            assert!(!should_auto_continue(
+                false,
+                0,
+                3,
+                SessionPhase::Failed,
+                false,
+                Some(false),
+                retryable_model_failure(&error)
+            ));
+        }
+        for error in [
+            json!({"category":"provider","code":"AUTH"}),
+            json!({"category":"provider","code":"QUOTA_EXCEEDED"}),
+            json!({"category":"provider","code":"CONTENT_POLICY"}),
+            json!({"category":"provider","code":"PI_AI_ERROR"}),
+            json!({"category":"provider","code":"CONTEXT_WINDOW_EXCEEDED"}),
+            json!({"category":"output_delivery","code":"TRANSPORT"}),
+            json!({"message":"DeepSeek Messages transport failed (TRANSPORT)"}),
+            json!({"category":"provider","code":-32000}),
+            Value::Null,
+        ] {
+            assert!(
+                !should_auto_continue(
+                    true,
+                    0,
+                    3,
+                    SessionPhase::Failed,
+                    false,
+                    Some(false),
+                    retryable_model_failure(&error)
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_continue_backoff_doubles_caps_and_resets_after_success() {
+        let mut retry = AutoContinueRetry::default();
+        for seconds in [30, 60, 120, 240, 480, 600, 600, 600] {
+            retry.finish_turn(SessionPhase::Failed);
+            assert_eq!(retry.next_delay(), Duration::from_secs(seconds));
+        }
+        retry.finish_turn(SessionPhase::Completed);
+        assert_eq!(retry.next_delay(), Duration::from_secs(30));
+        retry.failures = u32::MAX;
+        assert_eq!(retry.next_delay(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn auto_continue_wait_rejects_stale_generations_and_turns() {
+        let wait = AutoContinueWait {
+            generation: 7,
+            turn: Some("failed-turn".into()),
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        assert!(wait.is_current(7, Some("failed-turn")));
+        assert!(!wait.is_current(8, Some("failed-turn")));
+        assert!(!wait.is_current(7, Some("new-turn")));
+        assert!(!wait.is_current(8, None));
+    }
+
+    #[test]
     fn auto_continue_runs_only_on_an_idle_incomplete_floor_within_budget() {
         use SessionPhase::*;
         assert!(should_auto_continue(
@@ -5478,7 +5713,8 @@ mod tests {
             3,
             Completed,
             false,
-            Some(false)
+            Some(false),
+            false
         ));
         assert!(!should_auto_continue(
             false,
@@ -5486,23 +5722,26 @@ mod tests {
             3,
             Completed,
             false,
-            Some(false)
-        ));
-        assert!(!should_auto_continue(
-            true,
-            3,
-            3,
-            Completed,
-            false,
-            Some(false)
+            Some(false),
+            false
         ));
         assert!(!should_auto_continue(
             true,
+            3,
+            3,
+            Completed,
+            false,
+            Some(false),
+            false
+        ));
+        assert!(!should_auto_continue(
+            true,
             0,
             0,
             Completed,
             false,
-            Some(false)
+            Some(false),
+            false
         ));
         assert!(!should_auto_continue(
             true,
@@ -5510,7 +5749,8 @@ mod tests {
             3,
             Failed,
             false,
-            Some(false)
+            Some(false),
+            false
         ));
         assert!(!should_auto_continue(
             true,
@@ -5518,7 +5758,8 @@ mod tests {
             3,
             Interrupted,
             false,
-            Some(false)
+            Some(false),
+            false
         ));
         assert!(!should_auto_continue(
             true,
@@ -5526,7 +5767,8 @@ mod tests {
             3,
             Completed,
             true,
-            Some(false)
+            Some(false),
+            false
         ));
         assert!(!should_auto_continue(
             true,
@@ -5534,9 +5776,12 @@ mod tests {
             3,
             Completed,
             false,
-            Some(true)
+            Some(true),
+            false
         ));
-        assert!(!should_auto_continue(true, 0, 3, Completed, false, None));
+        assert!(!should_auto_continue(
+            true, 0, 3, Completed, false, None, false
+        ));
     }
     use crate::journal::{tests::Fixture as JournalFixture, JournalView, Payload, Replay};
     use serde_json::json;

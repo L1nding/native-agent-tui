@@ -2270,11 +2270,24 @@ impl AcpBridge {
             }
         }
         self.background_notice()?;
+        // Preserve only the host's typed provider classification, never infer it
+        // from the display message or an ACP JSON-RPC error number.
+        let provider_code = match &self.background.failure {
+            Some(BackgroundFailure::Provider(Some(code))) if status == "failed" => Some(*code),
+            _ => None,
+        };
         self.core.send(Envelope::notification(
             "turn/completed",
             Some(json!({
                 "threadId":self.session_id,
-                "turn":{"id":turn,"status":status,"error":error.map(|message| json!({"message":message}))}
+                "turn":{"id":turn,"status":status,"error":error.map(|message| {
+                    let mut error = json!({"message":message});
+                    if let Some(code) = provider_code {
+                        error["category"] = json!("provider");
+                        error["code"] = json!(code);
+                    }
+                    error
+                })}
             })),
         ))?;
         self.turn_started = false;
@@ -2806,6 +2819,12 @@ mod tests {
             (
                 "failed",
                 Some("provider"),
+                Some("TRANSPORT"),
+                Some("模型服务请求失败（TRANSPORT）"),
+            ),
+            (
+                "failed",
+                Some("provider"),
                 Some("PRIVATE_CODE"),
                 Some("模型服务请求失败（未知错误码）"),
             ),
@@ -2978,6 +2997,17 @@ mod tests {
                     assert_eq!(params["turn"]["id"], root_turn);
                     assert_eq!(params["turn"]["status"], terminal);
                     assert_eq!(params["turn"]["error"]["message"].as_str(), expected_error);
+                    let expected_code = match (category, code) {
+                        (Some("provider"), Some("PI_AI_ERROR" | "RATE_LIMIT" | "TRANSPORT")) => {
+                            code
+                        }
+                        _ => None,
+                    };
+                    assert_eq!(params["turn"]["error"]["code"].as_str(), expected_code);
+                    assert_eq!(
+                        params["turn"]["error"]["category"].as_str(),
+                        expected_code.map(|_| "provider")
+                    );
                     assert!(!params.to_string().contains("PRIVATE_"));
                     break;
                 }
