@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn platform_floor_stop_without_scope_preserves_diagnostic_and_sequence() {
+    let mut facts = sequenced_facts();
+    facts.setup.as_mut().unwrap().mode = DomainMode::Project;
+    let mut value = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"floor_advance","ok":true,"fact_sequence":10,
+        "needs":{"type":"blocked","proposal":null,"diagnostic":{"rejection":{
+            "category":"platform_contract","code":"invalid_fact","split_batch_allowed":false,
+            "next_action":"stop_and_report_original_binding_and_diagnostic"}}}});
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    assert!(facts.snapshot.floor_advance_auto_continue_paused);
+    let needs = facts.snapshot.floor_advance_needs.clone().unwrap();
+    assert_eq!(needs.diagnostic_code.as_deref(), Some("invalid_fact"));
+    assert_eq!(needs.split_batch_allowed, Some(false));
+    assert_eq!(
+        needs.next_action.as_deref(),
+        Some("stop_and_report_original_binding_and_diagnostic")
+    );
+    assert!(facts.snapshot.project_scope.is_none());
+    assert!(facts.snapshot.proposal.is_none());
+    value["fact_sequence"] = json!(9);
+    value["needs"]["diagnostic"]["rejection"]["code"] = json!("older");
+    assert_eq!(
+        facts.apply_verified_fact(&value),
+        FactProjection::Superseded
+    );
+    assert_eq!(facts.snapshot.floor_advance_needs, Some(needs));
+    value["fact_sequence"] = json!(11);
+    value["project_scope"] = json!({"scope_id":"invalid"});
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    value.as_object_mut().unwrap().remove("project_scope");
+    value["run_id"] = json!("other-run");
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    value["run_id"] = json!("run");
+    value["needs"] = json!({"type":"approve_card"});
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Invalid);
+    assert!(facts.snapshot.floor_advance_auto_continue_paused);
+}
+
+#[test]
 fn advance_floor_reissued_card_uses_latest_build_without_duplicate_pending_cards() {
     let mut facts = sequenced_facts();
     let mut advance = floor_story_height_proposal();

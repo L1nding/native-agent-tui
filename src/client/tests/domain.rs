@@ -1,6 +1,190 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "requires session-e2e1d70b and sealed facts from the validation worktree"]
+async fn replay_full_floor_advance_platform_block_stops_auto_continue() {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let records: Vec<Value> =
+        std::fs::read_to_string("target/codex-tmp/replay/session-e2e1d70b.jsonl")
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let fixture = PathBuf::from("target/codex-tmp/replay/platform-block-python");
+    std::fs::create_dir_all(fixture.join("blender_agent/integrations")).unwrap();
+    for file in [
+        "blender_agent/__init__.py",
+        "blender_agent/integrations/__init__.py",
+    ] {
+        std::fs::write(fixture.join(file), "").unwrap();
+    }
+    let context = PathBuf::from("D:/project/bam-workflow-validation-20261022/outputs/domain/project-29052-1792673801123156600/context.json");
+    std::fs::write(
+        fixture.join("context.json"),
+        std::fs::read(context).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(fixture.join("blender_agent/integrations/project_mcp.py"), r#"import sys
+from pathlib import Path
+sha = sys.argv[sys.argv.index('--read-fact') + 1]
+sys.stdout.buffer.write((Path(r'D:/project/bam-workflow-validation-20261022/outputs/domain/project-29052-1792673801123156600/project/facts') / (sha + '.json')).read_bytes())
+"#).unwrap();
+    let fixture = fixture.canonicalize().unwrap();
+    let source = std::path::Path::new("D:/project/bam-workflow-validation-20261022/outputs/domain/project-29052-1792673801123156600/project/facts");
+    let baseline = fixture.join("outputs/domain/project-29052-1792673801123156600/project/facts");
+    std::fs::create_dir_all(&baseline).unwrap();
+    let mut pending = vec![
+        "673b1c06a0476ca5f7441c93bc78aaf0bc87f9a7b578bf2763d86487e85f8261".to_owned(),
+        "10a57ecaddb783bb11893cbbdb3b346a023bfb9ca9df8790b7787ab00072d197".to_owned(),
+        "182cc03cc0e4e5b67cd371bfea7a9f6107b1d60a32c429e1eb3c2c76e8de3016".to_owned(),
+        "a4a991420c68ae844cfb19db3429afeb2d884b0221f27861b00beea7fddad9c9".to_owned(),
+        "95089184fd96cbbfe8360fc5b3f2d4c87a7a63a9f22e295074c829f1c992299b".to_owned(),
+    ];
+    let mut index = serde_json::Map::new();
+    while let Some(sha) = pending.pop() {
+        if index.contains_key(&sha) {
+            continue;
+        }
+        let raw = std::fs::read(source.join(format!("{sha}.json"))).unwrap();
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        index.insert(sha.clone(), value["fact_sequence"].clone());
+        std::fs::write(baseline.join(format!("{sha}.json")), raw).unwrap();
+        let mut fields = vec![value];
+        while let Some(field) = fields.pop() {
+            match field {
+                Value::Object(values) => {
+                    if let Some(pages) = values.get("$fact_pages").and_then(Value::as_array) {
+                        pending.extend(pages.iter().map(|page| page.as_str().unwrap().to_owned()));
+                    }
+                    fields.extend(values.into_values());
+                }
+                Value::Array(values) => fields.extend(values),
+                _ => {}
+            }
+        }
+    }
+    std::fs::write(
+        baseline.parent().unwrap().join("fact-sequences.json"),
+        serde_json::to_vec(&json!({"next":2075,"facts":index})).unwrap(),
+    )
+    .unwrap();
+    // Replay both real terminal boundaries, also returning the same sealed result
+    // directly from advance_floor to cover the synchronous tool completion path.
+    for direct in [false, true] {
+        for (start_seq, end_seq) in [(277, 310), (320, 353)] {
+            let (mut client, mut server) = harness_with_config(Config {
+                auto_continue: 20,
+                domain_setup: Some(crate::domain::DomainSetup {
+                    mode: crate::domain::DomainMode::Project,
+                    context_path: fixture.join("context.json"),
+                    repository: fixture.clone(),
+                    python: "D:/project/bam-workflow-validation-20261022/.venv/Scripts/python.exe"
+                        .into(),
+                    run_id: "project-29052-1792673801123156600".into(),
+                    context_sha256:
+                        "bb49ba58552e29bfc9e993c4061b292c19174f1b325debce6ca9851b8b767186".into(),
+                    floor_id: "项目目标".into(),
+                }),
+                ..Default::default()
+            })
+            .await;
+            running_root(&mut client, &mut server).await;
+            assert_eq!(
+                client.snapshots.borrow().extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .floor_progress_v2
+                    .as_ref()
+                    .map(|progress| progress.completion),
+                Some(false)
+            );
+            let mut calls = HashMap::new();
+            for record in records.iter().filter(|r| {
+                r["seq"]
+                    .as_u64()
+                    .is_some_and(|seq| seq >= start_seq && seq <= end_seq)
+            }) {
+                let event = match record["type"].as_str() {
+                    Some("tool/call") => {
+                        let name = record["data"]["name"].as_str().unwrap();
+                        let id = record["data"]["callId"].as_str().unwrap();
+                        calls.insert(id.to_owned(), name.to_owned());
+                        name.strip_prefix("mcp__modeling_domain__").map(|tool| {
+                            let tool = if direct && tool == "inspect_tool_operation" { "advance_floor" } else { tool };
+                            json!({"method":"item/started","params":{"threadId":"root","turnId":"root-turn","item":{"id":id,"type":"mcpToolCall","server":"modeling_domain","tool":tool,"status":"inProgress"}}})
+                        })
+                    }
+                    Some("tool/result") => {
+                        let message = &record["data"]["message"];
+                        let id = message["toolCallId"].as_str().unwrap();
+                        calls.get(id).and_then(|name| name.strip_prefix("mcp__modeling_domain__")).map(|tool| {
+                            let tool = if direct && tool == "inspect_tool_operation" { "advance_floor" } else { tool };
+                            json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn","item":{"id":id,"type":"mcpToolCall","server":"modeling_domain","tool":tool,"status":"completed","result":{"content":message["content"].clone()}}}})
+                        })
+                    }
+                    Some("turn/end") => Some(
+                        json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}}),
+                    ),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    observation_event(&mut client, &mut server, event).await;
+                }
+            }
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                client.snapshots.wait_for(|snapshot| {
+                    snapshot.root_start_requests > 1
+                        || snapshot
+                            .notice
+                            .as_deref()
+                            .is_some_and(|notice| notice.contains("推进器报告平台阻塞"))
+                }),
+            )
+            .await
+            .ok();
+            let snapshot = client.snapshots.borrow().clone();
+            assert_eq!(
+                snapshot.root_start_requests, 1,
+                "automatic continuation at real seq {end_seq}, direct={direct}; notice={:?}",
+                snapshot.notice
+            );
+            assert!(snapshot.notice.as_deref().unwrap_or("").contains("推进器报告平台阻塞（invalid_fact）"), "missing platform blocker at real seq {end_seq}, direct={direct}; notice={:?}; domain={:?}", snapshot.notice, snapshot.extensions[0].modeling().unwrap().rejected_facts.iter().map(|fact| &fact.reason).collect::<Vec<_>>());
+            let domain = snapshot.extensions[0].modeling().unwrap();
+            let verified = domain.verified_fact.as_ref().unwrap();
+            assert_eq!(verified.kind, "floor_advance");
+            assert_eq!(
+                (verified.sequence, verified.bytes),
+                if end_seq == 310 {
+                    (2164, 412009)
+                } else {
+                    (2166, 795573)
+                }
+            );
+            let needs = snapshot.extensions[0]
+                .modeling()
+                .unwrap()
+                .floor_advance_needs
+                .as_ref()
+                .unwrap();
+            assert_eq!(needs.split_batch_allowed, Some(false));
+            assert_eq!(
+                needs.next_action.as_deref(),
+                Some("stop_and_report_original_binding_and_diagnostic")
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), next(&mut server))
+                    .await
+                    .is_err()
+            );
+            client.commands.send(Command::Quit).await.unwrap();
+            client.join.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires the supplied full session and sealed facts from the validation worktree"]
 async fn replay_full_advance_floor_approval_card_is_projected_before_auto_continue() {
     use sha2::Digest;

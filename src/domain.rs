@@ -394,6 +394,25 @@ pub struct ApprovalCardRequest {
 }
 
 impl FloorAdvanceNeeds {
+    fn parse(needs: &Value) -> Self {
+        let rejection = &needs["diagnostic"]["rejection"];
+        Self {
+            needs_type: needs["type"].as_str().unwrap_or("unknown").to_owned(),
+            diagnostic_code: rejection["code"]
+                .as_str()
+                .or_else(|| needs["diagnostic"]["code"].as_str())
+                .map(str::to_owned),
+            rejection_category: rejection["category"].as_str().map(str::to_owned),
+            split_batch_allowed: rejection["split_batch_allowed"]
+                .as_bool()
+                .or_else(|| needs["split_batch_allowed"].as_bool()),
+            next_action: rejection["next_action"]
+                .as_str()
+                .or_else(|| needs["next_action"].as_str())
+                .map(str::to_owned),
+        }
+    }
+
     pub fn blocks_auto_continue(&self) -> bool {
         self.needs_type == "approve_card"
             || self.needs_type == "blocked"
@@ -1512,7 +1531,15 @@ impl DomainFacts {
         {
             return FactProjection::Superseded;
         }
+        // A verified platform stop can arrive without a project scope when the
+        // advance itself rejected an invalid envelope. Preserve that stop decision
+        // without granting any proposal or projecting scoped business facts.
+        let floor_stop = kind == "floor_advance"
+            && value.get("project_scope").is_none()
+            && value["needs"]["type"] == "blocked"
+            && FloorAdvanceNeeds::parse(&value["needs"]).blocks_auto_continue();
         let incoming_scope = if setup.mode == DomainMode::Project
+            && !floor_stop
             && !matches!(
                 kind,
                 "project_catalog"
@@ -2557,15 +2584,7 @@ impl DomainFacts {
                         }
                         self.snapshot.approval_card_request = Some(request);
                     }
-                    let parsed = FloorAdvanceNeeds {
-                        needs_type,
-                        diagnostic_code: needs["diagnostic"]["code"].as_str().map(str::to_owned),
-                        rejection_category: needs["diagnostic"]["rejection"]["category"]
-                            .as_str()
-                            .map(str::to_owned),
-                        split_batch_allowed: needs["split_batch_allowed"].as_bool(),
-                        next_action: needs["next_action"].as_str().map(str::to_owned),
-                    };
+                    let parsed = FloorAdvanceNeeds::parse(needs);
                     self.snapshot.floor_advance_auto_continue_paused =
                         parsed.blocks_auto_continue();
                     self.snapshot.floor_advance_needs = Some(parsed);
