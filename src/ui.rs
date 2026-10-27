@@ -1433,6 +1433,41 @@ fn apply_workflow_key_result(
 }
 
 #[cfg(test)]
+pub(crate) fn replay_modeling_confirmation(
+    snapshot: &CoreSnapshot,
+) -> (String, Option<crate::extensions::ExtensionConfirmation>) {
+    lang::with_zh(|| {
+        let mut local = LocalState::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 64)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, snapshot, &local))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        let action = extensions::REGISTRY.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            snapshot,
+            &mut local.extension,
+            ratatui::layout::Rect::new(0, 0, 160, 64),
+            "",
+            None,
+        );
+        let confirmation = match action {
+            Some(extensions::ExtensionAction::Confirm(confirmation)) => Some(confirmation),
+            _ => None,
+        };
+        (screen, confirmation)
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::RpcId;

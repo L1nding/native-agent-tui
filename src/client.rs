@@ -2784,6 +2784,16 @@ impl Core {
             return;
         }
         if self.domain.snapshot.floor_advance_auto_continue_paused {
+            if self
+                .domain
+                .snapshot
+                .floor_advance_needs
+                .as_ref()
+                .is_some_and(|needs| needs.needs_type == "approve_card")
+            {
+                self.state.view.notice = Some("等待审批卡确认，已暂停自动续接".into());
+                return;
+            }
             let code = self
                 .domain
                 .snapshot
@@ -2976,8 +2986,19 @@ impl Core {
                             .as_ref()
                             .and_then(|needs| needs.diagnostic_code.as_deref())
                             .unwrap_or("unknown");
-                        self.state.view.notice =
-                            Some(format!("推进器报告平台阻塞（{code}），已暂停自动续接"));
+                        self.state.view.notice = Some(
+                            if self
+                                .domain
+                                .snapshot
+                                .floor_advance_needs
+                                .as_ref()
+                                .is_some_and(|needs| needs.needs_type == "approve_card")
+                            {
+                                "等待审批卡确认，已暂停自动续接".into()
+                            } else {
+                                format!("推进器报告平台阻塞（{code}），已暂停自动续接")
+                            },
+                        );
                     }
                 }
             },

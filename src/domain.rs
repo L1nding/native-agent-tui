@@ -385,16 +385,25 @@ pub struct FloorAdvanceNeeds {
     pub next_action: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalCardRequest {
+    pub binding: ProposalBinding,
+    pub fact_sequence: u64,
+    pub build_id: String,
+    pub card_ref: String,
+}
+
 impl FloorAdvanceNeeds {
     pub fn blocks_auto_continue(&self) -> bool {
-        self.needs_type == "blocked"
-            && (matches!(
-                self.rejection_category.as_deref(),
-                Some("unclassified" | "platform_contract")
-            ) || (self.split_batch_allowed == Some(false)
-                && self.next_action.as_deref().is_some_and(|action| {
-                    action.starts_with("report") || action.starts_with("stop")
-                })))
+        self.needs_type == "approve_card"
+            || self.needs_type == "blocked"
+                && (matches!(
+                    self.rejection_category.as_deref(),
+                    Some("unclassified" | "platform_contract")
+                ) || (self.split_batch_allowed == Some(false)
+                    && self.next_action.as_deref().is_some_and(|action| {
+                        action.starts_with("report") || action.starts_with("stop")
+                    })))
     }
 }
 
@@ -575,6 +584,7 @@ pub struct DomainSnapshot {
     pub floor_progress: Option<FloorProgress>,
     pub floor_progress_v2: Option<FloorProgressV2>,
     pub floor_advance_needs: Option<FloorAdvanceNeeds>,
+    pub approval_card_request: Option<ApprovalCardRequest>,
     pub floor_advance_auto_continue_paused: bool,
     pub groups: Option<SourceGroupsFact>,
     pub linework: Option<LineworkCoverageFact>,
@@ -905,7 +915,11 @@ impl DomainSnapshot {
             if required {
                 !image.required
             } else {
-                !images.iter().any(|new| new.binding == image.binding)
+                !images.iter().any(|new| {
+                    new.binding.proposal == image.binding.proposal
+                        && new.binding.review_key == image.binding.review_key
+                        && new.binding.image_sha256 == image.binding.image_sha256
+                })
             }
         });
         if required {
@@ -1031,6 +1045,9 @@ impl DomainSnapshot {
     pub fn candidate_review_delivered(&self, proposal: &ProposalBinding) -> bool {
         self.artifacts.iter().any(|artifact| {
             artifact.binding.candidate
+                && self.approval_card_request.as_ref().is_none_or(|request| {
+                    request.binding != *proposal || artifact.binding.build_id == request.build_id
+                })
                 && self
                     .approval_restore_build_id
                     .as_ref()
@@ -2431,6 +2448,25 @@ impl DomainFacts {
                 if value["ok"] != true || !matches!(status, "ready" | "blocked") {
                     return invalid!();
                 }
+                if self
+                    .snapshot
+                    .approval_card_request
+                    .as_ref()
+                    .is_some_and(|request| {
+                        request.binding.proposal_id == proposal_id
+                            && request.fact_sequence >= sequence.unwrap_or(0)
+                    })
+                {
+                    return FactProjection::Superseded;
+                }
+                if self
+                    .snapshot
+                    .approval_card_request
+                    .as_ref()
+                    .is_some_and(|request| request.binding.proposal_id == proposal_id)
+                {
+                    self.snapshot.approval_card_request = None;
+                }
                 self.snapshot.approval_card_restore = Some(ApprovalCardRestore {
                     proposal_id,
                     build_id: restored["build_id"].as_str().map(str::to_owned),
@@ -2450,6 +2486,77 @@ impl DomainFacts {
                 if kind == "floor_advance" {
                     let needs = &value["needs"];
                     let needs_type = needs["type"].as_str().unwrap_or("unknown").to_owned();
+                    if needs_type == "approve_card"
+                        && self
+                            .snapshot
+                            .approval_card_restore
+                            .as_ref()
+                            .is_some_and(|restored| {
+                                needs["proposal_id"] == restored.proposal_id
+                                    && sequence
+                                        .is_some_and(|incoming| incoming <= restored.fact_sequence)
+                            })
+                    {
+                        return FactProjection::Superseded;
+                    }
+                    if needs_type == "approve_card"
+                        && self
+                            .fact_sequences
+                            .get("floor_advance")
+                            .is_none_or(|last| sequence.is_some_and(|incoming| incoming > *last))
+                    {
+                        // The sealed advance result already owns this proposal. Project
+                        // it before its image receipts; a later historical read must
+                        // not replace the newer proposal/evidence from this result.
+                        let mut proposal = value.clone();
+                        proposal["kind"] = json!("proposal");
+                        match self.project_fact(&proposal) {
+                            FactProjection::Applied | FactProjection::Superseded => {}
+                            result => return result,
+                        }
+                    }
+                    if needs_type == "approve_card" {
+                        let request = (|| {
+                            Some(ApprovalCardRequest {
+                                fact_sequence: sequence.unwrap_or(0),
+                                binding: ProposalBinding {
+                                    run_id: text(value, "run_id").ok()?,
+                                    context_sha256: text(value, "context_sha256").ok()?,
+                                    proposal_id: text(needs, "proposal_id").ok()?,
+                                    revision: needs["revision"].as_u64()?,
+                                    prepare_token: text(needs, "prepare_token").ok()?,
+                                    base_sha256: text(needs, "base_sha256").ok()?,
+                                    candidate_sha256: text(needs, "candidate_sha256").ok()?,
+                                },
+                                build_id: text(needs, "build_id").ok()?,
+                                card_ref: text(needs, "card_ref").ok()?,
+                            })
+                        })();
+                        let Some(request) = request else {
+                            return invalid!();
+                        };
+                        if self
+                            .snapshot
+                            .proposal
+                            .as_ref()
+                            .is_none_or(|proposal| proposal.binding != request.binding)
+                        {
+                            return invalid!("approval request and proposal identity mismatch");
+                        }
+                        if self
+                            .snapshot
+                            .approval_card_restore
+                            .as_ref()
+                            .is_some_and(|restored| {
+                                sequence.is_some_and(|incoming| incoming > restored.fact_sequence)
+                            })
+                        {
+                            self.snapshot.approval_card_restore = None;
+                            self.snapshot.approval_restore_build_id = None;
+                            self.snapshot.approval_restore_blocked = false;
+                        }
+                        self.snapshot.approval_card_request = Some(request);
+                    }
                     let parsed = FloorAdvanceNeeds {
                         needs_type,
                         diagnostic_code: needs["diagnostic"]["code"].as_str().map(str::to_owned),
@@ -2579,6 +2686,7 @@ impl DomainFacts {
     }
 
     fn clear_project_scope(&mut self) {
+        self.snapshot.approval_card_request = None;
         self.snapshot.approval_card_restore = None;
         self.snapshot.approval_restore_blocked = false;
         self.snapshot.approval_restore_build_id = None;
@@ -2889,7 +2997,8 @@ impl DomainFacts {
                 })
                 .or_else(|| self.deferred_sequences.iter().next().map(|(sequence, kind)| {
                     format!("领域事实依赖尚未到达：{kind} (seq {sequence})；等待对应作用域或前置事实")
-                }));
+                }))
+                .or_else(|| self.synchronizing.then(|| "正在同步完整领域事实".into()));
         }
     }
 
@@ -3742,6 +3851,13 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     // 已验证事实受单文件及分页聚合预算约束，批准前必须逐条投影全部操作。
     let correction = p.get("drawing_review").filter(|v| !v.is_null());
     let edit = p.get("component_edit").filter(|v| !v.is_null());
+    // 交通修订的方案和来源封存在编辑证书中，不另造普通 component_plan。
+    let component_plan = edit
+        .map(|proof| &proof["plan"]["replacements"])
+        .unwrap_or(&p["component_plan"]);
+    let vertical_sources = edit
+        .map(|proof| &proof["sources"])
+        .unwrap_or(&p["vertical_sources"]);
     let structure_revision =
         !p["structure_revision_source"].is_null() || !p["slab_revision_source"].is_null();
     if structure_revision {
@@ -4084,12 +4200,14 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             if !schematic && !first_connection {
                 continue;
             }
-            let connection = p["component_plan"]["connections"]
+            let connection = component_plan["connections"]
                 .as_array()?
                 .iter()
                 .find(|c| c["component_id"].as_str() == Some(component))?;
             let source = metadata["source_instance_id"].as_str()?;
             let shaft = schematic && connection["kind"] == "shaft";
+            let escalator =
+                edit.is_some() && schematic && connection["circulation_type"] == "escalator";
             let matching_schematic_role = match connection["kind"].as_str() {
                 Some("shaft") => role == "shaft_wall",
                 Some("stair") => role != "shaft_wall",
@@ -4105,7 +4223,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     || p["scope"]["floor_id"].as_str().is_none()
                     || !connection["openings"].as_array()?.is_empty()
                     || connection["source_instance_id"].as_str() != Some(source)
-                    || !p["vertical_sources"][source].is_object()
+                    || !vertical_sources[source].is_object()
                     || metadata["modeling_mode"] != "single_floor_schematic"
                     || metadata["connection_status"] != "unverified"
                     || metadata["step_dimension_basis"] != "assumed"
@@ -4119,7 +4237,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                 return None;
             }
             if shaft || schematic && role == "partition" && !reference {
-                let source_fact = &p["vertical_sources"][source];
+                let source_fact = &vertical_sources[source];
                 if op["op"] != "add"
                     || op["target_id"] != element["id"]
                     || op["floor_id"] != p["scope"]["floor_id"]
@@ -4173,11 +4291,18 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                 }
             }
             if schematic && role == "partition" && !reference {
-                let indices: Vec<usize> =
-                    serde_json::from_str(metadata["side_panel_line_indices"].as_str()?).ok()?;
-                let lines = p["vertical_sources"][source]["linework_m"].as_array()?;
-                if indices.len() != 2 || indices.iter().any(|index| *index >= lines.len()) {
-                    return None;
+                // 扶梯的三段及精确方案已由编辑证书核验；它没有楼梯侧板线索引。
+                if !escalator {
+                    let indices: Vec<usize> =
+                        serde_json::from_str(metadata["side_panel_line_indices"].as_str()?).ok()?;
+                    let lines = vertical_sources[source]["linework_m"].as_array()?;
+                    if indices.len() != 2 || indices.iter().any(|index| *index >= lines.len()) {
+                        return None;
+                    }
+                    objects.push(format!(
+                        "CAD 侧板来源折线(m) {} · {}",
+                        lines[indices[0]], lines[indices[1]]
+                    ));
                 }
                 let mut elevations = Vec::new();
                 for plane in [&element["stair_soffit"], &element["stair_top"]] {
@@ -4233,10 +4358,6 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     element["stair_soffit"],
                     element["stair_top"]
                 ));
-                objects.push(format!(
-                    "CAD 侧板来源折线(m) {} · {}",
-                    lines[indices[0]], lines[indices[1]]
-                ));
             }
             let has_reference = !connection["reference_sha256"].is_null()
                 || !connection["reference_surfaces"].is_null()
@@ -4252,7 +4373,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             if reference {
                 let reference_sha256 = connection["reference_sha256"].as_str()?;
                 let surfaces = connection["reference_surfaces"].as_array()?;
-                let source_fact = &p["vertical_sources"][source];
+                let source_fact = &vertical_sources[source];
                 let source_path = source_fact["instance_path"]
                     .as_array()?
                     .iter()
@@ -4480,10 +4601,10 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     };
                     objects.push(format!(
                         "单层示意{} · {rise_label} {} m · assumed · 连接待核验 · 楼层 {} · 来源位置 {}",
-                        if shaft { "电梯外部体量" } else { "楼梯" },
+                        if shaft { "电梯外部体量" } else if escalator { "扶梯" } else { "楼梯" },
                         connection["rise_m"],
                         connection["served_floors"],
-                        p["vertical_sources"][source]["origin_m"]
+                        vertical_sources[source]["origin_m"]
                     ));
                     objects.push(format!(
                         "体量表示：{}",
@@ -4494,7 +4615,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                         "服务楼层 {} · 既有洞口 {} · 来源位置 {} · 台阶参数依据 {}",
                         connection["served_floors"],
                         connection["openings"],
-                        p["vertical_sources"][source]["origin_m"],
+                        vertical_sources[source]["origin_m"],
                         metadata["step_dimension_basis"]
                     ));
                 }

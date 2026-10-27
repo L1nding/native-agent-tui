@@ -1,6 +1,323 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "requires the supplied full session and sealed facts from the validation worktree"]
+async fn replay_full_advance_floor_approval_card_is_projected_before_auto_continue() {
+    use sha2::Digest;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let replay = PathBuf::from("target/codex-tmp/replay/session-862606cb-full.jsonl");
+    assert!(
+        replay.is_file(),
+        "missing real replay: {}",
+        replay.display()
+    );
+    let fixture = PathBuf::from("target/codex-tmp/replay/advance-floor-python");
+    std::fs::create_dir_all(fixture.join("blender_agent/cli")).unwrap();
+    std::fs::create_dir_all(fixture.join("blender_agent/integrations")).unwrap();
+    std::fs::write(
+        fixture.join("blender_agent/__init__.py"),
+        "__path__.append(r'D:/project/bam-workflow-validation-20261022/src/blender_agent')\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.join("blender_agent/cli/__init__.py"), "").unwrap();
+    std::fs::write(fixture.join("blender_agent/integrations/__init__.py"), "").unwrap();
+    let context = PathBuf::from("D:/project/bam-workflow-validation-20261022/outputs/domain/project-29052-1792673801123156600/context.json");
+    let context_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(std::fs::read(&context).unwrap())
+    );
+    std::fs::write(
+        fixture.join("context.json"),
+        std::fs::read(&context).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("blender_agent/integrations/project_mcp.py"),
+        r#"import sys,json
+from pathlib import Path
+roots = [
+ r'D:/project/bam-workflow-validation-20261022/outputs/domain/project-29052-1792673801123156600/project/facts',
+ r'D:/project/bam-workflow-validation-20261022/outputs/domain/project-29052-1792673801123156600-db8dc1473b54/changes/facts',
+]
+if '--authorize' in sys.argv:
+    Path('approval-arguments.json').write_text(json.dumps(sys.argv),encoding='utf-8')
+    def arg(name):
+        return sys.argv[sys.argv.index(name)+1]
+    context=Path(arg('--context')).read_bytes()
+    import hashlib
+    print(json.dumps({'ok':True,'kind':'authorization','run_id':'project-29052-1792673801123156600',
+      'context_sha256':hashlib.sha256(context).hexdigest(),'grant':{'authorization_id':'replay-grant',
+      'proposal_id':arg('--proposal'),'revision':int(arg('--revision')),'prepare_token':arg('--prepare-token'),
+      'review_set_sha256':arg('--expected-review-set-sha256')}}))
+    raise SystemExit(0)
+sha = sys.argv[sys.argv.index('--read-fact') + 1]
+for root in roots:
+    p = Path(root) / (sha + '.json')
+    if p.is_file():
+        sys.stdout.buffer.write(p.read_bytes())
+        break
+else:
+    raise SystemExit(2)
+"#,
+    ).unwrap();
+    let fixture = fixture.canonicalize().unwrap();
+    let source = context.parent().unwrap().join("project/facts");
+    let facts = fixture.join("outputs/domain/project-29052-1792673801123156600/project/facts");
+    std::fs::create_dir_all(&facts).unwrap();
+    let mut pending = vec![
+        "673b1c06a0476ca5f7441c93bc78aaf0bc87f9a7b578bf2763d86487e85f8261".to_owned(),
+        "10a57ecaddb783bb11893cbbdb3b346a023bfb9ca9df8790b7787ab00072d197".to_owned(),
+        "182cc03cc0e4e5b67cd371bfea7a9f6107b1d60a32c429e1eb3c2c76e8de3016".to_owned(),
+        "a4a991420c68ae844cfb19db3429afeb2d884b0221f27861b00beea7fddad9c9".to_owned(),
+        "95089184fd96cbbfe8360fc5b3f2d4c87a7a63a9f22e295074c829f1c992299b".to_owned(),
+    ];
+    let mut index = serde_json::Map::new();
+    while let Some(sha) = pending.pop() {
+        if index.contains_key(&sha) {
+            continue;
+        }
+        let raw = std::fs::read(source.join(format!("{sha}.json"))).unwrap();
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        index.insert(sha.clone(), value["fact_sequence"].clone());
+        std::fs::write(facts.join(format!("{sha}.json")), raw).unwrap();
+        let mut fields = vec![value];
+        while let Some(field) = fields.pop() {
+            match field {
+                Value::Object(values) => {
+                    if let Some(pages) = values.get("$fact_pages").and_then(Value::as_array) {
+                        pending.extend(pages.iter().map(|page| page.as_str().unwrap().to_owned()));
+                    }
+                    fields.extend(values.into_values());
+                }
+                Value::Array(values) => fields.extend(values),
+                _ => {}
+            }
+        }
+    }
+    std::fs::write(
+        facts.parent().unwrap().join("fact-sequences.json"),
+        serde_json::to_vec(&json!({"next":2075,"facts":index})).unwrap(),
+    )
+    .unwrap();
+
+    let (mut client, mut server) = harness_with_config(Config {
+        auto_continue: 20,
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Project,
+            context_path: fixture.join("context.json"),
+            repository: fixture.clone(),
+            python: "D:/project/bam-workflow-validation-20261022/.venv/Scripts/python.exe".into(),
+            run_id: "project-29052-1792673801123156600".into(),
+            context_sha256: context_hash,
+            floor_id: "项目目标".into(),
+        }),
+        ..Default::default()
+    })
+    .await;
+    running_root(&mut client, &mut server).await;
+
+    let records: Vec<Value> = std::fs::read_to_string(replay)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut calls = HashMap::new();
+    let mut after = 0;
+    let mut confirmation = None;
+    for (end_sequence, expected_card) in [
+        (321, "c_J-xTIjTC"),
+        (400, "c_5zkZHd-4"),
+        (553, "c_5zkZHd-4"),
+    ] {
+        let expected_starts = match end_sequence {
+            321 => 1,
+            400 => 2,
+            _ => 8,
+        };
+        for value in records.iter().filter(|value| {
+            value["seq"]
+                .as_u64()
+                .is_some_and(|seq| seq > after && seq <= end_sequence)
+        }) {
+            let turn = value["data"]["turn"].as_u64().unwrap_or(1);
+            let turn_id = if turn == 1 {
+                "root-turn".to_owned()
+            } else {
+                format!("replay-turn-{turn}")
+            };
+            if value["type"] == "turn/start" && turn > 1 {
+                // Automatic continuation is checked at each terminal event. Start
+                // later recorded turns explicitly to inspect repeated card receipts.
+                client
+                    .commands
+                    .send(Command::SubmitRootInput {
+                        text: "继续".into(),
+                    })
+                    .await
+                    .unwrap();
+                let start = next(&mut server).await;
+                assert_eq!(start["method"], "turn/start");
+                send(
+                    &mut server,
+                    json!({"id":start["id"],"result":{"turn":{"id":turn_id}}}),
+                )
+                .await;
+                phase(&mut client, SessionPhase::Running).await;
+            }
+            let event = match value["type"].as_str() {
+                Some("turn/start") => Some(
+                    json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":turn_id}}}),
+                ),
+                Some("turn/end") => Some(
+                    json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":turn_id,"status":"completed"}}}),
+                ),
+                Some("tool/call") => {
+                    let name = value["data"]["name"].as_str().unwrap();
+                    let call_id = value["data"]["callId"].as_str().unwrap();
+                    calls.insert(call_id.to_owned(), name.to_owned());
+                    name.strip_prefix("mcp__modeling_domain__").map(|tool| json!({"method":"item/started","params":{"threadId":"root","turnId":turn_id,"item":{"id":call_id,"type":"mcpToolCall","server":"modeling_domain","tool":tool,"arguments":serde_json::from_str::<Value>(value["data"]["arguments"].as_str().unwrap()).unwrap(),"status":"inProgress"}}}))
+                }
+                Some("tool/result") => {
+                    let message = &value["data"]["message"];
+                    let call_id = message["toolCallId"].as_str().unwrap();
+                    calls.get(call_id).and_then(|name| name.strip_prefix("mcp__modeling_domain__"))
+                        .map(|tool| json!({"method":"item/completed","params":{"threadId":"root","turnId":turn_id,"item":{"id":call_id,"type":"mcpToolCall","server":"modeling_domain","tool":tool,"status":"completed","result":{"content":message["content"].clone()}}}}))
+                }
+                _ => None,
+            };
+            if let Some(event) = event {
+                observation_event(&mut client, &mut server, event).await;
+            }
+            if value["type"] == "turn/end" {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    client.snapshots.wait_for(|snapshot| {
+                        let domain = snapshot.extensions[0].modeling().unwrap();
+                        snapshot.root_start_requests > turn
+                            || (domain.fact_sync_notice.is_none() && domain.approval_card_waiting())
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    client.snapshots.borrow().root_start_requests,
+                    turn,
+                    "automatic continuation at real seq {}",
+                    value["seq"]
+                );
+            }
+        }
+        // End the turn while private fact reads are still queued, as in the real
+        // client. Completion must wait for these reads before deciding to continue.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.snapshots.wait_for(|snapshot| {
+                let domain = snapshot.extensions[0].modeling().unwrap();
+                snapshot.root_start_requests > expected_starts
+                    || (domain.approval_card_waiting()
+                        && domain
+                            .approval_card_request
+                            .as_ref()
+                            .is_some_and(|request| request.card_ref == expected_card))
+            }),
+        )
+        .await;
+        let snapshot = client.snapshots.borrow().clone();
+        let domain = snapshot.extensions[0].modeling().unwrap();
+        assert!(domain.approval_card_waiting(), "expected approvable card at real seq {end_sequence}; root_starts={}, sync={:?}, proposal={:?}, rejected={:?}", snapshot.root_start_requests, domain.fact_sync_notice, domain.proposal.as_ref().map(|p| &p.binding), domain.rejected_facts.iter().map(|f| &f.reason).collect::<Vec<_>>());
+        let card = domain.selected_approval_card().unwrap();
+        let binding = &card.proposal.as_ref().unwrap().binding;
+        assert_eq!(binding.proposal_id, "5f0bb072a1d74d578432e010ef6a948d");
+        assert_eq!(binding.revision, 1);
+        assert_eq!(
+            binding.prepare_token,
+            "cf6beecadcbff29089847735ef37785c8a9171fc7a7256bba2c67d58834d0bc0"
+        );
+        assert_eq!(
+            domain.approval_card_request.as_ref().unwrap().card_ref,
+            expected_card
+        );
+        let (screen, rendered_confirmation) = crate::ui::replay_modeling_confirmation(&snapshot);
+        assert!(screen.contains("建模确认"), "{screen}");
+        assert!(screen.contains("待批1张（可确认1）"), "{screen}");
+        assert!(screen.contains("Ctrl+Y"), "{screen}");
+        assert!(
+            rendered_confirmation.is_some(),
+            "real Ctrl+Y must confirm the rendered card"
+        );
+        confirmation = rendered_confirmation;
+        assert_eq!(domain.approval_card_snapshots().len(), 1);
+        phase(&mut client, SessionPhase::Completed).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), next(&mut server))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client.snapshots.borrow().root_start_requests,
+            expected_starts
+        );
+        after = end_sequence;
+    }
+    client
+        .commands
+        .send(Command::ConfirmExtension {
+            confirmation: confirmation.unwrap(),
+        })
+        .await
+        .unwrap();
+    let mut approved_line = String::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        server.read_line(&mut approved_line),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "Ctrl+Y approval request timed out: {:?}; domain={:?}",
+        client.snapshots.borrow().notice,
+        client.snapshots.borrow().extensions[0]
+            .modeling()
+            .unwrap()
+            .notice
+    );
+    result.unwrap().unwrap();
+    let approved: Value = serde_json::from_str(&approved_line).unwrap();
+    assert_eq!(approved["method"], "turn/start");
+    let text = approved["params"]["input"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(
+        payload["apply_change_arguments"]["proposal_id"],
+        "5f0bb072a1d74d578432e010ef6a948d"
+    );
+    assert_eq!(payload["apply_change_arguments"]["revision"], 1);
+    assert_eq!(
+        payload["apply_change_arguments"]["prepare_token"],
+        "cf6beecadcbff29089847735ef37785c8a9171fc7a7256bba2c67d58834d0bc0"
+    );
+    let arguments: Vec<String> =
+        serde_json::from_slice(&std::fs::read(fixture.join("approval-arguments.json")).unwrap())
+            .unwrap();
+    for (flag, expected) in [
+        ("--proposal", "5f0bb072a1d74d578432e010ef6a948d"),
+        ("--revision", "1"),
+        (
+            "--prepare-token",
+            "cf6beecadcbff29089847735ef37785c8a9171fc7a7256bba2c67d58834d0bc0",
+        ),
+    ] {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .unwrap();
+        assert_eq!(arguments[index + 1], expected);
+    }
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
 async fn restored_approval_receipt_stops_auto_continue_and_confirms_the_restored_proposal() {
     use sha2::{Digest, Sha256};
     let directory = std::env::temp_dir().join(format!(

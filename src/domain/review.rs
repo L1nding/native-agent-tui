@@ -305,7 +305,10 @@ fn requirements_with_openings(
             proposal["draft"]["operations"]
                 .as_array()?
                 .iter()
-                .filter(|op| op["op"] == "add" && op["collection"] == "solids")
+                .filter(|op| {
+                    op["op"] == "add"
+                        && matches!(op["collection"].as_str(), Some("solids" | "elements"))
+                })
                 .map(|op| serde_json::from_str(op["value_json"].as_str()?).ok())
                 .collect::<Option<Vec<Value>>>()?,
         )
@@ -951,12 +954,21 @@ pub(super) fn project(
             _ => return None,
         }
         hash(&item["cad_evidence_sha256"])?;
+        let edit_part_limit = if previous
+            .edit_parts
+            .as_ref()
+            .is_some_and(|parts| parts.iter().any(|part| part.get("boundary").is_some()))
+        {
+            300
+        } else {
+            64
+        };
         strings(
             &item["part_ids"],
             if item["category"] == "structure_revision" {
                 50000
             } else {
-                64
+                edit_part_limit
             },
         )?;
         let dimensions = &item["dimensions"];
@@ -1055,21 +1067,45 @@ pub(super) fn project(
             for part in rendered {
                 let id = part["id"].as_str()?;
                 let original = expected.iter().find(|old| old["id"] == id)?;
-                if !seen_parts.insert(id)
-                    || [
+                let geometry: &[&str] = if original.get("boundary").is_some() {
+                    &[
+                        "role",
+                        "boundary",
+                        "holes",
+                        "base_z",
+                        "height",
+                        "stair_soffit",
+                        "stair_top",
+                        "source_ids",
+                    ]
+                } else {
+                    &[
                         "primitive_id",
                         "arguments",
                         "origin",
                         "rotation_z_deg",
                         "scale",
                     ]
-                    .iter()
-                    .any(|key| part.get(*key) != original.get(*key))
+                };
+                if !seen_parts.insert(id)
+                    || geometry
+                        .iter()
+                        .any(|key| part.get(*key) != original.get(*key))
+                    || original.get("boundary").is_some()
+                        && original["metadata"]
+                            .as_object()?
+                            .iter()
+                            .any(|(key, value)| {
+                                !matches!(
+                                    key.as_str(),
+                                    "patch_id" | "patch_reason" | "value_basis" | "decision_id"
+                                ) && part["metadata"].get(key) != Some(value)
+                            })
                 {
                     return None;
                 }
             }
-            if strings(&item["part_ids"], 64)?
+            if strings(&item["part_ids"], edit_part_limit)?
                 != seen_parts.iter().map(|id| (*id).to_owned()).collect()
             {
                 return None;

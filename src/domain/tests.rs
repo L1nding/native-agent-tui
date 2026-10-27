@@ -1,5 +1,142 @@
 use super::*;
 
+#[test]
+fn advance_floor_reissued_card_uses_latest_build_without_duplicate_pending_cards() {
+    let mut facts = sequenced_facts();
+    let mut advance = floor_story_height_proposal();
+    advance["kind"] = json!("floor_advance");
+    advance["fact_sequence"] = json!(10);
+    let p = &advance["proposal"];
+    advance["needs"] = json!({"type":"approve_card", "proposal_id":p["proposal_id"],
+        "revision":p["revision"],"prepare_token":p["prepare_token"],"base_sha256":p["base_sha256"],
+        "candidate_sha256":p["candidate_sha256"],"build_id":"first-build","card_ref":"first-card"});
+    assert_eq!(facts.apply_verified_fact(&advance), FactProjection::Applied);
+    assert!(facts.snapshot.floor_advance_auto_continue_paused);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    facts.snapshot.artifacts[0].binding.build_id = "first-build".into();
+    facts.snapshot.review_images[0].binding.review_key = "first-build".into();
+    assert!(facts.can_authorize(&binding));
+    let restored = approval_restore_fact(&binding.proposal_id, "first-build", 11);
+    assert_eq!(
+        facts.apply_verified_fact(&restored),
+        FactProjection::Applied
+    );
+    let old = advance.clone();
+    advance["fact_sequence"] = json!(20);
+    advance["needs"]["card_ref"] = json!("latest-card");
+    advance["needs"]["build_id"] = json!("latest-build");
+    assert_eq!(facts.apply_verified_fact(&advance), FactProjection::Applied);
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 1);
+    assert!(
+        !facts.can_authorize(&binding),
+        "old build evidence cannot approve a reissued build"
+    );
+    let mut blocked = advance.clone();
+    blocked["fact_sequence"] = json!(21);
+    blocked["needs"] = json!({"type":"blocked"});
+    assert_eq!(facts.apply_verified_fact(&blocked), FactProjection::Applied);
+    assert!(
+        !facts.can_authorize(&binding),
+        "unrelated needs cannot remove latest-build binding"
+    );
+    let mut latest = facts.snapshot.artifacts[0].clone();
+    latest.binding.build_id = "latest-build".into();
+    facts.snapshot.artifacts.push(latest);
+    let mut image = facts.snapshot.review_images[0].clone();
+    image.binding.review_key = "latest-build".into();
+    facts.snapshot.review_images.push(image);
+    assert!(facts.can_authorize(&binding));
+    assert_eq!(
+        facts.apply_verified_fact(&restored),
+        FactProjection::Superseded
+    );
+    assert!(
+        facts.can_authorize(&binding),
+        "re-reading an old restore cannot constrain the latest build"
+    );
+    assert_eq!(facts.apply_verified_fact(&old), FactProjection::Superseded);
+    assert_eq!(
+        facts
+            .snapshot
+            .approval_card_request
+            .as_ref()
+            .unwrap()
+            .card_ref,
+        "latest-card"
+    );
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 1);
+    assert!(facts.snapshot.approval_card_waiting());
+    assert!(facts.can_authorize(&binding));
+    advance["fact_sequence"] = json!(22);
+    assert_eq!(facts.apply_verified_fact(&advance), FactProjection::Applied);
+    assert!(
+        facts.can_authorize(&binding),
+        "re-reading a card cannot erase delivered evidence"
+    );
+    let mut late = sequenced_facts();
+    assert_eq!(late.apply_verified_fact(&advance), FactProjection::Applied);
+    add_reviewed_candidate(&mut late.snapshot, &binding);
+    late.snapshot.artifacts[0].binding.build_id = "latest-build".into();
+    late.snapshot.review_images[0].binding.review_key = "latest-build".into();
+    assert!(late.can_authorize(&binding));
+    assert_eq!(
+        late.apply_verified_fact(&restored),
+        FactProjection::Superseded
+    );
+    assert!(
+        late.can_authorize(&binding),
+        "a first late restore cannot constrain the latest build"
+    );
+    let mut fresh = restored.clone();
+    fresh["fact_sequence"] = json!(30);
+    fresh["build_id"] = json!("fresh-restored-build");
+    assert_eq!(late.apply_verified_fact(&fresh), FactProjection::Applied);
+    assert!(!late.can_authorize(&binding));
+    assert_eq!(
+        late.apply_verified_fact(&advance),
+        FactProjection::Superseded
+    );
+    late.snapshot.artifacts[0].binding.build_id = "fresh-restored-build".into();
+    late.snapshot.review_images[0].binding.review_key = "fresh-restored-build".into();
+    assert!(
+        late.can_authorize(&binding),
+        "the newest restore also replaces the direct build constraint"
+    );
+}
+
+#[test]
+fn advance_floor_rejects_approval_identity_different_from_embedded_proposal() {
+    for key in [
+        "proposal_id",
+        "revision",
+        "prepare_token",
+        "base_sha256",
+        "candidate_sha256",
+    ] {
+        let mut facts = sequenced_facts();
+        let mut advance = floor_story_height_proposal();
+        advance["kind"] = json!("floor_advance");
+        advance["fact_sequence"] = json!(10);
+        let p = &advance["proposal"];
+        advance["needs"] = json!({"type":"approve_card","proposal_id":p["proposal_id"],"revision":p["revision"],
+            "prepare_token":p["prepare_token"],"base_sha256":p["base_sha256"],"candidate_sha256":p["candidate_sha256"],
+            "build_id":"build","card_ref":"card"});
+        advance["needs"][key] = if key == "revision" {
+            json!(99)
+        } else {
+            json!("foreign")
+        };
+        assert_eq!(
+            facts.apply_verified_fact(&advance),
+            FactProjection::Invalid,
+            "{key}"
+        );
+        assert!(facts.snapshot.proposal.is_none(), "{key}");
+        assert!(facts.snapshot.approval_card_snapshots().is_empty(), "{key}");
+    }
+}
+
 pub(crate) fn floor_story_height_proposal() -> Value {
     let mut value = envelope();
     let decision = json!({"request_id":"f02-height-4m","floor_id":"floor.f02.trial",
