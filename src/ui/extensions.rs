@@ -13,6 +13,7 @@ pub(super) struct ExtensionPanel {
     pub scroll: u16,
     pub reply_scroll_from_bottom: u16,
     pub selected_image: usize,
+    selected_approval: Option<crate::domain::ProposalBinding>,
     displayed: RefCell<Option<ExtensionConfirmation>>,
 }
 
@@ -25,6 +26,24 @@ impl ExtensionPanel {
     }
     pub fn clear_displayed(&self) {
         *self.displayed.borrow_mut() = None;
+    }
+
+    fn selected_approval_index(&self, cards: &[&crate::domain::DomainSnapshot]) -> Option<usize> {
+        if cards.is_empty() {
+            return None;
+        }
+        Some(
+            self.selected_approval
+                .as_ref()
+                .and_then(|selected| {
+                    cards.iter().position(|card| {
+                        card.proposal
+                            .as_ref()
+                            .is_some_and(|proposal| proposal.binding == *selected)
+                    })
+                })
+                .unwrap_or(0),
+        )
     }
 
     pub fn toggle(&mut self, snapshot: &CoreSnapshot) {
@@ -177,10 +196,27 @@ impl Registry<'_> {
         let Some((view, projection)) = self.projection(snapshot, id) else {
             return false;
         };
-        view.draw(frame, area, projection, context);
-        *context.panel.displayed.borrow_mut() = view
-            .confirmation(projection)
-            .filter(|confirmation| confirmation.id() == id);
+        let selected_projection = projection.modeling().and_then(|domain| {
+            let cards = domain.approval_card_snapshots();
+            let selected = context.panel.selected_approval_index(&cards)?;
+            let mut card = cards[selected].clone();
+            card.authorizing = domain.authorizing;
+            card.fact_sync_notice = domain.fact_sync_notice.clone();
+            Some(ExtensionSnapshot::Modeling(card))
+        });
+        let display_projection = selected_projection.as_ref().unwrap_or(projection);
+        view.draw(frame, area, display_projection, context);
+        let confirmation = projection.modeling().and_then(|domain| {
+            let cards = domain.approval_card_snapshots();
+            context
+                .panel
+                .selected_approval_index(&cards)
+                .and_then(|index| cards.get(index).copied())
+                .filter(|card| domain.approval_card_waiting_for(card))
+                .and_then(|_| view.confirmation(display_projection))
+        });
+        *context.panel.displayed.borrow_mut() =
+            confirmation.filter(|confirmation| confirmation.id() == id);
         true
     }
 
@@ -192,13 +228,30 @@ impl Registry<'_> {
         panel: &ExtensionPanel,
     ) -> Rect {
         panel.clear_displayed();
-        let Some((view, projection)) = self.projection(snapshot, ExtensionId::Modeling) else {
+        let Some((_view, projection)) = self.projection(snapshot, ExtensionId::Modeling) else {
             return area;
         };
         let domain = projection.modeling().expect("modeling projection");
-        let mut content = super::domain::approval_card_lines(domain, panel.selected_image);
+        let cards = domain.approval_card_snapshots();
+        let Some(selected_index) = panel.selected_approval_index(&cards) else {
+            return area;
+        };
+        let selected_card = cards[selected_index];
+        let approvable_count = cards
+            .iter()
+            .filter(|card| domain.approval_card_waiting_for(card))
+            .count();
+        let selected_can_approve = domain.approval_card_waiting_for(selected_card);
+        let mut display_card = selected_card.clone();
+        display_card.authorizing = domain.authorizing;
+        display_card.fact_sync_notice = domain.fact_sync_notice.clone();
+        let mut content = super::domain::approval_card_lines(&display_card, panel.selected_image);
         if content.is_empty() {
             return area;
+        }
+        if approvable_count > 0 && !selected_can_approve {
+            *content.last_mut().expect("approval action") =
+                "本卡未就绪 · 有可批准卡 · Alt+[/]切换后 Ctrl+Y 确认".into();
         }
         // Human approval binds the exact displayed version; running turns and tasks
         // (the root "继续" task, subagents) do not block it. Only a pending question does.
@@ -223,7 +276,7 @@ impl Registry<'_> {
         let compact = !full && area.width >= 40 && area.height >= 8;
         let lines = if compact {
             super::domain::compact_approval_card_lines(
-                domain,
+                &display_card,
                 &content,
                 usize::from(area.width.saturating_sub(2)),
             )
@@ -261,14 +314,28 @@ impl Registry<'_> {
                             | ratatui::widgets::Borders::LEFT
                             | ratatui::widgets::Borders::RIGHT
                     })
-                    .title("建模确认 · F6 详情"),
+                    .title(if area.width >= 64 {
+                        format!(
+                            "建模确认 · 待批 {} 张（可确认 {}） · F6 详情",
+                            cards.len(),
+                            approvable_count
+                        )
+                    } else if area.width >= 32 {
+                        format!(
+                            "建模确认 · 待批 {} 张/可确认 {}",
+                            cards.len(),
+                            approvable_count
+                        )
+                    } else {
+                        format!("待批 {} 张/可确认 {}", cards.len(), approvable_count)
+                    }),
             ),
             card,
         );
-        if complete && snapshot.requests.is_empty() {
-            *panel.displayed.borrow_mut() = view
-                .confirmation(projection)
-                .filter(|confirmation| confirmation.id() == ExtensionId::Modeling);
+        if complete && snapshot.requests.is_empty() && selected_can_approve {
+            *panel.displayed.borrow_mut() = Some(ExtensionConfirmation::Modeling(
+                selected_card.confirmation(),
+            ));
         }
         Rect {
             height: area.height.saturating_sub(height),
@@ -290,6 +357,32 @@ impl Registry<'_> {
             return None;
         }
         let (view, projection) = self.projection(snapshot, id)?;
+        let domain = projection.modeling()?;
+        let cards = domain.approval_card_snapshots();
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('[' | ']'))
+            && !cards.is_empty()
+        {
+            let current = panel.selected_approval_index(&cards).unwrap_or(0);
+            let next = if key.code == KeyCode::Char('[') {
+                current.checked_sub(1).unwrap_or(cards.len() - 1)
+            } else {
+                (current + 1) % cards.len()
+            };
+            panel.selected_approval = Some(
+                cards[next]
+                    .proposal
+                    .as_ref()
+                    .expect("approval card proposal")
+                    .binding
+                    .clone(),
+            );
+            panel.selected_image = 0;
+            panel.clear_displayed();
+            return Some(ExtensionAction::Handled);
+        }
+        let selected_index = panel.selected_approval_index(&cards);
+        let selected_card = selected_index.and_then(|index| cards.get(index).copied());
         let image_or_approval_key = matches!((key.code, key.modifiers),
             (KeyCode::Char('y' | 'o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL))
             || (matches!(key.code, KeyCode::Left | KeyCode::Right)
@@ -297,13 +390,13 @@ impl Registry<'_> {
         if panel.visible.is_none() && !image_or_approval_key {
             return None;
         }
-        if panel.visible.is_none() && projection.modeling()?.proposal.is_none() {
+        if panel.visible.is_none() && selected_card.is_none() && domain.proposal.is_none() {
             return None;
         }
         let context = ViewContext::new(snapshot, panel, draft, notice);
         match key.code {
             KeyCode::Left | KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                let count = projection.modeling()?.review_images.len();
+                let count = selected_card?.review_images.len();
                 panel.selected_image = if count == 0 {
                     0
                 } else if key.code == KeyCode::Left {
@@ -314,7 +407,7 @@ impl Registry<'_> {
                 panel.scroll = 0;
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let images = &projection.modeling()?.review_images;
+                let images = &selected_card?.review_images;
                 return Some(
                     images
                         .get(panel.selected_image.min(images.len().saturating_sub(1)))
@@ -350,17 +443,17 @@ impl Registry<'_> {
                 };
             }
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let current_confirmation = selected_card
+                    .filter(|card| domain.approval_card_waiting_for(card))
+                    .map(|card| ExtensionConfirmation::Modeling(card.confirmation()));
                 return Some(
                     panel
                         .displayed
                         .borrow()
                         .clone()
                         .filter(|confirmation| confirmation.id() == id)
-                        .filter(|confirmation| {
-                            view.confirmation(projection).as_ref() == Some(confirmation)
-                                && area.width >= 24
-                                && area.height >= 8
-                        })
+                        .filter(|confirmation| current_confirmation.as_ref() == Some(confirmation))
+                        .filter(|_| area.width >= 24 && area.height >= 8)
                         .map_or(
                             ExtensionAction::NoDisplayedConfirmation,
                             ExtensionAction::Confirm,
@@ -386,7 +479,8 @@ mod tests {
     use super::super::LocalState;
     use super::*;
     use crate::domain::{
-        ArtifactBinding, ArtifactFact, ArtifactState, DomainSnapshot, ProposalBinding, ProposalFact,
+        ApprovalCard, ArtifactBinding, ArtifactFact, ArtifactState, DomainSnapshot,
+        ProposalBinding, ProposalFact,
     };
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -395,6 +489,7 @@ mod tests {
             phase: SessionPhase::Completed,
             extensions: vec![ExtensionSnapshot::Modeling(DomainSnapshot {
                 enabled: true,
+                source_current: Some(true),
                 proposal: Some(ProposalFact {
                     binding: ProposalBinding {
                         run_id: "run".into(),
@@ -439,6 +534,212 @@ mod tests {
             "preview",
         ));
         snapshot
+    }
+
+    fn approval_domain(
+        seed: &DomainSnapshot,
+        proposal_id: &str,
+        revision: u64,
+        category: &str,
+        ready: bool,
+    ) -> DomainSnapshot {
+        let mut card = seed.clone();
+        card.approval_cards.clear();
+        card.source_current = Some(true);
+        card.proposal_not_approvable = false;
+        let proposal = card.proposal.as_mut().unwrap();
+        proposal.binding.proposal_id = proposal_id.into();
+        proposal.binding.revision = revision;
+        proposal.binding.prepare_token = format!("{proposal_id}-prepare");
+        proposal.summary = proposal_id.into();
+        proposal.ready = ready;
+        for artifact in &mut card.artifacts {
+            artifact.binding.proposal_id = proposal_id.into();
+            artifact.binding.revision = revision;
+            artifact.binding.prepare_token = proposal.binding.prepare_token.clone();
+        }
+        for image in &mut card.review_images {
+            image.binding.proposal = proposal.binding.clone();
+        }
+        card.proposal_categories.clear();
+        card.proposal_categories.insert(category.into(), 1);
+        if !ready {
+            card.artifacts.clear();
+            card.review_images.clear();
+        }
+        card
+    }
+
+    fn snapshot_with_approval_cards() -> CoreSnapshot {
+        let mut snapshot = snapshot();
+        let ExtensionSnapshot::Modeling(root) = &mut snapshot.extensions[0];
+        let seed = root.clone();
+        let earlier_ready = approval_domain(&seed, "ready-earlier", 8, "wall", true);
+        let latest_ready = approval_domain(&seed, "ready-latest", 9, "armchair", true);
+        let latest_unready = approval_domain(&seed, "unready-latest", 10, "examination_bed", false);
+        let mut current = latest_unready;
+        current.approval_cards = vec![
+            ApprovalCard {
+                fact_sequence: 8,
+                snapshot: earlier_ready.approval_card_snapshot(),
+            },
+            ApprovalCard {
+                fact_sequence: 9,
+                snapshot: latest_ready.approval_card_snapshot(),
+            },
+        ];
+        *root = current;
+        snapshot
+    }
+
+    fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in buffer.content().chunks(usize::from(buffer.area.width)) {
+            let mut continuation = 0;
+            for cell in row {
+                if continuation > 0 {
+                    continuation -= 1;
+                    continue;
+                }
+                let symbol = cell.symbol();
+                continuation = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+                if !symbol.chars().all(char::is_whitespace) {
+                    text.push_str(symbol);
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn approval_card_collection_counts_prioritizes_switches_and_confirms_exact_card() {
+        let snapshot = snapshot_with_approval_cards();
+        let ExtensionSnapshot::Modeling(domain) = &snapshot.extensions[0];
+        let cards = domain.approval_card_snapshots();
+        assert_eq!(cards.len(), 3);
+        assert!(domain.approval_card_waiting_for(cards[0]));
+        assert_eq!(
+            cards[0].proposal.as_ref().unwrap().binding.proposal_id,
+            "ready-latest"
+        );
+
+        let panel = ExtensionPanel::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).unwrap();
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(rendered.contains("待批3张（可确认2）"), "{rendered}");
+        assert!(rendered.contains("待你确认：扶手椅1把"), "{rendered}");
+        assert_eq!(
+            panel
+                .displayed
+                .borrow()
+                .as_ref()
+                .map(|confirmation| match confirmation {
+                    ExtensionConfirmation::Modeling(binding) =>
+                        binding.proposal.proposal_id.as_str(),
+                }),
+            Some("ready-latest")
+        );
+
+        let mut panel = panel;
+        let switch = |panel: &mut ExtensionPanel, code| {
+            REGISTRY.handle_key(
+                KeyEvent::new(code, KeyModifiers::ALT),
+                &snapshot,
+                panel,
+                Rect::new(0, 0, 120, 44),
+                "",
+                None,
+            )
+        };
+        assert!(matches!(
+            switch(&mut panel, KeyCode::Char(']')),
+            Some(ExtensionAction::Handled)
+        ));
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        assert!(terminal_text(&terminal).contains("待你确认：墙体1处"));
+        let action = REGISTRY.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut panel,
+            Rect::new(0, 0, 120, 44),
+            "",
+            None,
+        );
+        assert!(matches!(
+            action,
+            Some(ExtensionAction::Confirm(ExtensionConfirmation::Modeling(ref confirmation)))
+                if confirmation.proposal.proposal_id == "ready-earlier"
+        ));
+
+        panel.visible = Some(ExtensionId::Modeling);
+        terminal
+            .draw(|frame| {
+                let context = ViewContext::new(&snapshot, &panel, "", None);
+                REGISTRY.draw(frame, &snapshot, &context);
+            })
+            .unwrap();
+        assert!(terminal_text(&terminal).contains("ready-earlier"));
+        assert!(!terminal_text(&terminal).contains("unready-latest"));
+        panel.visible = None;
+
+        assert!(matches!(
+            switch(&mut panel, KeyCode::Char(']')),
+            Some(ExtensionAction::Handled)
+        ));
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(rendered.contains("有可批准卡"), "{rendered}");
+        assert!(panel.displayed.borrow().is_none());
+        let mut compact = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        compact
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        let compact_text = terminal_text(&compact);
+        assert!(
+            compact_text.contains("建模确认·待批3张/可确认2"),
+            "{compact_text}"
+        );
+        assert!(compact_text.contains("有可批准卡"), "{compact_text}");
+        assert!(compact_text.contains("Ctrl+Y确认"), "{compact_text}");
+
+        for width in [24, 27, 31] {
+            let mut narrow = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            narrow
+                .draw(|frame| {
+                    REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+                })
+                .unwrap();
+            let text = terminal_text(&narrow);
+            assert!(text.contains("待批3张/可确认2"), "{width} columns: {text}");
+        }
+        let action = REGISTRY.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &snapshot,
+            &mut panel,
+            Rect::new(0, 0, 120, 44),
+            "",
+            None,
+        );
+        assert!(matches!(
+            action,
+            Some(ExtensionAction::NoDisplayedConfirmation)
+        ));
     }
 
     #[test]
@@ -1062,17 +1363,36 @@ mod tests {
                     "正在保存你的确认"
                 }
                 "approved" => {
-                    domain.proposal.as_mut().unwrap().ready = false;
                     domain.operation = Some(crate::domain::OperationFact {
                         operation_id: "op".into(),
-                        state: "applying".into(),
+                        state: "applied".into(),
                         recovery: "not_required".into(),
                         current_sha256: String::new(),
                     });
-                    "你已批准"
+                    ""
                 }
                 _ => "Ctrl+Y 确认",
             };
+            if condition == "approved" {
+                assert!(domain.approval_card_snapshots().is_empty());
+                let panel = ExtensionPanel::default();
+                let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+                    })
+                    .unwrap();
+                assert!(panel.displayed.borrow().is_none());
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(!screen.contains("待你确认"));
+                continue;
+            }
             let full = super::super::domain::approval_card_lines(domain, 0);
             let lines = super::super::domain::compact_approval_card_lines(domain, &full, 38);
             assert_eq!(lines.len(), 7);

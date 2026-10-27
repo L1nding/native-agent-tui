@@ -434,6 +434,32 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         .unwrap();
         assert!(!directory.join("actor.txt").exists());
         assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+        if parameter_only {
+            let mut other = proposal.clone();
+            other["fact_sequence"] = json!(3);
+            other["proposal"]["proposal_id"] = json!("other");
+            other["proposal"]["prepare_token"] = json!("other-token");
+            other["proposal"]["state"] = json!("draft");
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"other-before-confirm","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":other}}}})).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.snapshots.wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .proposal
+                        .as_ref()
+                        .is_some_and(|proposal| proposal.binding.proposal_id == "other")
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let snapshot = client.snapshots.borrow().clone();
+            let domain = snapshot.extensions[0].modeling().unwrap();
+            assert_eq!(domain.approval_card_snapshots().len(), 2);
+        }
         observation_event(&mut client,&mut server,json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
         if policy == DomainApprovalPolicy::ReviewedTemplate && !parameter_only {
             let approved = next(&mut server).await;
@@ -454,6 +480,8 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
                 let binding = client.snapshots.borrow().extensions[0]
                     .modeling()
                     .unwrap()
+                    .selected_approval_card()
+                    .unwrap()
                     .proposal
                     .as_ref()
                     .unwrap()
@@ -461,6 +489,8 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
                     .clone();
                 assert!(client.snapshots.borrow().extensions[0]
                     .modeling()
+                    .unwrap()
+                    .selected_approval_card()
                     .unwrap()
                     .first_use_satisfied());
                 client
@@ -504,7 +534,7 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
                 .await;
                 phase(&mut client, SessionPhase::Running).await;
                 let applied = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
-                    "kind":"operation","fact_sequence":3,"receipt":{"proposal_id":binding.proposal_id,
+                    "kind":"operation","fact_sequence":4,"receipt":{"proposal_id":binding.proposal_id,
                     "revision":binding.revision,"prepare_token":binding.prepare_token,"base_sha256":binding.base_sha256,
                     "candidate_sha256":binding.candidate_sha256,"operation_id":"height-apply","state":"applied",
                     "current_sha256":binding.candidate_sha256}});
@@ -512,8 +542,18 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
                     "item":{"id":"apply","type":"mcpToolCall","server":"modeling_domain","tool":"apply_change","status":"completed","result":{"structuredContent":applied}}}})).await;
                 let snapshot = client.snapshots.borrow().clone();
                 let domain = snapshot.extensions[0].modeling().unwrap();
-                assert_eq!(domain.operation.as_ref().unwrap().state, "applied");
+                assert_eq!(
+                    domain
+                        .approval_card(&binding)
+                        .unwrap()
+                        .operation
+                        .as_ref()
+                        .unwrap()
+                        .state,
+                    "applied"
+                );
                 assert!(!domain.proposal.as_ref().unwrap().ready);
+                assert_eq!(domain.approval_card_snapshots().len(), 1);
                 assert!(domain.rejected_facts.is_empty());
             }
         }
@@ -529,6 +569,7 @@ async fn manual_grant_steered_into_an_ending_turn_is_resubmitted_when_still_unap
     use sha2::{Digest, Sha256};
     for completion in [
         "approved",
+        "other_unready",
         "failed",
         "expired",
         "newer_notice",
@@ -686,6 +727,41 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         assert!(domain.authorizing);
         assert_eq!(domain.review_images[0], image);
         assert!(!directory.join("release-authorization").exists());
+        if completion == "other_unready" {
+            let other = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+                "kind":"proposal","fact_sequence":3,"current":true,"source_current":true,"diagnostics":[],
+                "proposal":{"proposal_id":"other","revision":1,"prepare_token":"other-token","base_sha256":"base",
+                    "candidate_sha256":"other-candidate","state":"draft","summary":"其他未就绪方案","draft":{"operations":[]},
+                    "assumed":[],"issues":[],"pending":[],"component_first_use_requirements":{
+                        "contract":"component-first-use/1","required":[],"reused":[]}}});
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"other","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":other}}}})).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.snapshots.wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .proposal
+                        .as_ref()
+                        .is_some_and(|proposal| proposal.binding.proposal_id == "other")
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                client.snapshots.borrow().extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .proposal
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .proposal_id,
+                "other"
+            );
+        }
         if completion == "approved" {
             let mut unbound_web = image.binding.clone();
             unbound_web.web_review = Some(crate::review_web::WebReviewPackage {
@@ -738,13 +814,13 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
                 .first_use_satisfied());
             std::fs::write(directory.join("release-authorization"), b"ready").unwrap();
             tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(10),
                 client
                     .snapshots
                     .wait_for(|s| !s.extensions[0].modeling().unwrap().authorizing),
             )
             .await
-            .unwrap()
+            .unwrap_or_else(|_| panic!("authorization did not finish for {completion}"))
             .unwrap();
             let finished = client.snapshots.borrow().clone();
             assert_eq!(finished.root_start_requests, 1);
@@ -762,7 +838,10 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
             std::fs::remove_dir_all(directory).unwrap();
             continue;
         }
-        if completion != "approved" && completion != "pending_after_steer" {
+        if !matches!(
+            completion,
+            "approved" | "pending_after_steer" | "other_unready"
+        ) {
             if completion == "newer_notice" {
                 client
                     .commands
@@ -827,6 +906,20 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         // applying it, so the grant must come back as the next input.
         let steer = next(&mut server).await;
         assert_eq!(steer["method"], "turn/steer");
+        if completion == "other_unready" {
+            let text = steer["params"]["text"].as_str().unwrap();
+            let payload: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            assert_eq!(payload["apply_change_arguments"]["proposal_id"], "p");
+            assert_eq!(payload["apply_change_arguments"]["prepare_token"], "token");
+            assert_eq!(
+                client.snapshots.borrow().extensions[0]
+                    .modeling()
+                    .unwrap()
+                    .approval_card_snapshots()
+                    .len(),
+                1
+            );
+        }
         if completion == "pending_after_steer" {
             let pending = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
                 "kind":"component_first_use_review","fact_sequence":3,

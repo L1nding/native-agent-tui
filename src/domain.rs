@@ -312,6 +312,17 @@ pub struct ProposalBinding {
     pub candidate_sha256: String,
 }
 
+fn proposal_operation_sequence_key(binding: &ProposalBinding) -> String {
+    format!(
+        "approval-operation:{}:{}:{}:{}:{}",
+        binding.proposal_id,
+        binding.revision,
+        binding.prepare_token,
+        binding.base_sha256,
+        binding.candidate_sha256
+    )
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposalFact {
@@ -543,6 +554,10 @@ pub struct DomainSnapshot {
     pub enabled: bool,
     pub floor_id: String,
     pub proposal: Option<ProposalFact>,
+    pub approval_cards: Vec<ApprovalCard>,
+    pub source_current: Option<bool>,
+    pub proposal_not_approvable: bool,
+    pub(crate) approval_card_tombstones: Vec<ProposalBinding>,
     pub proposal_categories: BTreeMap<String, usize>,
     pub project: Option<ProjectCatalogFact>,
     pub selection: Option<ProjectSelectionFact>,
@@ -575,6 +590,21 @@ pub struct DomainSnapshot {
     pub verified_fact: Option<VerifiedFact>,
     pub preview_connection: Option<String>,
     pub preview_selection: Option<crate::preview::Selection>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApprovalCard {
+    pub snapshot: Box<DomainSnapshot>,
+    pub fact_sequence: u64,
+}
+
+impl ApprovalCard {
+    fn binding(&self) -> Option<&ProposalBinding> {
+        self.snapshot
+            .proposal
+            .as_ref()
+            .map(|proposal| &proposal.binding)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,6 +668,256 @@ fn structure_review(value: &Value) -> Option<StructureReview> {
 }
 
 impl DomainSnapshot {
+    pub fn approval_card_snapshot(&self) -> Box<Self> {
+        let mut snapshot = self.clone();
+        snapshot.approval_cards.clear();
+        snapshot.approval_card_tombstones.clear();
+        Box::new(snapshot)
+    }
+
+    pub fn approval_card_snapshots(&self) -> Vec<&DomainSnapshot> {
+        let mut cards = self
+            .approval_cards
+            .iter()
+            .filter_map(|card| {
+                let snapshot = if self
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|proposal| Some(&proposal.binding) == card.binding())
+                {
+                    self
+                } else {
+                    card.snapshot.as_ref()
+                };
+                let binding = snapshot.proposal.as_ref()?.binding.clone();
+                (!self.approval_card_removed(&binding)
+                    && snapshot.source_current != Some(false)
+                    && !snapshot.proposal_not_approvable
+                    && snapshot.application.is_none()
+                    && snapshot.operation.is_none())
+                .then_some((card.fact_sequence, snapshot))
+            })
+            .collect::<Vec<_>>();
+        if let Some(proposal) = &self.proposal {
+            if !self
+                .approval_cards
+                .iter()
+                .any(|card| card.binding() == Some(&proposal.binding))
+                && !self.approval_card_removed(&proposal.binding)
+                && self.source_current != Some(false)
+                && !self.proposal_not_approvable
+                && self.application.is_none()
+                && self.operation.is_none()
+            {
+                cards.push((u64::MAX, self));
+            }
+        }
+        cards.sort_by(|(left_sequence, left), (right_sequence, right)| {
+            self.approval_card_waiting_for(right)
+                .cmp(&self.approval_card_waiting_for(left))
+                .then_with(|| right_sequence.cmp(left_sequence))
+        });
+        cards.into_iter().map(|(_, card)| card).collect()
+    }
+
+    pub fn selected_approval_card(&self) -> Option<&DomainSnapshot> {
+        self.approval_card_snapshots().into_iter().next()
+    }
+
+    pub fn approval_card(&self, binding: &ProposalBinding) -> Option<&DomainSnapshot> {
+        if self
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.binding == *binding)
+        {
+            return Some(self);
+        }
+        self.approval_cards
+            .iter()
+            .find(|card| card.binding() == Some(binding))
+            .map(|card| card.snapshot.as_ref())
+    }
+
+    pub fn approval_card_mut(&mut self, binding: &ProposalBinding) -> Option<&mut DomainSnapshot> {
+        if self
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.binding == *binding)
+        {
+            return Some(self);
+        }
+        self.approval_cards
+            .iter_mut()
+            .find(|card| card.binding() == Some(binding))
+            .map(|card| card.snapshot.as_mut())
+    }
+
+    fn proposal_binding_for_owner(&self, owner: &Value) -> Option<ProposalBinding> {
+        let matches = |binding: &ProposalBinding| {
+            let base_sha256 = owner["base_sha256"].as_str();
+            let candidate_sha256 = owner["candidate_sha256"].as_str();
+            owner["proposal_id"].as_str() == Some(binding.proposal_id.as_str())
+                && owner["revision"].as_u64() == Some(binding.revision)
+                && owner["prepare_token"].as_str() == Some(binding.prepare_token.as_str())
+                && base_sha256.is_none_or(|sha256| sha256 == binding.base_sha256)
+                && candidate_sha256.is_none_or(|sha256| sha256 == binding.candidate_sha256)
+        };
+        self.proposal
+            .as_ref()
+            .map(|proposal| &proposal.binding)
+            .filter(|binding| matches(binding))
+            .cloned()
+            .or_else(|| {
+                self.approval_cards
+                    .iter()
+                    .filter_map(ApprovalCard::binding)
+                    .find(|binding| matches(binding))
+                    .cloned()
+            })
+    }
+
+    fn application_binding_for_owner(&self, owner: &Value) -> Option<ProposalBinding> {
+        self.proposal_binding_for_owner(owner).or_else(|| {
+            if !owner["revision"].is_null() {
+                return None;
+            }
+            let proposal_id = owner["proposal_id"].as_str()?;
+            let prepare_token = owner["prepare_token"].as_str()?;
+            let base_sha256 = owner["base_sha256"].as_str();
+            let candidate_sha256 = owner["candidate_sha256"].as_str();
+            let matches = |binding: &ProposalBinding| {
+                binding.proposal_id == proposal_id
+                    && binding.prepare_token == prepare_token
+                    && base_sha256.is_none_or(|sha256| sha256 == binding.base_sha256)
+                    && candidate_sha256.is_none_or(|sha256| sha256 == binding.candidate_sha256)
+            };
+            let mut matching_bindings = Vec::new();
+            if let Some(binding) = self
+                .proposal
+                .as_ref()
+                .map(|proposal| &proposal.binding)
+                .filter(|binding| matches(binding))
+            {
+                matching_bindings.push(binding.clone());
+            }
+            for binding in self
+                .approval_cards
+                .iter()
+                .filter_map(ApprovalCard::binding)
+                .filter(|binding| matches(binding))
+            {
+                if !matching_bindings.contains(binding) {
+                    matching_bindings.push(binding.clone());
+                }
+            }
+            (matching_bindings.len() == 1).then(|| matching_bindings.remove(0))
+        })
+    }
+
+    fn replace_review_images(&mut self, mut images: Vec<ReviewImageFact>, required: bool) {
+        for image in &mut images {
+            if let Some(old) = self
+                .review_images
+                .iter()
+                .find(|old| old.binding == image.binding)
+            {
+                image.file_state = old.file_state.clone();
+                image.externally_opened = old.externally_opened;
+                image.notice.clone_from(&old.notice);
+            }
+        }
+        self.review_images.retain(|image| {
+            if required {
+                !image.required
+            } else {
+                !images.iter().any(|new| new.binding == image.binding)
+            }
+        });
+        if required {
+            let remaining = review::MAX_IMAGES.saturating_sub(images.len());
+            images.extend(self.review_images.drain(..).take(remaining));
+            self.review_images = images;
+        } else {
+            let remaining = review::MAX_IMAGES.saturating_sub(self.review_images.len());
+            self.review_images
+                .extend(images.into_iter().take(remaining));
+        }
+    }
+
+    fn invalidate_artifact_currency(&mut self) {
+        if let Some(operation) = &self.operation {
+            if self
+                .drawing_audit
+                .as_ref()
+                .is_some_and(|audit| audit.scene_sha256 != operation.current_sha256)
+            {
+                self.drawing_audit = None;
+            }
+            for building in &mut self.buildings {
+                let connection_scope = self
+                    .project_scope
+                    .as_ref()
+                    .filter(|scope| scope.assembly_binding.is_some());
+                let changed = if let Some(scope) = connection_scope {
+                    building
+                        .connection_authority
+                        .as_ref()
+                        .is_some_and(|authority| {
+                            authority.scope_id == scope.scope_id
+                                && authority.scene_sha256 != operation.current_sha256
+                        })
+                } else {
+                    building
+                        .floor_authorities
+                        .get(&self.floor_id)
+                        .is_some_and(|sha| sha != &operation.current_sha256)
+                };
+                if changed {
+                    building.current = false;
+                }
+            }
+        }
+        for artifact in &mut self.artifacts {
+            if self.operation.as_ref().is_some_and(|operation| {
+                operation.current_sha256 != artifact.binding.authority_sha256
+            }) {
+                artifact.current = Some(false);
+            } else if artifact.binding.candidate {
+                // Applying without an inspected authority cannot prove preview currency.
+                artifact.current = None;
+            }
+        }
+    }
+
+    fn approval_card_removed(&self, binding: &ProposalBinding) -> bool {
+        self.approval_card_tombstones
+            .iter()
+            .any(|removed| removed == binding)
+    }
+
+    fn approval_card_is_pending(&self, binding: &ProposalBinding) -> bool {
+        self.approval_card_snapshots().iter().any(|card| {
+            card.proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.binding == *binding)
+        })
+    }
+
+    pub fn approval_card_waiting_for(&self, card: &Self) -> bool {
+        self.fact_sync_notice.is_none()
+            && !self.authorizing
+            && card.operation.is_none()
+            && card.proposal.as_ref().is_some_and(|proposal| {
+                card.source_current != Some(false)
+                    && !card.proposal_not_approvable
+                    && !self.approval_card_removed(&proposal.binding)
+                    && proposal.ready
+                    && card.application.is_none()
+                    && card.candidate_review_delivered(&proposal.binding)
+                    && card.first_use_satisfied()
+            })
+    }
+
     pub fn current_floor_progress(&self) -> Option<&FloorProgress> {
         self.floor_progress.as_ref().filter(|progress| {
             self.current_linework().is_some_and(|linework| {
@@ -695,14 +975,9 @@ impl DomainSnapshot {
 
     /// The approval card is visible and waiting for the user's decision.
     pub fn approval_card_waiting(&self) -> bool {
-        self.fact_sync_notice.is_none()
-            && !self.authorizing
-            && self.operation.is_none()
-            && self.proposal.as_ref().is_some_and(|proposal| {
-                proposal.ready
-                    && self.candidate_review_delivered(&proposal.binding)
-                    && self.first_use_satisfied()
-            })
+        self.approval_card_snapshots()
+            .into_iter()
+            .any(|card| self.approval_card_waiting_for(card))
     }
 
     /// The floor as the drawing names it (`二层`), falling back to the scene id.
@@ -906,6 +1181,11 @@ impl DomainFacts {
         if let Some(proposal) = &mut facts.snapshot.proposal {
             proposal.ready = false;
         }
+        for card in &mut facts.snapshot.approval_cards {
+            if let Some(proposal) = &mut card.snapshot.proposal {
+                proposal.ready = false;
+            }
+        }
         facts
     }
 
@@ -1036,6 +1316,9 @@ impl DomainFacts {
             }
         }
         self.refresh_rejections();
+        if result == FactProjection::Applied {
+            self.capture_approval_card(sequence);
+        }
         result
     }
 
@@ -1312,7 +1595,18 @@ impl DomainFacts {
                 _ => false,
             };
         let artifact_kind = matches!(kind, "artifact" | "artifact_validation");
-        let fact_key = if kind == "project_building" {
+        let receipt_binding = match kind {
+            "operation" => self.snapshot.proposal_binding_for_owner(&value["receipt"]),
+            "application" => self
+                .snapshot
+                .application_binding_for_owner(&value["receipt"]),
+            _ => None,
+        };
+        let fact_key = if matches!(kind, "operation" | "application") {
+            receipt_binding
+                .as_ref()
+                .map_or_else(|| kind.to_owned(), proposal_operation_sequence_key)
+        } else if kind == "project_building" {
             let Some(id) = value["project_building"]["build_id"].as_str() else {
                 return invalid!();
             };
@@ -1514,6 +1808,22 @@ impl DomainFacts {
                 self.replace_review_images(images, true);
                 self.snapshot.proposal_categories = proposal_category_counts(&value["proposal"]);
                 self.snapshot.proposal = Some(proposal);
+                self.snapshot.source_current = value["source_current"].as_bool();
+                self.snapshot.proposal_not_approvable = value["approval_review"]["status"]
+                    == "proposal_not_approvable"
+                    || matches!(
+                        value["proposal"]["state"].as_str(),
+                        Some(
+                            "superseded"
+                                | "discarded"
+                                | "invalidated"
+                                | "cancelled"
+                                | "approved"
+                                | "authorized"
+                                | "applied"
+                                | "built"
+                        )
+                    );
                 self.snapshot.structure_review = structure_review(&value["structure_review"]);
                 accepted = true;
             }
@@ -1635,11 +1945,51 @@ impl DomainFacts {
                         first_use = projected;
                         images = projected_images;
                     }
-                    let old = self.snapshot.proposal.as_ref();
-                    let same = old.is_some_and(|p| p.binding == proposal.binding);
+                    let old_binding = self
+                        .snapshot
+                        .proposal
+                        .as_ref()
+                        .map(|old| old.binding.clone());
+                    let same = old_binding.as_ref() == Some(&proposal.binding);
+                    if !same && value["current"] != true {
+                        if let Some(card) = self
+                            .snapshot
+                            .approval_cards
+                            .iter_mut()
+                            .find(|card| card.binding() == Some(&proposal.binding))
+                        {
+                            card.snapshot.proposal = Some(proposal);
+                            card.snapshot.source_current = value["source_current"].as_bool();
+                            card.snapshot.proposal_not_approvable =
+                                value["approval_review"]["status"] == "proposal_not_approvable"
+                                    || matches!(
+                                        value["proposal"]["state"].as_str(),
+                                        Some(
+                                            "superseded"
+                                                | "discarded"
+                                                | "invalidated"
+                                                | "cancelled"
+                                                | "approved"
+                                                | "authorized"
+                                                | "applied"
+                                                | "built"
+                                        )
+                                    );
+                            card.snapshot.first_use_review = Some(first_use);
+                            card.snapshot.replace_review_images(images, true);
+                            card.snapshot.proposal_categories =
+                                proposal_category_counts(&value["proposal"]);
+                            if let Some(sequence) = sequence {
+                                card.fact_sequence = sequence;
+                                self.highest_sequence = self.highest_sequence.max(sequence);
+                                self.fact_sequences.insert(fact_key, sequence);
+                            }
+                            return FactProjection::Applied;
+                        }
+                    }
                     let parent = value["proposal"]["parent_id"].as_str();
-                    let follows = old.is_none_or(|p| {
-                        parent == Some(p.binding.proposal_id.as_str()) || value["current"] == true
+                    let follows = old_binding.as_ref().is_none_or(|binding| {
+                        parent == Some(binding.proposal_id.as_str()) || value["current"] == true
                     });
                     if !same && !follows {
                         // Valid historical-family reads are not current state
@@ -1648,6 +1998,18 @@ impl DomainFacts {
                     }
                     if same || follows {
                         if !same {
+                            self.capture_approval_card(self.highest_sequence);
+                            if let Some(parent) = parent {
+                                self.invalidate_approval_cards_for_proposal(parent);
+                            }
+                            if let Some(old) = old_binding.as_ref() {
+                                if old.proposal_id == proposal.binding.proposal_id
+                                    || parent == Some(old.proposal_id.as_str())
+                                {
+                                    self.invalidate_approval_card(old);
+                                }
+                            }
+                            self.invalidate_other_approval_versions(&proposal.binding);
                             self.snapshot.application = None;
                             self.snapshot.operation = None;
                             self.snapshot.artifacts.clear();
@@ -1677,6 +2039,22 @@ impl DomainFacts {
                             && value["diagnostics"].as_array().is_some_and(Vec::is_empty))
                         .then(|| proposal.binding.clone());
                         self.snapshot.proposal = Some(proposal);
+                        self.snapshot.source_current = value["source_current"].as_bool();
+                        self.snapshot.proposal_not_approvable = value["approval_review"]["status"]
+                            == "proposal_not_approvable"
+                            || matches!(
+                                value["proposal"]["state"].as_str(),
+                                Some(
+                                    "superseded"
+                                        | "discarded"
+                                        | "invalidated"
+                                        | "cancelled"
+                                        | "approved"
+                                        | "authorized"
+                                        | "applied"
+                                        | "built"
+                                )
+                            );
                         accepted = true;
                     }
                 }
@@ -1726,124 +2104,116 @@ impl DomainFacts {
                     accepted = true;
                 }
             }
-            Some("operation") if matches_proposal(&self.snapshot, &value["receipt"]) => {
-                if let Some(operation) = self
-                    .snapshot
-                    .proposal
-                    .as_ref()
-                    .and_then(|p| operation_fact(value, &p.binding))
-                {
-                    self.snapshot.application = Some(format!(
+            Some("operation") | Some("application") => {
+                let owner = &value["receipt"];
+                let binding = if kind == "application" {
+                    self.snapshot.application_binding_for_owner(owner)
+                } else {
+                    self.snapshot.proposal_binding_for_owner(owner)
+                };
+                let Some(binding) = binding else {
+                    return if self.snapshot.proposal.is_none() {
+                        FactProjection::Deferred
+                    } else {
+                        FactProjection::Superseded
+                    };
+                };
+                let operation = operation_fact(value, &binding);
+                let Some(card) = self.snapshot.approval_card_mut(&binding) else {
+                    return FactProjection::Superseded;
+                };
+                if kind == "operation" {
+                    let Some(operation) = operation else {
+                        return FactProjection::Unrelated;
+                    };
+                    card.application = Some(format!(
                         "{} · current={}",
                         operation.state,
                         value["receipt"]["candidate_sha256"] == operation.current_sha256
                     ));
-                    self.snapshot.operation = Some(operation);
-                    self.invalidate_artifact_currency();
-                    if let Some(proposal) = &mut self.snapshot.proposal {
-                        proposal.ready = false;
+                    card.operation = Some(operation);
+                } else {
+                    if let Some(operation) = operation {
+                        card.operation = Some(operation);
                     }
-                    if let Some(sequence) = sequence {
-                        for kind in ["proposal", "application"] {
-                            let watermark = self.fact_sequences.entry(kind.into()).or_default();
-                            *watermark = (*watermark).max(sequence);
-                        }
-                    }
-                    accepted = true;
+                    card.application = value["receipt"]["state"]
+                        .as_str()
+                        .map(|state| format!("{state} · current={}", value["current"]));
                 }
-            }
-            Some("application") if matches_proposal(&self.snapshot, &value["receipt"]) => {
-                if let Some(operation) = self
-                    .snapshot
-                    .proposal
-                    .as_ref()
-                    .and_then(|p| operation_fact(value, &p.binding))
-                {
-                    self.snapshot.operation = Some(operation);
-                }
-                self.snapshot.application = value["receipt"]["state"]
-                    .as_str()
-                    .map(|state| format!("{state} · current={}", value["current"]));
-                self.invalidate_artifact_currency();
-                if let Some(proposal) = &mut self.snapshot.proposal {
+                if let Some(proposal) = &mut card.proposal {
                     proposal.ready = false;
                 }
-                if let Some(sequence) = sequence {
-                    for kind in ["proposal", "operation"] {
-                        let watermark = self.fact_sequences.entry(kind.into()).or_default();
-                        *watermark = (*watermark).max(sequence);
-                    }
-                }
+                card.invalidate_artifact_currency();
                 accepted = true;
             }
             Some("component_first_use_review") => {
-                if self.snapshot.proposal.is_none() || self.snapshot.first_use_review.is_none() {
-                    return FactProjection::Deferred;
-                }
-                if let (Some(proposal), Some(first_use)) =
-                    (&self.snapshot.proposal, &self.snapshot.first_use_review)
-                {
-                    let owner = &value["component_first_use_review"];
-                    if owner["proposal_id"] != proposal.binding.proposal_id
-                        || owner["revision"] != proposal.binding.revision
-                        || owner["prepare_token"] != proposal.binding.prepare_token
-                        || owner["base_sha256"] != proposal.binding.base_sha256
-                        || owner["candidate_sha256"] != proposal.binding.candidate_sha256
-                    {
-                        return FactProjection::Superseded;
-                    }
-                    let Some((first_use, images)) =
-                        review::project(value, &proposal.binding, first_use)
-                    else {
-                        self.remember_projection_failure(
-                            value,
-                            review::project_failure_reason(value),
-                        );
-                        return invalid!();
+                let owner = &value["component_first_use_review"];
+                let Some(binding) = self.snapshot.proposal_binding_for_owner(owner) else {
+                    return if self.snapshot.proposal.is_none() {
+                        FactProjection::Deferred
+                    } else {
+                        FactProjection::Superseded
                     };
-                    self.snapshot.first_use_review = Some(first_use);
-                    self.replace_review_images(images, true);
-                    accepted = true;
-                }
+                };
+                let Some(first_use) = self
+                    .snapshot
+                    .approval_card(&binding)
+                    .and_then(|card| card.first_use_review.as_ref())
+                    .cloned()
+                else {
+                    return FactProjection::Deferred;
+                };
+                let Some((first_use, images)) = review::project(value, &binding, &first_use) else {
+                    self.remember_projection_failure(value, review::project_failure_reason(value));
+                    return invalid!();
+                };
+                let Some(card) = self.snapshot.approval_card_mut(&binding) else {
+                    return FactProjection::Superseded;
+                };
+                card.first_use_review = Some(first_use);
+                card.replace_review_images(images, true);
+                accepted = true;
             }
             Some("artifact" | "artifact_validation") => {
-                if self.snapshot.proposal.is_none() {
-                    return FactProjection::Deferred;
-                }
                 let owner = &value["artifact"];
-                if let Some(proposal) = &self.snapshot.proposal {
-                    if owner["proposal_id"]
-                        .as_str()
-                        .is_some_and(|id| id != proposal.binding.proposal_id)
-                    {
-                        return FactProjection::Superseded;
-                    }
-                }
-                if let Some(mut artifact) = self
-                    .snapshot
-                    .proposal
-                    .as_ref()
-                    .and_then(|p| artifact_fact(value, &p.binding))
+                if owner["proposal_id"].as_str().is_none()
+                    || owner["revision"].as_u64().is_none()
+                    || owner["prepare_token"].as_str().is_none()
                 {
+                    return invalid!("artifact proposal identity");
+                }
+                let Some(binding) = self.snapshot.proposal_binding_for_owner(owner) else {
+                    return if self.snapshot.proposal.is_none() {
+                        FactProjection::Deferred
+                    } else {
+                        FactProjection::Superseded
+                    };
+                };
+                if let Some(mut artifact) = artifact_fact(value, &binding) {
+                    let current_sha256 = self
+                        .snapshot
+                        .approval_card(&binding)
+                        .and_then(|card| card.operation.as_ref())
+                        .map(|operation| operation.current_sha256.clone());
                     if sequence.is_none_or(|seq| {
                         self.fact_sequences
-                            .get("application")
+                            .get(&proposal_operation_sequence_key(&binding))
                             .is_some_and(|last| seq < *last)
                     }) {
-                        artifact.current = self.snapshot.operation.as_ref().and_then(|operation| {
-                            if operation.current_sha256 != artifact.binding.authority_sha256 {
+                        artifact.current = current_sha256.as_ref().and_then(|current| {
+                            if *current != artifact.binding.authority_sha256 {
                                 Some(false)
                             } else if !artifact.binding.candidate {
-                                // A later read of the same applied authority proves that
-                                // the sealed older build still belongs to this scene.
                                 Some(true)
                             } else {
                                 None
                             }
                         });
                     }
-                    let existing = self
-                        .snapshot
+                    let Some(card) = self.snapshot.approval_card_mut(&binding) else {
+                        return FactProjection::Superseded;
+                    };
+                    let existing = card
                         .artifacts
                         .iter_mut()
                         .find(|a| a.binding.build_id == artifact.binding.build_id);
@@ -1859,24 +2229,25 @@ impl DomainFacts {
                         }
                     } else {
                         // Receipts remain durable in Python; bound the in-memory display history.
-                        if self.snapshot.artifacts.len() >= 32 {
-                            let evicted = self.snapshot.artifacts.remove(0);
+                        if card.artifacts.len() >= 32 {
+                            let evicted = card.artifacts.remove(0);
                             self.fact_sequences
                                 .remove(&format!("artifact:{}", evicted.binding.build_id));
                         }
-                        self.snapshot.artifacts.push(artifact);
+                        card.artifacts.push(artifact);
                         accepted = true;
                     }
                     if accepted {
-                        if let Some(image) = review::artifact_image(
-                            value,
-                            &self.snapshot.proposal.as_ref().unwrap().binding,
-                        ) {
-                            self.replace_review_images(vec![image], false);
+                        if let Some(image) = review::artifact_image(value, &binding) {
+                            card.replace_review_images(vec![image], false);
                         } else if value["artifact"]["review_image"]
                             .get("review_web")
                             .is_some()
                         {
+                            self.remember_projection_failure(
+                                value,
+                                "artifact.review_image.review_web binding".into(),
+                            );
                             return invalid!("artifact.review_image.review_web binding");
                         }
                     }
@@ -2078,12 +2449,19 @@ impl DomainFacts {
     }
 
     fn clear_project_scope(&mut self) {
+        let approved = self.snapshot.approval_card_tombstones.clone();
+        self.snapshot.approval_cards.retain(|card| {
+            card.binding()
+                .is_some_and(|binding| approved.contains(binding))
+        });
         self.source_view = None;
         self.snapshot.project_scope = None;
         self.snapshot.structure_review = None;
         self.snapshot.structure_revision = None;
         self.snapshot.drawing_audit = None;
         self.snapshot.proposal = None;
+        self.snapshot.source_current = None;
+        self.snapshot.proposal_not_approvable = false;
         self.snapshot.proposal_categories.clear();
         self.snapshot.ledger = None;
         self.snapshot.floor_progress = None;
@@ -2382,53 +2760,6 @@ impl DomainFacts {
         }
     }
 
-    fn invalidate_artifact_currency(&mut self) {
-        if let Some(operation) = &self.snapshot.operation {
-            if self
-                .snapshot
-                .drawing_audit
-                .as_ref()
-                .is_some_and(|audit| audit.scene_sha256 != operation.current_sha256)
-            {
-                self.snapshot.drawing_audit = None;
-            }
-            for building in &mut self.snapshot.buildings {
-                let connection_scope = self
-                    .snapshot
-                    .project_scope
-                    .as_ref()
-                    .filter(|scope| scope.assembly_binding.is_some());
-                let changed = if let Some(scope) = connection_scope {
-                    building
-                        .connection_authority
-                        .as_ref()
-                        .is_some_and(|authority| {
-                            authority.scope_id == scope.scope_id
-                                && authority.scene_sha256 != operation.current_sha256
-                        })
-                } else {
-                    building
-                        .floor_authorities
-                        .get(&self.snapshot.floor_id)
-                        .is_some_and(|sha| sha != &operation.current_sha256)
-                };
-                if changed {
-                    building.current = false;
-                }
-            }
-        }
-        for artifact in &mut self.snapshot.artifacts {
-            if self.snapshot.operation.as_ref().is_some_and(|operation| {
-                operation.current_sha256 != artifact.binding.authority_sha256
-            }) {
-                artifact.current = Some(false);
-            } else if artifact.binding.candidate {
-                // Applying without an inspected authority cannot prove preview currency.
-                artifact.current = None;
-            }
-        }
-    }
-
     pub fn remember_control(&mut self, text: &str) {
         while self.control_messages.len() >= 8 && !self.control_messages.contains_key(text) {
             let key = self.control_messages.keys().next().cloned().unwrap();
@@ -2467,41 +2798,117 @@ impl DomainFacts {
         }
     }
 
+    fn capture_approval_card(&mut self, fact_sequence: u64) {
+        let Some(binding) = self
+            .snapshot
+            .proposal
+            .as_ref()
+            .map(|proposal| proposal.binding.clone())
+        else {
+            return;
+        };
+        let card = ApprovalCard {
+            snapshot: self.snapshot.approval_card_snapshot(),
+            fact_sequence: self
+                .snapshot
+                .approval_cards
+                .iter()
+                .find(|existing| existing.binding() == Some(&binding))
+                .map_or(fact_sequence, |existing| existing.fact_sequence),
+        };
+        self.snapshot
+            .approval_cards
+            .retain(|existing| existing.binding() != Some(&binding));
+        self.snapshot.approval_cards.push(card);
+    }
+
+    fn invalidate_approval_card(&mut self, binding: &ProposalBinding) {
+        if self.snapshot.approval_card_tombstones.contains(binding) {
+            return;
+        }
+        self.snapshot
+            .approval_cards
+            .retain(|card| card.binding() != Some(binding));
+    }
+
+    fn invalidate_approval_cards_for_proposal(&mut self, proposal_id: &str) {
+        let approved = self.snapshot.approval_card_tombstones.clone();
+        self.snapshot.approval_cards.retain(|card| {
+            card.binding().is_none_or(|binding| {
+                binding.proposal_id != proposal_id || approved.contains(binding)
+            })
+        });
+    }
+
+    fn invalidate_other_approval_versions(&mut self, binding: &ProposalBinding) {
+        let approved = self.snapshot.approval_card_tombstones.clone();
+        self.snapshot.approval_cards.retain(|card| {
+            card.binding().is_none_or(|existing| {
+                existing.proposal_id != binding.proposal_id
+                    || existing == binding
+                    || approved.contains(existing)
+            })
+        });
+    }
+
+    /// Retain the exact card for a grant that may need redelivery, while removing it
+    /// from the set of cards awaiting approval.
+    pub fn remove_approval_card(&mut self, binding: &ProposalBinding) {
+        if self
+            .snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.binding == *binding)
+        {
+            self.capture_approval_card(self.highest_sequence);
+        }
+        if !self.snapshot.approval_card_tombstones.contains(binding) {
+            self.snapshot.approval_card_tombstones.push(binding.clone());
+        }
+    }
+
     pub(crate) fn can_auto_authorize(&self, binding: &ProposalBinding) -> bool {
         self.auto_approval_binding.as_ref() == Some(binding)
             && self
                 .snapshot
-                .first_use_review
-                .as_ref()
+                .approval_card(binding)
+                .and_then(|card| card.first_use_review.as_ref())
                 .is_some_and(|review| review.required_count == 0)
             && self.can_authorize(binding)
     }
 
     /// The displayed proposal is still exactly this version and nothing applied it yet.
     pub fn shows_binding(&self, binding: &ProposalBinding) -> bool {
-        self.snapshot
-            .proposal
-            .as_ref()
-            .is_some_and(|proposal| &proposal.binding == binding)
-            && self.snapshot.operation.is_none()
-            && !self
-                .snapshot
-                .rejected_facts
-                .iter()
-                .any(|fact| fact.blocking)
+        self.snapshot.approval_card(binding).is_some_and(|card| {
+            card.source_current != Some(false)
+                && !card.proposal_not_approvable
+                && card
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|proposal| &proposal.binding == binding)
+                && card.application.is_none()
+                && card.operation.is_none()
+        }) && !self
+            .snapshot
+            .rejected_facts
+            .iter()
+            .any(|fact| fact.blocking)
     }
 
     pub fn can_authorize(&self, binding: &ProposalBinding) -> bool {
+        let Some(card) = self.snapshot.approval_card(binding) else {
+            return false;
+        };
         self.setup.as_ref().is_some_and(|setup| {
             setup.run_id == binding.run_id
                 && setup.context_sha256 == binding.context_sha256
                 && (setup.mode == DomainMode::Floor
-                    || self.snapshot.project_scope.as_ref().is_some_and(|scope| {
-                        self.snapshot.selection.as_ref().is_some_and(|selection| {
+                    || card.project_scope.as_ref().is_some_and(|scope| {
+                        card.selection.as_ref().is_some_and(|selection| {
                             selection.selection_id == scope.selection_id
                                 && selection.state == SelectionState::Selected
                         }) && scope.assembly_binding.as_ref().is_none_or(|binding| {
-                            self.snapshot.buildings.iter().any(|building| {
+                            card.buildings.iter().any(|building| {
                                 building.build_id == binding.build_id
                                     && building.input_binding == binding.input_binding
                                     && building.current
@@ -2519,46 +2926,21 @@ impl DomainFacts {
                 .any(|fact| fact.blocking)
             && self.deferred_sequences.is_empty()
             && !self.snapshot.authorizing
-            && self.snapshot.operation.is_none()
-            && self.snapshot.candidate_review_delivered(binding)
-            && self.snapshot.first_use_satisfied()
-            && self
-                .snapshot
+            && self.snapshot.approval_card_is_pending(binding)
+            && card.source_current != Some(false)
+            && !card.proposal_not_approvable
+            && card.application.is_none()
+            && card.operation.is_none()
+            && card.candidate_review_delivered(binding)
+            && card.first_use_satisfied()
+            && card
                 .proposal
                 .as_ref()
-                .is_some_and(|p| p.ready && p.binding == *binding)
+                .is_some_and(|proposal| proposal.ready && proposal.binding == *binding)
     }
 
-    fn replace_review_images(&mut self, mut images: Vec<ReviewImageFact>, required: bool) {
-        for image in &mut images {
-            if let Some(old) = self
-                .snapshot
-                .review_images
-                .iter()
-                .find(|old| old.binding == image.binding)
-            {
-                image.file_state = old.file_state.clone();
-                image.externally_opened = old.externally_opened;
-                image.notice.clone_from(&old.notice);
-            }
-        }
-        self.snapshot.review_images.retain(|image| {
-            if required {
-                !image.required
-            } else {
-                !images.iter().any(|new| new.binding == image.binding)
-            }
-        });
-        if required {
-            let remaining = review::MAX_IMAGES.saturating_sub(images.len());
-            images.extend(self.snapshot.review_images.drain(..).take(remaining));
-            self.snapshot.review_images = images;
-        } else {
-            let remaining = review::MAX_IMAGES.saturating_sub(self.snapshot.review_images.len());
-            self.snapshot
-                .review_images
-                .extend(images.into_iter().take(remaining));
-        }
+    fn replace_review_images(&mut self, images: Vec<ReviewImageFact>, required: bool) {
+        self.snapshot.replace_review_images(images, required);
     }
 }
 
@@ -2666,13 +3048,6 @@ fn operation_fact(value: &Value, binding: &ProposalBinding) -> Option<OperationF
         state,
         recovery: recovery.into(),
         current_sha256: current_sha256.into(),
-    })
-}
-
-fn matches_proposal(snapshot: &DomainSnapshot, value: &Value) -> bool {
-    snapshot.proposal.as_ref().is_some_and(|p| {
-        value["proposal_id"] == p.binding.proposal_id
-            && value["prepare_token"] == p.binding.prepare_token
     })
 }
 

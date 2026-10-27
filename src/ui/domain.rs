@@ -930,7 +930,12 @@ pub(super) fn compact_approval_card_lines(
 ) -> Vec<String> {
     full.iter()
         .map(|line| {
-            super::activity::truncate_display_label(&line.replace(['\n', '\r'], " "), width)
+            let line = line.replace(['\n', '\r'], " ");
+            if width <= 38 && line.starts_with("本卡未就绪 · 有可批准卡") {
+                "未就绪·有可批准卡·Alt+[/] Ctrl+Y确认".into()
+            } else {
+                super::activity::truncate_display_label(&line, width)
+            }
         })
         .collect()
 }

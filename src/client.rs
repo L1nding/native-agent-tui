@@ -2009,9 +2009,12 @@ impl Core {
                         if let Some(image) = self
                             .domain
                             .snapshot
-                            .review_images
-                            .iter_mut()
-                            .find(|image| image.binding == binding)
+                            .approval_card_mut(&binding.proposal)
+                            .and_then(|card| {
+                                card.review_images
+                                    .iter_mut()
+                                    .find(|image| image.binding == binding)
+                            })
                         {
                             image.file_state = if result.is_ok() {
                                 crate::domain::ImageFileState::Available
@@ -2052,9 +2055,12 @@ impl Core {
                     if let Some(image) = self
                         .domain
                         .snapshot
-                        .review_images
-                        .iter_mut()
-                        .find(|image| image.binding == binding)
+                        .approval_card_mut(&binding.proposal)
+                        .and_then(|card| {
+                            card.review_images
+                                .iter_mut()
+                                .find(|image| image.binding == binding)
+                        })
                     {
                         image.finish_open(outcome);
                         if owns_notice {
@@ -2092,9 +2098,11 @@ impl Core {
                     // readiness check. A pending zero-requirement review also has no set SHA.
                     || (manual
                         && (!self.domain.shows_binding(&binding)
-                            || !self.domain.snapshot.first_use_satisfied()))
+                            || !self.domain.snapshot.approval_card(&binding)
+                                .is_some_and(|card| card.first_use_satisfied())))
                     || (!manual && !self.domain.can_authorize(&binding))
-                    || self.domain.snapshot.review_set_sha256() != review_set_sha256
+                    || self.domain.snapshot.approval_card(&binding)
+                        .and_then(|card| card.review_set_sha256()) != review_set_sha256
                     || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
                         && !self.domain.can_auto_authorize(&binding))
                 {
@@ -2103,6 +2111,7 @@ impl Core {
                 }
                 match outcome {
                     Ok(text) => {
+                        self.domain.remove_approval_card(&binding);
                         self.domain.remember_control(&text);
                         self.domain.snapshot.notice = Some(
                             if policy == crate::config::DomainApprovalPolicy::ReviewedTemplate {
@@ -2124,9 +2133,11 @@ impl Core {
                     }
                     Err(reason) => {
                         if reason.starts_with("图片不可用") {
-                            for image in &mut self.domain.snapshot.review_images {
-                                image.file_state = crate::domain::ImageFileState::Pending;
-                                image.externally_opened = false;
+                            if let Some(card) = self.domain.snapshot.approval_card_mut(&binding) {
+                                for image in &mut card.review_images {
+                                    image.file_state = crate::domain::ImageFileState::Pending;
+                                    image.externally_opened = false;
+                                }
                             }
                         }
                         self.domain.snapshot.notice = Some(reason);
@@ -2781,16 +2792,11 @@ impl Core {
             return;
         }
         if let Some((binding, text)) = self.undelivered_grant.take() {
-            let unapplied = self.domain.snapshot.operation.is_none()
-                && self
-                    .domain
-                    .snapshot
-                    .proposal
-                    .as_ref()
-                    .is_some_and(|proposal| proposal.binding == binding);
+            let card = self.domain.snapshot.approval_card(&binding);
+            let unapplied = self.domain.shows_binding(&binding);
             if self.state.view.phase == SessionPhase::Completed
                 && unapplied
-                && self.domain.snapshot.first_use_satisfied()
+                && card.is_some_and(|card| card.first_use_satisfied())
                 && self.state.view.phase.can_submit()
                 && self.state.view.requests.is_empty()
                 && !self.domain.snapshot.authorizing
@@ -2992,6 +2998,13 @@ impl Core {
             .snapshot
             .review_images
             .iter_mut()
+            .chain(
+                self.domain
+                    .snapshot
+                    .approval_cards
+                    .iter_mut()
+                    .flat_map(|card| card.snapshot.review_images.iter_mut()),
+            )
             .filter(|image| image.file_state == crate::domain::ImageFileState::Pending)
             .map(|image| {
                 image.file_state = crate::domain::ImageFileState::Checking;
@@ -3148,12 +3161,12 @@ impl Core {
         if !self
             .domain
             .snapshot
-            .proposal
-            .as_ref()
-            .is_some_and(|proposal| proposal.binding == binding.proposal)
-            || !self.domain.snapshot.review_images.iter().any(|image| {
-                image.binding == binding
-                    && image.file_state == crate::domain::ImageFileState::Available
+            .approval_card(&binding.proposal)
+            .is_some_and(|card| {
+                card.review_images.iter().any(|image| {
+                    image.binding == binding
+                        && image.file_state == crate::domain::ImageFileState::Available
+                })
             })
         {
             self.domain.snapshot.notice =
@@ -3166,10 +3179,12 @@ impl Core {
         self.state.view.notice = Some(DOMAIN_IMAGE_OPENING_NOTICE.into());
         self.domain_image_attempt = self.domain_image_attempt.wrapping_add(1);
         let attempt_id = self.domain_image_attempt;
-        for image in &mut self.domain.snapshot.review_images {
-            if image.binding == binding {
-                image.externally_opened = false;
-                image.notice = Some("正在外部打开".into());
+        if let Some(card) = self.domain.snapshot.approval_card_mut(&binding.proposal) {
+            for image in &mut card.review_images {
+                if image.binding == binding {
+                    image.externally_opened = false;
+                    image.notice = Some("正在外部打开".into());
+                }
             }
         }
         self.domain_image_open_task = Some((
@@ -3276,7 +3291,12 @@ impl Core {
         };
         if !ready
             || !self.domain.can_authorize(&binding)
-            || self.domain.snapshot.review_set_sha256() != review_set_sha256
+            || self
+                .domain
+                .snapshot
+                .approval_card(&binding)
+                .and_then(|card| card.review_set_sha256())
+                != review_set_sha256
             || (policy == crate::config::DomainApprovalPolicy::ReviewedTemplate
                 && !self.domain.can_auto_authorize(&binding))
             || self
@@ -3304,6 +3324,8 @@ impl Core {
         let images = self
             .domain
             .snapshot
+            .approval_card(&binding)
+            .expect("authorized card")
             .review_images
             .iter()
             .filter(|image| image.file_state == crate::domain::ImageFileState::Available)

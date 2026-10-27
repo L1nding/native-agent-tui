@@ -30,7 +30,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Requests",
         &[
             ("F2", "next request / details"),
-            ("Ctrl+Y", "accept approval"),
+            ("Ctrl+Y", "confirm selected card"),
+            ("Alt+[/]", "switch approval card"),
             ("Ctrl+N", "decline approval"),
             ("Ctrl+B", "cancel approval"),
         ],
@@ -85,7 +86,8 @@ const SECTIONS_ZH: &[(&str, &[(&str, &str)])] = &[
         "请求",
         &[
             ("F2", "下一个请求 / 详情"),
-            ("Ctrl+Y", "接受审批"),
+            ("Ctrl+Y", "确认当前可批准卡"),
+            ("Alt+[/]", "切换待批卡"),
             ("Ctrl+N", "拒绝审批"),
             ("Ctrl+B", "取消审批"),
         ],
@@ -128,7 +130,11 @@ fn active_sections() -> &'static [Section] {
     }
 }
 
-fn section_lines(sections: &[(&str, &[(&str, &str)])], width: usize) -> Vec<Line<'static>> {
+fn section_lines(
+    sections: &[(&str, &[(&str, &str)])],
+    width: usize,
+    separate_sections: bool,
+) -> Vec<Line<'static>> {
     let theme = theme::current();
     // 键名列按全部分组对齐，两栏之间也保持同一列宽。
     let key_column = active_sections()
@@ -138,7 +144,7 @@ fn section_lines(sections: &[(&str, &[(&str, &str)])], width: usize) -> Vec<Line
         .unwrap_or(0);
     let mut lines = Vec::new();
     for (title, keys) in sections {
-        if !lines.is_empty() {
+        if separate_sections && !lines.is_empty() {
             lines.push(Line::from(""));
         }
         lines.push(Line::from(clip_spans(
@@ -166,18 +172,24 @@ pub(super) fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         .saturating_sub(2)
         .min(if two_columns { 90 } else { 50 });
     let sections = active_sections();
-    let section_height = |sections: &[Section]| {
+    let section_height = |sections: &[Section], separate_sections: bool| {
         sections
             .iter()
             .map(|(_, keys)| keys.len() + 1)
             .sum::<usize>()
-            + sections.len().saturating_sub(1)
+            + if separate_sections {
+                sections.len().saturating_sub(1)
+            } else {
+                0
+            }
     };
+    let separate_sections =
+        two_columns || section_height(sections, true).saturating_add(2) <= usize::from(area.height);
     let content_height = if two_columns {
         let (left, right) = sections.split_at(2);
-        section_height(left).max(section_height(right))
+        section_height(left, true).max(section_height(right, true))
     } else {
-        section_height(sections)
+        section_height(sections, separate_sections)
     };
     let height = area.height.min((content_height + 2) as u16);
     let rect = Rect {
@@ -207,7 +219,7 @@ pub(super) fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
             (right, inner.x + half + 1, inner.width - half - 1),
         ] {
             frame.render_widget(
-                Paragraph::new(section_lines(column, w as usize)),
+                Paragraph::new(section_lines(column, w as usize, true)),
                 Rect {
                     x,
                     width: w,
@@ -217,7 +229,11 @@ pub(super) fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         }
     } else {
         frame.render_widget(
-            Paragraph::new(section_lines(active_sections(), inner.width as usize)),
+            Paragraph::new(section_lines(
+                active_sections(),
+                inner.width as usize,
+                separate_sections,
+            )),
             inner,
         );
     }
@@ -365,5 +381,21 @@ mod tests {
                 zh_rows(width, height);
             }
         });
+    }
+
+    #[test]
+    fn approval_card_selection_keys_are_documented_in_both_languages() {
+        let (_, english_requests) = SECTIONS
+            .iter()
+            .find(|(title, _)| *title == "Requests")
+            .unwrap();
+        let (_, chinese_requests) = SECTIONS_ZH
+            .iter()
+            .find(|(title, _)| *title == "请求")
+            .unwrap();
+        assert!(english_requests.contains(&("Ctrl+Y", "confirm selected card")));
+        assert!(english_requests.contains(&("Alt+[/]", "switch approval card")));
+        assert!(chinese_requests.contains(&("Ctrl+Y", "确认当前可批准卡")));
+        assert!(chinese_requests.contains(&("Alt+[/]", "切换待批卡")));
     }
 }

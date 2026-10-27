@@ -403,6 +403,338 @@ fn authorization_must_match_exact_binding_and_cannot_repeat_while_pending() {
 }
 
 #[test]
+fn pending_cards_keep_the_approvable_card_first_and_route_its_exact_grant() {
+    let mut facts = sequenced_facts();
+    let mut ready = recovery_proposal();
+    ready["fact_sequence"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&ready), FactProjection::Applied);
+    let ready_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &ready_binding);
+    assert!(facts.can_authorize(&ready_binding));
+
+    let mut unready = recovery_proposal();
+    unready["fact_sequence"] = json!(2);
+    unready["proposal"]["proposal_id"] = json!("other-proposal");
+    unready["proposal"]["revision"] = json!(1);
+    unready["proposal"]["prepare_token"] = json!("other-token");
+    unready["proposal"]["base_sha256"] = json!("c".repeat(64));
+    unready["proposal"]["candidate_sha256"] = json!("d".repeat(64));
+    assert_eq!(facts.apply_verified_fact(&unready), FactProjection::Applied);
+
+    let cards = facts.snapshot.approval_card_snapshots();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[0].proposal.as_ref().unwrap().binding, ready_binding);
+    assert!(facts.snapshot.approval_card_waiting());
+    assert!(facts.can_authorize(&ready_binding));
+    assert!(!facts.can_authorize(&cards[1].proposal.as_ref().unwrap().binding));
+
+    let mut grant_result = operation_envelope("applied", "not_required", 3);
+    grant_result["receipt"]["operation_id"] = json!("ready-card-operation");
+    assert_eq!(
+        facts.apply_verified_fact(&grant_result),
+        FactProjection::Applied
+    );
+    let ready_card = facts.snapshot.approval_card(&ready_binding).unwrap();
+    assert_eq!(
+        ready_card.operation.as_ref().unwrap().operation_id,
+        "ready-card-operation"
+    );
+    assert_eq!(
+        facts
+            .snapshot
+            .proposal
+            .as_ref()
+            .unwrap()
+            .binding
+            .proposal_id,
+        "other-proposal"
+    );
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 1);
+}
+
+#[test]
+fn legacy_application_routes_to_its_unique_archived_card_and_rejects_ambiguous_tokens() {
+    let mut facts = sequenced_facts();
+    let mut old = recovery_proposal();
+    old["fact_sequence"] = json!(1);
+    old["proposal"]["proposal_id"] = json!("old-proposal");
+    old["proposal"]["prepare_token"] = json!("old-token");
+    assert_eq!(facts.apply_verified_fact(&old), FactProjection::Applied);
+    let old_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+
+    let mut current = recovery_proposal();
+    current["fact_sequence"] = json!(2);
+    current["proposal"]["proposal_id"] = json!("current-proposal");
+    current["proposal"]["revision"] = json!(1);
+    current["proposal"]["prepare_token"] = json!("current-token");
+    current["proposal"]["base_sha256"] = json!("c".repeat(64));
+    current["proposal"]["candidate_sha256"] = json!("d".repeat(64));
+    assert_eq!(facts.apply_verified_fact(&current), FactProjection::Applied);
+
+    let legacy_application = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"application","fact_sequence":3,
+        "receipt":{"proposal_id":"old-proposal","prepare_token":"old-token","state":"applied"}});
+    assert_eq!(
+        facts.apply_verified_fact(&legacy_application),
+        FactProjection::Applied
+    );
+    let archived = facts.snapshot.approval_card(&old_binding).unwrap();
+    assert!(archived
+        .application
+        .as_deref()
+        .is_some_and(|application| application.starts_with("applied · current=")));
+    assert!(!facts.shows_binding(&old_binding));
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 1);
+    assert_eq!(
+        facts.snapshot.approval_card_snapshots()[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .binding
+            .proposal_id,
+        "current-proposal"
+    );
+
+    let mut ambiguous = sequenced_facts();
+    let first = recovery_proposal();
+    assert_eq!(
+        ambiguous.apply_verified_fact(&first),
+        FactProjection::Applied
+    );
+    let first_binding = ambiguous
+        .snapshot
+        .proposal
+        .as_ref()
+        .unwrap()
+        .binding
+        .clone();
+    ambiguous.remove_approval_card(&first_binding);
+    let mut second = recovery_proposal();
+    second["fact_sequence"] = json!(2);
+    second["proposal"]["revision"] = json!(3);
+    second["proposal"]["base_sha256"] = json!("c".repeat(64));
+    second["proposal"]["candidate_sha256"] = json!("d".repeat(64));
+    assert_eq!(
+        ambiguous.apply_verified_fact(&second),
+        FactProjection::Applied
+    );
+    assert_eq!(
+        ambiguous.apply_verified_fact(&legacy_application),
+        FactProjection::Superseded
+    );
+}
+
+#[test]
+fn superseded_versions_and_explicit_parent_cards_leave_the_pending_set() {
+    let mut facts = sequenced_facts();
+    let mut first = recovery_proposal();
+    first["fact_sequence"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&first), FactProjection::Applied);
+    let first_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+
+    let mut newer_version = recovery_proposal();
+    newer_version["fact_sequence"] = json!(2);
+    newer_version["proposal"]["revision"] = json!(3);
+    newer_version["proposal"]["prepare_token"] = json!("new-token");
+    newer_version["proposal"]["base_sha256"] = json!("c".repeat(64));
+    newer_version["proposal"]["candidate_sha256"] = json!("d".repeat(64));
+    assert_eq!(
+        facts.apply_verified_fact(&newer_version),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.approval_card(&first_binding).is_none());
+    let newer_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 1);
+    assert_eq!(
+        facts.snapshot.approval_card_snapshots()[0]
+            .proposal
+            .as_ref()
+            .unwrap()
+            .binding,
+        newer_binding
+    );
+
+    let mut independent = recovery_proposal();
+    independent["fact_sequence"] = json!(3);
+    independent["proposal"]["proposal_id"] = json!("independent");
+    independent["proposal"]["revision"] = json!(1);
+    independent["proposal"]["prepare_token"] = json!("independent-token");
+    independent["proposal"]["base_sha256"] = json!("e".repeat(64));
+    independent["proposal"]["candidate_sha256"] = json!("f".repeat(64));
+    assert_eq!(
+        facts.apply_verified_fact(&independent),
+        FactProjection::Applied
+    );
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 2);
+
+    let mut child = recovery_proposal();
+    child["fact_sequence"] = json!(4);
+    child["proposal"]["proposal_id"] = json!("child");
+    child["proposal"]["revision"] = json!(1);
+    child["proposal"]["prepare_token"] = json!("child-token");
+    child["proposal"]["base_sha256"] = json!("1".repeat(64));
+    child["proposal"]["candidate_sha256"] = json!("2".repeat(64));
+    child["proposal"]["parent_id"] = json!(newer_binding.proposal_id);
+    assert_eq!(facts.apply_verified_fact(&child), FactProjection::Applied);
+    assert!(facts.snapshot.approval_card(&newer_binding).is_none());
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 2);
+}
+
+#[test]
+fn approved_stale_and_non_approvable_cards_are_not_pending_but_approved_grants_remain_queryable() {
+    for disposition in ["approved", "stale", "non_approvable"] {
+        let mut facts = sequenced_facts();
+        let mut proposal = recovery_proposal();
+        proposal["source_current"] = json!(true);
+        if disposition == "stale" {
+            proposal["source_current"] = json!(false);
+        } else if disposition == "non_approvable" {
+            proposal["approval_review"] = json!({"status":"proposal_not_approvable"});
+        }
+        assert_eq!(
+            facts.apply_verified_fact(&proposal),
+            FactProjection::Applied
+        );
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        add_reviewed_candidate(&mut facts.snapshot, &binding);
+
+        if disposition == "approved" {
+            facts.remove_approval_card(&binding);
+            assert!(facts.snapshot.approval_card(&binding).is_some());
+        } else {
+            assert!(facts.snapshot.approval_card(&binding).is_some());
+        }
+        assert!(facts.snapshot.approval_card_snapshots().is_empty());
+        assert!(!facts.can_authorize(&binding));
+        assert_eq!(facts.shows_binding(&binding), disposition == "approved");
+    }
+}
+
+#[test]
+fn historical_card_invalidation_removes_only_the_matching_pending_card() {
+    for disposition in ["source_stale", "not_approvable", "superseded"] {
+        let mut facts = sequenced_facts();
+        let mut first = recovery_proposal();
+        first["fact_sequence"] = json!(1);
+        assert_eq!(facts.apply_verified_fact(&first), FactProjection::Applied);
+        let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+        add_reviewed_candidate(&mut facts.snapshot, &binding);
+        let mut other = recovery_proposal();
+        other["fact_sequence"] = json!(2);
+        other["proposal"]["proposal_id"] = json!("other");
+        other["proposal"]["prepare_token"] = json!("other-token");
+        assert_eq!(facts.apply_verified_fact(&other), FactProjection::Applied);
+        assert_eq!(facts.snapshot.approval_card_snapshots().len(), 2);
+
+        first["fact_sequence"] = json!(3);
+        first["current"] = json!(false);
+        match disposition {
+            "source_stale" => first["source_current"] = json!(false),
+            "not_approvable" => {
+                first["approval_review"] = json!({"status":"proposal_not_approvable"})
+            }
+            _ => first["proposal"]["state"] = json!("superseded"),
+        }
+        assert_eq!(facts.apply_verified_fact(&first), FactProjection::Applied);
+        let cards = facts.snapshot.approval_card_snapshots();
+        assert_eq!(cards.len(), 1, "{disposition}");
+        assert_eq!(
+            cards[0].proposal.as_ref().unwrap().binding.proposal_id,
+            "other"
+        );
+        assert_eq!(
+            facts
+                .snapshot
+                .proposal
+                .as_ref()
+                .unwrap()
+                .binding
+                .proposal_id,
+            "other"
+        );
+        assert!(!facts.can_authorize(&binding));
+    }
+}
+
+#[test]
+fn waiting_for_any_approvable_card_still_blocks_auto_continue_during_approval() {
+    let mut facts = sequenced_facts();
+    let mut ready = recovery_proposal();
+    ready["fact_sequence"] = json!(1);
+    assert_eq!(facts.apply_verified_fact(&ready), FactProjection::Applied);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+
+    let mut unready = recovery_proposal();
+    unready["fact_sequence"] = json!(2);
+    unready["proposal"]["proposal_id"] = json!("later-unready");
+    unready["proposal"]["revision"] = json!(1);
+    unready["proposal"]["prepare_token"] = json!("later-token");
+    unready["proposal"]["base_sha256"] = json!("c".repeat(64));
+    unready["proposal"]["candidate_sha256"] = json!("d".repeat(64));
+    assert_eq!(facts.apply_verified_fact(&unready), FactProjection::Applied);
+
+    assert!(facts.snapshot.approval_card_waiting());
+    facts.snapshot.authorizing = true;
+    assert!(!facts.snapshot.approval_card_waiting());
+    facts.snapshot.authorizing = false;
+    facts.snapshot.fact_sync_notice = Some("同步中".into());
+    assert!(!facts.snapshot.approval_card_waiting());
+}
+
+#[test]
+fn baseline_replay_requires_fresh_reads_for_every_pending_card() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("target/codex-tmp")
+        .join(format!(
+            "domain-baseline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let directory = root.join("outputs/domain/run/changes");
+    std::fs::create_dir_all(directory.join("facts")).unwrap();
+    let context = b"{}";
+    std::fs::write(root.join("context.json"), context).unwrap();
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.repository = root.clone();
+    setup.context_path = root.join("context.json");
+    setup.context_sha256 = format!("{:x}", Sha256::digest(context));
+
+    let mut index = serde_json::Map::new();
+    for (sequence, proposal_id) in [(1, "first"), (2, "second")] {
+        let mut proposal = recovery_proposal();
+        proposal["context_sha256"] = json!(setup.context_sha256);
+        proposal["fact_sequence"] = json!(sequence);
+        proposal["source_current"] = json!(true);
+        proposal["proposal"]["proposal_id"] = json!(proposal_id);
+        proposal["proposal"]["prepare_token"] = json!(format!("{proposal_id}-token"));
+        let raw = serde_json::to_vec(&proposal).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(directory.join("facts").join(format!("{sha}.json")), raw).unwrap();
+        index.insert(sha, json!(sequence));
+    }
+    std::fs::write(
+        directory.join("fact-sequences.json"),
+        json!({"next":3,"facts":index}).to_string(),
+    )
+    .unwrap();
+
+    let facts = DomainFacts::new(Some(setup));
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 2);
+    assert!(!facts.snapshot.proposal.as_ref().unwrap().ready);
+    assert!(facts.snapshot.approval_cards.iter().all(|card| {
+        card.snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| !proposal.ready)
+    }));
+}
+
+#[test]
 fn automatic_approval_requires_current_eligibility_and_the_existing_candidate_review() {
     let mut facts = sequenced_facts();
     let mut value = envelope();
@@ -1447,7 +1779,7 @@ fn reference_stair_proposal() -> Value {
 }
 
 #[test]
-fn reference_stair_replaces_the_old_card_and_preserves_assumptions_and_approval_gates() {
+fn reference_stair_keeps_an_independent_old_card_and_preserves_approval_gates() {
     let value = reference_stair_proposal();
     let mut facts = sequenced_facts();
     let mut old = envelope();
@@ -1461,6 +1793,7 @@ fn reference_stair_replaces_the_old_card_and_preserves_assumptions_and_approval_
     assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
     let proposal = facts.snapshot.proposal.as_ref().unwrap();
     let binding = proposal.binding.clone();
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 2);
     let detail = proposal.objects.join("\n");
     for expected in [
         "参考",
@@ -1478,7 +1811,7 @@ fn reference_stair_replaces_the_old_card_and_preserves_assumptions_and_approval_
         assert!(detail.contains(expected), "missing {expected}");
     }
     assert!(proposal.ready);
-    assert!(!facts.can_authorize(&old_binding));
+    assert!(facts.can_authorize(&old_binding));
     assert!(!facts.can_authorize(&binding));
     add_reviewed_candidate(&mut facts.snapshot, &binding);
     assert!(facts.can_authorize(&binding));

@@ -2261,7 +2261,7 @@ mod tests {
             );
             for (key, action) in [
                 ("Ctrl+G", "context"),
-                ("Ctrl+Y", "accept approval"),
+                ("Ctrl+Y", "confirm selected card"),
                 ("Ctrl+W", "silence reminder"),
                 ("F12", "history and export"),
             ] {
