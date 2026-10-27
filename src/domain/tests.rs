@@ -990,6 +990,202 @@ fn recovery_proposal() -> Value {
     value
 }
 
+pub(crate) fn approval_restore_fact(proposal_id: &str, build_id: &str, sequence: u64) -> Value {
+    json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+        "kind":"approval_card_restore","ok":true,"fact_sequence":sequence,
+        "proposal_id":proposal_id,"build_id":build_id,"status":"ready","missing":[],
+        "restore_id":"restore-one","card_ref":"opaque-card-reference",
+        "first_use_readers":[],"overview_readers":[],
+        "next_call":{"action":"end_turn_for_core_approval"},
+        "replayed_facts":[{"kind":"proposal","fact_sequence":sequence-1,"fact_sha256":"a".repeat(64)}]})
+}
+
+#[test]
+fn restored_card_becomes_current_and_waits_for_approval_through_nested_tool_text() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "prepared", recovery_proposal());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    let mut other = recovery_proposal();
+    other["fact_sequence"] = json!(2);
+    other["proposal"]["proposal_id"] = json!("other");
+    other["proposal"]["prepare_token"] = json!("other-token");
+    deliver_fact(&mut facts, "other", other);
+    let other_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &other_binding);
+    assert_eq!(
+        facts
+            .snapshot
+            .selected_approval_card()
+            .unwrap()
+            .proposal
+            .as_ref()
+            .unwrap()
+            .binding,
+        other_binding
+    );
+
+    let restored = approval_restore_fact("proposal", "review-proposal-2", 3);
+    let item = json!({"id":"restore","type":"mcpToolCall","server":"modeling_domain",
+        "tool":"restore_approval_card","status":"completed",
+        "result":{"content":[{"type":"text","text":restored.to_string()}]}});
+    let notice = crate::protocol::decode_observed_tool(
+        "item/completed",
+        &json!({"threadId":"root","turnId":"turn","item":item}),
+    )
+    .unwrap()
+    .unwrap();
+    facts.observe(&notice, &item);
+    assert_eq!(
+        facts
+            .snapshot
+            .selected_approval_card()
+            .unwrap()
+            .proposal
+            .as_ref()
+            .unwrap()
+            .binding,
+        binding
+    );
+    assert_eq!(facts.snapshot.approval_card_snapshots().len(), 2);
+    assert!(facts.snapshot.approval_card_waiting());
+    assert!(facts.snapshot.approval_restore_waiting());
+    assert!(facts.can_authorize(&binding));
+    facts.remove_approval_card(&binding);
+    assert!(!facts.snapshot.approval_restore_waiting());
+    assert_ne!(
+        facts
+            .snapshot
+            .selected_approval_card()
+            .unwrap()
+            .proposal
+            .as_ref()
+            .unwrap()
+            .binding,
+        binding
+    );
+}
+
+#[test]
+fn restore_missing_evidence_cannot_authorize_even_when_old_card_was_ready() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "prepared", recovery_proposal());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    let mut restored = approval_restore_fact("proposal", "review-proposal-2", 3);
+    restored["build_id"] = json!("not-yet-replayed-build");
+    restored["missing"] = json!(["overview_delivery:top"]);
+    // A contradictory ready status never overrides missing evidence.
+    assert_eq!(
+        facts.apply_verified_fact(&restored),
+        FactProjection::Applied
+    );
+    assert!(!facts.can_authorize(&binding));
+    assert!(!facts.snapshot.approval_card_waiting());
+    assert!(facts.snapshot.approval_restore_waiting());
+    assert!(facts.snapshot.restored_approval_selection().is_none());
+
+    let mut replay = recovery_proposal();
+    replay["fact_sequence"] = json!(2);
+    facts.apply_verified_fact(&replay);
+    assert!(!facts.can_authorize(&binding));
+    restored["fact_sequence"] = json!(4);
+    restored["build_id"] = json!("review-proposal-2");
+    restored["missing"] = json!([]);
+    assert_eq!(
+        facts.apply_verified_fact(&restored),
+        FactProjection::Applied
+    );
+    assert!(facts.can_authorize(&binding));
+    let mut invalidated = recovery_proposal();
+    invalidated["fact_sequence"] = json!(5);
+    invalidated["proposal"]["state"] = json!("invalidated");
+    facts.apply_verified_fact(&invalidated);
+    assert!(!facts.snapshot.approval_restore_waiting());
+    assert!(facts.snapshot.approval_card_snapshots().is_empty());
+}
+
+#[test]
+fn restored_card_requires_its_own_build_validation_and_image_delivery() {
+    let mut facts = sequenced_facts();
+    deliver_fact(&mut facts, "prepared", recovery_proposal());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert!(facts.can_authorize(&binding));
+    let restored = approval_restore_fact("proposal", "restored-build", 3);
+    facts.apply_verified_fact(&restored);
+    assert!(!facts.can_authorize(&binding));
+    assert!(!facts.snapshot.approval_card_waiting());
+    assert!(facts.snapshot.approval_restore_waiting());
+    let mut artifact = reviewed_candidate(&binding);
+    artifact.binding.build_id = "restored-build".into();
+    artifact.valid = None;
+    artifact.reviewed = false;
+    facts.snapshot.artifacts.push(artifact);
+    assert!(!facts.can_authorize(&binding));
+    let artifact = facts.snapshot.artifacts.last_mut().unwrap();
+    artifact.valid = Some(true);
+    artifact.reviewed = true;
+    assert!(!facts.can_authorize(&binding));
+    facts
+        .snapshot
+        .review_images
+        .push(review::test_image(&binding, "restored-build"));
+    assert!(facts.can_authorize(&binding));
+    assert!(facts.snapshot.approval_card_waiting());
+}
+
+#[test]
+fn restore_before_replayed_revision_keeps_waiting_for_the_exact_recovered_version() {
+    let mut facts = sequenced_facts();
+    let mut old = recovery_proposal();
+    old["proposal"]["revision"] = json!(1);
+    deliver_fact(&mut facts, "old", old);
+    let old_binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    add_reviewed_candidate(&mut facts.snapshot, &old_binding);
+    facts.remove_approval_card(&old_binding);
+    let restored = approval_restore_fact("proposal", "review-proposal-2", 4);
+    facts.apply_verified_fact(&restored);
+    assert!(facts.snapshot.approval_restore_waiting());
+    assert!(!facts.snapshot.approval_card_waiting());
+    let mut replay = recovery_proposal();
+    replay["fact_sequence"] = json!(3);
+    deliver_fact(&mut facts, "replayed", replay);
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert_eq!(binding.revision, 2);
+    assert!(facts.snapshot.approval_restore_waiting());
+    assert!(facts.snapshot.restored_approval_selection().is_none());
+    assert!(!facts.can_authorize(&binding));
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert_eq!(
+        facts.snapshot.restored_approval_selection(),
+        Some((4, &binding))
+    );
+    assert!(facts.can_authorize(&binding));
+}
+
+#[test]
+fn restore_waits_for_replayed_evidence_without_creating_approval_from_ready_text() {
+    let mut facts = sequenced_facts();
+    let restored = approval_restore_fact("proposal", "review-proposal-2", 3);
+    assert_eq!(
+        facts.apply_verified_fact(&restored),
+        FactProjection::Applied
+    );
+    assert!(facts.snapshot.approval_restore_waiting());
+    assert!(!facts.snapshot.approval_card_waiting());
+    assert!(facts.snapshot.selected_approval_card().is_none());
+    deliver_fact(&mut facts, "replayed-prepared", recovery_proposal());
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert!(!facts.can_authorize(&binding));
+    add_reviewed_candidate(&mut facts.snapshot, &binding);
+    assert_eq!(
+        facts.snapshot.restored_approval_selection(),
+        Some((3, &binding))
+    );
+    assert!(facts.can_authorize(&binding));
+}
+
 fn operation_envelope(state: &str, recovery: &str, sequence: u64) -> Value {
     json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
         "kind":"operation","fact_sequence":sequence,"receipt":{

@@ -2147,6 +2147,9 @@ impl Core {
             Command::SubmitRootInput { text } => {
                 if !std::mem::take(&mut self.auto_submission) {
                     self.domain.snapshot.floor_advance_auto_continue_paused = false;
+                    if let Some(restored) = &mut self.domain.snapshot.approval_card_restore {
+                        restored.awaiting_user = false;
+                    }
                     self.auto_continues = 0;
                     self.auto_continue_retry.failures = 0;
                 }
@@ -2791,6 +2794,12 @@ impl Core {
             self.state.view.notice = Some(format!("推进器报告平台阻塞（{code}），已暂停自动续接"));
             return;
         }
+        if self.domain.snapshot.approval_restore_waiting()
+            || self.domain.snapshot.approval_card_waiting()
+        {
+            self.state.view.notice = Some("等待审批卡确认，已暂停自动续接".into());
+            return;
+        }
         if let Some((binding, text)) = self.undelivered_grant.take() {
             let card = self.domain.snapshot.approval_card(&binding);
             let unapplied = self.domain.shows_binding(&binding);
@@ -2834,6 +2843,7 @@ impl Core {
                 self.state.view.phase,
                 !self.state.view.requests.is_empty()
                     || self.domain.snapshot.authorizing
+                    || self.domain.snapshot.approval_restore_waiting()
                     || self.domain.snapshot.approval_card_waiting(),
                 self.domain
                     .snapshot

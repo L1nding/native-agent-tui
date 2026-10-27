@@ -13,7 +13,8 @@ pub(super) struct ExtensionPanel {
     pub scroll: u16,
     pub reply_scroll_from_bottom: u16,
     pub selected_image: usize,
-    selected_approval: Option<crate::domain::ProposalBinding>,
+    selected_approval: RefCell<Option<crate::domain::ProposalBinding>>,
+    restored_approval: RefCell<Option<(u64, crate::domain::ProposalBinding)>>,
     displayed: RefCell<Option<ExtensionConfirmation>>,
 }
 
@@ -28,12 +29,24 @@ impl ExtensionPanel {
         *self.displayed.borrow_mut() = None;
     }
 
-    fn selected_approval_index(&self, cards: &[&crate::domain::DomainSnapshot]) -> Option<usize> {
+    fn selected_approval_index(
+        &self,
+        domain: &crate::domain::DomainSnapshot,
+        cards: &[&crate::domain::DomainSnapshot],
+    ) -> Option<usize> {
+        if let Some((sequence, binding)) = domain.restored_approval_selection() {
+            let restored = (sequence, binding.clone());
+            if self.restored_approval.borrow().as_ref() != Some(&restored) {
+                *self.selected_approval.borrow_mut() = Some(binding.clone());
+                *self.restored_approval.borrow_mut() = Some(restored);
+            }
+        }
         if cards.is_empty() {
             return None;
         }
         Some(
             self.selected_approval
+                .borrow()
                 .as_ref()
                 .and_then(|selected| {
                     cards.iter().position(|card| {
@@ -198,7 +211,7 @@ impl Registry<'_> {
         };
         let selected_projection = projection.modeling().and_then(|domain| {
             let cards = domain.approval_card_snapshots();
-            let selected = context.panel.selected_approval_index(&cards)?;
+            let selected = context.panel.selected_approval_index(domain, &cards)?;
             let mut card = cards[selected].clone();
             card.authorizing = domain.authorizing;
             card.fact_sync_notice = domain.fact_sync_notice.clone();
@@ -210,7 +223,7 @@ impl Registry<'_> {
             let cards = domain.approval_card_snapshots();
             context
                 .panel
-                .selected_approval_index(&cards)
+                .selected_approval_index(domain, &cards)
                 .and_then(|index| cards.get(index).copied())
                 .filter(|card| domain.approval_card_waiting_for(card))
                 .and_then(|_| view.confirmation(display_projection))
@@ -233,7 +246,7 @@ impl Registry<'_> {
         };
         let domain = projection.modeling().expect("modeling projection");
         let cards = domain.approval_card_snapshots();
-        let Some(selected_index) = panel.selected_approval_index(&cards) else {
+        let Some(selected_index) = panel.selected_approval_index(domain, &cards) else {
             return area;
         };
         let selected_card = cards[selected_index];
@@ -363,13 +376,13 @@ impl Registry<'_> {
             && matches!(key.code, KeyCode::Char('[' | ']'))
             && !cards.is_empty()
         {
-            let current = panel.selected_approval_index(&cards).unwrap_or(0);
+            let current = panel.selected_approval_index(domain, &cards).unwrap_or(0);
             let next = if key.code == KeyCode::Char('[') {
                 current.checked_sub(1).unwrap_or(cards.len() - 1)
             } else {
                 (current + 1) % cards.len()
             };
-            panel.selected_approval = Some(
+            *panel.selected_approval.borrow_mut() = Some(
                 cards[next]
                     .proposal
                     .as_ref()
@@ -381,7 +394,7 @@ impl Registry<'_> {
             panel.clear_displayed();
             return Some(ExtensionAction::Handled);
         }
-        let selected_index = panel.selected_approval_index(&cards);
+        let selected_index = panel.selected_approval_index(domain, &cards);
         let selected_card = selected_index.and_then(|index| cards.get(index).copied());
         let image_or_approval_key = matches!((key.code, key.modifiers),
             (KeyCode::Char('y' | 'o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL))
@@ -738,6 +751,126 @@ mod tests {
         );
         assert!(matches!(
             action,
+            Some(ExtensionAction::NoDisplayedConfirmation)
+        ));
+    }
+
+    #[test]
+    fn restored_card_overrides_previous_selection_and_ctrl_y_confirms_its_exact_version() {
+        let mut snapshot = snapshot_with_approval_cards();
+        let mut panel = ExtensionPanel::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).unwrap();
+        for _ in 0..2 {
+            REGISTRY.handle_key(
+                KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT),
+                &snapshot,
+                &mut panel,
+                Rect::new(0, 0, 120, 44),
+                "",
+                None,
+            );
+        }
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        assert!(terminal_text(&terminal).contains("本卡未就绪"));
+        assert!(panel.displayed.borrow().is_none());
+
+        let mut facts = crate::domain::DomainFacts::new(Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: "context.json".into(),
+            repository: ".".into(),
+            python: "unused-python".into(),
+            run_id: "run".into(),
+            context_sha256: "context".into(),
+            floor_id: "floor".into(),
+        }));
+        facts.snapshot = snapshot.extensions[0].modeling().unwrap().clone();
+        let mut restored = crate::domain::tests::approval_restore_fact(
+            "ready-earlier",
+            "not-yet-replayed-build",
+            19,
+        );
+        restored["context_sha256"] = serde_json::json!("context");
+        facts.apply_verified_fact(&restored);
+        snapshot.extensions[0] = ExtensionSnapshot::Modeling(facts.snapshot.clone());
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        assert!(panel.displayed.borrow().is_none());
+        assert!(terminal_text(&terminal).contains("待批3张（可确认1）"));
+        restored["fact_sequence"] = serde_json::json!(20);
+        restored["build_id"] = serde_json::json!("preview");
+        assert_eq!(
+            facts.apply_verified_fact(&restored),
+            crate::domain::FactProjection::Applied
+        );
+        snapshot.extensions[0] = ExtensionSnapshot::Modeling(facts.snapshot.clone());
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("待你确认：墙体1处"), "{text}");
+        assert!(text.contains("待批3张（可确认2）"), "{text}");
+        assert!(text.contains("Ctrl+Y确认"), "{text}");
+        assert!(matches!(REGISTRY.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), &snapshot, &mut panel,
+            Rect::new(0, 0, 120, 44), "", None),
+            Some(ExtensionAction::Confirm(ExtensionConfirmation::Modeling(ref confirmation)))
+                if confirmation.proposal.proposal_id == "ready-earlier"
+                    && confirmation.proposal.revision == 8
+                    && confirmation.proposal.prepare_token == "ready-earlier-prepare"));
+
+        // An already observed restore must still allow subsequent manual navigation.
+        REGISTRY.handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT),
+            &snapshot,
+            &mut panel,
+            Rect::new(0, 0, 120, 44),
+            "",
+            None,
+        );
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        assert!(panel.displayed.borrow().is_none());
+        assert!(terminal_text(&terminal).contains("有可批准卡"));
+
+        restored["fact_sequence"] = serde_json::json!(21);
+        restored["missing"] = serde_json::json!(["overview_delivery:top"]);
+        facts.apply_verified_fact(&restored);
+        snapshot.extensions[0] = ExtensionSnapshot::Modeling(facts.snapshot.clone());
+        *panel.selected_approval.borrow_mut() = facts
+            .snapshot
+            .approval_cards
+            .iter()
+            .filter_map(|card| card.snapshot.proposal.as_ref())
+            .find(|proposal| proposal.binding.proposal_id == "ready-earlier")
+            .map(|proposal| proposal.binding.clone());
+        terminal
+            .draw(|frame| {
+                REGISTRY.draw_conversation_card(frame, frame.area(), &snapshot, &panel);
+            })
+            .unwrap();
+        assert!(terminal_text(&terminal).contains("有可批准卡"));
+        assert!(panel.displayed.borrow().is_none());
+        assert!(matches!(
+            REGISTRY.handle_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                &snapshot,
+                &mut panel,
+                Rect::new(0, 0, 120, 44),
+                "",
+                None
+            ),
             Some(ExtensionAction::NoDisplayedConfirmation)
         ));
     }

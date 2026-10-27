@@ -1,6 +1,216 @@
 use super::*;
 
 #[tokio::test]
+async fn restored_approval_receipt_stops_auto_continue_and_confirms_the_restored_proposal() {
+    use sha2::{Digest, Sha256};
+    let directory = std::env::temp_dir().join(format!(
+        "restored-card-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(directory.join("blender_agent/cli")).unwrap();
+    std::fs::write(directory.join("blender_agent/__init__.py"), "").unwrap();
+    std::fs::write(directory.join("blender_agent/cli/__init__.py"), "").unwrap();
+    std::fs::write(directory.join("context.json"), b"{}").unwrap();
+    let context_hash = format!("{:x}", Sha256::digest(b"{}"));
+    std::fs::write(directory.join("blender_agent/cli/main.py"), format!(r#"
+import sys,json
+from pathlib import Path
+if '--fact-sha256' in sys.argv:
+    sys.stdout.buffer.write(Path('restore.json').read_bytes())
+else:
+    print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha256':'{context_hash}',
+    'grant':{{'authorization_id':'restored-grant','proposal_id':'5f0bb072','revision':2,'prepare_token':'token'}}}}))
+"#)).unwrap();
+    let png = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+    ];
+    let image_path = directory.join("review.png");
+    std::fs::write(&image_path, png).unwrap();
+    let image_sha = format!("{:x}", Sha256::digest(png));
+    let (mut client, mut server) = harness_with_config(Config {
+        auto_continue: 20,
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: directory.join("context.json"),
+            repository: directory.clone(),
+            python: crate::domain::receipt::tests::python(),
+            run_id: "run".into(),
+            context_sha256: context_hash.clone(),
+            floor_id: "floor".into(),
+        }),
+        ..Default::default()
+    })
+    .await;
+    running_root(&mut client, &mut server).await;
+    let mut proposal = crate::domain::tests::floor_story_height_proposal();
+    proposal["context_sha256"] = json!(context_hash);
+    proposal["fact_sequence"] = json!(1);
+    proposal["source_current"] = json!(true);
+    proposal["proposal"]["proposal_id"] = json!("5f0bb072");
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"prepared","type":"mcpToolCall","server":"modeling_domain","tool":"inspect_change","status":"completed","result":{"structuredContent":proposal.clone()}}}})).await;
+    let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,
+        "kind":"artifact_validation","fact_sequence":2,
+        "artifact":{"build_id":"restored-build","proposal_id":"5f0bb072","revision":2,"prepare_token":"token",
+            "candidate":true,"authority_sha256":proposal["proposal"]["base_sha256"],
+            "input_sha256":proposal["proposal"]["candidate_sha256"],"state":"built","output":"model.glb","valid":true,"current":true,
+            "review_image":{"delivery":"attached_png","image_sha256":image_sha,"image_path":image_path,"dimensions_px":[1,1],
+                "request":{"build_id":"restored-build","proposal_id":"5f0bb072","revision":2,"prepare_token":"token",
+                    "input_sha256":proposal["proposal"]["candidate_sha256"],"blend_sha256":"a".repeat(64),"focus_m":null}}}});
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"review","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.snapshots.wait_for(|snapshot| {
+            snapshot.extensions[0]
+                .modeling()
+                .unwrap()
+                .approval_card_waiting()
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut other = proposal.clone();
+    other["fact_sequence"] = json!(3);
+    other["proposal"]["proposal_id"] = json!("other-unready");
+    other["proposal"]["prepare_token"] = json!("other-token");
+    other["proposal"]["state"] = json!("draft");
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"other","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":other}}}})).await;
+
+    let mut restored = crate::domain::tests::approval_restore_fact("5f0bb072", "restored-build", 4);
+    restored["context_sha256"] = json!(context_hash);
+    let raw = serde_json::to_vec(&restored).unwrap();
+    std::fs::write(directory.join("restore.json"), &raw).unwrap();
+    let receipt = json!({"contract":"modeling-fact-receipt/v1","kind":"approval_card_restore","ok":true,
+        "run_id":"run","context_sha256":context_hash,"fact_sequence":4,
+        "fact_sha256":format!("{:x}",Sha256::digest(&raw)),"fact_bytes":raw.len(),"binding":{},
+        "agent_view":{"value":{"status":"ready","proposal_id":"5f0bb072","build_id":"restored-build",
+            "card_ref":"opaque-card-reference","first_use_readers":[],"overview_readers":[],"missing":[],
+            "next_call":{"action":"end_turn_for_core_approval"},"replayed_facts":{"count":5}}}});
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"restore","type":"mcpToolCall","server":"modeling_domain","tool":"restore_approval_card","status":"completed",
+            "result":{"content":[{"type":"text","text":receipt.to_string()}]}}}})).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.snapshots.wait_for(|snapshot| {
+            let domain = snapshot.extensions[0].modeling().unwrap();
+            domain.fact_sync_notice.is_none() && domain.restored_approval_selection().is_some()
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let snapshot = client.snapshots.borrow().clone();
+    let domain = snapshot.extensions[0].modeling().unwrap();
+    assert_eq!(
+        domain.proposal.as_ref().unwrap().binding.proposal_id,
+        "other-unready"
+    );
+    let binding = domain
+        .selected_approval_card()
+        .unwrap()
+        .proposal
+        .as_ref()
+        .unwrap()
+        .binding
+        .clone();
+    assert_eq!(binding.proposal_id, "5f0bb072");
+    assert_eq!(binding.revision, 2);
+    assert!(domain.approval_card_waiting());
+    assert!(domain.approval_restore_waiting());
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/completed","params":{"threadId":"root",
+        "turn":{"id":"root-turn","status":"completed"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Completed).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), next(&mut server))
+            .await
+            .is_err()
+    );
+    assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+    client
+        .commands
+        .send(Command::ConfirmExtension {
+            confirmation: crate::extensions::ExtensionConfirmation::Modeling(
+                binding.clone().into(),
+            ),
+        })
+        .await
+        .unwrap();
+    let approved = next(&mut server).await;
+    assert_eq!(approved["method"], "turn/start");
+    let text = approved["params"]["input"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(
+        payload["apply_change_arguments"]["proposal_id"],
+        binding.proposal_id
+    );
+    assert_eq!(
+        payload["apply_change_arguments"]["revision"],
+        binding.revision
+    );
+    assert_eq!(
+        payload["apply_change_arguments"]["prepare_token"],
+        binding.prepare_token
+    );
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
+async fn restore_end_turn_instruction_blocks_auto_continue_before_card_evidence_arrives() {
+    let (mut client, mut server) = harness_with_config(Config {
+        auto_continue: 20,
+        domain_setup: Some(crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path: "context.json".into(),
+            repository: ".".into(),
+            python: "unused-python".into(),
+            run_id: "run".into(),
+            context_sha256: "ctx".into(),
+            floor_id: "floor".into(),
+        }),
+        ..Default::default()
+    })
+    .await;
+    running_root(&mut client, &mut server).await;
+    let restored = crate::domain::tests::approval_restore_fact("5f0bb072", "restored-build", 4);
+    observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+        "item":{"id":"restore","type":"mcpToolCall","server":"modeling_domain","tool":"restore_approval_card","status":"completed",
+            "result":{"content":[{"type":"text","text":restored.to_string()}]}}}})).await;
+    assert!(!client.snapshots.borrow().extensions[0]
+        .modeling()
+        .unwrap()
+        .approval_card_waiting());
+    observation_event(
+        &mut client,
+        &mut server,
+        json!({"method":"turn/completed","params":{"threadId":"root",
+        "turn":{"id":"root-turn","status":"completed"}}}),
+    )
+    .await;
+    phase(&mut client, SessionPhase::Completed).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), next(&mut server))
+            .await
+            .is_err()
+    );
+    assert_eq!(client.snapshots.borrow().root_start_requests, 1);
+    client.commands.send(Command::Quit).await.unwrap();
+    client.join.await.unwrap();
+}
+
+#[tokio::test]
 async fn tool_operation_waits_never_replace_scope_or_authorize_business_facts() {
     let (mut client, mut server) = harness_with_config(Config {
         domain_setup: Some(crate::domain::DomainSetup {
@@ -577,6 +787,8 @@ async fn manual_grant_steered_into_an_ending_turn_is_resubmitted_when_still_unap
         "restore_candidate_review",
         "unknown",
         "pending_after_steer",
+        "restore_wait_after_steer",
+        "ready_card_after_steer",
     ] {
         let policy = DomainApprovalPolicy::Manual;
         let directory = std::env::temp_dir().join(format!(
@@ -614,6 +826,14 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         let config = Config {
             permission: Some("read-only".into()),
             domain_approval_policy: policy,
+            auto_continue: if matches!(
+                completion,
+                "restore_wait_after_steer" | "ready_card_after_steer"
+            ) {
+                20
+            } else {
+                0
+            },
             domain_setup: Some(crate::domain::DomainSetup {
                 mode: crate::domain::DomainMode::Floor,
                 context_path: directory.join("context.json"),
@@ -657,12 +877,12 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
             "assumed":[],"issues":[],"pending":[],"component_first_use_requirements":{
                 "contract":"component-first-use/1","required":[],"reused":[{"review_key":"human-reviewed"}]}}});
         observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
-            "item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal}}}})).await;
+            "item":{"id":"p","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":proposal.clone()}}}})).await;
         let artifact = json!({"contract":"modeling-domain/v2","run_id":"run","context_sha256":context_hash,"kind":"artifact_validation","fact_sequence":2,
             "artifact":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","candidate":true,"authority_sha256":"base","input_sha256":"candidate","state":"built","output":"model.glb","valid":true,"current":true,
             "review_image":{"delivery":"attached_png","image_sha256":image_sha,"image_path":path,"dimensions_px":[1,1],"request":{"build_id":"b","proposal_id":"p","revision":1,"prepare_token":"token","input_sha256":"candidate","blend_sha256":"a".repeat(64),"focus_m":null}}}});
         observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
-            "item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact}}}})).await;
+            "item":{"id":"b","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":artifact.clone()}}}})).await;
         tokio::time::timeout(
             Duration::from_secs(5),
             client.snapshots.wait_for(|s| {
@@ -840,7 +1060,11 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
         }
         if !matches!(
             completion,
-            "approved" | "pending_after_steer" | "other_unready"
+            "approved"
+                | "pending_after_steer"
+                | "other_unready"
+                | "restore_wait_after_steer"
+                | "ready_card_after_steer"
         ) {
             if completion == "newer_notice" {
                 client
@@ -928,8 +1152,54 @@ print(json.dumps({{'ok':True,'kind':'authorization','run_id':'run','context_sha2
             observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
                 "item":{"id":"pending-after-steer","type":"mcpToolCall","server":"modeling_domain","tool":"inspect_change","status":"completed","result":{"structuredContent":pending}}}})).await;
         }
+        if completion == "restore_wait_after_steer" {
+            let mut restored =
+                crate::domain::tests::approval_restore_fact("p", "revision-2-build", 3);
+            restored["context_sha256"] = json!(context_hash);
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"restore-after-steer","type":"mcpToolCall","server":"modeling_domain","tool":"restore_approval_card","status":"completed","result":{"structuredContent":restored}}}})).await;
+            assert!(client.snapshots.borrow().extensions[0]
+                .modeling()
+                .unwrap()
+                .approval_restore_waiting());
+        }
+        if completion == "ready_card_after_steer" {
+            let mut other = proposal.clone();
+            other["fact_sequence"] = json!(3);
+            other["proposal"]["proposal_id"] = json!("other");
+            other["proposal"]["prepare_token"] = json!("other-token");
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"other-after-steer","type":"mcpToolCall","server":"modeling_domain","tool":"prepare_change","status":"completed","result":{"structuredContent":other}}}})).await;
+            let mut other_artifact = artifact.clone();
+            other_artifact["fact_sequence"] = json!(4);
+            other_artifact["artifact"]["build_id"] = json!("other-build");
+            other_artifact["artifact"]["proposal_id"] = json!("other");
+            other_artifact["artifact"]["prepare_token"] = json!("other-token");
+            other_artifact["artifact"]["review_image"]["request"]["build_id"] =
+                json!("other-build");
+            other_artifact["artifact"]["review_image"]["request"]["proposal_id"] = json!("other");
+            other_artifact["artifact"]["review_image"]["request"]["prepare_token"] =
+                json!("other-token");
+            observation_event(&mut client,&mut server,json!({"method":"item/completed","params":{"threadId":"root","turnId":"root-turn",
+                "item":{"id":"other-review-after-steer","type":"mcpToolCall","server":"modeling_domain","tool":"read_artifact_review_image","status":"completed","result":{"structuredContent":other_artifact}}}})).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.snapshots.wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .approval_card_waiting()
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
         observation_event(&mut client,&mut server,json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"root-turn","status":"completed"}}})).await;
-        if completion == "pending_after_steer" {
+        if matches!(
+            completion,
+            "pending_after_steer" | "restore_wait_after_steer" | "ready_card_after_steer"
+        ) {
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), next(&mut server))
                     .await

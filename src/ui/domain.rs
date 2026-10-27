@@ -1213,6 +1213,8 @@ pub(super) fn approval_card_lines(
         })
     } else if !proposal.ready {
         Some("方案尚未准备好，请在下方输入意见或在 F6 查看问题")
+    } else if domain.approval_restore_blocked {
+        Some("审批卡恢复仍缺少证据，请在 F6 查看进度")
     } else if !built {
         Some(if failed {
             "模型检查未通过，需修正后重试"
@@ -1269,7 +1271,10 @@ impl ExtensionView for ModelingView {
     }
     fn confirmation(&self, snapshot: &ExtensionSnapshot) -> Option<ExtensionConfirmation> {
         let domain = snapshot.modeling()?;
-        if domain.fact_sync_notice.is_some() || domain.authorizing {
+        if domain.fact_sync_notice.is_some()
+            || domain.authorizing
+            || domain.approval_restore_blocked
+        {
             return None;
         }
         domain

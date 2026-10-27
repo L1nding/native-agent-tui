@@ -555,6 +555,9 @@ pub struct DomainSnapshot {
     pub floor_id: String,
     pub proposal: Option<ProposalFact>,
     pub approval_cards: Vec<ApprovalCard>,
+    pub(crate) approval_card_restore: Option<ApprovalCardRestore>,
+    pub approval_restore_blocked: bool,
+    pub approval_restore_build_id: Option<String>,
     pub source_current: Option<bool>,
     pub proposal_not_approvable: bool,
     pub(crate) approval_card_tombstones: Vec<ProposalBinding>,
@@ -596,6 +599,15 @@ pub struct DomainSnapshot {
 pub struct ApprovalCard {
     pub snapshot: Box<DomainSnapshot>,
     pub fact_sequence: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalCardRestore {
+    pub proposal_id: String,
+    pub build_id: Option<String>,
+    pub fact_sequence: u64,
+    pub ready: bool,
+    pub awaiting_user: bool,
 }
 
 impl ApprovalCard {
@@ -672,6 +684,7 @@ impl DomainSnapshot {
         let mut snapshot = self.clone();
         snapshot.approval_cards.clear();
         snapshot.approval_card_tombstones.clear();
+        snapshot.approval_card_restore = None;
         Box::new(snapshot)
     }
 
@@ -721,7 +734,69 @@ impl DomainSnapshot {
     }
 
     pub fn selected_approval_card(&self) -> Option<&DomainSnapshot> {
-        self.approval_card_snapshots().into_iter().next()
+        let cards = self.approval_card_snapshots();
+        self.restored_approval_selection()
+            .and_then(|(_, binding)| {
+                cards.iter().copied().find(|card| {
+                    card.proposal
+                        .as_ref()
+                        .is_some_and(|p| p.binding == *binding)
+                })
+            })
+            .or_else(|| cards.into_iter().next())
+    }
+
+    pub fn restored_approval_selection(&self) -> Option<(u64, &ProposalBinding)> {
+        let restored = self.approval_card_restore.as_ref().filter(|r| r.ready)?;
+        let card = self.restored_approval_card()?;
+        let binding = &card.proposal.as_ref()?.binding;
+        (self.approval_card_is_pending(binding)
+            && restored.build_id.as_ref().is_none_or(|build_id| {
+                card.artifacts
+                    .iter()
+                    .any(|artifact| artifact.binding.build_id == *build_id)
+            }))
+        .then_some((restored.fact_sequence, binding))
+    }
+
+    fn restored_approval_card(&self) -> Option<&DomainSnapshot> {
+        let restored = self.approval_card_restore.as_ref()?;
+        std::iter::once(self)
+            .chain(
+                self.approval_cards
+                    .iter()
+                    .map(|card| card.snapshot.as_ref()),
+            )
+            .find(|card| {
+                card.proposal
+                    .as_ref()
+                    .is_some_and(|proposal| proposal.binding.proposal_id == restored.proposal_id)
+            })
+    }
+
+    pub fn approval_restore_waiting(&self) -> bool {
+        self.approval_card_restore.as_ref().is_some_and(|restored| {
+            restored.awaiting_user
+                && self.restored_approval_card().is_none_or(|card| {
+                    // An older version's terminal state cannot settle a restore
+                    // whose build and proposal facts have not arrived yet.
+                    if restored.build_id.as_ref().is_some_and(|build_id| {
+                        !card
+                            .artifacts
+                            .iter()
+                            .any(|artifact| artifact.binding.build_id == *build_id)
+                    }) {
+                        return true;
+                    }
+                    card.proposal.as_ref().is_some_and(|proposal| {
+                        !self.approval_card_removed(&proposal.binding)
+                            && card.source_current != Some(false)
+                            && !card.proposal_not_approvable
+                            && card.operation.is_none()
+                            && card.application.is_none()
+                    })
+                })
+        })
     }
 
     pub fn approval_card(&self, binding: &ProposalBinding) -> Option<&DomainSnapshot> {
@@ -906,6 +981,7 @@ impl DomainSnapshot {
     pub fn approval_card_waiting_for(&self, card: &Self) -> bool {
         self.fact_sync_notice.is_none()
             && !self.authorizing
+            && !card.approval_restore_blocked
             && card.operation.is_none()
             && card.proposal.as_ref().is_some_and(|proposal| {
                 card.source_current != Some(false)
@@ -955,6 +1031,10 @@ impl DomainSnapshot {
     pub fn candidate_review_delivered(&self, proposal: &ProposalBinding) -> bool {
         self.artifacts.iter().any(|artifact| {
             artifact.binding.candidate
+                && self
+                    .approval_restore_build_id
+                    .as_ref()
+                    .is_none_or(|build_id| artifact.binding.build_id == *build_id)
                 && artifact.binding.proposal_id == proposal.proposal_id
                 && artifact.binding.revision == proposal.revision
                 && artifact.binding.prepare_token == proposal.prepare_token
@@ -1318,6 +1398,22 @@ impl DomainFacts {
         self.refresh_rejections();
         if result == FactProjection::Applied {
             self.capture_approval_card(sequence);
+            // Restore receipts and their separately sealed replay facts can arrive
+            // in either order. Ready text never replaces the evidence checks.
+            if let Some(restored) = self.snapshot.approval_card_restore.clone() {
+                let binding = self
+                    .snapshot
+                    .restored_approval_card()
+                    .and_then(|card| card.proposal.as_ref())
+                    .map(|proposal| proposal.binding.clone());
+                if let Some(card) = binding
+                    .as_ref()
+                    .and_then(|binding| self.snapshot.approval_card_mut(binding))
+                {
+                    card.approval_restore_blocked = !restored.ready;
+                    card.approval_restore_build_id = restored.build_id;
+                }
+            }
         }
         result
     }
@@ -1998,6 +2094,14 @@ impl DomainFacts {
                     }
                     if same || follows {
                         if !same {
+                            if self.snapshot.approval_card_restore.as_ref().is_some_and(
+                                |restored| {
+                                    restored.proposal_id == proposal.binding.proposal_id
+                                        && sequence.is_some_and(|seq| seq > restored.fact_sequence)
+                                },
+                            ) {
+                                self.snapshot.approval_card_restore = None;
+                            }
                             self.capture_approval_card(self.highest_sequence);
                             if let Some(parent) = parent {
                                 self.invalidate_approval_cards_for_proposal(parent);
@@ -2014,6 +2118,8 @@ impl DomainFacts {
                             self.snapshot.operation = None;
                             self.snapshot.artifacts.clear();
                             self.snapshot.review_images.clear();
+                            self.snapshot.approval_restore_blocked = false;
+                            self.snapshot.approval_restore_build_id = None;
                             self.fact_sequences
                                 .retain(|key, _| !key.starts_with("artifact:"));
                             for kind in ["application", "operation"] {
@@ -2309,9 +2415,33 @@ impl DomainFacts {
                     .map(str::to_owned);
                 accepted = true;
             }
+            Some("approval_card_restore") => {
+                let restored = if value["agent_view"]["value"].is_object() {
+                    &value["agent_view"]["value"]
+                } else {
+                    value
+                };
+                let (Ok(proposal_id), Some(missing), Some(status)) = (
+                    text(restored, "proposal_id"),
+                    restored["missing"].as_array(),
+                    restored["status"].as_str(),
+                ) else {
+                    return invalid!();
+                };
+                if value["ok"] != true || !matches!(status, "ready" | "blocked") {
+                    return invalid!();
+                }
+                self.snapshot.approval_card_restore = Some(ApprovalCardRestore {
+                    proposal_id,
+                    build_id: restored["build_id"].as_str().map(str::to_owned),
+                    fact_sequence: sequence.unwrap_or(0),
+                    ready: status == "ready" && missing.is_empty(),
+                    awaiting_user: restored["next_call"]["action"] == "end_turn_for_core_approval",
+                });
+                accepted = true;
+            }
             Some(
                 "floor_advance"
-                | "approval_card_restore"
                 | "circulation_revision"
                 | "drawing_batch"
                 | "drawing_sheet"
@@ -2449,6 +2579,9 @@ impl DomainFacts {
     }
 
     fn clear_project_scope(&mut self) {
+        self.snapshot.approval_card_restore = None;
+        self.snapshot.approval_restore_blocked = false;
+        self.snapshot.approval_restore_build_id = None;
         let approved = self.snapshot.approval_card_tombstones.clone();
         self.snapshot.approval_cards.retain(|card| {
             card.binding()
@@ -2832,6 +2965,14 @@ impl DomainFacts {
     }
 
     fn invalidate_approval_cards_for_proposal(&mut self, proposal_id: &str) {
+        if self
+            .snapshot
+            .approval_card_restore
+            .as_ref()
+            .is_some_and(|restored| restored.proposal_id == proposal_id)
+        {
+            self.snapshot.approval_card_restore = None;
+        }
         let approved = self.snapshot.approval_card_tombstones.clone();
         self.snapshot.approval_cards.retain(|card| {
             card.binding().is_none_or(|binding| {
@@ -2929,6 +3070,7 @@ impl DomainFacts {
             && self.snapshot.approval_card_is_pending(binding)
             && card.source_current != Some(false)
             && !card.proposal_not_approvable
+            && !card.approval_restore_blocked
             && card.application.is_none()
             && card.operation.is_none()
             && card.candidate_review_delivered(binding)
