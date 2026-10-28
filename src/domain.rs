@@ -2784,6 +2784,10 @@ impl DomainFacts {
         Ok(())
     }
 
+    pub(crate) fn floor_advance_sequence(&self) -> Option<u64> {
+        self.fact_sequences.get("floor_advance").copied()
+    }
+
     pub(crate) fn synchronization_failed(&mut self, kind: &str, sequence: u64, reason: String) {
         if self
             .snapshot

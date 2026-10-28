@@ -2968,40 +2968,64 @@ impl Core {
             })
         };
         match result {
-            Ok(value) => match self.domain.apply_verified_fact(&value) {
-                crate::domain::FactProjection::Deferred => self.domain.synchronization_failed(
-                    &pending.receipt.kind,
-                    pending.receipt.fact_sequence,
-                    "完整事实的投影依赖尚未到达".into(),
-                ),
-                crate::domain::FactProjection::Invalid
-                | crate::domain::FactProjection::DependencyRejected => {}
-                _ => {
-                    self.domain.synchronization_finished(&pending.receipt);
-                    if self.domain.snapshot.floor_advance_auto_continue_paused {
-                        let code = self
-                            .domain
-                            .snapshot
-                            .floor_advance_needs
-                            .as_ref()
-                            .and_then(|needs| needs.diagnostic_code.as_deref())
-                            .unwrap_or("unknown");
-                        self.state.view.notice = Some(
-                            if self
+            Ok(value) => {
+                let was_floor_advance_paused =
+                    self.domain.snapshot.floor_advance_auto_continue_paused;
+                let previous_floor_advance_needs = self.domain.snapshot.floor_advance_needs.clone();
+                let previous_floor_advance_sequence = self.domain.floor_advance_sequence();
+                let projection = self.domain.apply_verified_fact(&value);
+                match projection {
+                    crate::domain::FactProjection::Deferred => self.domain.synchronization_failed(
+                        &pending.receipt.kind,
+                        pending.receipt.fact_sequence,
+                        "完整事实的投影依赖尚未到达".into(),
+                    ),
+                    crate::domain::FactProjection::Invalid
+                    | crate::domain::FactProjection::DependencyRejected => {}
+                    _ => {
+                        self.domain.synchronization_finished(&pending.receipt);
+                        if self.domain.snapshot.floor_advance_auto_continue_paused {
+                            let code = self
                                 .domain
                                 .snapshot
                                 .floor_advance_needs
                                 .as_ref()
-                                .is_some_and(|needs| needs.needs_type == "approve_card")
-                            {
-                                "等待审批卡确认，已暂停自动续接".into()
-                            } else {
-                                format!("推进器报告平台阻塞（{code}），已暂停自动续接")
-                            },
-                        );
+                                .and_then(|needs| needs.diagnostic_code.as_deref())
+                                .unwrap_or("unknown");
+                            self.state.view.notice = Some(
+                                if self
+                                    .domain
+                                    .snapshot
+                                    .floor_advance_needs
+                                    .as_ref()
+                                    .is_some_and(|needs| needs.needs_type == "approve_card")
+                                {
+                                    "等待审批卡确认，已暂停自动续接".into()
+                                } else {
+                                    format!("推进器报告平台阻塞（{code}），已暂停自动续接")
+                                },
+                            );
+                        } else if was_floor_advance_paused
+                            && previous_floor_advance_needs
+                                .as_ref()
+                                .is_some_and(|needs| needs.needs_type != "approve_card")
+                            && pending.receipt.kind == "floor_advance"
+                            && previous_floor_advance_sequence
+                                .is_none_or(|sequence| pending.receipt.fact_sequence > sequence)
+                            && projection == crate::domain::FactProjection::Applied
+                            && self.state.view.notice.as_deref().is_some_and(|notice| {
+                                let code = previous_floor_advance_needs
+                                    .as_ref()
+                                    .and_then(|needs| needs.diagnostic_code.as_deref())
+                                    .unwrap_or("unknown");
+                                notice == format!("推进器报告平台阻塞（{code}），已暂停自动续接")
+                            })
+                        {
+                            self.state.view.notice = None;
+                        }
                     }
                 }
-            },
+            }
             Err(reason) => self.domain.synchronization_failed(
                 &pending.receipt.kind,
                 pending.receipt.fact_sequence,
@@ -5987,6 +6011,478 @@ mod tests {
         };
         assert!(!completed.blocks_auto_continue());
     }
+
+    #[tokio::test]
+    async fn resolved_floor_advance_receipt_clears_only_its_stale_blocking_notice() {
+        use sha2::Digest;
+
+        let root = std::env::temp_dir().join(format!(
+            "native-agent-tui-domain-notice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("outputs/domain/notice-test/changes/facts")).unwrap();
+        std::fs::create_dir_all(root.join("blender_agent/cli")).unwrap();
+        std::fs::write(root.join("blender_agent/__init__.py"), "").unwrap();
+        std::fs::write(root.join("blender_agent/cli/__init__.py"), "").unwrap();
+        std::fs::write(
+            root.join("blender_agent/cli/main.py"),
+            r#"import pathlib
+import sys
+
+sha = sys.argv[sys.argv.index("--fact-sha256") + 1]
+path = pathlib.Path("outputs/domain/notice-test/changes/facts") / f"{sha}.json"
+sys.stdout.buffer.write(path.read_bytes())
+"#,
+        )
+        .unwrap();
+        let context_path = root.join("context.json");
+        let context = serde_json::to_vec(&json!({
+            "contract": "modeling-context/v2",
+            "run_id": "notice-test",
+            "project_root": root,
+            "scene_path": "scene.json",
+            "scope": {"floor_id": "floor.lower", "region": [0, 0, 1, 1], "protected_ids": []},
+            "sources": []
+        }))
+        .unwrap();
+        std::fs::write(&context_path, &context).unwrap();
+        let context_sha256 = format!("{:x}", sha2::Sha256::digest(&context));
+        let python = crate::domain::receipt::tests::python();
+        let setup = crate::domain::DomainSetup {
+            mode: crate::domain::DomainMode::Floor,
+            context_path,
+            repository: root.clone(),
+            python,
+            run_id: "notice-test".into(),
+            context_sha256: context_sha256.clone(),
+            floor_id: "floor.lower".into(),
+        };
+        let blocked = json!({"type":"blocked", "diagnostic":{"rejection":{"code":"fact_too_large"}}, "rejection_category":"unclassified", "split_batch_allowed":false, "next_action":"report_without_guessing_or_splitting"});
+        let mut facts: Vec<Value> = [
+            (1, blocked.clone()),
+            (2, json!({"type":"ready"})),
+            (3, blocked),
+            (4, json!({"type":"ready"})),
+            (5, json!({"type":"approve_card"})),
+            (6, json!({"type":"ready"})),
+        ]
+        .into_iter()
+        .map(|(sequence, needs)| {
+            json!({
+                "contract":"modeling-domain/v2", "run_id":"notice-test",
+                "context_sha256":context_sha256, "kind":"floor_advance", "ok":true,
+                "fact_sequence":sequence, "needs":needs,
+            })
+        })
+        .collect();
+        let mut approval = crate::domain::tests::floor_story_height_proposal();
+        approval["run_id"] = json!("notice-test");
+        approval["context_sha256"] = json!(context_sha256);
+        approval["kind"] = json!("floor_advance");
+        approval["ok"] = json!(true);
+        approval["fact_sequence"] = json!(7);
+        let proposal = &approval["proposal"];
+        approval["needs"] = json!({"type":"approve_card",
+            "proposal_id":proposal["proposal_id"], "revision":proposal["revision"],
+            "prepare_token":proposal["prepare_token"], "base_sha256":proposal["base_sha256"],
+            "candidate_sha256":proposal["candidate_sha256"], "build_id":"notice-build", "card_ref":"notice-card"});
+        facts.push(approval);
+        facts.push(
+            json!({"contract":"modeling-domain/v2", "run_id":"notice-test",
+            "context_sha256":context_sha256, "kind":"floor_advance", "ok":true,
+            "fact_sequence":8, "needs":{"type":"ready"}}),
+        );
+        // A later queued read proves the stale read finished even though its projection changes nothing.
+        facts.push(
+            json!({"contract":"modeling-domain/v2", "run_id":"notice-test",
+            "context_sha256":context_sha256, "kind":"drawing_sheet", "ok":true,
+            "fact_sequence":3}),
+        );
+        for (sequence, kind, needs) in [
+            (
+                9,
+                "floor_advance",
+                json!({"type":"blocked", "diagnostic":{"rejection":{"code":"fact_too_large"}}, "rejection_category":"unclassified", "split_batch_allowed":false, "next_action":"report_without_guessing_or_splitting"}),
+            ),
+            (100, "drawing_sheet", json!(null)),
+            (10, "floor_advance", json!({"type":"ready"})),
+            (101, "drawing_sheet", json!(null)),
+            (
+                11,
+                "floor_advance",
+                json!({"type":"blocked", "diagnostic":{"rejection":{"code":"fact_too_large"}}, "rejection_category":"unclassified", "split_batch_allowed":false, "next_action":"report_without_guessing_or_splitting"}),
+            ),
+            (11, "floor_advance", json!({"type":"ready"})),
+            (102, "drawing_sheet", json!(null)),
+        ] {
+            facts.push(
+                json!({"contract":"modeling-domain/v2", "run_id":"notice-test",
+                "context_sha256":context_sha256, "kind":kind, "ok":true,
+                "fact_sequence":sequence, "needs":needs}),
+            );
+        }
+        let mut receipts = Vec::new();
+        for value in facts {
+            let fact = serde_json::to_vec(&value).unwrap();
+            let sha256 = format!("{:x}", sha2::Sha256::digest(&fact));
+            std::fs::write(
+                root.join(format!(
+                    "outputs/domain/notice-test/changes/facts/{sha256}.json"
+                )),
+                &fact,
+            )
+            .unwrap();
+            let binding: serde_json::Map<String, Value> = [
+                "proposal_id",
+                "revision",
+                "prepare_token",
+                "base_sha256",
+                "candidate_sha256",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                value["proposal"]
+                    .get(key)
+                    .map(|value| (key.into(), value.clone()))
+            })
+            .collect();
+            receipts.push(json!({
+                "contract":"modeling-fact-receipt/v1", "run_id":"notice-test",
+                "context_sha256":context_sha256, "kind":value["kind"], "ok":true,
+                "fact_sha256":sha256, "fact_bytes":fact.len(),
+                "fact_sequence":value["fact_sequence"], "binding":binding,
+            }));
+        }
+        // Preserve fixture files: this task forbids deleting directories, including on failure.
+        let fixture = std::mem::ManuallyDrop::new(JournalFixture {
+            root: root.join("journal"),
+        });
+        let (mut client, mut server, _, _) =
+            journal_harness_with_setup(&fixture, false, Some(setup)).await;
+        running_root(&mut client, &mut server).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            send_floor_receipt(&mut client, &mut server, receipts[0].clone(), "fact-1").await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.notice.as_deref()
+                        == Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+                        && snapshot.extensions[0]
+                            .modeling()
+                            .unwrap()
+                            .verified_fact
+                            .as_ref()
+                            .is_some_and(|fact| fact.sequence == 1)
+                })
+                .await
+                .unwrap();
+            send_floor_receipt(&mut client, &mut server, receipts[1].clone(), "fact-2").await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.notice.is_none()
+                        && snapshot.extensions[0]
+                            .modeling()
+                            .and_then(|domain| domain.verified_fact.as_ref())
+                            .is_some_and(|fact| fact.sequence == 2)
+                })
+                .await
+                .unwrap();
+
+            send_floor_receipt(&mut client, &mut server, receipts[2].clone(), "fact-3").await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.notice.as_deref()
+                        == Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+                        && snapshot.extensions[0]
+                            .modeling()
+                            .and_then(|domain| domain.verified_fact.as_ref())
+                            .is_some_and(|fact| fact.sequence == 3)
+                })
+                .await
+                .unwrap();
+            // Integrity failure must finish on the private read path without clearing the blocker.
+            let mut invalid = receipts[3].clone();
+            invalid["fact_bytes"] = json!(invalid["fact_bytes"].as_u64().unwrap() + 1);
+            send_floor_receipt(&mut client, &mut server, invalid, "invalid-read").await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .fact_sync_notice
+                        .as_deref()
+                        .is_some_and(|notice| {
+                            notice.contains("同步失败") && notice.contains("seq 4")
+                        })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.snapshots.borrow().notice.as_deref(),
+                Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+            );
+            // A sealed but semantically invalid fact must also preserve the blocker.
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[4].clone(),
+                "invalid-projection",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .rejected_facts
+                        .iter()
+                        .any(|fact| fact.sequence == 5)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.snapshots.borrow().notice.as_deref(),
+                Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+            );
+            send_floor_receipt(&mut client, &mut server, receipts[1].clone(), "stale-ready").await;
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[8].clone(),
+                "stale-read-barrier",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .verified_fact
+                        .as_ref()
+                        .is_some_and(|fact| {
+                            fact.sha256 == receipts[8]["fact_sha256"].as_str().unwrap()
+                        })
+                })
+                .await
+                .unwrap();
+            {
+                let snapshot = client.snapshots.borrow();
+                assert_eq!(
+                    snapshot.notice.as_deref(),
+                    Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+                );
+                assert!(
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .floor_advance_auto_continue_paused
+                );
+            }
+            client
+                .commands
+                .send(Command::ConfigureAttention {
+                    class: AttentionClass::Model,
+                    quiet_ms: 5000,
+                    attention_ms: 10000,
+                })
+                .await
+                .unwrap();
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot
+                        .notice
+                        .as_deref()
+                        .is_some_and(|notice| notice.contains("settings applied"))
+                })
+                .await
+                .unwrap();
+            let preserved_notice = client.snapshots.borrow().notice.clone();
+            send_floor_receipt(&mut client, &mut server, receipts[3].clone(), "fact-4").await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.notice == preserved_notice
+                        && snapshot.extensions[0]
+                            .modeling()
+                            .and_then(|domain| domain.verified_fact.as_ref())
+                            .is_some_and(|fact| fact.sequence == 4)
+                })
+                .await
+                .unwrap();
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[6].clone(),
+                "approval-wait",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .verified_fact
+                        .as_ref()
+                        .is_some_and(|fact| fact.sequence == 7)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.snapshots.borrow().notice.as_deref(),
+                Some("等待审批卡确认，已暂停自动续接")
+            );
+            let pending_approval = client.snapshots.borrow().extensions[0]
+                .modeling()
+                .unwrap()
+                .approval_card_request
+                .clone();
+            assert!(pending_approval.is_some());
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[7].clone(),
+                "ready-with-approval-pending",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .verified_fact
+                        .as_ref()
+                        .is_some_and(|fact| fact.sequence == 8)
+                })
+                .await
+                .unwrap();
+            {
+                let snapshot = client.snapshots.borrow();
+                assert_eq!(
+                    snapshot.notice.as_deref(),
+                    Some("等待审批卡确认，已暂停自动续接")
+                );
+                let domain = snapshot.extensions[0].modeling().unwrap();
+                assert!(domain.approval_card_request == pending_approval);
+                assert!(domain.operation.is_none());
+                assert!(domain.application.is_none());
+                assert!(!domain.authorizing);
+            }
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[9].clone(),
+                "blocked-before-unrelated",
+            )
+            .await;
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[10].clone(),
+                "newer-unrelated-kind",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .verified_fact
+                        .as_ref()
+                        .is_some_and(|fact| fact.sequence == 100)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.snapshots.borrow().notice.as_deref(),
+                Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+            );
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[11].clone(),
+                "resolved-after-unrelated",
+            )
+            .await;
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[12].clone(),
+                "resolved-read-barrier",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .verified_fact
+                        .as_ref()
+                        .is_some_and(|fact| fact.sequence == 101)
+                })
+                .await
+                .unwrap();
+            assert!(client.snapshots.borrow().notice.is_none());
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[13].clone(),
+                "blocked-before-same-sequence",
+            )
+            .await;
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[14].clone(),
+                "same-sequence-ready",
+            )
+            .await;
+            send_floor_receipt(
+                &mut client,
+                &mut server,
+                receipts[15].clone(),
+                "same-sequence-barrier",
+            )
+            .await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0]
+                        .modeling()
+                        .unwrap()
+                        .verified_fact
+                        .as_ref()
+                        .is_some_and(|fact| fact.sequence == 102)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client.snapshots.borrow().notice.as_deref(),
+                Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+            );
+        })
+        .await;
+        if outcome.is_err() {
+            let snapshot = client.snapshots.borrow();
+            let domain = snapshot.extensions[0].modeling().unwrap();
+            panic!("notice regression timed out: notice={:?}, sync={:?}, verified={:?}, paused={}, needs={:?}, rejected={:?}", snapshot.notice, domain.fact_sync_notice, domain.verified_fact, domain.floor_advance_auto_continue_paused, domain.floor_advance_needs, domain.rejected_facts.iter().map(|fact| (&fact.kind, fact.sequence, &fact.reason)).collect::<Vec<_>>());
+        }
+        client.commands.send(Command::Quit).await.unwrap();
+        client.join.await.unwrap();
+    }
     use crate::journal::{tests::Fixture as JournalFixture, JournalView, Payload, Replay};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -6011,9 +6507,23 @@ mod tests {
         Config,
         String,
     ) {
+        journal_harness_with_setup(fixture, strict_outcome, None).await
+    }
+
+    async fn journal_harness_with_setup(
+        fixture: &JournalFixture,
+        strict_outcome: bool,
+        domain_setup: Option<crate::domain::DomainSetup>,
+    ) -> (
+        ClientHandle,
+        BufReader<tokio::io::DuplexStream>,
+        Config,
+        String,
+    ) {
         let config = Config {
             journal: fixture.settings(),
             strict_outcome,
+            domain_setup,
             ..Default::default()
         };
         let observer = Observer::new(config.attention.clone());
@@ -7238,6 +7748,34 @@ mod tests {
             .wait_for(|snapshot| snapshot.observation.raw_message_count > raw)
             .await
             .unwrap();
+    }
+
+    async fn send_floor_receipt(
+        client: &mut ClientHandle,
+        server: &mut BufReader<tokio::io::DuplexStream>,
+        receipt: Value,
+        id: &str,
+    ) {
+        observation_event(
+            client,
+            server,
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": id,
+                        "type": "mcpToolCall",
+                        "status": "completed",
+                        "server": "modeling_domain",
+                        "tool": "advance_floor",
+                        "result": {"structuredContent": receipt}
+                    }
+                }
+            }),
+        )
+        .await;
     }
 
     #[tokio::test]
