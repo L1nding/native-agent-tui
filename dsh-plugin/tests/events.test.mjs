@@ -536,6 +536,9 @@ test('host ACP tags delayed outputs and publishes turn settlement only after the
     kind: 'error', error: { code: 'PRIVATE_UNKNOWN_CODE', message: 'PRIVATE_PROVIDER_SECRET' },
   } } })
   record.onSessionEvent(session, { seq: 8, type: 'turn/end', data: { turn: 8, reason: { kind: 'blocked' } } })
+  record.onSessionEvent(session, { seq: 9, type: 'turn/end', data: { turn: 9, reason: {
+    kind: 'error', error: { code: 'QUOTA', status: 402, message: 'PRIVATE_INSUFFICIENT_BALANCE' },
+  } } })
   await Promise.resolve()
   assert.equal(order.length, 0, 'raw turn/end is not an output-drained completion')
   release()
@@ -543,6 +546,7 @@ test('host ACP tags delayed outputs and publishes turn settlement only after the
   assert.deepEqual(order.map(item => [item.method, item.value._meta?.zfHostTurn ?? item.value.turn]), [
     ['update', 4], ['zf-tui/acp-turn-settled', 4], ['update', 5], ['zf-tui/acp-turn-settled', 5],
     ['zf-tui/acp-turn-settled', 6], ['zf-tui/acp-turn-settled', 7], ['zf-tui/acp-turn-settled', 8],
+    ['zf-tui/acp-turn-settled', 9],
   ])
   assert.deepEqual(order.filter(item => item.method === 'zf-tui/acp-turn-settled').map(item => item.value), [
     { sessionId: 'parent', turn: 4, state: 'completed' },
@@ -550,6 +554,7 @@ test('host ACP tags delayed outputs and publishes turn settlement only after the
     { sessionId: 'parent', turn: 6, state: 'failed', failureCategory: 'output_delivery' },
     { sessionId: 'parent', turn: 7, state: 'failed', failureCategory: 'provider' },
     { sessionId: 'parent', turn: 8, state: 'failed', failureCategory: 'unknown' },
+    { sessionId: 'parent', turn: 9, state: 'failed', failureCategory: 'provider', failureCode: 'QUOTA_EXCEEDED' },
   ])
   assert.ok(!JSON.stringify(order).includes('PRIVATE_'))
 })

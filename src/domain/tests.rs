@@ -1,5 +1,582 @@
 use super::*;
 
+#[tokio::test]
+#[ignore = "read-only current glazing receiver replay; set NATIVE_GLAZING_REAL_ROOT"]
+async fn glazing_real_receipts_reach_core_pending_card_without_history_scan() {
+    let root = PathBuf::from(
+        std::env::var_os("NATIVE_GLAZING_REAL_ROOT").expect("frozen modeler repository"),
+    );
+    let context_path = root.join("outputs/domain/project-29052-1792673801123156600/context.json");
+    let config = configure(Config {
+        cwd: root.clone(),
+        domain_context: Some(context_path),
+        ..Config::default()
+    })
+    .unwrap();
+    let directory = root.join("outputs/domain/project-29052-1792673801123156600/project/facts");
+    let hashes = [
+        "d75b5fff652a885e9fa1557e4e99a899144fcbf54e33a054b7bedfa60e043ba2",
+        "65342a3993a76a8e0d07b92b40b2f84862204ea992c37e60b67a085c347c392f",
+        "f992449b7ec36907932fc684a1b1b255b632f6d49ff284f5c5e4ffe573b88d03",
+        "9b38a0956cb7a18c7dc63d451025c36150286f7c5869cbaf392d678740514038",
+        "74ff4516f0797096e72ec732241f57765f88d5da394fe5de79fcd8cb0a779601",
+        "1aa9d6cc504739fd17c96b47f35b9c110ba93f94cad8fad07d169f02fb38efbd",
+    ];
+    let initial: Value = serde_json::from_slice(
+        &std::fs::read(directory.join(format!("{}.json", hashes[0]))).unwrap(),
+    )
+    .unwrap();
+    let scope = project::scope_fact(&initial).unwrap();
+    // Only the already accepted selection/scope is seeded. The real receipts
+    // must create the proposal, rendered review, images and pending card.
+    let mut facts = DomainFacts::new(None);
+    facts.setup = config.domain_setup;
+    facts.snapshot.enabled = true;
+    facts.snapshot.selection = Some(ProjectSelectionFact {
+        selection_id: scope.selection_id.clone(),
+        catalog_id: "controlled-existing-catalog".into(),
+        target: scope.floor_key.clone(),
+        state: SelectionState::Selected,
+        selected_keys: vec![scope.floor_key.clone()],
+        candidate_keys: vec![scope.floor_key.clone()],
+        source_sha256: scope.source_sha256.clone(),
+        rows: Vec::new(),
+    });
+    facts.snapshot.floor_id = scope.floor_id.clone();
+    facts.snapshot.project_scope = Some(scope);
+    for hash in hashes {
+        let raw = std::fs::read(directory.join(format!("{hash}.json"))).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&raw)), hash);
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        let owner = [
+            "proposal",
+            "receipt",
+            "artifact",
+            "grant",
+            "component_first_use_review",
+        ]
+        .into_iter()
+        .find_map(|key| value[key].as_object());
+        let receipt = receipt::FactReceipt {
+            contract: "modeling-fact-receipt/v1".into(),
+            run_id: value["run_id"].as_str().unwrap().into(),
+            context_sha256: value["context_sha256"].as_str().unwrap().into(),
+            kind: value["kind"].as_str().unwrap().into(),
+            ok: value["ok"].as_bool().unwrap(),
+            fact_sha256: hash.into(),
+            fact_bytes: raw.len(),
+            fact_sequence: value["fact_sequence"].as_u64().unwrap(),
+            binding: Value::Object(
+                [
+                    "proposal_id",
+                    "revision",
+                    "prepare_token",
+                    "base_sha256",
+                    "candidate_sha256",
+                    "operation_id",
+                    "build_id",
+                    "authority_sha256",
+                    "authorization_id",
+                ]
+                .into_iter()
+                .filter_map(|key| {
+                    owner
+                        .and_then(|map| map.get(key))
+                        .map(|v| (key.into(), v.clone()))
+                })
+                .collect(),
+            ),
+        };
+        let verified = receipt::verify(facts.setup.as_ref().unwrap(), &receipt, &raw).unwrap();
+        assert_eq!(
+            facts.apply_verified_fact(&verified),
+            FactProjection::Applied,
+            "real seq {} failed: {:?}",
+            receipt.fact_sequence,
+            facts.projection_failure
+        );
+        facts.synchronization_finished(&receipt);
+        if receipt.fact_sequence == 3834 {
+            for mutation in [
+                "height",
+                "role",
+                "source",
+                "field",
+                "extra_target",
+                "order",
+                "required",
+            ] {
+                let mut bad = verified.clone();
+                match mutation {
+                    "height" => {
+                        bad["component_first_use_review"]["manifest"]["items"][0]["dimensions"]
+                            ["parts"][0]["height"] = json!(99)
+                    }
+                    "role" => {
+                        bad["component_first_use_review"]["manifest"]["items"][0]["dimensions"]
+                            ["parts"][0]["role"] = json!("column")
+                    }
+                    "source" => {
+                        bad["proposal"]["draft"]["operations"][0]["source_ids"] =
+                            json!(["dxf.foreign"])
+                    }
+                    "field" => bad["proposal"]["draft"]["operations"][0]["field"] = json!("height"),
+                    "extra_target" => {
+                        bad["proposal"]["draft"]["operations"][0]["target_id"] =
+                            json!("glazing.cad.dc872879c55f3a8c.jamb.1.3922a8242d349930")
+                    }
+                    "order" => bad["proposal"]["draft"]["operations"]
+                        .as_array_mut()
+                        .unwrap()
+                        .reverse(),
+                    "required" => {
+                        bad["proposal"]["component_first_use_requirements"]["required"][0]
+                            ["entity_ids"] = json!([])
+                    }
+                    _ => unreachable!(),
+                }
+                let bad_raw = serde_json::to_vec(&bad).unwrap();
+                let mut bad_receipt = receipt.clone();
+                bad_receipt.fact_bytes = bad_raw.len();
+                bad_receipt.fact_sha256 = format!("{:x}", Sha256::digest(&bad_raw));
+                let checked =
+                    receipt::verify(facts.setup.as_ref().unwrap(), &bad_receipt, &bad_raw)
+                        .expect("hypothetical receipt remains byte/hash/certificate valid");
+                let mut rejected = DomainFacts::new(None);
+                rejected.setup = facts.setup.clone();
+                rejected.snapshot = facts.snapshot.clone();
+                assert_eq!(
+                    rejected.apply_verified_fact(&checked),
+                    FactProjection::Invalid,
+                    "receiver must reject {mutation}"
+                );
+                assert!(rejected
+                    .snapshot
+                    .rejected_facts
+                    .iter()
+                    .any(|fact| fact.blocking));
+                let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+                assert!(!rejected.can_authorize(&binding), "{mutation}");
+            }
+        }
+    }
+    for image in &mut facts.snapshot.review_images {
+        review::verify_image(&image.binding)
+            .await
+            .expect("real image and web package");
+        image.file_state = ImageFileState::Available;
+    }
+    facts.synchronization_queue_drained();
+    let binding = facts.snapshot.proposal.as_ref().unwrap().binding.clone();
+    assert_eq!(binding.proposal_id, "dd3fb87bd2b741bd848a7f65a61d9ef2");
+    assert_eq!(binding.revision, 1);
+    assert!(facts.shows_binding(&binding));
+    assert_eq!(facts.snapshot.confirmation().proposal, binding);
+    assert!(facts.snapshot.first_use_satisfied());
+    assert!(facts.snapshot.candidate_review_delivered(&binding));
+    assert!(facts.deferred_sequences.is_empty());
+    assert!(!facts
+        .snapshot
+        .rejected_facts
+        .iter()
+        .any(|fact| fact.blocking));
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+    assert!(facts.can_authorize(&binding));
+}
+
+#[test]
+fn glazing_first_use_merges_set_fields_and_keeps_first_target_order() {
+    let (mut value, root) = glazing_projection_fixture();
+    let first = value["proposal"]["draft"]["operations"][0].clone();
+    let first_id = first["target_id"].clone();
+    let second_id = value["structure_revision"]["components"][0]["element_ids"][0].clone();
+    let mut second = first.clone();
+    second["target_id"] = second_id.clone();
+    let mut holes = first.clone();
+    holes["field"] = json!("holes");
+    holes["value_json"] = json!("[]");
+    value["proposal"]["draft"]["operations"] = json!([first, second, holes]);
+    value["structure_revision"]["components"][0]["changed_element_ids"] =
+        json!([first_id, second_id]);
+    reseal_glazing_projection_fixture(&mut value);
+    let parts = project::local_glazing_review_parts(&value["proposal"], &root).unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].1["id"], first_id);
+    assert_eq!(parts[1].1["id"], second_id);
+    assert_eq!(parts[0].1["role"], "window_frame");
+    assert_eq!(parts[1].1["role"], "window_glass");
+    assert!(parts[0].1["boundary"].is_array());
+    assert_eq!(parts[0].1["holes"], json!([]));
+    for field in ["role", "height", "base_z", "metadata"] {
+        let mut bad = value.clone();
+        bad["proposal"]["draft"]["operations"][0]["field"] = json!(field);
+        assert!(
+            project::local_glazing_review_parts(&bad["proposal"], &root).is_none(),
+            "{field}"
+        );
+    }
+    let mut mixed = value.clone();
+    mixed["proposal"]["draft"]["operations"][0]["op"] = json!("add");
+    assert!(project::local_glazing_review_parts(&mixed["proposal"], &root).is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn glazing_projection_fixture() -> (Value, PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "glazing-projection-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let config_path = root.join("config.json");
+    let context_path = root.join("context.json");
+    let source_path = root.join("drawing.dxf");
+    let scene_path = root.join("authority.json");
+    let baseline_path = root.join("approved-base.scene.json");
+    let certificate_path = root.join("certificate.json");
+    let scope = json!({"floor_id":"floor","structural_additions":true,"region":[0,0,10,10]});
+    let config = json!({"source":source_path,"root_insert_handle":"ROOT","origin_dxf":[0,0],"crop_dxf":[0,0,10000,10000]});
+    let context = json!({"scope":scope,"scene_path":scene_path,
+        "sources":[{"floor_id":"floor","path":source_path,"root_insert_handle":"ROOT","origin_dxf":[0,0],"crop_dxf":[0,0,10000,10000]}]});
+    let config_raw = serde_json::to_vec(&config).unwrap();
+    let context_raw = serde_json::to_vec(&context).unwrap();
+    std::fs::write(&config_path, &config_raw).unwrap();
+    std::fs::write(&context_path, &context_raw).unwrap();
+    std::fs::write(&scene_path, b"authority path; scene is not loaded by Core").unwrap();
+    std::fs::write(&source_path, b"frozen source; never interpreted by Core").unwrap();
+    let source_sha = format!("{:x}", Sha256::digest(std::fs::read(&source_path).unwrap()));
+    let cid = "glazing.cad.1111111111111111";
+    let derived = "glazing.cad.2222222222222222";
+    let ids = [
+        format!("{cid}.glass.aaaaaaaaaaaaaaaa"),
+        format!("{cid}.sill.bbbbbbbbbbbbbbbb"),
+        format!("{cid}.head.cccccccccccccccc"),
+        format!("{cid}.jamb.0.dddddddddddddddd"),
+        format!("{cid}.jamb.1.eeeeeeeeeeeeeeee"),
+    ];
+    let derived_ids: Vec<_> = ids.iter().map(|id| id.replace(cid, derived)).collect();
+    let audit = json!({"contract":"cad-glazing-local-revision/1","pending":[],
+        "glazing_component_ids":[cid],"source_sha256":source_sha,"config_sha256":"d".repeat(64),
+        "protected_scene_sha256":"e".repeat(64),
+        "slab":{"status":"preserved_verbatim","preserved_sha256":"f".repeat(64),"verification_questions":[]},
+        "components":[{"component_id":cid,"derived_component_id":derived,"source_ids":["dxf.ROOT.rail"],
+            "trial_dimensions":[0.9,2.1,"user-authorized trial"],"element_ids":ids,
+            "derived_element_ids":derived_ids,"changed_element_ids":[ids[3]]}]});
+    let dependencies = json!({
+        config_path.to_str().unwrap():format!("{:x}",Sha256::digest(&config_raw)),
+        context_path.to_str().unwrap():format!("{:x}",Sha256::digest(&context_raw)),
+        source_path.to_str().unwrap():source_sha,
+        baseline_path.to_str().unwrap():"a".repeat(64)
+    });
+    let proof = json!({"contract":"cad-structure-revision/1","project_root":root,
+        "config_path":config_path,"context_path":context_path,"scene_path":scene_path,
+        "base_scene_path":baseline_path,"base_sha256":"a".repeat(64),"reason":"Resolve sourced end-frame overlap",
+        "dependencies":dependencies,"glazing_component_ids":[cid],"audit":audit,
+        "void_decisions":[],"layer_decisions":[],"opening_dimension_decision":null});
+    let proof_raw = serde_json::to_vec(&proof).unwrap();
+    std::fs::write(&certificate_path, &proof_raw).unwrap();
+    let proof_sha = format!("{:x}", Sha256::digest(&proof_raw));
+    let mut dependencies = dependencies;
+    dependencies[certificate_path.to_str().unwrap()] = json!(proof_sha);
+    let value = json!({"project_structure":true,"verification_questions":[],
+        "project_scope":{"floor_id":"floor","source_sha256":source_sha},
+        "structure_revision":audit,
+        "proposal":{"base_sha256":"a".repeat(64),"candidate_sha256":"b".repeat(64),
+            "scene_path":scene_path,"scope":scope,"source_dependencies":dependencies,
+            "structure_revision_source":{"contract":"cad-structure-revision/1","path":certificate_path,"sha256":proof_sha},
+            "draft":{"pending":[],"operations":[{"op":"set","collection":"elements","target_id":ids[3],"field":"boundary",
+                "floor_id":"floor","basis":"assumed","source_ids":["dxf.ROOT.rail"],
+                "reason":"Resolve sourced end-frame overlap",
+                "value_json":json!([{"x":1,"y":1},{"x":1.04,"y":1},{"x":1.04,"y":1.04},{"x":1,"y":1.04}]).to_string()}]} }
+    });
+    (value, root)
+}
+
+fn reseal_glazing_projection_fixture(value: &mut Value) {
+    let path = value["proposal"]["structure_revision_source"]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut proof: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    proof["audit"] = value["structure_revision"].clone();
+    let raw = serde_json::to_vec(&proof).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&raw));
+    value["proposal"]["structure_revision_source"]["sha256"] = json!(digest);
+    value["proposal"]["source_dependencies"][&path] = json!(digest);
+}
+
+#[test]
+fn glazing_local_revision_projects_sourced_original_parts_without_wall_reconstruction() {
+    let (mut value, root) = glazing_projection_fixture();
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.repository = root.clone();
+    assert_ne!(
+        std::env::current_dir().unwrap().canonicalize().unwrap(),
+        root
+    );
+    for (key, entry) in envelope().as_object().unwrap() {
+        value
+            .as_object_mut()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| entry.clone());
+    }
+    for (key, entry) in envelope()["proposal"].as_object().unwrap() {
+        value["proposal"]
+            .as_object_mut()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| entry.clone());
+    }
+    value["ok"] = json!(true);
+    value["fact_sequence"] = json!(1);
+    let make_receipt = |fact: &Value| {
+        let mut receipt = private_receipt(fact);
+        receipt.binding = receipt
+            .binding
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter_map(|key| {
+                fact["proposal"]
+                    .get(key)
+                    .map(|binding| (key.clone(), binding.clone()))
+            })
+            .collect();
+        receipt
+    };
+    let mut foreign_setup = setup.clone();
+    foreign_setup.repository = root.join("other-repository");
+    std::fs::create_dir(&foreign_setup.repository).unwrap();
+    for relative in [false, true] {
+        if relative {
+            let certificate = &value["proposal"]["structure_revision_source"];
+            let path = certificate["path"].as_str().unwrap().to_owned();
+            let digest = certificate["sha256"].clone();
+            value["proposal"]["source_dependencies"]
+                .as_object_mut()
+                .unwrap()
+                .remove(&path);
+            value["proposal"]["source_dependencies"]["certificate.json"] = digest;
+            value["proposal"]["structure_revision_source"]["path"] = json!("certificate.json");
+        }
+        let parts = project::local_glazing_review_parts(&value["proposal"], &root).unwrap();
+        let (template, _) = structure_revision_fixture();
+        let mut requirements = template["proposal"]["component_first_use_requirements"].clone();
+        let item = &mut requirements["required"][0];
+        let ids: Vec<_> = parts.iter().map(|(_, part)| part["id"].clone()).collect();
+        item["component_ids"] = json!(ids);
+        item["entity_ids"] = json!(ids);
+        let geometries: Vec<_> = parts.iter().map(|(_, part)| part.clone()).collect();
+        item["definition_sha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&geometries).unwrap())
+        ));
+        item["arguments_sha256"] = json!(format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({
+            "certificate":value["proposal"]["structure_revision_source"],"base":value["proposal"]["base_sha256"]
+        })).unwrap())));
+        let mut key = item["source_bindings"][0].clone();
+        key["definition"] = item["definition_sha256"].clone();
+        key["arguments"] = item["arguments_sha256"].clone();
+        item["review_key"] = json!(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&key).unwrap())
+        ));
+        value["proposal"]["component_first_use_requirements"] = requirements;
+        let receipt = make_receipt(&value);
+        let raw = serde_json::to_vec(&value).unwrap();
+        let verified =
+            receipt::verify(&setup, &receipt, &raw).expect("sealed certificate at repository root");
+        let rows = project::structure_revision_rows(&verified, &setup.repository)
+            .expect("sealed local glazing revision");
+        assert!(rows.iter().any(|row| row.contains("jamb.0")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("0.9") && row.contains("2.1")));
+        assert!(rows.iter().any(|row| row.contains("dxf.ROOT.rail")));
+        assert!(!rows.iter().any(|row| row.contains("宿主映射")));
+        assert!(proposal_fact_in_repository(&verified, &root).unwrap().ready);
+        assert_eq!(
+            review::requirements(&verified["proposal"], &root)
+                .unwrap()
+                .required_count,
+            1
+        );
+        assert_eq!(
+            project::local_glazing_review_parts(&verified["proposal"], &root)
+                .unwrap()
+                .len(),
+            1
+        );
+        let path = value["proposal"]["structure_revision_source"]["path"]
+            .as_str()
+            .unwrap();
+        for certificate_hash in [false, true] {
+            let mut invalid = value.clone();
+            if certificate_hash {
+                invalid["proposal"]["structure_revision_source"]["sha256"] = json!("9".repeat(64));
+            } else {
+                invalid["proposal"]["source_dependencies"][path] = json!("9".repeat(64));
+            }
+            let raw = serde_json::to_vec(&invalid).unwrap();
+            assert!(receipt::verify(&setup, &make_receipt(&invalid), &raw).is_err());
+            assert!(project::structure_revision_rows(&invalid, &root).is_none());
+            assert!(project::local_glazing_review_parts(&invalid["proposal"], &root).is_none());
+        }
+        let mut wrong_owner = receipt.clone();
+        wrong_owner.binding["proposal_id"] = json!("foreign");
+        assert!(receipt::verify(&setup, &wrong_owner, &raw).is_err());
+        assert!(receipt::verify(&foreign_setup, &receipt, &raw).is_err());
+        assert!(project::structure_revision_rows(&value, &foreign_setup.repository).is_none());
+        assert!(
+            project::local_glazing_review_parts(&value["proposal"], &foreign_setup.repository)
+                .is_none()
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn glazing_local_revision_rejects_unselected_edits_and_incomplete_sealed_mappings() {
+    let (value, root) = glazing_projection_fixture();
+    for (pointer, replacement) in [
+        ("/proposal/draft/pending", json!(false)),
+        ("/proposal/draft/pending", json!({})),
+        ("/proposal/draft/pending", json!("unresolved")),
+        ("/proposal/draft/operations/0/collection", json!("slabs")),
+        ("/proposal/draft/operations/0/op", json!("add")),
+        ("/proposal/draft/operations/0/field", json!("height")),
+        (
+            "/proposal/draft/operations/0/source_ids",
+            json!(["dxf.other"]),
+        ),
+        (
+            "/proposal/draft/operations/0/target_id",
+            json!("glazing.cad.3333333333333333.jamb.0.dddddddddddddddd"),
+        ),
+        ("/proposal/draft/operations/0/floor_id", json!("foreign")),
+        (
+            "/structure_revision/components/0/changed_element_ids",
+            json!([]),
+        ),
+        (
+            "/structure_revision/components/0/derived_element_ids",
+            json!([]),
+        ),
+        (
+            "/structure_revision/components/0/trial_dimensions",
+            json!([0.9, 0, "trial"]),
+        ),
+        ("/structure_revision/components/0/source_ids", json!([])),
+        (
+            "/structure_revision/protected_scene_sha256",
+            json!("invalid"),
+        ),
+        ("/structure_revision/source_sha256", json!("9".repeat(64))),
+        ("/structure_revision/slab/status", json!("rederived")),
+    ] {
+        let mut bad = value.clone();
+        *bad.pointer_mut(pointer).unwrap() = replacement;
+        reseal_glazing_projection_fixture(&mut bad);
+        assert!(
+            project::structure_revision_rows(&bad, &root).is_none(),
+            "{pointer}"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn glazing_local_revision_keeps_certificate_scope_and_operation_coverage_binding() {
+    let (mut value, root) = glazing_projection_fixture();
+    let mut proof: Value = serde_json::from_slice(
+        &std::fs::read(
+            value["proposal"]["structure_revision_source"]["path"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    proof["glazing_component_ids"] = json!(["glazing.cad.9999999999999999"]);
+    let path = value["proposal"]["structure_revision_source"]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let raw = serde_json::to_vec(&proof).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&raw));
+    value["proposal"]["structure_revision_source"]["sha256"] = json!(digest);
+    value["proposal"]["source_dependencies"][&path] = json!(digest);
+    assert!(project::structure_revision_rows(&value, &root).is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "set NATIVE_GLAZING_REAL_FACT to the frozen proposal fact for read-only replay"]
+fn glazing_local_revision_replays_real_sealed_proof_without_weakening_receipt_validation() {
+    let path = std::env::var_os("NATIVE_GLAZING_REAL_FACT").expect("frozen fact path");
+    let raw = std::fs::read(path).unwrap();
+    let mut value: Value = serde_json::from_slice(&raw).unwrap();
+    let certificate = &value["proposal"]["structure_revision_source"];
+    let proof_raw = std::fs::read(certificate["path"].as_str().unwrap()).unwrap();
+    assert!(proof_raw.len() < receipt::FACT_LIMIT);
+    let proof: Value = serde_json::from_slice(&proof_raw).unwrap();
+    let mut setup = sequenced_facts().setup.unwrap();
+    setup.mode = DomainMode::Project;
+    setup.repository = PathBuf::from(proof["project_root"].as_str().unwrap());
+    setup.run_id = value["run_id"].as_str().unwrap().to_owned();
+    setup.context_sha256 = value["context_sha256"].as_str().unwrap().to_owned();
+    setup.context_path = setup
+        .repository
+        .join("outputs/domain")
+        .join(&setup.run_id)
+        .join("context.json");
+    let make_receipt = |value: &Value, raw: &[u8]| receipt::FactReceipt {
+        contract: "modeling-fact-receipt/v1".into(),
+        run_id: setup.run_id.clone(),
+        context_sha256: setup.context_sha256.clone(),
+        kind: "proposal".into(),
+        ok: true,
+        fact_sequence: value["fact_sequence"].as_u64().unwrap(),
+        fact_bytes: raw.len(),
+        fact_sha256: format!("{:x}", Sha256::digest(raw)),
+        binding: Value::Object(
+            [
+                "proposal_id",
+                "revision",
+                "prepare_token",
+                "base_sha256",
+                "candidate_sha256",
+            ]
+            .into_iter()
+            .map(|key| (key.to_owned(), value["proposal"][key].clone()))
+            .collect(),
+        ),
+    };
+    assert!(receipt::verify(&setup, &make_receipt(&value, &raw), &raw).is_err());
+    value["structure_revision"] = proof["audit"].clone();
+    let corrected = serde_json::to_vec(&value).unwrap();
+    let verified = receipt::verify(&setup, &make_receipt(&value, &corrected), &corrected).unwrap();
+    let rows = project::structure_revision_rows(&verified, &setup.repository)
+        .expect("real local glazing projection");
+    assert!(rows
+        .iter()
+        .any(|row| row.contains("991ed81e96de0929.jamb.0")));
+    assert_eq!(
+        verified["proposal"]["draft"]["operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+}
+
 #[test]
 fn platform_floor_stop_without_scope_preserves_diagnostic_and_sequence() {
     let mut facts = sequenced_facts();
@@ -2080,6 +2657,278 @@ fn schematic_shaft_massing_and_cad_side_panels_require_bound_sources() {
     }
 }
 
+fn initial_escalator_proposal() -> Value {
+    let mut value = envelope();
+    value["proposal"]["scope"] = json!({"floor_id":"floor.lower"});
+    let connection = json!({
+        "component_id":"escalator.1", "source_instance_id":"source.escalator",
+        "kind":"stair", "circulation_type":"escalator", "cad_completion":true,
+        "mode":"single_floor_schematic", "served_floors":["floor.lower"],
+        "openings":[], "dimension_basis":"assumed", "rise_m":4.0,
+        "flights":[{"axis":"y","ascending":false,"bottom_m":0.0,"top_m":4.0}],
+        "source_ids":[], "limitations":"CAD envelope; thickness and level ends assumed"
+    });
+    value["proposal"]["component_plan"] = json!({"connections":[connection]});
+    value["proposal"]["vertical_sources"]["source.escalator"] = json!({
+        "source_id":"source.escalator", "component_id":"escalator.1",
+        "floor_id":"floor.lower", "source_sha256":"a".repeat(64),
+        "geometry_sha256":"b".repeat(64), "cad_source_ids":["dxf.rail"],
+        "origin_m":[0.0,0.0]
+    });
+    let owner = "escalator.1.flight.01.step.001";
+    let operations: Vec<Value> = (1..=3)
+        .map(|segment| {
+            let id = format!("escalator.1.flight.01.step.{segment:03}");
+            let y0 = [0.0, 0.5, 9.5][segment - 1];
+            let y1 = [0.5, 9.5, 10.0][segment - 1];
+            let z0 = [4.0, 4.0, 0.0][segment - 1];
+            let z1 = [4.0, 0.0, 0.0][segment - 1];
+            let mut metadata = json!({
+                "component_id":"escalator.1", "source_instance_id":"source.escalator",
+                "source_sha256":"a".repeat(64), "source_geometry_sha256":"b".repeat(64),
+                "relation_validator":"vertical-schematic/1", "circulation_type":"escalator",
+                "modeling_mode":"single_floor_schematic", "connection_status":"unverified",
+                "step_dimension_basis":"assumed", "geometry_status":"schematic",
+                "vertical_spec_owner":owner,
+                "escalator_part":if segment == 2 {"incline"} else {"level_end"},
+                "solid_representation":"schematic escalator truss with level ends and continuous incline",
+                "limitations":connection["limitations"], "level_end_depth_m":"0.5",
+                "endpoint_top_z_m":json!([z0,z1]).to_string(),
+                "not_checked":"cross-floor connection, openings, headroom and compliance"
+            });
+            if segment == 1 {
+                metadata["vertical_spec"] = json!(connection.to_string());
+            } else {
+                metadata["reason_ref"] = json!(owner);
+            }
+            let element = json!({
+                "id":id, "role":"partition", "base_z":-0.12,
+                "height":if segment == 3 {0.12} else {4.12},
+                "boundary":[{"x":0.0,"y":y0},{"x":1.0,"y":y0},
+                    {"x":1.0,"y":y1},{"x":0.0,"y":y1}], "holes":[],
+                "source_ids":["source.escalator","dxf.rail"], "metadata":metadata,
+                "stair_top":{"start":{"x":0.5,"y":y0},"end":{"x":0.5,"y":y1},
+                    "start_z":z0,"end_z":z1},
+                "stair_soffit":{"start":{"x":0.5,"y":y0},"end":{"x":0.5,"y":y1},
+                    "start_z":z0-0.12,"end_z":z1-0.12}
+            });
+            json!({"op":"add","collection":"elements","floor_id":"floor.lower",
+                "target_id":id,"basis":"assumed","source_ids":element["source_ids"],
+                "value_json":element.to_string()})
+        })
+        .collect();
+    value["proposal"]["draft"]["operations"] = json!(operations);
+    value
+}
+
+#[test]
+fn initial_escalator_projects_complete_source_bound_three_part_flight() {
+    let value = initial_escalator_proposal();
+    let projected = proposal_fact(&value).expect("initial CAD escalator is a supported proposal");
+    assert!(projected.ready);
+    assert!(projected
+        .objects
+        .iter()
+        .any(|row| row.contains("单层示意扶梯")));
+    let mut facts = sequenced_facts();
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Applied);
+    assert!(!facts.can_authorize(&projected.binding));
+}
+
+#[tokio::test]
+#[ignore = "read-only frozen receiver replay; set DOMAIN_REAL_FACT and DOMAIN_REAL_CWD"]
+async fn initial_escalator_frozen_receipts_reach_the_exact_pending_card() {
+    let path = std::env::var_os("DOMAIN_REAL_FACT").expect("frozen proposal fact");
+    let raw = std::fs::read(path).unwrap();
+    let value: Value = serde_json::from_slice(&raw).unwrap();
+    let fact = proposal_fact(&value).expect("frozen initial escalator proposal projects");
+    assert_eq!(fact.binding.proposal_id, value["proposal"]["proposal_id"]);
+    assert_eq!(
+        fact.binding.candidate_sha256,
+        value["proposal"]["candidate_sha256"]
+    );
+    assert!(fact.ready);
+    assert_eq!(
+        value["proposal"]["draft"]["operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(fact.objects.iter().any(|row| row.contains("单层示意扶梯")));
+    let root = normalized_path(Path::new(&std::env::var("DOMAIN_REAL_CWD").unwrap())).unwrap();
+    let run_id = value["run_id"].as_str().unwrap();
+    let context_path = root.join(format!("outputs/domain/{run_id}/context.json"));
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&context_path).unwrap())
+        ),
+        value["context_sha256"].as_str().unwrap()
+    );
+    let scope = project::scope_fact(&value).unwrap();
+    // Seed only the already accepted selection/scope, without loading old proposals.
+    let mut facts = DomainFacts::new(None);
+    facts.setup = Some(DomainSetup {
+        mode: DomainMode::Project,
+        context_path,
+        repository: root.clone(),
+        python: "unused-read-only-receiver".into(),
+        run_id: run_id.into(),
+        context_sha256: value["context_sha256"].as_str().unwrap().into(),
+        floor_id: scope.floor_id.clone(),
+    });
+    facts.snapshot.enabled = true;
+    facts.snapshot.selection = Some(ProjectSelectionFact {
+        selection_id: scope.selection_id.clone(),
+        catalog_id: "controlled-existing-catalog".into(),
+        target: scope.floor_key.clone(),
+        state: SelectionState::Selected,
+        selected_keys: vec![scope.floor_key.clone()],
+        candidate_keys: vec![scope.floor_key.clone()],
+        source_sha256: scope.source_sha256.clone(),
+        rows: Vec::new(),
+    });
+    facts.snapshot.project_scope = Some(scope);
+    let directory = root.join(format!("outputs/domain/{run_id}/project/facts"));
+    let mut captured = vec![raw];
+    for prefix in [
+        "a9ef7a9bd562d7ce",
+        "78625d609ea76bd5",
+        "e32b9283a5e335c4",
+        "f132676aa856f96e",
+        "9ab84960e08c33b5",
+    ] {
+        let paths: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .collect();
+        assert_eq!(paths.len(), 1, "unique frozen receipt prefix {prefix}");
+        captured.push(std::fs::read(paths[0].path()).unwrap());
+    }
+    for raw in captured {
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        let owner = [
+            "proposal",
+            "receipt",
+            "artifact",
+            "grant",
+            "component_first_use_review",
+        ]
+        .into_iter()
+        .find_map(|key| value[key].as_object());
+        let receipt = receipt::FactReceipt {
+            contract: "modeling-fact-receipt/v1".into(),
+            run_id: run_id.into(),
+            context_sha256: value["context_sha256"].as_str().unwrap().into(),
+            kind: value["kind"].as_str().unwrap().into(),
+            ok: value["ok"].as_bool().unwrap(),
+            fact_sha256: format!("{:x}", Sha256::digest(&raw)),
+            fact_bytes: raw.len(),
+            fact_sequence: value["fact_sequence"].as_u64().unwrap(),
+            binding: Value::Object(
+                [
+                    "proposal_id",
+                    "revision",
+                    "prepare_token",
+                    "base_sha256",
+                    "candidate_sha256",
+                    "operation_id",
+                    "build_id",
+                    "authority_sha256",
+                    "authorization_id",
+                ]
+                .into_iter()
+                .filter_map(|key| {
+                    owner
+                        .and_then(|map| map.get(key))
+                        .map(|value| (key.into(), value.clone()))
+                })
+                .collect(),
+            ),
+        };
+        let verified = receipt::verify(facts.setup.as_ref().unwrap(), &receipt, &raw).unwrap();
+        assert_eq!(
+            facts.apply_verified_fact(&verified),
+            FactProjection::Applied,
+            "real seq {}: {:?}",
+            receipt.fact_sequence,
+            facts.projection_failure
+        );
+        facts.synchronization_finished(&receipt);
+    }
+    for image in &mut facts.snapshot.review_images {
+        review::verify_image(&image.binding).await.unwrap();
+        image.file_state = ImageFileState::Available;
+    }
+    facts.synchronization_queue_drained();
+    assert_eq!(facts.snapshot.confirmation().proposal, fact.binding);
+    assert!(facts.snapshot.first_use_satisfied());
+    assert!(facts.snapshot.candidate_review_delivered(&fact.binding));
+    assert!(facts.deferred_sequences.is_empty());
+    assert!(facts.snapshot.fact_sync_notice.is_none());
+    assert!(facts.can_authorize(&fact.binding));
+}
+
+#[test]
+fn initial_escalator_rejects_missing_duplicate_or_unbound_parts_and_invalid_planes() {
+    let original = initial_escalator_proposal();
+    for mutation in [
+        "missing",
+        "duplicate",
+        "cad_completion",
+        "source",
+        "owner",
+        "spec",
+        "reason_ref",
+        "endpoint",
+        "plane",
+        "part_role",
+        "source_refs",
+        "flight",
+        "flight_height",
+    ] {
+        let mut value = original.clone();
+        let proposal = &mut value["proposal"];
+        let operations = proposal["draft"]["operations"].as_array_mut().unwrap();
+        if mutation == "missing" {
+            operations.pop();
+        } else if mutation == "duplicate" {
+            operations[2] = operations[1].clone();
+        } else if mutation == "cad_completion" {
+            proposal["component_plan"]["connections"][0]["cad_completion"] = json!(false);
+        } else if mutation == "flight" {
+            proposal["component_plan"]["connections"][0]["flights"] = json!([]);
+        } else {
+            let index = usize::from(mutation == "reason_ref");
+            let operation = &mut operations[index];
+            let mut part: Value =
+                serde_json::from_str(operation["value_json"].as_str().unwrap()).unwrap();
+            match mutation {
+                "source" => part["metadata"]["source_geometry_sha256"] = json!("c".repeat(64)),
+                "owner" => part["metadata"]["vertical_spec_owner"] = json!("other"),
+                "spec" => part["metadata"]["vertical_spec"] = json!("{}"),
+                "reason_ref" => part["metadata"]["reason_ref"] = json!("other"),
+                "endpoint" => part["metadata"]["endpoint_top_z_m"] = json!("[0,0]"),
+                "plane" => part["stair_soffit"] = part["stair_top"].clone(),
+                "flight_height" => {
+                    part["stair_top"]["start_z"] = json!(3.0);
+                    part["stair_top"]["end_z"] = json!(3.0);
+                    part["stair_soffit"]["start_z"] = json!(2.88);
+                    part["stair_soffit"]["end_z"] = json!(2.88);
+                    part["metadata"]["endpoint_top_z_m"] = json!("[3.0,3.0]");
+                }
+                "part_role" => part["metadata"]["escalator_part"] = json!("incline"),
+                "source_refs" => part["source_ids"] = json!(["source.escalator"]),
+                _ => unreachable!(),
+            }
+            operation["value_json"] = json!(part.to_string());
+        }
+        assert!(proposal_fact(&value).is_none(), "{mutation}");
+    }
+}
+
 fn reference_stair_proposal() -> Value {
     let mut value = envelope();
     value["source_current"] = json!(true);
@@ -2492,6 +3341,40 @@ fn private_receipt(value: &Value) -> receipt::FactReceipt {
         binding: json!({"proposal_id":"proposal","revision":2,"prepare_token":"token",
             "base_sha256":"base","candidate_sha256":"candidate"}),
     }
+}
+
+#[test]
+fn ai_recognition_receipts_verify_without_granting_modeling_authority() {
+    let mut facts = sequenced_facts();
+    let setup = facts.setup.clone().unwrap();
+    let before = facts.snapshot.clone();
+    let kind = "ai_cad_recognition";
+    let value = json!({"contract":CONTRACT,"run_id":"run","context_sha256":"ctx",
+            "kind":kind,"ok":true,"fact_sequence":17,"status":"unresolved"});
+    let raw = serde_json::to_vec(&value).unwrap();
+    let mut expected = private_receipt(&value);
+    expected.binding = json!({});
+    let item = json!({"id":"orchestration","type":"mcpToolCall",
+            "server":"modeling_domain","tool":"inspect_tool_operation","status":"completed",
+            "result":{"structuredContent":expected}});
+    let notice = crate::protocol::decode_observed_tool(
+        "item/completed",
+        &json!({"threadId":"root","turnId":"turn","item":item}),
+    )
+    .unwrap()
+    .unwrap();
+    let received = receipt::from_tool(&setup, &notice, &item)
+        .unwrap_or_else(|error| panic!("{kind}: {error}"))
+        .unwrap();
+    assert_eq!(receipt::verify(&setup, &received, &raw).unwrap(), value);
+    assert_eq!(facts.apply_verified_fact(&value), FactProjection::Unrelated);
+    assert_eq!(facts.snapshot, before);
+    let mut invalid = received.clone();
+    invalid.context_sha256 = "foreign".into();
+    assert!(receipt::verify(&setup, &invalid, &raw).is_err());
+    invalid = received;
+    invalid.kind = "unknown_orchestration".into();
+    assert!(receipt::validate(&setup, &invalid).is_err());
 }
 
 #[test]
@@ -3294,22 +4177,30 @@ fn opening_completion_first_use_allows_only_authorized_null_cad_source_hashes() 
         "contract":"component-first-use/5","required":[required.clone()],"reused":[]
     });
     let projected = project::scope_fact(&scope).unwrap();
-    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_some());
+    assert!(
+        review::requirements_for_scope(&scope["proposal"], &projected, Path::new(".")).is_some()
+    );
 
     required["source_instance_id"] = json!("foreign-door");
     scope["proposal"]["component_first_use_requirements"]["required"] = json!([required.clone()]);
-    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_none());
+    assert!(
+        review::requirements_for_scope(&scope["proposal"], &projected, Path::new(".")).is_none()
+    );
     required["source_instance_id"] = json!("door.1");
     required["source_bindings"][0]["source_sha256"] = json!("5".repeat(64));
     scope["proposal"]["component_first_use_requirements"]["required"] = json!([required]);
-    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_none());
-    assert!(review::requirements(&scope["proposal"]).is_none());
+    assert!(
+        review::requirements_for_scope(&scope["proposal"], &projected, Path::new(".")).is_none()
+    );
+    assert!(review::requirements(&scope["proposal"], Path::new(".")).is_none());
 
     scope["proposal"]["component_first_use_requirements"]["required"][0]["source_sha256"] =
         json!("6".repeat(64));
     scope["proposal"]["component_first_use_requirements"]["required"][0]["source_bindings"][0]
         ["source_sha256"] = json!("6".repeat(64));
-    assert!(review::requirements_for_scope(&scope["proposal"], &projected).is_none());
+    assert!(
+        review::requirements_for_scope(&scope["proposal"], &projected, Path::new(".")).is_none()
+    );
 }
 
 #[test]
@@ -6406,7 +7297,7 @@ fn structural_revision_projects_exact_operations_hosts_void_decisions_and_review
     assert_eq!(revision.host_mapping_count, 1);
     assert_eq!(revision.changes.len(), 2);
     assert!(revision.void_decisions[0].contains("保留楼板"));
-    let required = review::requirements(&proposal["proposal"]).unwrap();
+    let required = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let (review, mut images) = review::project(&evidence, &card.binding, &required).unwrap();
     assert!(!review.satisfied(&images));
     images[0].file_state = ImageFileState::Available;
@@ -6545,7 +7436,7 @@ fn structural_audit_and_decision_text_remain_inside_the_receipt_hash() {
 fn structural_review_rejects_changed_geometry_or_missing_and_foreign_meshes() {
     let (proposal, evidence) = structure_revision_fixture();
     let binding = proposal_fact(&proposal).unwrap().binding;
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     for ids in [
         json!(["unrelated.mesh"]),
         json!([]),
@@ -6616,7 +7507,7 @@ fn structural_review_accepts_more_than_sixty_four_typed_parts() {
             serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
         )
     ));
-    let required = review::requirements(&proposal["proposal"]).unwrap();
+    let required = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let (_, images) = review::project(&evidence, &binding, &required).unwrap();
     assert_eq!(images.len(), 1);
@@ -6635,7 +7526,7 @@ fn web_first_use_projects_sealed_package_and_rejects_changed_evidence() {
         "manifest":{"data_sha256":"b".repeat(64),"artifact_sha256":"d".repeat(64),
             "image_sha256":"8".repeat(64)}
     });
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let (ready, mut images) = review::project(&evidence, &binding, &requirement).unwrap();
     let package = images[0].binding.web_review.as_ref().unwrap();
@@ -6892,7 +7783,7 @@ fn evaluation_receipt_uses_empty_owner_binding_and_seals_new_report_fields() {
 #[test]
 fn first_use_requires_exact_template_arguments_sources_revision_and_opened_review_set() {
     let (proposal, evidence) = first_use_fixture();
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let (ready, mut images) = review::project(&evidence, &binding, &requirement).unwrap();
     assert!(!ready.satisfied(&images));
@@ -6953,7 +7844,7 @@ fn first_use_accepts_review_set_from_attached_delivery_record() {
         "review_set_sha256": set,
         "request_id": "first-use-0"
     });
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let (ready, images) = review::project(
         &evidence,
         &proposal_fact(&proposal).unwrap().binding,
@@ -7013,7 +7904,7 @@ fn first_use_accepts_six_item_batch_after_cumulative_progress_fact() {
             serde_json::to_vec(&proposal["proposal"]["component_first_use_requirements"]).unwrap()
         )
     ));
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let (ready, images) = review::project(
         &evidence,
         &proposal_fact(&proposal).unwrap().binding,
@@ -7046,7 +7937,7 @@ fn first_use_v3_accepts_group_ranges_and_blocked_manifest_entries() {
         json!("component-first-use/3");
     proposal["proposal"]["component_first_use_requirements"]["required"][0]
         ["source_dimension_ranges_m"] = json!({"cad_x":[0.6,0.6],"cad_y":[0.5,0.5]});
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     evidence["component_first_use_review"]["manifest"]["items"][0]["source_dimension_ranges_m"] =
         proposal["proposal"]["component_first_use_requirements"]["required"][0]
             ["source_dimension_ranges_m"]
@@ -7099,7 +7990,7 @@ fn first_use_v5_and_v6_separate_source_directions_and_bind_the_manifest() {
             "{:x}",
             Sha256::digest(serde_json::to_vec(requirements).unwrap())
         ));
-        let requirement = review::requirements(&proposal["proposal"]).unwrap();
+        let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
         let binding = proposal_fact(&proposal).unwrap().binding;
         let (ready, images) = review::project(&evidence, &binding, &requirement).unwrap();
         assert_eq!(ready.status, "ready");
@@ -7119,7 +8010,7 @@ fn first_use_v5_and_v6_separate_source_directions_and_bind_the_manifest() {
             bad["proposal"]["component_first_use_requirements"]["required"][0]
                 ["source_direction"] = direction.clone();
             assert!(
-                review::requirements(&bad["proposal"]).is_none(),
+                review::requirements(&bad["proposal"], Path::new(".")).is_none(),
                 "{direction}"
             );
             let mut changed = evidence.clone();
@@ -7132,19 +8023,22 @@ fn first_use_v5_and_v6_separate_source_directions_and_bind_the_manifest() {
             .as_object_mut()
             .unwrap()
             .remove("source_direction");
-        assert!(review::requirements(&missing["proposal"]).is_none());
+        assert!(review::requirements(&missing["proposal"], Path::new(".")).is_none());
         for (field, value) in [
             ("rotation_z_deg", json!(90.0)),
             ("scale", json!([-1.0, 1.0, 1.0])),
         ] {
             let mut bad = proposal.clone();
             bad["proposal"]["component_plan"]["components"][1][field] = value;
-            assert!(review::requirements(&bad["proposal"]).is_none(), "{field}");
+            assert!(
+                review::requirements(&bad["proposal"], Path::new(".")).is_none(),
+                "{field}"
+            );
         }
         let mut bad = proposal.clone();
         bad["proposal"]["component_first_use_requirements"]["required"][0]["source_bindings"][1]
             ["source_geometry_sha256"] = json!("f".repeat(64));
-        assert!(review::requirements(&bad["proposal"]).is_none());
+        assert!(review::requirements(&bad["proposal"], Path::new(".")).is_none());
         let mut changed = evidence.clone();
         changed["component_first_use_review"]["manifest"]["items"][0]["source_bindings"][1]
             ["source_geometry_sha256"] = json!("f".repeat(64));
@@ -7210,7 +8104,7 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
         ));
         manifest["items"][0]["part_ids"] = json!(["bed.1.body"]);
         manifest["items"][0]["dimensions"]["parts"] = json!([part]);
-        let requirement = review::requirements(&proposal["proposal"]).unwrap();
+        let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
         let binding = proposal_fact(&proposal).unwrap().binding;
         let (ready, images) = review::project(&evidence, &binding, &requirement).unwrap();
         assert_eq!(ready.status, "ready");
@@ -7226,7 +8120,7 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
             let mut bad = proposal.clone();
             bad["proposal"]["component_edit"]["sources"]["source.1"][field] = invalid;
             assert!(
-                review::requirements(&bad["proposal"]).is_none(),
+                review::requirements(&bad["proposal"], Path::new(".")).is_none(),
                 "{basis}/{field}"
             );
         }
@@ -7241,7 +8135,7 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
             bad["proposal"]["component_edit"]["plan"]["replacements"]["components"][0][field] =
                 invalid;
             assert!(
-                review::requirements(&bad["proposal"]).is_none(),
+                review::requirements(&bad["proposal"], Path::new(".")).is_none(),
                 "{basis}/{field}"
             );
         }
@@ -7251,7 +8145,7 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
                 bad["proposal"]["component_edit"]["plan"]["replacements"]["components"][0][field] =
                     invalid;
                 assert!(
-                    review::requirements(&bad["proposal"]).is_none(),
+                    review::requirements(&bad["proposal"], Path::new(".")).is_none(),
                     "{basis}/{field}"
                 );
             }
@@ -7261,7 +8155,7 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
             .as_object_mut()
             .unwrap()
             .remove("source_direction");
-        assert!(review::requirements(&missing["proposal"]).is_none());
+        assert!(review::requirements(&missing["proposal"], Path::new(".")).is_none());
         for (field, invalid) in [
             ("origin", json!([8, 2, 0])),
             ("rotation_z_deg", json!(180)),
@@ -7283,7 +8177,7 @@ fn first_use_cad_edit_binds_source_direction_and_rendered_edit_pose_separately()
             .as_array_mut()
             .unwrap()
             .push(placement);
-        assert!(review::requirements(&duplicate["proposal"]).is_none());
+        assert!(review::requirements(&duplicate["proposal"], Path::new(".")).is_none());
     }
 }
 
@@ -7307,7 +8201,7 @@ fn first_use_v4_style_groups_project_with_aperture_ranges() {
         requirements["required"][0]["category"] = json!("door");
         requirements["required"][0]["source_bindings"][1]["source_geometry_sha256"] =
             json!("6".repeat(64));
-        let requirement = review::requirements(&proposal["proposal"]).unwrap();
+        let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
         for (field, value) in proposal["proposal"]["component_first_use_requirements"]["required"]
             [0]
         .as_object()
@@ -7357,7 +8251,10 @@ fn first_use_v4_style_groups_project_with_aperture_ranges() {
                 }
                 _ => unreachable!(),
             }
-            assert!(review::requirements(&bad["proposal"]).is_none(), "{fault}");
+            assert!(
+                review::requirements(&bad["proposal"], Path::new(".")).is_none(),
+                "{fault}"
+            );
         }
         for field in [
             "source_bindings",
@@ -7398,7 +8295,7 @@ fn first_use_2d_overlay_is_accepted_for_any_sealed_category() {
         let (mut proposal, mut evidence) = first_use_fixture();
         proposal["proposal"]["component_first_use_requirements"]["required"][0]["category"] =
             json!(category);
-        let requirement = review::requirements(&proposal["proposal"]).unwrap();
+        let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
         let item = &mut evidence["component_first_use_review"]["manifest"]["items"][0];
         item["category"] = json!(category);
         item["renderer"] = json!({"engine":"PIL_2D_OVERLAY","version":"1","font":"PIL-default"});
@@ -7426,7 +8323,7 @@ fn first_use_async_progress_is_projected_without_images() {
         "proposal_id":"proposal", "revision":2, "prepare_token":"token",
         "base_sha256":"base", "candidate_sha256":"candidate"
     });
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let (running, images) = review::project(
         &evidence,
         &proposal_fact(&proposal).unwrap().binding,
@@ -7948,7 +8845,7 @@ fn missing_first_use_contract_is_unknown_and_user_request_is_explicit_without_fa
         .as_object_mut()
         .unwrap()
         .remove("component_first_use_requirements");
-    let unknown = review::requirements(&proposal["proposal"]).unwrap();
+    let unknown = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     assert_eq!(unknown.status, "unknown");
     assert!(!unknown.satisfied(&[]));
     let (mut proposal, _) = first_use_fixture();
@@ -7958,7 +8855,7 @@ fn missing_first_use_contract_is_unknown_and_user_request_is_explicit_without_fa
     for source in required["source_bindings"].as_array_mut().unwrap() {
         source["source_instance_id"] = Value::Null;
     }
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let fields = proposal["proposal"]["component_first_use_requirements"]["required"][0]
         .as_object()
         .unwrap();
@@ -8032,7 +8929,7 @@ async fn png_verification_rejects_missing_changed_dimensions_and_nonlocal_files_
     image["image_path"] = json!(path);
     image["dimensions_px"] = json!([1, 1]);
     image["image_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
-    let requirements = review::requirements(&proposal["proposal"]).unwrap();
+    let requirements = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let (_, images) = review::project(&evidence, &binding, &requirements).unwrap();
     let missing = review::open_image(images[0].binding.clone()).await;
@@ -8093,7 +8990,7 @@ async fn png_verification_rejects_missing_changed_dimensions_and_nonlocal_files_
 #[test]
 fn failed_external_open_keeps_card_delivery_and_new_review_sets_clear_old_openings() {
     let (proposal, evidence) = first_use_fixture();
-    let first_use = review::requirements(&proposal["proposal"]).unwrap();
+    let first_use = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let (ready, mut images) = review::project(&evidence, &binding, &first_use).unwrap();
     images[0].file_state = ImageFileState::Available;
@@ -8216,7 +9113,7 @@ fn review_labels_show_chinese_categories_and_drawing_evidence() {
         "open_custom_category"
     );
     let (proposal, evidence) = first_use_fixture();
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let (ready, images) = review::project(&evidence, &binding, &requirement).unwrap();
     assert!(images[0]
@@ -8229,7 +9126,7 @@ fn review_labels_show_chinese_categories_and_drawing_evidence() {
 #[test]
 fn first_use_details_use_all_chinese_display_parameters_and_never_dump_raw_templates() {
     let (proposal, mut evidence) = first_use_fixture();
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     let dimensions =
         &mut evidence["component_first_use_review"]["manifest"]["items"][0]["dimensions"];
@@ -8295,7 +9192,7 @@ fn first_use_details_use_all_chinese_display_parameters_and_never_dump_raw_templ
 #[test]
 fn first_use_form_metadata_is_optional_version_compatible_and_validated_when_present() {
     let (proposal, evidence) = first_use_fixture();
-    let requirement = review::requirements(&proposal["proposal"]).unwrap();
+    let requirement = review::requirements(&proposal["proposal"], Path::new(".")).unwrap();
     let binding = proposal_fact(&proposal).unwrap().binding;
     assert!(review::project(&evidence, &binding, &requirement).is_some());
     for (version, kind, diagnostic) in [

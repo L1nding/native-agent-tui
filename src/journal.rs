@@ -1078,7 +1078,7 @@ impl Store {
             // A live session cannot be discarded just because its append-only history
             // reached the global budget. Keep the newest durable state as the replay
             // baseline and continue writing; closed/uncertain sessions remain protected.
-            if commit.session_closed {
+            if commit.session_closed && !commit.needs_recovery {
                 return Err(error);
             }
             self.log.set_len(0)?;

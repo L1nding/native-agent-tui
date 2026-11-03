@@ -93,7 +93,8 @@ const repairs = [
           // 只传封闭类别和错误码，不把 provider 原文带入界面协议。
           const failureCategory = this.zfFailedTurn === event.data.turn ? "output_delivery"
             : event.data.reason?.kind === "error" ? "provider" : "unknown";
-          const code = event.data.reason?.error?.code;
+          const rawCode = event.data.reason?.error?.code;
+          const code = rawCode === "QUOTA" ? "QUOTA_EXCEEDED" : rawCode;
           const failureCode = failureCategory === "provider" && ["AUTH", "QUOTA_EXCEEDED", "RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", "PI_AI_ERROR", "CONTEXT_WINDOW_EXCEEDED", "EMPTY_RESPONSE"].includes(code) ? code : undefined;
           return this.ctx.emit("zf-tui/acp-turn-settled", {
             sessionId: this.agent.session.id, turn: event.data.turn, state,

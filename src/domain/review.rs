@@ -196,16 +196,17 @@ pub(crate) fn category_label(category: &str) -> &str {
     }
 }
 
-pub(super) fn requirements(proposal: &Value) -> Option<FirstUseReviewFact> {
-    requirements_with_openings(proposal, None)
+pub(super) fn requirements(proposal: &Value, repository: &Path) -> Option<FirstUseReviewFact> {
+    requirements_with_openings(proposal, None, repository)
 }
 
 pub(super) fn requirements_for_scope(
     proposal: &Value,
     scope: &ProjectScopeFact,
+    repository: &Path,
 ) -> Option<FirstUseReviewFact> {
     let Some(completion) = &scope.opening_completion_binding else {
-        return requirements(proposal);
+        return requirements(proposal, repository);
     };
     let needs_completion_sources = proposal["component_first_use_requirements"]["required"]
         .as_array()
@@ -218,7 +219,7 @@ pub(super) fn requirements_for_scope(
             })
         });
     if !needs_completion_sources {
-        return requirements(proposal);
+        return requirements(proposal, repository);
     }
     let evidence = &proposal["opening_completion_source"];
     let path = text(evidence, "path").ok()?;
@@ -245,12 +246,13 @@ pub(super) fn requirements_for_scope(
     if operation_ids.len() != operations.len() {
         return None;
     }
-    requirements_with_openings(proposal, Some(&operation_ids))
+    requirements_with_openings(proposal, Some(&operation_ids), repository)
 }
 
 fn requirements_with_openings(
     proposal: &Value,
     opening_ids: Option<&BTreeSet<String>>,
+    repository: &Path,
 ) -> Option<FirstUseReviewFact> {
     let value = &proposal["component_first_use_requirements"];
     if !proposal["structure_revision_source"].is_null()
@@ -319,22 +321,26 @@ fn requirements_with_openings(
         &edit["plan"]["replacements"]
     });
     let structure_parts = if value["contract"] == "component-first-use/structure-revision-1" {
-        let mut parts = Vec::new();
-        // Match structure_specs' candidate collection order, retaining operation
-        // order inside each collection as apply_patch appends the replacements.
-        for collection in ["walls", "slabs", "solids", "elements", "openings"] {
-            for op in proposal["draft"]["operations"]
-                .as_array()?
-                .iter()
-                .filter(|op| op["op"] == "add" && op["collection"] == collection)
-            {
-                parts.push((
-                    collection.to_owned(),
-                    serde_json::from_str(op["value_json"].as_str()?).ok()?,
-                ));
+        let operations = proposal["draft"]["operations"].as_array()?;
+        if operations.iter().any(|op| op["op"] == "set") {
+            Some(project::local_glazing_review_parts(proposal, repository)?)
+        } else {
+            let mut parts = Vec::new();
+            // Match structure_specs' candidate collection order, retaining operation
+            // order inside each collection as apply_patch appends the replacements.
+            for collection in ["walls", "slabs", "solids", "elements", "openings"] {
+                for op in operations
+                    .iter()
+                    .filter(|op| op["op"] == "add" && op["collection"] == collection)
+                {
+                    parts.push((
+                        collection.to_owned(),
+                        serde_json::from_str(op["value_json"].as_str()?).ok()?,
+                    ));
+                }
             }
+            Some(parts)
         }
-        Some(parts)
     } else {
         None
     };
@@ -401,11 +407,10 @@ fn requirements_with_openings(
             // Structural review has one CAD binding for a set of typed entities,
             // rather than one binding per furniture component.
             let ids = strings(&item["entity_ids"], 50000)?;
-            let operations = proposal["draft"]["operations"].as_array()?;
-            let added: BTreeSet<_> = operations
+            let affected: BTreeSet<_> = structure_parts
+                .as_ref()?
                 .iter()
-                .filter(|op| op["op"] == "add" && op["collection"] != "constraints")
-                .map(|op| op["target_id"].as_str().map(str::to_owned))
+                .map(|(_, part)| part["id"].as_str().map(str::to_owned))
                 .collect::<Option<_>>()?;
             let certificate = &proposal["structure_revision_source"];
             let path = text(certificate, "path").ok()?;
@@ -441,7 +446,7 @@ fn requirements_with_openings(
                 || item["source_instance_id"] != "structure.revision"
                 || item["source_kind"] != "cad"
                 || strings(&item["component_ids"], 50000)? != ids
-                || ids != added
+                || ids != affected
                 || item["source_bindings"] != json!([binding])
                 || certificate["contract"] != "cad-structure-revision/1"
                 || proposal["source_dependencies"][&path] != sha

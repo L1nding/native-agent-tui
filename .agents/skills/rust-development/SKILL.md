@@ -50,6 +50,7 @@ Use this skill when changing Rust code, Cargo metadata, execution boundaries, or
 - Keep JSON-RPC, process management, gate logic, and mutable execution facts out of views.
 - Bound log, telemetry, and queue memory. Redact credentials, full prompts, and unsanitized tool output before diagnostics or export.
 - On Windows, test process-tree termination and handle cleanup through the transport seam; do not rely on Unix-only signals.
+- When monitoring a live TUI, correlate the current process, journal session, DSH session events, and durable tool-operation receipts. Orca screen snapshots and `tui-idle` alone do not prove completion or a stall. Keep delegated monitors read-only; the session owner checks outstanding operations before requesting graceful shutdown. After an interruption, inspect the original operation ID before deciding whether recovery permits another invocation.
 - For DSH background delegation or parent continuation changes, read the lifecycle contract in [`dsh-plugin/README.md`](../../../dsh-plugin/README.md). Verify two independently settled children across the real ACP bridge transport, including delayed output, failure and stop; keep DSH as the sole sender of its settlement messages and automatic model requests.
 
 ## DSH image context

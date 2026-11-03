@@ -167,6 +167,7 @@ pub fn validate(setup: &DomainSetup, receipt: &FactReceipt) -> Result<(), String
                 | "schematic_circulation"
                 | "opening_type_representatives"
                 | "unknown_box_presort"
+                | "ai_cad_recognition"
         )
         || receipt.fact_sequence == 0
         || receipt.fact_bytes == 0
@@ -506,9 +507,36 @@ fn revision_proof_matches(value: &Value, proof: &Value, slab_only: bool) -> bool
     }
 }
 
-fn verify_revision_certificate(setup: &DomainSetup, value: &Value) -> Result<(), String> {
+pub(super) fn revision_certificate(
+    repository: &Path,
+    certificate: &Value,
+) -> Option<(PathBuf, Value)> {
     use std::io::Read;
 
+    let root = repository.canonicalize().ok()?;
+    let path = root
+        .join(text(certificate, "path").ok()?)
+        .canonicalize()
+        .ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let file = std::fs::File::open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > FACT_LIMIT as u64 {
+        return None;
+    }
+    let mut raw = Vec::new();
+    file.take(FACT_LIMIT as u64 + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > FACT_LIMIT || certificate["sha256"] != format!("{:x}", Sha256::digest(&raw)) {
+        return None;
+    }
+    Some((path, serde_json::from_slice(&raw).ok()?))
+}
+
+fn verify_revision_certificate(setup: &DomainSetup, value: &Value) -> Result<(), String> {
     let proposal = &value["proposal"];
     let slab_only = !proposal["slab_revision_source"].is_null();
     let structure = !proposal["structure_revision_source"].is_null();
@@ -524,26 +552,7 @@ fn verify_revision_certificate(setup: &DomainSetup, value: &Value) -> Result<(),
         } else {
             "structure_revision_source"
         }];
-        let root = setup.repository.canonicalize().ok()?;
-        let name = text(certificate, "path").ok()?;
-        let path = root.join(name).canonicalize().ok()?;
-        if !path.starts_with(&root) {
-            return None;
-        }
-        let file = std::fs::File::open(path).ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.is_file() || metadata.len() > FACT_LIMIT as u64 {
-            return None;
-        }
-        let mut raw = Vec::new();
-        file.take(FACT_LIMIT as u64 + 1)
-            .read_to_end(&mut raw)
-            .ok()?;
-        if raw.len() > FACT_LIMIT || certificate["sha256"] != format!("{:x}", Sha256::digest(&raw))
-        {
-            return None;
-        }
-        let proof: Value = serde_json::from_slice(&raw).ok()?;
+        let (_, proof) = revision_certificate(&setup.repository, certificate)?;
         // CAD and historical dependencies remain sealed hash bindings here; only
         // the bounded certificate is read on Core's private verification path.
         revision_proof_matches(value, &proof, slab_only).then_some(())
@@ -1461,7 +1470,7 @@ pub(crate) mod tests {
         value["proposal"]["hosted_sources"] = json!({});
         value["proposal"]["vertical_sources"] = json!({});
         value["proposal"]["decision_drafts"] = json!([]);
-        assert!(project::structure_revision_rows(&value).is_some());
+        assert!(project::structure_revision_rows(&value, Path::new(".")).is_some());
         for (key, mixed) in [
             ("source_evidence", json!({})),
             ("hosted_sources", json!({"source":{}})),
@@ -1473,7 +1482,7 @@ pub(crate) mod tests {
             let mut changed = value.clone();
             changed["proposal"][key] = mixed;
             assert!(
-                project::structure_revision_rows(&changed).is_none(),
+                project::structure_revision_rows(&changed, Path::new(".")).is_none(),
                 "{key}"
             );
         }
@@ -1496,7 +1505,7 @@ pub(crate) mod tests {
             "slab":{"verification_questions":[],"void_decisions":[]}});
         value["verification_questions"] = json!([]);
         assert!(serde_json::to_vec(&value).unwrap().len() < FACT_LIMIT);
-        assert!(project::structure_revision_rows(&value).is_some());
+        assert!(project::structure_revision_rows(&value, Path::new(".")).is_some());
     }
 
     /// A just-terminated process can hold its working directory for a moment on Windows.

@@ -2,7 +2,7 @@
 use super::*;
 use std::io::Write;
 
-pub(super) fn structure_revision_rows(value: &Value) -> Option<Vec<String>> {
+pub(super) fn structure_revision_rows(value: &Value, repository: &Path) -> Option<Vec<String>> {
     let proposal = &value["proposal"];
     let slab_only = !proposal["slab_revision_source"].is_null();
     let certificate = &proposal[if slab_only {
@@ -80,6 +80,9 @@ pub(super) fn structure_revision_rows(value: &Value) -> Option<Vec<String>> {
             op["source_ids"],
             bounded_text(op, "reason", 4000)?
         )]);
+    }
+    if audit["contract"] == "cad-glazing-local-revision/1" {
+        return glazing_revision_rows(value, repository, &digest);
     }
     let hosts = audit["host_mapping"].as_object()?;
     if hosts
@@ -269,6 +272,357 @@ pub(super) fn structure_revision_rows(value: &Value) -> Option<Vec<String>> {
         }
     }
     rows.push(format!("楼板修订 · {}", audit["slab"]));
+    Some(rows)
+}
+
+fn glazing_json(path: &Path, expected_sha256: &str) -> Option<Value> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() || file.metadata().ok()?.len() > receipt::FACT_LIMIT as u64
+    {
+        return None;
+    }
+    let mut raw = Vec::new();
+    file.take(receipt::FACT_LIMIT as u64 + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > receipt::FACT_LIMIT || format!("{:x}", Sha256::digest(&raw)) != expected_sha256 {
+        return None;
+    }
+    serde_json::from_slice(&raw).ok()
+}
+
+fn glazing_parts<'a>(component: &str, ids: &'a Value) -> Option<BTreeMap<String, &'a str>> {
+    let mut parts = BTreeMap::new();
+    for value in ids.as_array()? {
+        let id = value.as_str()?;
+        let tail = id.strip_prefix(&format!("{component}."))?;
+        let (logical, hash) = tail.rsplit_once('.')?;
+        let numbered = |prefix: &str| {
+            logical.strip_prefix(prefix).is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        };
+        if hash.len() != 16
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || !(matches!(logical, "glass" | "sill" | "head" | "jamb.0" | "jamb.1")
+                || numbered("sill_wall.")
+                || numbered("header_wall."))
+            || parts.insert(logical.to_owned(), id).is_some()
+        {
+            return None;
+        }
+    }
+    if !["glass", "sill", "head"]
+        .iter()
+        .all(|key| parts.contains_key(*key))
+        || parts.contains_key("jamb.0") != parts.contains_key("jamb.1")
+    {
+        return None;
+    }
+    Some(parts)
+}
+
+pub(super) fn local_glazing_review_parts(
+    proposal: &Value,
+    repository: &Path,
+) -> Option<Vec<(String, Value)>> {
+    let certificate = &proposal["structure_revision_source"];
+    let (_, proof) = receipt::revision_certificate(repository, certificate)?;
+    let audit = &proof["audit"];
+    if audit["contract"] != "cad-glazing-local-revision/1" {
+        return None;
+    }
+    // Reuse the complete local-contract guard, including its sealed context and
+    // mapping. First-use review must never independently widen the set operation seam.
+    structure_revision_rows(
+        &json!({
+            "project_structure":true, "verification_questions":[],
+            "project_scope":{"floor_id":proposal["scope"]["floor_id"],"source_sha256":audit["source_sha256"]},
+            "proposal":proposal, "structure_revision":audit
+        }),
+        repository,
+    )?;
+    let mut parts: Vec<(String, Value)> = Vec::new();
+    for operation in proposal["draft"]["operations"].as_array()? {
+        let id = operation["target_id"].as_str()?;
+        let field = operation["field"].as_str()?;
+        let geometry: Value = serde_json::from_str(operation["value_json"].as_str()?).ok()?;
+        if let Some((_, part)) = parts.iter_mut().find(|(_, part)| part["id"] == id) {
+            part[field] = geometry;
+            continue;
+        }
+        let component = audit["components"].as_array()?.iter().find(|component| {
+            component["changed_element_ids"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|value| value == id))
+        })?;
+        let cid = component["component_id"].as_str()?;
+        let logical_parts = glazing_parts(cid, &component["element_ids"])?;
+        let logical = logical_parts.iter().find(|(_, part_id)| **part_id == id)?.0;
+        let role = if logical == "glass" {
+            "window_glass"
+        } else if logical.starts_with("sill_wall.") || logical.starts_with("header_wall.") {
+            "wall_detail"
+        } else {
+            "window_frame"
+        };
+        let mut part = json!({
+            "id":id, "role":role, "source_ids":operation["source_ids"],
+            "metadata":{"component_id":cid,"category":"glazing_envelope","source_sha256":audit["source_sha256"]}
+        });
+        part[field] = geometry;
+        // Preserve first occurrence order, matching structure_specs' original
+        // candidate order. The full rendered parts still have to match their digest.
+        parts.push(("elements".into(), part));
+    }
+    Some(parts)
+}
+
+fn glazing_revision_rows(
+    value: &Value,
+    repository: &Path,
+    certificate_sha256: &str,
+) -> Option<Vec<String>> {
+    let proposal = &value["proposal"];
+    let audit = &value["structure_revision"];
+    let certificate = &proposal["structure_revision_source"];
+    let (certificate_path, proof) = receipt::revision_certificate(repository, certificate)?;
+    let root = Path::new(proof["project_root"].as_str()?)
+        .canonicalize()
+        .ok()?;
+    let dependency = |name: &str| -> Option<(PathBuf, String)> {
+        let path = root.join(proof[name].as_str()?).canonicalize().ok()?;
+        if !path.starts_with(&root) {
+            return None;
+        }
+        let hash = sha(&proof["dependencies"], proof[name].as_str()?)?;
+        if proposal["source_dependencies"][proof[name].as_str()?] != hash {
+            return None;
+        }
+        Some((path, hash))
+    };
+    let (config_path, config_hash) = dependency("config_path")?;
+    let (context_path, context_hash) = dependency("context_path")?;
+    let config = glazing_json(&config_path, &config_hash)?;
+    let context = glazing_json(&context_path, &context_hash)?;
+    let source_path = root.join(config["source"].as_str()?).canonicalize().ok()?;
+    let source_sha256 = sha(audit, "source_sha256")?;
+    let config_sha256 = sha(audit, "config_sha256")?;
+    let protected_sha256 = sha(audit, "protected_scene_sha256")?;
+    let slab_sha256 = sha(&audit["slab"], "preserved_sha256")?;
+    let base_sha256 = sha(proposal, "base_sha256")?;
+    let source_binding = proof["dependencies"]
+        .as_object()?
+        .iter()
+        .find(|(name, hash)| {
+            **hash == source_sha256
+                && Path::new(name)
+                    .canonicalize()
+                    .is_ok_and(|path| path == source_path)
+        })?;
+    sha(proposal, "candidate_sha256")?;
+    if !certificate_path.starts_with(&root)
+        || !source_path.starts_with(&root)
+        || proof["contract"] != "cad-structure-revision/1"
+        || proof["audit"] != *audit
+        || proof["base_sha256"] != base_sha256
+        || proof["dependencies"][proof["base_scene_path"].as_str()?] != base_sha256
+        || proof["scene_path"] != proposal["scene_path"]
+        || context["scope"] != proposal["scope"]
+        || root
+            .join(context["scene_path"].as_str()?)
+            .canonicalize()
+            .ok()?
+            != Path::new(proof["scene_path"].as_str()?)
+                .canonicalize()
+                .ok()?
+        || proposal["scope"]["floor_id"] != value["project_scope"]["floor_id"]
+        || value["project_scope"]["source_sha256"] != source_sha256
+        || proposal["source_dependencies"][source_binding.0] != source_sha256
+        || !audit["pending"].as_array()?.is_empty()
+        || proposal["draft"].get("pending").is_some_and(|pending| {
+            !pending.is_null() && pending.as_array().is_none_or(|items| !items.is_empty())
+        })
+        || audit["slab"]["status"] != "preserved_verbatim"
+        || !audit["slab"]["verification_questions"]
+            .as_array()?
+            .is_empty()
+        || !proof["void_decisions"].as_array()?.is_empty()
+        || !proof["layer_decisions"].as_array()?.is_empty()
+        || !proof["opening_dimension_decision"].is_null()
+    {
+        return None;
+    }
+    // The proof seals the producer's normalized config hash. Core verifies the
+    // frozen config bytes and frame, without interpreting CAD or loading the scene.
+    if !context["sources"].as_array()?.iter().any(|source| {
+        source["floor_id"] == proposal["scope"]["floor_id"]
+            && source["root_insert_handle"] == config["root_insert_handle"]
+            && source["origin_dxf"] == config["origin_dxf"]
+            && source["crop_dxf"] == config["crop_dxf"]
+            && source["path"].as_str().is_some_and(|path| {
+                root.join(path)
+                    .canonicalize()
+                    .is_ok_and(|path| path == source_path)
+            })
+    }) {
+        return None;
+    }
+    let strings = |value: &Value| -> Option<std::collections::BTreeSet<String>> {
+        let items = value.as_array()?;
+        let strings = items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+            })
+            .collect::<Option<std::collections::BTreeSet<_>>>()?;
+        (strings.len() == items.len()).then_some(strings)
+    };
+    let selected = strings(&audit["glazing_component_ids"])?;
+    if selected.is_empty()
+        || selected != strings(&proof["glazing_component_ids"])?
+        || audit["components"].as_array()?.len() != selected.len()
+    {
+        return None;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut derived = std::collections::BTreeSet::new();
+    let mut closures = std::collections::BTreeSet::new();
+    let mut changed = BTreeMap::new();
+    let mut rows = vec![format!(
+        "玻璃围护局部修订 · 基线 {base_sha256} · 来源 {source_sha256} · 配置 {config_sha256} · 证书 {certificate_sha256}"
+    ), format!("楼板及未选对象保留 · 场景证据 {protected_sha256} · 楼板证据 {slab_sha256}")];
+    for component in audit["components"].as_array()? {
+        let cid = text(component, "component_id").ok()?;
+        let new_id = text(component, "derived_component_id").ok()?;
+        for id in [&cid, &new_id] {
+            let hash = id.strip_prefix("glazing.cad.")?;
+            if hash.len() != 16
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return None;
+            }
+        }
+        let sources = strings(&component["source_ids"])?;
+        let old_parts = glazing_parts(&cid, &component["element_ids"])?;
+        let new_parts = glazing_parts(&new_id, &component["derived_element_ids"])?;
+        let changed_ids = strings(&component["changed_element_ids"])?;
+        let dimensions = component["trial_dimensions"].as_array()?;
+        let sill = dimensions.first()?.as_f64()?;
+        let height = dimensions.get(1)?.as_f64()?;
+        let dimension_source = dimensions.get(2)?.as_str()?;
+        if !selected.contains(&cid)
+            || !seen.insert(cid.clone())
+            || !derived.insert(new_id)
+            || sources.is_empty()
+            || !closures.insert(sources.clone())
+            || old_parts.keys().ne(new_parts.keys())
+            || dimensions.len() != 3
+            || !sill.is_finite()
+            || sill < 0.0
+            || !height.is_finite()
+            || height <= 0.0
+            || dimension_source.trim().is_empty()
+            || dimension_source.len() > 4000
+        {
+            return None;
+        }
+        for id in changed_ids {
+            let (logical, _) = old_parts.iter().find(|(_, old_id)| **old_id == id)?;
+            let role = if logical == "glass" {
+                "window_glass"
+            } else if logical.starts_with("sill_wall.") || logical.starts_with("header_wall.") {
+                "wall_detail"
+            } else {
+                "window_frame"
+            };
+            if changed.insert(id, (sources.clone(), role)).is_some() {
+                return None;
+            }
+        }
+        rows.push(format!(
+            "{cid} · 原部件 {} · 窗台 {sill} m · 窗高 {height} m · 原角色/标高/高度保留 · 尺寸依据 {dimension_source} · 来源 {}",
+            old_parts.len(), component["source_ids"]
+        ));
+    }
+    let bounds = proposal["scope"]["region"].as_array()?;
+    let bounds = bounds
+        .iter()
+        .map(Value::as_f64)
+        .collect::<Option<Vec<_>>>()?;
+    if bounds.len() != 4
+        || bounds.iter().any(|n| !n.is_finite())
+        || bounds[0] >= bounds[2]
+        || bounds[1] >= bounds[3]
+    {
+        return None;
+    }
+    let ring = |value: &Value| -> Option<()> {
+        let points = value.as_array()?;
+        if points.len() < 3 {
+            return None;
+        }
+        for point in points {
+            let x = point["x"].as_f64()?;
+            let y = point["y"].as_f64()?;
+            if point.as_object()?.len() != 2
+                || !x.is_finite()
+                || !y.is_finite()
+                || x < bounds[0]
+                || x > bounds[2]
+                || y < bounds[1]
+                || y > bounds[3]
+            {
+                return None;
+            }
+        }
+        Some(())
+    };
+    let operations = proposal["draft"]["operations"].as_array()?;
+    let mut covered = std::collections::BTreeSet::new();
+    let mut fields = std::collections::BTreeSet::new();
+    for op in operations {
+        let id = text(op, "target_id").ok()?;
+        let field = text(op, "field").ok()?;
+        let (sources, role) = changed.get(&id)?;
+        if op["op"] != "set"
+            || op["collection"] != "elements"
+            || !matches!(field.as_str(), "boundary" | "holes")
+            || op["floor_id"] != proposal["scope"]["floor_id"]
+            || op["basis"] != "assumed"
+            || !op["decision_id"].is_null()
+            || strings(&op["source_ids"])? != *sources
+            || !fields.insert((id.clone(), field.clone()))
+            || op["reason"] != proof["reason"]
+        {
+            return None;
+        }
+        let geometry: Value = serde_json::from_str(op["value_json"].as_str()?).ok()?;
+        if field == "boundary" {
+            ring(&geometry)?;
+        } else {
+            for hole in geometry.as_array()? {
+                ring(hole)?;
+            }
+        }
+        covered.insert(id.clone());
+        rows.push(format!(
+            "{id} · {role} · 修改 {field} = {geometry} m · 来源 {} · assumed · {}",
+            op["source_ids"],
+            bounded_text(op, "reason", 4000)?
+        ));
+    }
+    if operations.is_empty() || covered.iter().ne(changed.keys()) {
+        return None;
+    }
     Some(rows)
 }
 

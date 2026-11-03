@@ -481,6 +481,32 @@ fn disk_budget_compacts_live_history_instead_of_terminating_the_session() {
     assert!(replay(&fixture, "active", 0).unwrap().info.needs_recovery);
 }
 
+#[test]
+fn disk_budget_compacts_the_current_uncertain_close_instead_of_failing_shutdown() {
+    let fixture = Fixture::new();
+    let mut protected = store(&fixture, snapshot("protected"));
+    protected.log.write_all(&vec![b'x'; 16 * 1024]).unwrap();
+    protected.log.sync_all().unwrap();
+    drop(protected);
+
+    let mut settings = fixture.settings();
+    settings.max_bytes = 8192;
+    let initial = Record::snapshot(0, snapshot("uncertain-close"));
+    let mut current =
+        Store::create(settings, Path::new(env!("CARGO_MANIFEST_DIR")), &initial).unwrap();
+    current
+        .persist(&initial, &initial.encode().unwrap())
+        .unwrap();
+
+    let mut uncertain = snapshot("uncertain-close");
+    uncertain.close(SessionPhase::Running, true);
+    let terminal = Record::snapshot(1, uncertain);
+    assert!(current
+        .persist(&terminal, &terminal.encode().unwrap())
+        .is_ok());
+    assert!(current.budget_warning);
+}
+
 #[tokio::test]
 async fn writer_failure_is_visible_and_normal_finish_waits_for_durable_close() {
     let fixture = Fixture::new();

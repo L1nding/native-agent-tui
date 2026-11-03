@@ -988,7 +988,11 @@ impl Core {
                 }
                 Some((generation, value)) = poll_rx.recv() => {
                     if generation == self.domain_generation {
-                        self.domain.apply_polled_fact(&value);
+                        let previous_needs = self.domain.snapshot.floor_advance_needs.clone();
+                        let previous_sequence = self.domain.floor_advance_sequence();
+                        if self.domain.apply_polled_fact(&value) == Some(crate::domain::FactProjection::Applied) {
+                            self.refresh_floor_advance_notice(previous_needs, previous_sequence);
+                        }
                     }
                 }
                 changed = async {
@@ -2969,8 +2973,6 @@ impl Core {
         };
         match result {
             Ok(value) => {
-                let was_floor_advance_paused =
-                    self.domain.snapshot.floor_advance_auto_continue_paused;
                 let previous_floor_advance_needs = self.domain.snapshot.floor_advance_needs.clone();
                 let previous_floor_advance_sequence = self.domain.floor_advance_sequence();
                 let projection = self.domain.apply_verified_fact(&value);
@@ -2984,45 +2986,10 @@ impl Core {
                     | crate::domain::FactProjection::DependencyRejected => {}
                     _ => {
                         self.domain.synchronization_finished(&pending.receipt);
-                        if self.domain.snapshot.floor_advance_auto_continue_paused {
-                            let code = self
-                                .domain
-                                .snapshot
-                                .floor_advance_needs
-                                .as_ref()
-                                .and_then(|needs| needs.diagnostic_code.as_deref())
-                                .unwrap_or("unknown");
-                            self.state.view.notice = Some(
-                                if self
-                                    .domain
-                                    .snapshot
-                                    .floor_advance_needs
-                                    .as_ref()
-                                    .is_some_and(|needs| needs.needs_type == "approve_card")
-                                {
-                                    "等待审批卡确认，已暂停自动续接".into()
-                                } else {
-                                    format!("推进器报告平台阻塞（{code}），已暂停自动续接")
-                                },
-                            );
-                        } else if was_floor_advance_paused
-                            && previous_floor_advance_needs
-                                .as_ref()
-                                .is_some_and(|needs| needs.needs_type != "approve_card")
-                            && pending.receipt.kind == "floor_advance"
-                            && previous_floor_advance_sequence
-                                .is_none_or(|sequence| pending.receipt.fact_sequence > sequence)
-                            && projection == crate::domain::FactProjection::Applied
-                            && self.state.view.notice.as_deref().is_some_and(|notice| {
-                                let code = previous_floor_advance_needs
-                                    .as_ref()
-                                    .and_then(|needs| needs.diagnostic_code.as_deref())
-                                    .unwrap_or("unknown");
-                                notice == format!("推进器报告平台阻塞（{code}），已暂停自动续接")
-                            })
-                        {
-                            self.state.view.notice = None;
-                        }
+                        self.refresh_floor_advance_notice(
+                            previous_floor_advance_needs,
+                            previous_floor_advance_sequence,
+                        );
                     }
                 }
             }
@@ -3041,6 +3008,45 @@ impl Core {
             if let Some(retryable_failure) = self.pending_domain_auto_continue.take() {
                 self.maybe_auto_continue(retryable_failure);
             }
+        }
+    }
+
+    fn refresh_floor_advance_notice(
+        &mut self,
+        previous_needs: Option<crate::domain::FloorAdvanceNeeds>,
+        previous_sequence: Option<u64>,
+    ) {
+        if self
+            .domain
+            .floor_advance_sequence()
+            .is_none_or(|sequence| previous_sequence.is_some_and(|previous| sequence <= previous))
+        {
+            return;
+        }
+        if self.domain.snapshot.floor_advance_auto_continue_paused {
+            let needs = self.domain.snapshot.floor_advance_needs.as_ref();
+            self.state.view.notice = Some(
+                if needs.is_some_and(|needs| needs.needs_type == "approve_card") {
+                    "等待审批卡确认，已暂停自动续接".into()
+                } else {
+                    let code = needs
+                        .and_then(|needs| needs.diagnostic_code.as_deref())
+                        .unwrap_or("unknown");
+                    format!("推进器报告平台阻塞（{code}），已暂停自动续接")
+                },
+            );
+        } else if previous_needs
+            .as_ref()
+            .is_some_and(|needs| needs.needs_type != "approve_card" && needs.blocks_auto_continue())
+            && self.state.view.notice.as_deref().is_some_and(|notice| {
+                let code = previous_needs
+                    .as_ref()
+                    .and_then(|needs| needs.diagnostic_code.as_deref())
+                    .unwrap_or("unknown");
+                notice == format!("推进器报告平台阻塞（{code}），已暂停自动续接")
+            })
+        {
+            self.state.view.notice = None;
         }
     }
 
@@ -4732,7 +4738,12 @@ impl Core {
             match crate::domain::receipt::from_tool(setup, notice, &params["item"]) {
                 Ok(Some(receipt)) => self.queue_domain_fact(receipt),
                 Err(reason) => self.domain.synchronization_failed("transport", 0, reason),
-                Ok(None) => self.domain.observe(notice, &params["item"]),
+                Ok(None) => {
+                    let previous_needs = self.domain.snapshot.floor_advance_needs.clone();
+                    let previous_sequence = self.domain.floor_advance_sequence();
+                    self.domain.observe(notice, &params["item"]);
+                    self.refresh_floor_advance_notice(previous_needs, previous_sequence);
+                }
             }
         }
         let Some(locator) = self.tool_locator(&notice.thread_id, &notice.turn_id, &notice.item_id)
@@ -6472,6 +6483,74 @@ sys.stdout.buffer.write(path.read_bytes())
             assert_eq!(
                 client.snapshots.borrow().notice.as_deref(),
                 Some("推进器报告平台阻塞（fact_too_large），已暂停自动续接")
+            );
+            let mut before_poll = receipts[13].clone();
+            let raw = serde_json::to_vec(
+                &json!({"contract":"modeling-domain/v2", "run_id":"notice-test",
+                "context_sha256":context_sha256, "kind":"floor_advance", "ok":true,
+                "fact_sequence":103, "needs":{"type":"blocked","diagnostic":{"rejection":{
+                    "category":"platform_contract","code":"fact_too_large"}}}}),
+            )
+            .unwrap();
+            let sha = format!("{:x}", sha2::Sha256::digest(&raw));
+            std::fs::write(
+                root.join(format!(
+                    "outputs/domain/notice-test/changes/facts/{sha}.json"
+                )),
+                &raw,
+            )
+            .unwrap();
+            before_poll["fact_sequence"] = json!(103);
+            before_poll["fact_sha256"] = json!(sha);
+            before_poll["fact_bytes"] = json!(raw.len());
+            send_floor_receipt(&mut client, &mut server, before_poll, "blocked-before-poll").await;
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0].modeling().is_some_and(|domain| {
+                        domain.floor_advance_auto_continue_paused
+                            && domain.floor_advance_needs.as_ref().is_some_and(|needs| {
+                                needs.rejection_category.as_deref() == Some("platform_contract")
+                            })
+                    })
+                })
+                .await
+                .unwrap();
+            // The file poll may project a successful advance before the tool receipt.
+            let polled = json!({"contract":"modeling-domain/v2", "run_id":"notice-test",
+                "context_sha256":context_sha256, "kind":"floor_advance", "ok":true,
+                "fact_sequence":104, "needs":{"type":"judge_sheets"}});
+            let raw = serde_json::to_vec(&polled).unwrap();
+            let sha = format!("{:x}", sha2::Sha256::digest(&raw));
+            std::fs::write(
+                root.join(format!(
+                    "outputs/domain/notice-test/changes/facts/{sha}.json"
+                )),
+                raw,
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("outputs/domain/notice-test/changes/fact-sequences.json"),
+                serde_json::to_vec(&json!({"next":105,"facts":{"polled":104}})).unwrap(),
+            )
+            .unwrap();
+            client
+                .snapshots
+                .wait_for(|snapshot| {
+                    snapshot.extensions[0].modeling().is_some_and(|domain| {
+                        domain
+                            .floor_advance_needs
+                            .as_ref()
+                            .is_some_and(|needs| needs.needs_type == "judge_sheets")
+                            && !domain.floor_advance_auto_continue_paused
+                    })
+                })
+                .await
+                .unwrap();
+            assert!(
+                client.snapshots.borrow().notice.is_none(),
+                "poll notice: {:?}",
+                client.snapshots.borrow().notice
             );
         })
         .await;

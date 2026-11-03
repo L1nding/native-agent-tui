@@ -1900,11 +1900,15 @@ impl DomainFacts {
                 let Some(scope) = incoming_scope else {
                     return invalid!();
                 };
-                let Some(proposal) = proposal_fact(value) else {
+                let repository = self
+                    .setup
+                    .as_ref()
+                    .map_or(Path::new("."), |setup| setup.repository.as_path());
+                let Some(proposal) = proposal_fact_in_repository(value, repository) else {
                     return invalid!("proposal_fact");
                 };
                 let Some(mut first_use) =
-                    review::requirements_for_scope(&value["proposal"], &scope)
+                    review::requirements_for_scope(&value["proposal"], &scope, repository)
                 else {
                     return invalid!("review::requirements");
                 };
@@ -2063,11 +2067,15 @@ impl DomainFacts {
                 accepted = true;
             }
             Some("proposal") => {
-                if let Some(proposal) = proposal_fact(value) {
+                let repository = self
+                    .setup
+                    .as_ref()
+                    .map_or(Path::new("."), |setup| setup.repository.as_path());
+                if let Some(proposal) = proposal_fact_in_repository(value, repository) {
                     let Some(mut first_use) = (if let Some(scope) = &self.snapshot.project_scope {
-                        review::requirements_for_scope(&value["proposal"], scope)
+                        review::requirements_for_scope(&value["proposal"], scope, repository)
                     } else {
-                        review::requirements(&value["proposal"])
+                        review::requirements(&value["proposal"], repository)
                     }) else {
                         return invalid!("review::requirements");
                     };
@@ -3856,7 +3864,12 @@ fn proposal_category_counts(proposal: &Value) -> BTreeMap<String, usize> {
     counts
 }
 
+#[cfg(test)]
 fn proposal_fact(value: &Value) -> Option<ProposalFact> {
+    proposal_fact_in_repository(value, Path::new("."))
+}
+
+fn proposal_fact_in_repository(value: &Value, repository: &Path) -> Option<ProposalFact> {
     let p = &value["proposal"];
     let binding = ProposalBinding {
         run_id: text(value, "run_id").ok()?,
@@ -3871,6 +3884,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     let mut parameter_only = false;
     let mut seen_connections = std::collections::BTreeSet::new();
     let mut remaining_reference_parts = std::collections::BTreeSet::new();
+    let mut remaining_escalator_parts = std::collections::BTreeSet::new();
     // 已验证事实受单文件及分页聚合预算约束，批准前必须逐条投影全部操作。
     let correction = p.get("drawing_review").filter(|v| !v.is_null());
     let edit = p.get("component_edit").filter(|v| !v.is_null());
@@ -3881,10 +3895,40 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
     let vertical_sources = edit
         .map(|proof| &proof["sources"])
         .unwrap_or(&p["vertical_sources"]);
+    if edit.is_none() {
+        for connection in component_plan["connections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if connection["circulation_type"] != "escalator" {
+                continue;
+            }
+            let component = text(connection, "component_id").ok()?;
+            let flights = connection["flights"].as_array()?;
+            if connection["kind"] != "stair"
+                || connection["mode"] != "single_floor_schematic"
+                || connection["cad_completion"] != true
+                || flights.is_empty()
+                || flights.len() > 100
+            {
+                return None;
+            }
+            for flight in 1..=flights.len() {
+                for segment in 1..=3 {
+                    if !remaining_escalator_parts
+                        .insert(format!("{component}.flight.{flight:02}.step.{segment:03}"))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
     let structure_revision =
         !p["structure_revision_source"].is_null() || !p["slab_revision_source"].is_null();
     if structure_revision {
-        objects.extend(project::structure_revision_rows(value)?);
+        objects.extend(project::structure_revision_rows(value, repository)?);
     }
     if edit.is_some() {
         objects.extend(component_edit::projection(p)?);
@@ -4229,8 +4273,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                 .find(|c| c["component_id"].as_str() == Some(component))?;
             let source = metadata["source_instance_id"].as_str()?;
             let shaft = schematic && connection["kind"] == "shaft";
-            let escalator =
-                edit.is_some() && schematic && connection["circulation_type"] == "escalator";
+            let escalator = schematic && connection["circulation_type"] == "escalator";
             let matching_schematic_role = match connection["kind"].as_str() {
                 Some("shaft") => role == "shaft_wall",
                 Some("stair") => role != "shaft_wall",
@@ -4287,6 +4330,92 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                     }
                 }
             }
+            if escalator && edit.is_none() {
+                // New escalators have no edit certificate: verify the complete
+                // three-part flight before bypassing ordinary stair side-panel evidence.
+                let id = element["id"].as_str()?;
+                let owner = format!("{component}.flight.01.step.001");
+                let source_fact = &vertical_sources[source];
+                let suffix = id.strip_prefix(&format!("{component}.flight."))?;
+                let (flight_number, segment_number) = suffix.split_once(".step.")?;
+                let flight = connection["flights"]
+                    .as_array()?
+                    .get(flight_number.parse::<usize>().ok()?.checked_sub(1)?)?;
+                let segment = segment_number.parse::<usize>().ok()?;
+                let ascending = flight["ascending"].as_bool()?;
+                let bottom = flight["bottom_m"].as_f64()?;
+                let top = flight["top_m"].as_f64()?;
+                let (start_z, end_z) = if ascending {
+                    (bottom, top)
+                } else {
+                    (top, bottom)
+                };
+                let expected_top = match segment {
+                    1 => [start_z, start_z],
+                    2 => [start_z, end_z],
+                    3 => [end_z, end_z],
+                    _ => return None,
+                };
+                let mut expected_sources = source_fact["cad_source_ids"]
+                    .as_array()?
+                    .iter()
+                    .chain(connection["source_ids"].as_array()?)
+                    .map(|id| id.as_str().filter(|id| !id.is_empty()))
+                    .collect::<Option<std::collections::BTreeSet<_>>>()?;
+                expected_sources.insert(source);
+                let actual_sources = element["source_ids"]
+                    .as_array()?
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Option<std::collections::BTreeSet<_>>>()?;
+                let endpoints: Value =
+                    serde_json::from_str(metadata["endpoint_top_z_m"].as_str()?).ok()?;
+                if !remaining_escalator_parts.remove(id)
+                    || reference
+                    || role != "partition"
+                    || expected_sources != actual_sources
+                    || op["source_ids"] != element["source_ids"]
+                    || metadata["circulation_type"] != "escalator"
+                    || metadata["vertical_spec_owner"] != owner
+                    || metadata["escalator_part"]
+                        != if segment == 2 { "incline" } else { "level_end" }
+                    || metadata["solid_representation"]
+                        != "schematic escalator truss with level ends and continuous incline"
+                    || metadata["limitations"] != connection["limitations"]
+                    || bounded_text(connection, "limitations", 2000).is_none()
+                    || metadata["level_end_depth_m"]
+                        .as_str()?
+                        .parse::<f64>()
+                        .ok()
+                        .is_none_or(|depth| !depth.is_finite() || depth <= 0.0)
+                    || bottom < 0.0
+                    || top <= bottom
+                    || top > connection["rise_m"].as_f64()? + 0.001
+                    || endpoints
+                        != json!([
+                            element["stair_top"]["start_z"],
+                            element["stair_top"]["end_z"]
+                        ])
+                    || expected_top
+                        .iter()
+                        .zip([
+                            element["stair_top"]["start_z"].as_f64()?,
+                            element["stair_top"]["end_z"].as_f64()?,
+                        ])
+                        .any(|(expected, actual)| (expected - actual).abs() > 0.001)
+                {
+                    return None;
+                }
+                if id == owner {
+                    if serde_json::from_str::<Value>(metadata["vertical_spec"].as_str()?).ok()?
+                        != *connection
+                    {
+                        return None;
+                    }
+                } else if metadata["reason_ref"] != owner {
+                    return None;
+                }
+            }
             if shaft {
                 let id = element["id"].as_str()?;
                 if reference
@@ -4314,7 +4443,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
                 }
             }
             if schematic && role == "partition" && !reference {
-                // 扶梯的三段及精确方案已由编辑证书核验；它没有楼梯侧板线索引。
+                // 扶梯已由编辑证书或首次新增校验核对三段；它没有楼梯侧板线索引。
                 if !escalator {
                     let indices: Vec<usize> =
                         serde_json::from_str(metadata["side_panel_line_indices"].as_str()?).ok()?;
@@ -4662,7 +4791,7 @@ fn proposal_fact(value: &Value) -> Option<ProposalFact> {
             op["basis"].as_str().unwrap_or("unknown")
         ));
     }
-    if !remaining_reference_parts.is_empty() {
+    if !remaining_reference_parts.is_empty() || !remaining_escalator_parts.is_empty() {
         return None;
     }
     let assumptions = p["assumed"]
